@@ -1,0 +1,20 @@
+<!--
+    Droidloom uses the host Linux kernel and does not load an Android SELinux
+    policy into it. A kernel policy version of zero is therefore the real
+    runtime contract, not a missing Android service.
+-->
+<compatibility-matrix version="9.0" type="framework">
+    <sepolicy>
+        <kernel-sepolicy-version>0</kernel-sepolicy-version>
+        <sepolicy-version>31.0</sepolicy-version>
+        <sepolicy-version>32.0</sepolicy-version>
+        <sepolicy-version>33.0</sepolicy-version>
+        <sepolicy-version>34.0</sepolicy-version>
+        <sepolicy-version>202404</sepolicy-version>
+        <sepolicy-version>202504</sepolicy-version>
+        <sepolicy-version>202604</sepolicy-version>
+    </sepolicy>
+    <avb>
+        <vbmeta-version>1.0</vbmeta-version>
+    </avb>
+</compatibility-matrix>

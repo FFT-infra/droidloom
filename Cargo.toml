@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "android/framework/droidloom-task-launcher",
+    "android/runtime/droidloom-classpath-wrapper",
+    "runtime/droidloom-applications",
+    "runtime/droidloom-package-support",
+    "runtime/droidloom-contracts",
+    "runtime/droidloom-doctor",
+    "runtime/droidloom-supervisor",
+    "runtime/droidloom-window-policy",
+    "graphics/droidloom-composer",
+    "graphics/droidloom-denial-ipc",
+    "graphics/droidloom-denial-endpoint",
+    "graphics/droidloom-wayland",
+    "graphics/droidloom-denial-protocol",
+    "graphics/droidloom-input-protocol",
+    "graphics/droidloom-minigbm",
+    "graphics/droidloom-syncobj",
+    "graphics/droidloom-surface-bridge",
+    "graphics/droidloom-task-control",
+    "graphics/droidloom-transport",
+    "tools/droidloom-image",
+    "tools/droidloom-update",
+    "tools/droidloom-package",
+    "tools/droidloom-mesa",
+    "tools/droidloom-source",
+    "tools/droidloom-dmabuf-probe",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/denialwm/droidloom"
+
+[workspace.dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+cc = "1.2.67"
+drm = "0.14.1"
+drm-fourcc = "2.2.0"
+flate2 = "1.1.9"
+gbm = "0.18.0"
+gbm-sys = "0.4.0"
+libc = "0.2.188"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+hex = "0.4.3"
+tempfile = "3.27.0"
+thiserror = "2.0.19"
+smithay-client-toolkit = { version = "0.20.0", default-features = false }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

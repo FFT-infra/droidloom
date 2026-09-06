@@ -1,0 +1,17 @@
+service droidloom-input-bridge /vendor/bin/droidloom-input-bridge
+    class main
+    user root
+    group root system graphics
+    socket droidloom_input seqpacket+listen 0660 system system
+    stdio_to_kmsg
+
+service droidloom-ime-setup /system/bin/sh /droidloom/ime/setup
+    class late_start
+    user shell
+    group shell
+    disabled
+    oneshot
+    stdio_to_kmsg
+
+on property:sys.boot_completed=1
+    start droidloom-ime-setup

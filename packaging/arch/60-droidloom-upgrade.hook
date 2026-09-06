@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = droidloom-runtime
+Target = droidloom-image
+
+[Action]
+Description = Stopping Droidloom before replacing its runtime and Android images...
+When = PreTransaction
+Exec = /usr/lib/droidloom/droidloom-package-helper before-upgrade
+AbortOnFail

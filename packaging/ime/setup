@@ -1,0 +1,18 @@
+#!/system/bin/sh
+# Android init invokes this once after boot, as shell. No app launch required.
+set -eu
+export PATH=/system/bin:/system/xbin
+apk=/droidloom/ime/DroidloomIME.apk
+marker=/data/local/tmp/droidloom-ime.sha256
+digest="$(sha256sum "$apk" | cut -d ' ' -f 1)"
+installed="$(cmd package path com.android.droidloom.ime 2>/dev/null || true)"
+previous=""
+if [ -f "$marker" ]; then previous="$(cat "$marker")"; fi
+if [ -z "$installed" ] || [ "$previous" != "$digest" ]; then
+    result="$(cmd package install -r "$apk")"
+    case "$result" in *Success*) ;; *) echo "$result" >&2; exit 1;; esac
+    printf '%s\n' "$digest" > "$marker"
+fi
+cmd input_method ime enable com.android.droidloom.ime/.HostInputMethod
+cmd input_method ime set com.android.droidloom.ime/.HostInputMethod
+cmd settings put secure show_ime_with_hard_keyboard 1

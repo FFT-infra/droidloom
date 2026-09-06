@@ -1,0 +1,29 @@
+#!/system/bin/sh
+# Invoked once after boot as shell, independently of keyboard provisioning.
+set -eu
+export PATH=/system/bin:/system/xbin
+apk=/droidloom/ime/DroidloomHome.apk
+package=com.android.droidloom.home
+component=$package/.HomeActivity
+marker=/data/local/tmp/droidloom-home.sha256
+digest="$(sha256sum "$apk" | cut -d ' ' -f 1)"
+installed="$(cmd package path --user 0 "$package" 2>/dev/null || true)"
+previous=""
+if [ -f "$marker" ]; then previous="$(cat "$marker")"; fi
+if [ -z "$installed" ] || [ "$previous" != "$digest" ]; then
+    result="$(cmd package install -r --user 0 "$apk")"
+    case "$result" in *Success*) ;; *) echo "$result" >&2; exit 1;; esac
+    printf '%s\n' "$digest" > "$marker"
+fi
+cmd package enable --user 0 "$package"
+cmd package set-home-activity --user 0 "$component"
+resolved="$(cmd package resolve-activity --brief --user 0 \
+    -a android.intent.action.MAIN -c android.intent.category.HOME | tail -n 1)"
+case "$resolved" in
+    "$component"|"$package/$package.HomeActivity") ;;
+    *) echo "Droidloom HOME resolution failed: $resolved" >&2; exit 1;;
+esac
+# Retire the stock launcher only after the replacement HOME is verified.
+# This is per-user and reversible; the base APK and its data remain intact.
+cmd package disable-user --user 0 com.android.launcher3
+am force-stop --user 0 com.android.launcher3

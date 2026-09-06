@@ -1,0 +1,31 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.android.systemui" android:sharedUserId="android.uid.systemui"
+    android:versionCode="37" android:versionName="Droidloom-1" coreApp="true">
+    <uses-sdk android:minSdkVersion="37" android:targetSdkVersion="37" />
+    <permission android:name="com.android.systemui.permission.SELF"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.android.systemui.permission.SELF" />
+    <uses-permission android:name="android.permission.STATUS_BAR_SERVICE" />
+    <uses-permission android:name="android.permission.ACCESS_KEYGUARD_SECURE_STORAGE" />
+    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    <uses-permission android:name="android.permission.READ_CLIPBOARD_IN_BACKGROUND" />
+    <application android:label="Droidloom SystemUI" android:persistent="true"
+        android:allowBackup="false" android:allowClearUserData="false"
+        android:hardwareAccelerated="false" android:directBootAware="true"
+        android:defaultToDeviceProtectedStorage="true">
+        <provider android:name=".clipboard.ClipboardProvider"
+            android:authorities="com.android.systemui.droidloom.clipboard"
+            android:exported="false" android:grantUriPermissions="true" />
+        <service android:name=".SystemUIService" android:exported="true"
+            android:permission="android.permission.STATUS_BAR_SERVICE" />
+        <service android:name=".SystemUISecondaryUserService" android:exported="true"
+            android:permission="com.android.systemui.permission.SELF" />
+        <service android:name=".keyguard.KeyguardService" android:exported="true"
+            android:permission="android.permission.CONTROL_KEYGUARD" />
+        <service android:name=".screenshot.TakeScreenshotService" android:exported="true"
+            android:permission="com.android.systemui.permission.SELF" />
+        <activity android:name=".mediaprojection.permission.MediaProjectionPermissionActivity"
+            android:exported="true" android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+    </application>
+</manifest>

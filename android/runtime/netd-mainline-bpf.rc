@@ -1,0 +1,35 @@
+# Android normally relies on its device kernel policy when netd performs its
+# boot-time BPF map self-test. Droidloom deliberately leaves the shared host
+# kernel's unprivileged-BPF lock enabled, so netd must retain the dedicated
+# CAP_BPF capability instead. All network administration remains confined to
+# the cell's network namespace.
+service netd1shot /system/bin/netd oneshot
+    disabled
+    class main
+    capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID BPF
+    user root
+    group root net_admin
+    rlimit memlock 1073741824 1073741824
+    updatable
+    oneshot
+    reboot_on_failure reboot,netd1shot-fail
+
+service netd /system/bin/netd
+    disabled
+    class main
+    capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID BPF
+    user root
+    group root net_admin
+    rlimit memlock 1073741824 1073741824
+    socket dnsproxyd stream 0660 root inet
+    socket mdns stream 0660 root system
+    socket fwmarkd stream 0660 root inet
+    updatable
+    onrestart restart zygote
+    onrestart restart zygote_secondary
+
+on property:persist.vendor.net.doxlat=true
+    setprop net.464xlat.cellular.enabled true
+
+on property:persist.vendor.net.doxlat=false
+    setprop net.464xlat.cellular.enabled false

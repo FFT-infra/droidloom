@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      A Droidloom local display represents an app window, never a mirror of
+      Android's bootstrap display. LocalDisplayAdapter converts this setting
+      into FLAG_OWN_CONTENT_ONLY, which makes DisplayManager declare every
+      Composer-created display capable of hosting tasks.
+    -->
+    <bool name="config_localDisplaysMirrorContent">false</bool>
+</resources>

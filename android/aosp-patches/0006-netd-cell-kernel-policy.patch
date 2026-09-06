@@ -1,0 +1,93 @@
+diff --git a/server/Controllers.cpp b/server/Controllers.cpp
+index 43ea13d..0000000 100644
+--- a/server/Controllers.cpp
++++ b/server/Controllers.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ 
++#include <cstdlib>
+ #include <cinttypes>
+ #include <regex>
+ #include <set>
+@@ -322,22 +323,31 @@ int Controllers::initIptablesRules() {
+ }
+ 
+ void Controllers::init() {
+-    if (initIptablesRules()) {
++    const bool cellOwnsPacketPolicy = std::getenv("DROIDLOOM_CELL") != nullptr;
++    const bool iptablesReady = initIptablesRules() == 0;
++    if (!iptablesReady && !cellOwnsPacketPolicy) {
+         gLog.error("Failed to initialize iptables rules");
+         exit(1);
+     }
++    if (!iptablesReady) {
++        gLog.info("Droidloom cell: host nftables owns packet policy; legacy iptables unavailable");
++    }
+     Stopwatch s;
+ 
+-    if (int ret = bandwidthCtrl.enableBandwidthControl()) {
+-        gLog.error("Failed to initialize BandwidthController (%s)", strerror(-ret));
+-        // A failure to init almost definitely means that iptables failed to load
+-        // our static ruleset, which then basically means network accounting will not work.
+-        // As such simply exit netd.  This may crash loop the system, but by failing
+-        // to bootup we will trigger rollback and thus this offers us protection against
+-        // a mainline update breaking things.
+-        exit(2);
++    if (iptablesReady) {
++        if (int ret = bandwidthCtrl.enableBandwidthControl()) {
++            gLog.error("Failed to initialize BandwidthController (%s)", strerror(-ret));
++            // A failure to init almost definitely means that iptables failed to load
++            // our static ruleset, which then basically means network accounting will not work.
++            // As such simply exit netd.  This may crash loop the system, but by failing
++            // to bootup we will trigger rollback and thus this offers us protection against
++            // a mainline update breaking things.
++            exit(2);
++        }
++        gLog.info("Enabling bandwidth control: %" PRId64 "us", s.getTimeAndResetUs());
++    } else {
++        gLog.info("Droidloom cell: Android bandwidth policy is delegated to the host");
+     }
+-    gLog.info("Enabling bandwidth control: %" PRId64 "us", s.getTimeAndResetUs());
+ 
+     if (int ret = RouteController::Init(NetworkController::LOCAL_NET_ID)) {
+         gLog.error("Failed to initialize RouteController (%s)", strerror(-ret));
+@@ -343,7 +353,13 @@ void Controllers::init() {
+ 
+     netdutils::Status xStatus = XfrmController::Init();
+     if (!isOk(xStatus)) {
+-        gLog.error("Failed to initialize XfrmController (%s)", netdutils::toString(xStatus).c_str());
++        if (cellOwnsPacketPolicy) {
++            gLog.info("Droidloom cell: XFRM is unavailable (%s)",
++                      netdutils::toString(xStatus).c_str());
++            return;
++        }
++        gLog.error("Failed to initialize XfrmController (%s)",
++                   netdutils::toString(xStatus).c_str());
+         exit(4);
+     };
+     gLog.info("Initializing XfrmController: %" PRId64 "us", s.getTimeAndResetUs());
+diff --git a/server/RouteController.cpp b/server/RouteController.cpp
+index 775bbbb..0000000 100644
+--- a/server/RouteController.cpp
++++ b/server/RouteController.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "RouteController.h"
+ 
++#include <cstdlib>
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -480,6 +481,11 @@ int modifyIpRoute(uint16_t action, uint16_t flags, uint32_t table,
+ //   same interface.
+ int modifyIncomingPacketMark(unsigned netId, const char* interface, Permission permission,
+                              bool add) {
++    if (std::getenv("DROIDLOOM_CELL") != nullptr) {
++        ALOGI("Droidloom cell: host nftables owns incoming packet policy");
++        return 0;
++    }
++
+     Fwmark fwmark;
+ 
+     fwmark.netId = netId;

@@ -1,0 +1,49 @@
+package {
+    // The APEX recipe adapts AOSP's example; keep its upstream attribution
+    // alongside the license for Droidloom's changes.
+    default_applicable_licenses: ["Android-Apache-2.0", "droidloom_license"],
+}
+
+// Droidloom only needs a timing-correct, silent audio endpoint to let Android's
+// framework boot.  The upstream example APEX also bundles the complete effects
+// suite (including ML-backed effects), which is unrelated to that requirement.
+apex {
+    name: "com.android.hardware.audio.droidloom",
+    apex_available_name: "com.android.hardware.audio",
+    manifest: "manifest.json",
+    file_contexts: "file_contexts",
+    key: "com.android.hardware.key",
+    certificate: ":com.android.hardware.certificate",
+    updatable: false,
+    vendor: true,
+
+    binaries: [
+        "android.hardware.audio.service-aidl.droidloom",
+        "android.hardware.audio.effect.service-aidl.example",
+    ],
+    prebuilts: [
+        "droidloom.audio.effects.config",
+        "droidloom.audio.service.rc",
+        "droidloom.audio.service.xml",
+    ],
+}
+
+prebuilt_etc {
+    name: "droidloom.audio.effects.config",
+    src: "audio_effects_config.xml",
+    filename: "audio_effects_config.xml",
+    installable: false,
+}
+
+prebuilt_etc {
+    name: "droidloom.audio.service.rc",
+    src: "droidloom.audio.service.rc",
+    installable: false,
+}
+
+prebuilt_etc {
+    name: "droidloom.audio.service.xml",
+    src: "droidloom.audio.service.xml",
+    sub_dir: "vintf",
+    installable: false,
+}

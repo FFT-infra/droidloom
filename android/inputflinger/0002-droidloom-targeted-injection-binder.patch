@@ -1,0 +1,183 @@
+diff --git a/services/inputflinger/InputManager.cpp b/services/inputflinger/InputManager.cpp
+index 469a616..57f28dc 100644
+--- a/services/inputflinger/InputManager.cpp
++++ b/services/inputflinger/InputManager.cpp
+@@ -18,7 +18,11 @@
+ 
+ //#define LOG_NDEBUG 0
+ 
++#include <algorithm>
++#include <array>
+ #include <memory>
++#include <optional>
++#include <vector>
+ 
+ #include "InputManager.h"
+ #include "InputReader.h"
+@@ -32,6 +36,7 @@
+ #include <android/binder_interface_utils.h>
+ #include <android/sysprop/InputProperties.sysprop.h>
+ #include <binder/IPCThreadState.h>
++#include <binder/Parcel.h>
+ #include <com_android_input_flags.h>
+ #include <inputflinger_bootstrap.rs.h>
+ #include <jni.h>
+@@ -66,6 +71,52 @@ int32_t exceptionCodeFromStatusT(status_t status) {
+     }
+ }
+ 
++status_t readDroidloomKeyEvent(const Parcel& parcel, KeyEvent* event) {
++    int32_t id;
++    int32_t deviceId;
++    uint32_t source;
++    int32_t displayId;
++    std::optional<std::vector<uint8_t>> serializedHmac;
++    int32_t action;
++    int32_t keyCode;
++    int32_t repeatCount;
++    int32_t metaState;
++    int32_t scanCode;
++    int32_t eventFlags;
++    int64_t downTime;
++    int64_t eventTime;
++    std::optional<String16> characters;
++
++    status_t status = parcel.readInt32(&id);
++    status = status == OK ? parcel.readInt32(&deviceId) : status;
++    status = status == OK ? parcel.readUint32(&source) : status;
++    status = status == OK ? parcel.readInt32(&displayId) : status;
++    status = status == OK ? parcel.readByteVector(&serializedHmac) : status;
++    status = status == OK ? parcel.readInt32(&action) : status;
++    status = status == OK ? parcel.readInt32(&keyCode) : status;
++    status = status == OK ? parcel.readInt32(&repeatCount) : status;
++    status = status == OK ? parcel.readInt32(&metaState) : status;
++    status = status == OK ? parcel.readInt32(&scanCode) : status;
++    status = status == OK ? parcel.readInt32(&eventFlags) : status;
++    status = status == OK ? parcel.readInt64(&downTime) : status;
++    status = status == OK ? parcel.readInt64(&eventTime) : status;
++    status = status == OK ? parcel.readString16(&characters) : status;
++    if (status != OK || (serializedHmac && serializedHmac->size() != 32)) {
++        return BAD_VALUE;
++    }
++
++    // Java-created KeyEvents have a null HMAC. Android represents that as
++    // INVALID_HMAC (all zeroes) for injected events; only events returning
++    // from the native dispatcher carry the fixed-size signed value.
++    std::array<uint8_t, 32> hmac{};
++    if (serializedHmac) {
++        std::copy(serializedHmac->begin(), serializedHmac->end(), hmac.begin());
++    }
++    event->initialize(id, deviceId, source, ui::LogicalDisplayId{displayId}, hmac, action,
++                      eventFlags, keyCode, scanCode, metaState, repeatCount, downTime, eventTime);
++    return OK;
++}
++
+ // Convert a binder interface into a raw pointer to an AIBinder.
+ using IInputFlingerRustBootstrapCallback = aidl::com::android::server::inputflinger::
+         IInputFlingerRust::IInputFlingerRustBootstrapCallback;
+@@ -182,6 +233,62 @@ InputManager::~InputManager() {
+     stop();
+ }
+ 
++status_t InputManager::onTransact(uint32_t code, const Parcel& data, Parcel* reply,
++                                  uint32_t flags) {
++    static constexpr uint32_t kDroidloomInjectToApplicationTransaction = 0x00444c02;
++    if (code != kDroidloomInjectToApplicationTransaction) {
++        return BnInputFlinger::onTransact(code, data, reply, flags);
++    }
++
++    CHECK_INTERFACE(android::os::IInputFlinger, data, reply);
++    const uid_t uid = IPCThreadState::self()->getCallingUid();
++    if (uid != AID_ROOT && uid != AID_SYSTEM) {
++        ALOGE("Permission Denial: Droidloom targeted input from uid=%d", uid);
++        return PERMISSION_DENIED;
++    }
++    if (reply == nullptr) {
++        return BAD_VALUE;
++    }
++
++    sp<IBinder> targetApplicationToken;
++    status_t status = data.readStrongBinder(&targetApplicationToken);
++    int32_t mode;
++    status = status == OK ? data.readInt32(&mode) : status;
++    int32_t eventType;
++    status = status == OK ? data.readInt32(&eventType) : status;
++    if (status != OK || targetApplicationToken == nullptr ||
++        mode != static_cast<int32_t>(android::os::InputEventInjectionSync::NONE)) {
++        return BAD_VALUE;
++    }
++
++    std::unique_ptr<InputEvent> event;
++    if (eventType == 1) {
++        auto motionEvent = std::make_unique<MotionEvent>();
++        status = motionEvent->readFromParcel(const_cast<Parcel*>(&data));
++        event = std::move(motionEvent);
++    } else if (eventType == 2) {
++        auto keyEvent = std::make_unique<KeyEvent>();
++        status = readDroidloomKeyEvent(data, keyEvent.get());
++        event = std::move(keyEvent);
++    } else {
++        return BAD_VALUE;
++    }
++    if (status != OK || data.dataAvail() != 0) {
++        return BAD_VALUE;
++    }
++
++    auto* dispatcher = static_cast<inputdispatcher::InputDispatcher*>(mDispatcher.get());
++    const android::os::InputEventInjectionResult result =
++            dispatcher->injectInputEventToApplication(
++                    event.get(), std::nullopt, android::os::InputEventInjectionSync::NONE,
++                    std::chrono::milliseconds(30'000), POLICY_FLAG_DISABLE_KEY_REPEAT,
++                    targetApplicationToken);
++    status = reply->writeNoException();
++    return status == OK
++            ? reply->writeBool(result == android::os::InputEventInjectionResult::SUCCEEDED)
++            : status;
++}
++
+ status_t InputManager::start() {
+     status_t result = mDispatcher->start();
+     if (result) {
+diff --git a/services/inputflinger/InputManager.h b/services/inputflinger/InputManager.h
+index b1133fd..02c0cb7 100644
+--- a/services/inputflinger/InputManager.h
++++ b/services/inputflinger/InputManager.h
+@@ -142,6 +142,8 @@ public:
+     void monitor() override;
+     void dump(std::string& dump) override;
+ 
++    status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply,
++                        uint32_t flags) override;
+     status_t dump(int fd, const Vector<String16>& args) override;
+     binder::Status createInputChannel(const std::string& name,
+                                       android::os::InputChannelCore* outChannel) override;
+diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/reader/EventHub.cpp
+index 2ac37b6..cb56f03 100644
+--- a/services/inputflinger/reader/EventHub.cpp
++++ b/services/inputflinger/reader/EventHub.cpp
+@@ -2967,6 +2967,25 @@ void EventHub::createVirtualKeyboardLocked() {
+             InputDeviceClass::DPAD | InputDeviceClass::VIRTUAL;
+     device->loadKeyMapLocked();
+     addDeviceLocked(std::move(device));
++
++    // Droidloom's real keyboard remains owned and routed by Denial. Advertise
++    // that host capability as a positive Android input-device identity so the
++    // framework selects hardware-keyboard mode without exposing /dev/input or
++    // /dev/uinput to the Android cell. Actual key events still use the exact
++    // task-token injection path above.
++    InputDeviceIdentifier hostKeyboardIdentifier;
++    hostKeyboardIdentifier.name = "Droidloom Host Keyboard";
++    hostKeyboardIdentifier.location = "droidloom/host-keyboard";
++    hostKeyboardIdentifier.uniqueId = "<droidloom-host-keyboard>";
++    assignDescriptorLocked(hostKeyboardIdentifier);
++
++    auto hostKeyboard = std::make_unique<Device>(
++            -1, mNextDeviceId++, "<droidloom-host-keyboard>", hostKeyboardIdentifier,
++            /*associatedDevice=*/nullptr);
++    hostKeyboard->classes = InputDeviceClass::KEYBOARD | InputDeviceClass::ALPHAKEY |
++            InputDeviceClass::DPAD | InputDeviceClass::VIRTUAL;
++    hostKeyboard->loadKeyMapLocked();
++    addDeviceLocked(std::move(hostKeyboard));
+ }
+ 
+ void EventHub::addDeviceLocked(std::unique_ptr<Device> device) {

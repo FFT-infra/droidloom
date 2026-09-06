@@ -1,0 +1,24 @@
+[package]
+name = "droidloom-applications"
+description = "XDG application catalog for the persistent Droidloom Android cell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+droidloom-supervisor = { path = "../droidloom-supervisor" }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

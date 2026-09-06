@@ -1,0 +1,372 @@
+package {
+    default_applicable_licenses: ["droidloom_license"],
+}
+
+license {
+    name: "droidloom_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-GPL-3.0-or-later"],
+    license_text: ["LICENSE", "LICENSES/GPL-3.0-or-later.txt"],
+}
+
+android_app {
+    name: "DroidloomIME",
+    manifest: "android/framework/droidloom-ime/AndroidManifest.xml",
+    srcs: ["android/framework/droidloom-ime/src/**/*.java"],
+    resource_dirs: ["android/framework/droidloom-ime/res"],
+    sdk_version: "37",
+    min_sdk_version: "31",
+    certificate: "testkey",
+    // This tiny SDK-only app needs no Bazel resource processor.
+    use_resource_processor: false,
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+android_app {
+    name: "DroidloomHome",
+    manifest: "android/framework/droidloom-home/AndroidManifest.xml",
+    srcs: ["android/framework/droidloom-home/src/**/*.java"],
+    resource_dirs: ["android/framework/droidloom-home/res"],
+    sdk_version: "37",
+    min_sdk_version: "31",
+    certificate: "testkey",
+    use_resource_processor: false,
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+android_app {
+    name: "DroidloomSystemUI",
+    manifest: "android/framework/droidloom-systemui/AndroidManifest.xml",
+    srcs: ["android/framework/droidloom-systemui/src/**/*.java"],
+    resource_dirs: [],
+    platform_apis: true,
+    system_ext_specific: true,
+    privileged: true,
+    certificate: "platform",
+    use_resource_processor: false,
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+// Runs without an Activity or UI event, under app_process as Android shell.
+java_library {
+    name: "DroidloomSystemUIProbe",
+    srcs: [
+        "android/framework/droidloom-systemui/src/com/android/systemui/StatusBarCallbacks.java",
+        "android/framework/droidloom-systemui/src/com/android/systemui/Unsupported.java",
+        "android/framework/droidloom-systemui/src/com/android/systemui/compat/*.java",
+        "android/framework/droidloom-systemui/tests/CallbacksProbe.java",
+    ],
+    installable: true,
+    dex_preopt: { enabled: false },
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+// Safe, Binder-independent state used by the Android Composer service. These
+// modules are vendor-only: Droidloom reuses the pinned AOSP system partitions
+// and builds its own vendor partition.
+rust_library {
+    name: "libdroidloom_transport",
+    crate_name: "droidloom_transport",
+    crate_root: "graphics/droidloom-transport/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libserde",
+        "libthiserror",
+    ],
+}
+
+// Composer V5 service entry point. Android init owns the privileged lifecycle
+// socket while the Droidloom runtime supplies the private Denial endpoint and
+// render node inside the cell's restricted /dev.
+rust_binary {
+    name: "android.hardware.graphics.composer3-service.droidloom",
+    crate_name: "droidloom_composer_service",
+    crate_root: "graphics/droidloom-composer-service/src/main.rs",
+    edition: "2021",
+    vendor: true,
+    relative_install_path: "hw",
+    init_rc: ["android/device/droidloom_arm64/droidloom-composer.rc"],
+    vintf_fragments: ["android/device/droidloom_arm64/droidloom-composer.xml"],
+    rustlibs: [
+        "android.hardware.graphics.composer3-V5-rust",
+        "libbinder_rs",
+        "libdroidloom_composer",
+        "libdroidloom_composer_aidl",
+        "libdroidloom_denial_ipc",
+        "libdroidloom_denial_protocol",
+        "libdroidloom_input_protocol",
+        "libdroidloom_minigbm",
+        "libdroidloom_syncobj",
+        "libdroidloom_surface_bridge",
+        "libdroidloom_task_control",
+    ],
+}
+
+// Safe fixed-record encoder used after Denial has selected one Android task.
+rust_library {
+    name: "libdroidloom_input_protocol",
+    crate_name: "droidloom_input_protocol",
+    crate_root: "graphics/droidloom-input-protocol/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    // The record codec is tiny and has a single Android consumer. Linking it
+    // directly avoids adding a new vendor partition ABI/runtime file.
+    prefer_rlib: true,
+    no_stdlibs: true,
+}
+
+// The routing, gesture identity, and policy remain in Rust. This framework
+// bridge contains the long-running input adapter plus a one-shot application
+// metadata adapter; Android remains authoritative for MotionEvents, launcher
+// intent resolution, localized labels, and adaptive icons.
+java_binary {
+    name: "droidloom-input-bridge",
+    vendor: true,
+    srcs: ["android/framework/droidloom-input-bridge/src/**/*.java"],
+    wrapper: "android/framework/droidloom-input-bridge/droidloom-input-bridge",
+    init_rc: ["android/framework/droidloom-input-bridge/droidloom-input-bridge.rc"],
+    sdk_version: "37",
+    // This privileged platform adapter is built from plain Java and is covered
+    // by the focused runtime tests. Avoid pulling Android's global app-lint
+    // plugin graph into the intentionally sparse Droidloom source checkout.
+    lint: {
+        enabled: false,
+    },
+}
+
+// Low-frequency privileged lifecycle protocol. This reserves/configures a
+// dedicated display before app launch, then binds the real Android task ID.
+rust_library {
+    name: "libdroidloom_task_control",
+    crate_name: "droidloom_task_control",
+    crate_root: "graphics/droidloom-task-control/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libthiserror",
+    ],
+}
+
+// Privileged one-shot primitive invoked by the host supervisor inside the
+// Android cell. It uses Android's own activity command service, discovers the
+// resulting leaf task on the newly reserved display, and commits the real task
+// ID through the two-phase control protocol.
+rust_library {
+    name: "libdroidloom_task_launcher",
+    crate_name: "droidloom_task_launcher",
+    crate_root: "android/framework/droidloom-task-launcher/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libdroidloom_denial_ipc",
+        "libdroidloom_task_control",
+    ],
+}
+
+rust_binary {
+    name: "droidloom-task-launcher",
+    crate_name: "droidloom_task_launcher_bin",
+    crate_root: "android/framework/droidloom-task-launcher/src/main.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: ["libdroidloom_task_launcher"],
+}
+
+// Development-only LMKD protocol endpoint. The Android cell's memory budget
+// is enforced outside Android; this keeps ActivityManager non-blocking without
+// claiming or implementing process-killing policy inside the guest.
+rust_binary {
+    name: "droidloom-lmkd-compat",
+    crate_name: "droidloom_lmkd_compat",
+    crate_root: "android/lmkd-compat/droidloom-lmkd-compat.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: ["liblibc"],
+}
+
+// Development-only compatibility boundary for host kernels that cannot mount
+// an otherwise valid APEX payload filesystem. The supervisor projects an
+// already-verified classpath subset below /droidloom; this one-shot bind
+// mounts it below /apex before delegating to Android's derive_classpath.
+rust_binary {
+    name: "droidloom-classpath-wrapper",
+    crate_name: "droidloom_classpath_wrapper",
+    crate_root: "android/runtime/droidloom-classpath-wrapper/src/main.rs",
+    edition: "2021",
+    vendor: true,
+}
+
+// Versioned Denial-native SOCK_SEQPACKET codec. The socket/SCM_RIGHTS adapter
+// stays platform-specific; this safe module validates every byte, bound, and
+// descriptor role before either side mutates compositor state.
+rust_library {
+    name: "libdroidloom_denial_protocol",
+    crate_name: "droidloom_denial_protocol",
+    crate_root: "graphics/droidloom-denial-protocol/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libdroidloom_transport",
+        "libthiserror",
+    ],
+}
+
+// Narrow audited Unix socket/SCM_RIGHTS adapter. Unsafe code is confined to
+// sendmsg/recvmsg and ancillary parsing; its public boundary owns every
+// received FD and pairs it with a role from the safe protocol codec.
+rust_library {
+    name: "libdroidloom_denial_ipc",
+    crate_name: "droidloom_denial_ipc",
+    crate_root: "graphics/droidloom-denial-ipc/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libdroidloom_denial_protocol",
+        "liblibc",
+        "libthiserror",
+    ],
+}
+
+// Shared DRM syncobj timeline operations for the Android Composer and Denial
+// endpoint. This wraps opaque task timelines and sync_file point transfers;
+// Android never receives a KMS/card node.
+rust_library {
+    name: "libdroidloom_syncobj",
+    crate_name: "droidloom_syncobj",
+    crate_root: "graphics/droidloom-syncobj/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libdrm_rust",
+        "liblibc",
+        "libthiserror",
+    ],
+}
+
+// Fixed-record, cell-private handoff used when SurfaceFlinger renders the
+// complete built-in display directly into a Denial-owned target.
+rust_library {
+    name: "libdroidloom_surface_bridge",
+    crate_name: "droidloom_surface_bridge",
+    crate_root: "graphics/droidloom-surface-bridge/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: ["libthiserror"],
+}
+
+rust_library {
+    name: "libdroidloom_composer",
+    crate_name: "droidloom_composer",
+    crate_root: "graphics/droidloom-composer/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libdroidloom_denial_protocol",
+        "libdroidloom_transport",
+        "libthiserror",
+    ],
+}
+
+// Exact parser for the pinned minigbm cros_gralloc_handle payload. Descriptor
+// ownership remains in the Binder-facing adapter.
+rust_library {
+    name: "libdroidloom_minigbm",
+    crate_name: "droidloom_minigbm",
+    crate_root: "graphics/droidloom-minigbm/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "libdroidloom_transport",
+        "libthiserror",
+    ],
+}
+
+// Soong-only boundary between frozen Composer V5 Binder types and the safe
+// platform-independent state machine. Keeping this as a vendor module forces
+// Soong to select the vendor AIDL variant used by the eventual HAL service.
+rust_library {
+    name: "libdroidloom_composer_aidl",
+    crate_name: "droidloom_composer_aidl",
+    crate_root: "graphics/droidloom-composer-aidl/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    rustlibs: [
+        "android.hardware.common-V2-rust",
+        "android.hardware.drm.common-V1-rust",
+        "android.hardware.graphics.common-V7-rust",
+        "android.hardware.graphics.composer3-V5-rust",
+        "libbinder_rs",
+        "libdroidloom_composer",
+        "libdroidloom_denial_ipc",
+        "libdroidloom_denial_protocol",
+        "libdroidloom_minigbm",
+        "libdroidloom_syncobj",
+        "libdroidloom_transport",
+        "libthiserror",
+    ],
+    shared_libs: [
+        "libEGL",
+        "libGLESv2",
+    ],
+}
+
+// Exercises the Soong-only Composer boundary against the exact frozen Android
+// AIDL types. These tests cover platform semantics that cannot be represented
+// by the host Cargo workspace, including SOLID_COLOR layer commands.
+rust_test {
+    name: "droidloom-composer-aidl-tests",
+    crate_name: "droidloom_composer_aidl_tests",
+    crate_root: "graphics/droidloom-composer-aidl/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    test_suites: ["general-tests"],
+    rustlibs: [
+        "android.hardware.common-V2-rust",
+        "android.hardware.drm.common-V1-rust",
+        "android.hardware.graphics.common-V7-rust",
+        "android.hardware.graphics.composer3-V5-rust",
+        "libbinder_rs",
+        "libdroidloom_composer",
+        "libdroidloom_denial_ipc",
+        "libdroidloom_denial_protocol",
+        "libdroidloom_minigbm",
+        "libdroidloom_syncobj",
+        "libdroidloom_transport",
+        "libthiserror",
+    ],
+    shared_libs: [
+        "libEGL",
+        "libGLESv2",
+    ],
+}
+
+// Installed only by explicit clipboard validation, never by runtime packaging.
+android_app {
+    name: "DroidloomClipboardProbe",
+    manifest: "android/framework/droidloom-systemui/tests/clipboard-probe/AndroidManifest.xml",
+    srcs: ["android/framework/droidloom-systemui/tests/clipboard-probe/*.java"],
+    resource_dirs: [],
+    platform_apis: true,
+    certificate: "platform",
+    use_resource_processor: false,
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+// Test-only notification producer, installed explicitly for integration validation.
+android_app {
+    name: "DroidloomNotificationProbe",
+    manifest: "android/framework/droidloom-systemui/tests/notification-probe/AndroidManifest.xml",
+    srcs: ["android/framework/droidloom-systemui/tests/notification-probe/*.java"],
+    resource_dirs: [],
+    platform_apis: true,
+    certificate: "platform",
+    use_resource_processor: false,
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}

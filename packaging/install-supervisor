@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Install host lifecycle binaries, the storage daemon and the cell spec.
+# Preserve Android images and Wayland; use services for lifecycle transitions.
+set -euo pipefail
+stage="${1:?staging directory required}"
+boot_id="${2:?verified boot identity required}"
+test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot_id"
+cd "$stage"
+sha256sum -c SHA256SUMS
+test "$(uname -m)" = aarch64
+test "$(tr '\000' '\n' </proc/device-tree/compatible | head -n1)" = oneplus,aston
+test "$(id -u logix)" = 1001
+# This mode must not accidentally replace local Android/graphics overrides.
+shared="$(python3 - <<'PY'
+import json
+with open('/etc/droidloom/cell.json') as source:
+    current = json.load(source)
+with open('cell.json') as source:
+    candidate = json.load(source)
+shared = candidate.pop('shared_storage_directories', [])
+current.pop('shared_storage_directories', None)
+for spec in (current, candidate):
+    spec['android_file_overrides'] = [entry for entry in spec['android_file_overrides']
+        if entry != {'source': '/usr/lib/droidloom/storage/vold', 'target': '/system/bin/vold'}]
+if current != candidate:
+    raise SystemExit('refusing to replace unrelated cell configuration')
+print(len(shared))
+PY
+)"
+if [[ "$shared" != 0 ]]; then
+    test -c /dev/fuse
+    grep -qw fuse /proc/filesystems
+    unshare --user --map-users 1001:1023:1 --map-groups 1001:1023:1 true
+    install -d -m 2770 -o 1001 -g 1001 /var/lib/droidloom/users/1001/shared-probe
+fi
+backup="$(mktemp -d "$stage/backup.XXXXXXXX")"
+cp -a /usr/bin/droidloomd /usr/bin/droidloomctl /usr/bin/droidloom-supervisor /etc/droidloom/cell.json "$backup/"
+if [[ -e /usr/lib/droidloom/storage/vold ]]; then
+    cp -a /usr/lib/droidloom/storage/vold "$backup/vold"
+fi
+user_service() {
+    runuser -u logix -- env XDG_RUNTIME_DIR=/run/user/1001 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus systemctl --user "$@"
+}
+rollback() {
+    trap - ERR
+    systemctl stop droidloomd.service || true
+    for binary in droidloomd droidloomctl droidloom-supervisor; do
+        install -m 0755 "$backup/$binary" "/usr/bin/$binary"
+    done
+    install -m 0644 "$backup/cell.json" /etc/droidloom/cell.json
+    if [[ -e "$backup/vold" ]]; then
+        install -m 0755 "$backup/vold" /usr/lib/droidloom/storage/vold
+    fi
+    systemctl start droidloomd.service
+    user_service start droidloom.service
+    echo "supervisor update failed; restored $backup" >&2
+    exit 1
+}
+trap rollback ERR
+install -D -m 0755 vold /usr/lib/droidloom/storage/vold.new
+mv -f /usr/lib/droidloom/storage/vold.new /usr/lib/droidloom/storage/vold
+./droidloom-supervisor development-validate --spec "$stage/cell.json"
+user_service stop droidloom.service
+systemctl stop droidloomd.service
+for binary in droidloomd droidloomctl droidloom-supervisor; do
+    install -m 0755 "$stage/$binary" "/usr/bin/$binary"
+done
+install -m 0644 cell.json /etc/droidloom/cell.json
+systemctl start droidloomd.service
+user_service start droidloom.service
+droidloomctl --json status
+trap - ERR
+printf 'Installed supervisor update; previous files preserved in %s\n' "$backup"

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="org.droidloom.setup">
+    <description>Set up Droidloom for this desktop user</description>
+    <message>Administrator access is needed to write Droidloom configuration in /etc/droidloom, authorize its service, and create Android data files in /var/lib/droidloom.</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/droidloom/droidloom-package-helper</annotate>
+  </action>
+</policyconfig>

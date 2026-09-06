@@ -1,0 +1,15 @@
+[package]
+name = "droidloom-minigbm"
+description = "Safe parser for the pinned minigbm native-handle ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+droidloom-transport = { path = "../droidloom-transport" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

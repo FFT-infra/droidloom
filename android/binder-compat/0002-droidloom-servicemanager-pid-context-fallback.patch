@@ -1,0 +1,58 @@
+From: Droidloom development build
+Subject: [PATCH] servicemanager: permit pid context fallback in a cell
+
+The shared host kernel does not provide Android SELinux transaction security
+contexts for the cell's private Binder context. The context manager therefore
+cannot require a transaction SID for every remote call. Keep the upstream
+assertion everywhere else, but allow the existing getpidcon(pid) fallback when
+the package-owned init has marked a Droidloom development cell.
+
+The current development libselinux compatibility layer supplies the process
+context and keeps access checks permissive. Production must restore Android
+SELinux enforcement before the runtime is declared secure.
+
+--- a/frameworks/native/cmds/servicemanager/Access.cpp
++++ b/frameworks/native/cmds/servicemanager/Access.cpp
+@@ -22,6 +22,7 @@
+ #include <selinux/android.h>
+ #include <selinux/avc.h>
+ 
++#include <cstdlib>
+ #include <sstream>
+ 
+ namespace android {
+@@ -35,8 +36,10 @@ constexpr bool kIsVendor = false;
+ #ifdef __ANDROID__
+ static std::string getPidcon(pid_t pid) {
+-    CHECK_EQ(nullptr, IPCThreadState::self()->getServingStackPointer())
+-            << "Did not get context from PID " << pid
+-            << ". We should always get contexts from other processes.";
++    if (std::getenv("DROIDLOOM_CELL") == nullptr) {
++        CHECK_EQ(nullptr, IPCThreadState::self()->getServingStackPointer())
++                << "Did not get context from PID " << pid
++                << ". We should always get contexts from other processes.";
++    }
+ 
+     char* lookup = nullptr;
+     if (getpidcon(pid, &lookup) < 0) {
+--- a/frameworks/native/cmds/servicemanager/main.cpp
++++ b/frameworks/native/cmds/servicemanager/main.cpp
+@@ -19,6 +19,7 @@
+ #include <binder/IPCThreadState.h>
+ #include <binder/ProcessState.h>
+ #include <binder/Status.h>
++#include <cstdlib>
+ #include <sys/timerfd.h>
+ #include <utils/Looper.h>
+ #include <utils/StrongPointer.h>
+@@ -165,7 +166,9 @@ int main(int argc, char** argv) {
+     IPCThreadState::self()->disableBackgroundScheduling(true);
+ 
+     sp<ServiceManager> manager = sp<ServiceManager>::make(std::make_unique<Access>());
+-    manager->setRequestingSid(true);
++    if (std::getenv("DROIDLOOM_CELL") == nullptr) {
++        manager->setRequestingSid(true);
++    }
+     if (!manager->addService("manager", manager, false /*allowIsolated*/, IServiceManager::DUMP_FLAG_PRIORITY_DEFAULT).isOk()) {
+         LOG(ERROR) << "Could not self register servicemanager";
+     }

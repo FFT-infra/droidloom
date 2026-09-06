@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "status": "base_compatibility_and_development_executor_proven_device_boot_pending",
+  "product": "droidloom_arm64",
+  "architecture": "arm64",
+  "shared_kernel": true,
+  "base": {
+    "source": "android/manifest/source-lock.json#aosp_ci_base",
+    "reused_read_only_partitions": [
+      "system",
+      "system_ext",
+      "product"
+    ],
+    "excluded_cuttlefish_partitions": [
+      "vendor",
+      "odm",
+      "boot",
+      "init_boot",
+      "vendor_boot",
+      "vendor_dlkm",
+      "odm_dlkm"
+    ]
+  },
+  "built_by_droidloom": {
+    "partition": "vendor",
+    "filesystem": "ext4",
+    "image_contents": [
+      "Composer AIDL V5 service",
+      "privileged Android task launcher",
+      "generic Health AIDL service",
+      "generic Power AIDL service",
+      "upstream AIDL audio service with Droidloom silent BUS endpoints",
+      "allocator AIDL V3 service",
+      "stable-C mapper V5 provider",
+      "Mesa Freedreno EGL/GLES and Turnip Vulkan drivers",
+      "Ethernet feature and static private-veth resource overlay",
+      "development-only shared-kernel SELinux compatibility interposer",
+      "VINTF manifest and compatibility matrix",
+      "Android init configuration"
+    ],
+    "build_proven_modules": [
+      "libdroidloom_transport",
+      "libdroidloom_denial_protocol",
+      "libdroidloom_denial_ipc",
+      "libdroidloom_syncobj",
+      "libdroidloom_minigbm",
+      "libdroidloom_composer",
+      "libdroidloom_composer_aidl",
+      "libdroidloom_task_launcher",
+      "libdroidloom_selinux_compat",
+      "android.hardware.health-service.example",
+      "android.hardware.power-service.example",
+      "com.android.hardware.audio",
+      "android.hardware.graphics.composer3-service.droidloom",
+      "droidloom-task-launcher",
+      "android.hardware.graphics.allocator-service.minigbm",
+      "mapper.minigbm",
+      "libgallium_dri",
+      "libEGL_mesa",
+      "libGLESv1_CM_mesa",
+      "libGLESv2_mesa",
+      "vulkan.freedreno"
+    ],
+    "compatibility_validation": {
+      "vintf": "compatible",
+      "vendor_elf_closure": "complete"
+    },
+    "still_required": [
+      "ARM64 cell boot and live SurfaceFlinger-to-Denial presentation"
+    ]
+  },
+  "forbidden_product_inputs": [
+    "Cuttlefish gfxstream",
+    "ranchu Composer",
+    "Cuttlefish DRM Composer",
+    "virtual-device kernel",
+    "DRM card node"
+  ]
+}

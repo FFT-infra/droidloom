@@ -1,0 +1,90 @@
+From: Droidloom development build
+Subject: [PATCH] init: use cell-relative reexec and one APEX namespace
+
+Droidloom enters Android second stage after assembling all partitions and
+writable storage in a private Linux mount namespace. Aston's host procfs
+renders Android init through the host boot-root name, which is not a valid
+guest executable path. Android's second APEX namespace also clones an
+externally assembled root in a form that cannot be used as a process root on
+this kernel.
+
+The namespace decision happens before ro.boot.hardware is reliably populated,
+so scope the early adaptation to the DROIDLOOM_CELL marker supplied only to
+the package-owned init process. Retain the already assembled namespace and
+avoid a redundant setns when Android's bootstrap and default namespace IDs
+are identical. Re-exec the guest-owned /system/bin/init path. Leave the host's
+global mmap ASLR sysctls untouched; production policy will validate or raise
+those values outside the cell instead of letting Android mutate the host.
+
+--- a/system/core/init/mount_namespace.cpp
++++ b/system/core/init/mount_namespace.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "mount_namespace.h"
++#include <stdlib.h>
+ 
+ #include <sys/mount.h>
+ 
+@@ -33,6 +34,7 @@
+ 
+ using android::base::GetBoolProperty;
+ using android::base::GetIntProperty;
++using android::base::GetProperty;
+ using android::base::SetProperty;
+ 
+ namespace android {
+@@ -85,6 +87,7 @@ static std::string GetMountNamespaceId() {
+ bool NeedsTwoMountNamespaces() {
+     static bool needs_two_mount_namespaces = []() {
+         if (IsRecoveryMode()) return false;
++        if (getenv("DROIDLOOM_CELL") != nullptr) return false;
+         // In microdroid, there's only one set of APEXes in built-in directories include block
+         // devices.
+         if (IsMicrodroid()) return false;
+@@ -223,6 +226,11 @@ Result<void> SwitchToMountNamespaceIfNeeded(MountNamespace target_mount_namespace) {
+     }
+ 
+     const std::string current_namespace_id = GetMountNamespaceId();
++    const auto& target_namespace_id =
++            target_mount_namespace == NS_BOOTSTRAP ? bootstrap_ns_id : default_ns_id;
++    if (current_namespace_id == target_namespace_id) {
++        return {};
++    }
+     MountNamespace current_mount_namespace;
+     if (current_namespace_id == bootstrap_ns_id) {
+         current_mount_namespace = NS_BOOTSTRAP;
+--- a/system/core/init/security.cpp
++++ b/system/core/init/security.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "security.h"
+ #include "util.h"
++#include <stdlib.h>
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -94,6 +95,10 @@ static bool SetMmapRndBitsMin(int start, int min, bool compat) {
+ // ec9ee4acd97c drivers: char: random: add get_random_long()
+ // 5ef11c35ce86 mm: ASLR: use get_random_long()
+ Result<void> SetMmapRndBitsAction(const BuiltinArguments&) {
++    if (getenv("DROIDLOOM_CELL") != nullptr) {
++        return {};
++    }
++
+ // values are arch-dependent
+ #if defined(USER_MODE_LINUX)
+     // uml does not support mmap_rnd_bits
+--- a/system/core/init/subcontext.cpp
++++ b/system/core/init/subcontext.cpp
+@@ -227,7 +227,9 @@ void Subcontext::Fork() {
+             LOG(FATAL) << "Could not switch to \"default\" mount namespace: " << result.error();
+         }
+ #endif
+-        auto init_path = GetExecutablePath();
++        auto init_path = GetProperty("ro.boot.hardware", "") == "droidloom"
++                                 ? std::string("/system/bin/init")
++                                 : GetExecutablePath();
+         auto child_fd_string = std::to_string(child_fd);
+         const char* args[] = {init_path.c_str(), "subcontext", context_.c_str(),
+                               child_fd_string.c_str(), nullptr};

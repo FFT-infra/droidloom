@@ -1,0 +1,188 @@
+diff --git a/bpf/loader/Android.bp b/bpf/loader/Android.bp
+index bee2681..13cad67 100644
+--- a/bpf/loader/Android.bp
++++ b/bpf/loader/Android.bp
+@@ -49,6 +49,7 @@ cc_binary {
+ 
+     defaults: ["bpf_cc_defaults"],
+     cflags: [
++        "-D__ANDROID_APEX__",
+         "-Wformat",
+         "-Wformat-signedness",
+     ],
+@@ -72,6 +73,6 @@ cc_binary {
+         "com.android.tethering",
+         "//apex_available:platform",
+     ],
+     min_sdk_version: "31",
+-    installable: false,
++    installable: true,
+ }
+diff --git a/bpf/loader/NetBpfLoad.cpp b/bpf/loader/NetBpfLoad.cpp
+index 7ba3247..80fb95b 100644
+--- a/bpf/loader/NetBpfLoad.cpp
++++ b/bpf/loader/NetBpfLoad.cpp
+@@ -117,6 +117,10 @@ static_assert(!minSupportedKernelVer, "NetBpfLoad must not assume min kver");
+ 
+ static unsigned int page_size = static_cast<unsigned int>(getpagesize());
+ 
++static bool isDroidloomCell() {
++    return getenv("DROIDLOOM_CELL") != nullptr;
++}
++
+ typedef struct {
+     const char* program_name;
+     vector<char> data;
+@@ -160,7 +164,7 @@ class ElfObject {
+             return self_st.st_dev;
+         }();
+ 
+-        if (st.st_dev != self_dev) {
++        if (st.st_dev != self_dev && !isDroidloomCell()) {
+             ALOGE("file %s is on device %llu, while we are on device %llu",
+                   path, (unsigned long long)st.st_dev, (unsigned long long)self_dev);
+             abort();
+@@ -1513,6 +1517,7 @@ static int doLoad(char** argv, char * const envp[]) {
+     libbpf_set_print(libbpfPrint);
+ 
+     const bool runningAsRoot = !getuid();  // true iff U QPR3 or V+
++    const bool droidloomCell = isDroidloomCell();
+ 
+     const int first_api_level = GetIntProperty("ro.board.first_api_level", api_level_full / 100);
+ 
+@@ -1779,7 +1784,7 @@ static int doLoad(char** argv, char * const envp[]) {
+         if (!createDir("/sys/fs/bpf/loader")) return 31;
+     }
+ 
+-    if (runningAsRoot) {  // implies U QPR3+ and kernel 4.14+
++    if (runningAsRoot && !droidloomCell) {  // implies U QPR3+ and kernel 4.14+
+         // There should not be any programs or maps yet
+         errno = 0;
+         uint32_t progId = bpfGetNextProgId(0);  // expect 0 with errno == ENOENT
+@@ -1793,10 +1798,14 @@ static int doLoad(char** argv, char * const envp[]) {
+             ALOGE("bpfGetNextMapId(zero) returned %u (errno %d)", mapId, errno);
+             return 33;
+         }
+-    } else if (isAtLeastKernelVersion(4, 14)) {  // implies S through U QPR2
++    } else if (isAtLeastKernelVersion(4, 14)) {
+         // bpfGetNext{Prog,Map}Id require 4.14+
+-        // furthermore since we're not running as root, we're not the initial
+-        // platform bpfloader, so there may already be some maps & programs.
++        // A non-root mainline loader is not the initial platform loader, and a
++        // Droidloom cell shares the kernel BPF ID registry with its host. In
++        // either case there may already be unrelated maps and programs.
++        if (droidloomCell) {
++            ALOGI("Droidloom cell: validating the shared kernel BPF ID registry");
++        }
+         uint32_t mapId = 0;
+         while (true) {
+             errno = 0;
+diff --git a/service/jni/com_android_server_connectivity_ClatCoordinator.cpp b/service/jni/com_android_server_connectivity_ClatCoordinator.cpp
+index 70991eb..7b2a1fc 100644
+--- a/service/jni/com_android_server_connectivity_ClatCoordinator.cpp
++++ b/service/jni/com_android_server_connectivity_ClatCoordinator.cpp
+@@ -26,6 +26,7 @@
+ #include <nativehelper/JNIHelp.h>
+ #include <net/if.h>
+ #include <spawn.h>
++#include <stdlib.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+@@ -53,6 +54,10 @@ namespace android {
+ 
+ static bool fatal = false;
+ 
++static bool isDroidloomCell() {
++    return getenv("DROIDLOOM_CELL") != nullptr;
++}
++
+ #define ALOGF(s ...) do { ALOGE(s); fatal = true; } while(0)
+ 
+ enum verify { VERIFY_DIR, VERIFY_BIN, VERIFY_PROG, VERIFY_MAP_RO, VERIFY_MAP_RW };
+@@ -70,8 +75,16 @@ static void verifyPerms(const char * const path,
+ 
+     char b[255] = {};
+     int v = lgetxattr(path, "security.selinux", &b, sizeof(b));
+-    if (v < 0) ALOGF("lgetxattr '%s' errno=%d", path, errno);
+-    if (strncmp(ctxt, b, sizeof(b))) ALOGF("context of '%s' is '%s' != '%s'", path, b, ctxt);
++    if (v < 0) {
++        if ((errno == EOPNOTSUPP || errno == ENODATA) && isDroidloomCell()) {
++            ALOGI("Droidloom cell: SELinux xattr absent or unavailable for '%s'; preserving other checks",
++                  path);
++        } else {
++            ALOGF("lgetxattr '%s' errno=%d", path, errno);
++        }
++    } else if (strncmp(ctxt, b, sizeof(b))) {
++        ALOGF("context of '%s' is '%s' != '%s'", path, b, ctxt);
++    }
+ 
+     int fd = -1;
+ 
+diff --git a/service/Android.bp b/service/Android.bp
+index 3bd1471..a61a5ce 100644
+--- a/service/Android.bp
++++ b/service/Android.bp
+@@ -141,6 +141,7 @@ cc_library_shared {
+     ],
+     header_libs: [
+         "bpf_connectivity_headers",
++        "jni_platform_headers",
+     ],
+     static_libs: [
+         "libclat",
+@@ -153,17 +154,18 @@ cc_library_shared {
+         "libserviceconnectivityjni",
+         "netd_aidl_interface-lateststable-ndk",
+         "libcommonconnectivityjni",
++        "libnativehelper_compat_libc++",
+     ],
+     shared_libs: [
+         "libbase",
+         "libcutils",
+         "libnetdutils",
+         "liblog",
+-        "libnativehelper",
+         "libnetworkstats",
+         "libstatssocket", // needed by libstatslog_connectivity_sdk30
+     ],
+     apex_available: [
++        "//apex_available:platform",
+         "com.android.tethering",
+     ],
+ }
+diff --git a/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp b/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp
+index 9e1c027..ddb3057 100644
+--- a/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp
++++ b/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp
+@@ -17,9 +17,8 @@
+ #define LOG_TAG "LocalNetEventListenerNative"
+ 
+ #include <android-base/unique_fd.h>
+-#include <android/file_descriptor_jni.h>
+ #include <jni.h>
+-#include <nativehelper/JNIPlatformHelp.h>
++#include <nativehelper/JNIHelp.h>
+ #include <nativehelper/jni_macros.h>
+ #include <nativehelper/scoped_local_ref.h>
+ #include <utils/misc.h>
+@@ -37,7 +36,18 @@ static jobject nativeGetLocalNetAccessRingbufFd(JNIEnv *env, jclass clazz) {
+         ALOGE("Failed to get local net event ring buffer.");
+         return nullptr;
+     }
+-    return jniCreateFileDescriptor(env, fd.release());
++    jclass fileDescriptorClass = env->FindClass("java/io/FileDescriptor");
++    if (fileDescriptorClass == nullptr) return nullptr;
++    jmethodID constructor = env->GetMethodID(fileDescriptorClass, "<init>", "()V");
++    jmethodID setInt = env->GetMethodID(fileDescriptorClass, "setInt$", "(I)V");
++    if (constructor == nullptr || setInt == nullptr) return nullptr;
++
++    jobject fileDescriptor = env->NewObject(fileDescriptorClass, constructor);
++    if (fileDescriptor == nullptr) return nullptr;
++    env->CallVoidMethod(fileDescriptor, setInt, fd.get());
++    if (env->ExceptionCheck()) return nullptr;
++    (void)fd.release();
++    return fileDescriptor;
+ }
+ 
+ static jintArray nativeConsumeAllLocalNetAccessEvents(JNIEnv *env,

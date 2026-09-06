@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "status": "composer_service_task_launcher_vendor_image_build_proven",
+  "binary": "/vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom",
+  "binder_instance": "android.hardware.graphics.composer3.IComposer/default",
+  "rust_core": "graphics/droidloom-composer",
+  "rust_denial_protocol": "graphics/droidloom-denial-protocol",
+  "rust_denial_ipc": "graphics/droidloom-denial-ipc",
+  "rust_minigbm_parser": "graphics/droidloom-minigbm",
+  "rust_composer_aidl": "graphics/droidloom-composer-aidl",
+  "rust_service": "graphics/droidloom-composer-service",
+  "aidl_lock": "android/hardware/composer/aidl-lock.json",
+  "service_integration": {
+    "binder_registration_implemented": true,
+    "denial_handshake_and_event_pump_implemented": true,
+    "task_identity_reservation_implemented": true,
+    "android_task_bridge_implemented": true,
+    "product_packaged": true,
+    "init_configured": true,
+    "vintf_registered": true
+  },
+  "composition": {
+    "display_model": "one_host_managed_android_logical_display_per_top_level_task",
+    "minimum_task_displays": 1,
+    "maximum_task_displays": 4096,
+    "virtual_displays": 0,
+    "path": "one_surfaceflinger_client_target_per_task_toplevel",
+    "combined_android_desktop_window": false,
+    "reported_capabilities": [],
+    "protected_content": false,
+    "delegated_device_layers": false
+  },
+  "transport": {
+    "wire": "denial_droidloom_native_v1_over_unix_sock_seqpacket",
+    "buffer": "cached_dmabuf_registration_with_scm_rights",
+    "synchronization": "shared_drm_syncobj_acquire_and_release_timelines",
+    "steady_state_present_descriptors": 0,
+    "presentation": "denial_native_monotonic_feedback",
+    "task_policy": "one_denial_task_object_per_android_task"
+  },
+  "allocator_mapper": {
+    "allocator": "android.hardware.graphics.allocator-service.minigbm",
+    "allocator_interface_version": 3,
+    "mapper": "mapper.minigbm",
+    "mapper_interface_version": 5,
+    "minigbm_backend": "msm",
+    "product_packaged": true
+  },
+  "device_policy": {
+    "allowed": [
+      "/dev/dri/renderD<number>",
+      "/dev/dma_heap/<selected-heap>",
+      "/dev/binder",
+      "/dev/hwbinder",
+      "/dev/vndbinder"
+    ],
+    "forbidden": [
+      "/dev/dri/card<number>",
+      "/dev/input/*",
+      "/dev/fb<number>"
+    ]
+  },
+  "required_failures": {
+    "protected_content": "unsupported",
+    "virtual_display": "unsupported",
+    "readback": "unsupported",
+    "sideband": "unsupported",
+    "missing_acquire_fence": "bad_parameter",
+    "stale_configure": "bad_parameter",
+    "buffer_reuse_before_release": "no_resources"
+  }
+}

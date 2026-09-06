@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = droidloom-runtime
+Target = droidloom-image
+
+[Action]
+Description = Updating Droidloom package configuration...
+When = PostTransaction
+Exec = /usr/lib/droidloom/droidloom-package-helper after-install

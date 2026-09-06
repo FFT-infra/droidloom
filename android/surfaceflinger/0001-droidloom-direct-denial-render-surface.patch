@@ -1,0 +1,1051 @@
+diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
+index 40718bc..ad2b6ce 100644
+--- a/services/surfaceflinger/Android.bp
++++ b/services/surfaceflinger/Android.bp
+@@ -271,6 +271,7 @@ filegroup {
+         "Display/DisplayModeController.cpp",
+         "Display/DisplaySnapshot.cpp",
+         "DisplayDevice.cpp",
++        "DroidloomNativeWindow.cpp",
+         "Effects/Daltonizer.cpp",
+         "FpsReporter.cpp",
+         "FrameTracer/FrameTracer.cpp",
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 7565080..e7a69e6 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -138,6 +138,7 @@
+ #include "Display/DisplayIdentification.h"
+ #include "Display/PhysicalDisplay.h"
+ #include "DisplayDevice.h"
++#include "DroidloomNativeWindow.h"
+ #include "DisplayHardware/ComposerHal.h"
+ #include "DisplayHardware/FramebufferSurface.h"
+ #include "DisplayHardware/Hal.h"
+@@ -2844,8 +2845,10 @@ bool SurfaceFlinger::updateLayerSnapshots(VsyncId vsyncId, nsecs_t frameTimeNs,
+                  .forceUpdate = FlagManager::getInstance().frontend_caching_v0()
+                          ? frontend::LayerSnapshotBuilder::ForceUpdateFlags::ALL
+                          : frontend::LayerSnapshotBuilder::ForceUpdateFlags::NONE,
+-                 .includeMetadata = mCompositionEngine->getFeatureFlags().test(
+-                         compositionengine::Feature::kSnapshotLayerMetadata),
++                 .includeMetadata =
++                         base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false) ||
++                         mCompositionEngine->getFeatureFlags().test(
++                                 compositionengine::Feature::kSnapshotLayerMetadata),
+                  .displays = mFrontEndDisplayInfos,
+                  .displayChanges = mFrontEndDisplayInfosChanged,
+                  .globalShadowSettings = mDrawingState.globalShadowSettings,
+@@ -3445,6 +3448,219 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         offloadedCompositionFuture =
+                 offloadGpuCompositedDisplays(std::move(*optionalOffloadedRefreshArgs));
+     }
++
++    // WindowManager tags every task root with METADATA_TASK_ID, and the
++    // snapshot builder inherits it through the complete task layer subtree.
++    // Render each such subtree into its own Denial-owned target. The physical
++    // output remains active during bring-up so Android keeps its ordinary
++    // scheduling and release-fence path while this split is validated.
++    if (base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++        struct DirectTaskFrame {
++            std::vector<std::pair<Layer*, sp<LayerFE>>> layers;
++            Rect sourceCrop;
++            bool hasCrop = false;
++            bool hasBuffer = false;
++        };
++        struct DirectTaskOutput {
++            sp<DroidloomNativeWindow> window;
++            std::unordered_map<uint64_t, std::shared_ptr<renderengine::ExternalTexture>> textures;
++            nsecs_t retryAfter = 0;
++            uint32_t retryAttempts = 0;
++            bool retired = false;
++            nsecs_t missingSince = 0;
++        };
++        static std::unordered_map<int32_t, DirectTaskOutput> taskOutputs;
++        std::unordered_map<int32_t, DirectTaskFrame> taskFrames;
++        std::unordered_map<int32_t, bool> liveTasks;
++
++        Rect displayBounds;
++        for (const auto& output : refreshArgs.outputs) {
++            if (output->getDisplayIdVariant().and_then(asPhysicalDisplayId) == pacesetterId) {
++                displayBounds = output->getState().layerStackSpace.getContent();
++                break;
++            }
++        }
++
++        for (const auto& [owner, layerFE] : layers) {
++            const auto* snapshot = layerFE->mSnapshot.get();
++            if (snapshot == nullptr) continue;
++            int32_t task = layerFE->getMetadata()->getInt32(gui::METADATA_TASK_ID, -1);
++            if (task <= 0) {
++                task = layerFE->getRelativeMetadata()->getInt32(gui::METADATA_TASK_ID, -1);
++            }
++            if (task <= 0) continue;
++            liveTasks[task] = true;
++            if (!snapshot->isVisible) continue;
++
++            auto& frame = taskFrames[task];
++            Rect bounds{snapshot->transformedBounds};
++            Rect clipped;
++            if (!displayBounds.isEmpty() && bounds.intersect(displayBounds, &clipped)) {
++                bounds = clipped;
++            }
++            if (!bounds.isEmpty()) {
++                if (!frame.hasCrop) {
++                    frame.sourceCrop = bounds;
++                    frame.hasCrop = true;
++                } else {
++                    frame.sourceCrop.left = std::min(frame.sourceCrop.left, bounds.left);
++                    frame.sourceCrop.top = std::min(frame.sourceCrop.top, bounds.top);
++                    frame.sourceCrop.right = std::max(frame.sourceCrop.right, bounds.right);
++                    frame.sourceCrop.bottom = std::max(frame.sourceCrop.bottom, bounds.bottom);
++                }
++            }
++            frame.hasBuffer |= snapshot->externalTexture != nullptr;
++            sp<LayerFE> copy = getFactory().createLayerFE(snapshot->name, owner);
++            copy->mSnapshot = std::make_unique<frontend::LayerSnapshot>(*snapshot);
++            frame.layers.emplace_back(owner, std::move(copy));
++        }
++
++        // A task output owns exactly one Denial window. Keep it across short
++        // transition gaps, but retire it when WindowManager has actually
++        // removed the task subtree. Destroying the native window sends an
++        // explicit retirement transaction to Composer, which destroys the
++        // ordinary Denial window through its normal lifecycle.
++        const nsecs_t taskNow = systemTime();
++        for (auto output = taskOutputs.begin(); output != taskOutputs.end();) {
++            if (liveTasks.find(output->first) != liveTasks.end()) {
++                output->second.missingSince = 0;
++                ++output;
++                continue;
++            }
++            if (output->second.missingSince == 0) {
++                output->second.missingSince = taskNow;
++                ++output;
++                continue;
++            }
++            if (taskNow - output->second.missingSince < 250'000'000) {
++                ++output;
++                continue;
++            }
++            ALOGI("Retiring Denial-native output for destroyed Android task %d", output->first);
++            output = taskOutputs.erase(output);
++        }
++
++        for (auto& [task, frame] : taskFrames) {
++            if (!frame.hasCrop || !frame.hasBuffer || frame.layers.empty()) continue;
++            auto& taskOutput = taskOutputs[task];
++            if (taskOutput.retired) continue;
++            if (!taskOutput.window) {
++                if (systemTime() < taskOutput.retryAfter) continue;
++                status_t initializationStatus = NO_ERROR;
++                taskOutput.window =
++                        DroidloomNativeWindow::createForTask(task, &initializationStatus);
++                if (!taskOutput.window) {
++                    if (initializationStatus == NAME_NOT_FOUND &&
++                        ++taskOutput.retryAttempts >= 24) {
++                        // WindowManager also tags hidden HOME/system tasks. They are
++                        // deliberately absent from Composer's explicit task allowlist;
++                        // permanently retire them after a six-second window that still
++                        // covers the launcher-to-SurfaceFlinger registration race.
++                        taskOutput.retired = true;
++                        ALOGI("Retired unregistered Android task %d from Denial output", task);
++                    } else {
++                        if (initializationStatus != NAME_NOT_FOUND) {
++                            taskOutput.retryAttempts = 0;
++                        }
++                        const nsecs_t delay =
++                                initializationStatus == NAME_NOT_FOUND ||
++                                        initializationStatus == WOULD_BLOCK
++                                ? 250'000'000
++                                : 5'000'000'000;
++                        taskOutput.retryAfter = systemTime() + delay;
++                    }
++                    continue;
++                }
++                taskOutput.retryAttempts = 0;
++                ALOGI("Created Denial-native output for Android task %d", task);
++            }
++
++            ANativeWindow* nativeWindow = taskOutput.window.get();
++            ANativeWindowBuffer* nativeBuffer = nullptr;
++            int acquireFence = -1;
++            status_t status = nativeWindow->dequeueBuffer(nativeWindow, &nativeBuffer,
++                                                           &acquireFence);
++            base::unique_fd targetAcquireFence(acquireFence);
++            if (status != NO_ERROR || nativeBuffer == nullptr) {
++                ALOGE("Failed to acquire target for Android task %d: %d", task, status);
++                continue;
++            }
++
++            sp<GraphicBuffer> graphicBuffer = GraphicBuffer::from(nativeBuffer);
++            auto& texture = taskOutput.textures[graphicBuffer->getId()];
++            if (!texture) {
++                texture = std::make_shared<renderengine::impl::ExternalTexture>(
++                        graphicBuffer, getRenderEngine(),
++                        renderengine::impl::ExternalTexture::Usage::WRITEABLE);
++            }
++
++            std::unique_ptr<compositionengine::CompositionEngine> compositionEngine =
++                    mFactory.createCompositionEngine();
++            compositionEngine->setRenderEngine(mRenderEngine.get());
++            compositionEngine->setHwComposer(mHWComposer.get());
++            // Denial consumes the exported dma-buf as ordinary SDR sRGB.
++            // Leaving this UNKNOWN lets RenderEngine choose a capture profile
++            // that does not describe the pixels handed to Wayland, visibly
++            // lifting dark colors and reducing saturation.
++            compositionengine::Output::ColorProfile colorProfile{
++                    .dataspace = ui::Dataspace::V0_SRGB,
++                    .renderIntent = ui::RenderIntent::TONE_MAP_COLORIMETRIC,
++            };
++            const ui::Size targetSize{nativeBuffer->width, nativeBuffer->height};
++            const Rect compositionCrop{
++                    frame.sourceCrop.left,
++                    frame.sourceCrop.top,
++                    frame.sourceCrop.left + targetSize.width,
++                    frame.sourceCrop.top + targetSize.height,
++            };
++            auto output = createScreenCaptureOutput(
++                    ScreenCaptureOutputArgs{.compositionEngine = *compositionEngine,
++                                            .colorProfile = colorProfile,
++                                            .layerStack = frame.layers.back()
++                                                                  .second->getCompositionState()
++                                                                  ->outputFilter.layerStack,
++                                            // Preserve 1:1 pixels. The Android task and the
++                                            // Denial-owned target share physical-pixel bounds;
++                                            // never hide a producer-size mismatch by scaling the
++                                            // last frame into a differently sized target.
++                                            .sourceCrop = compositionCrop,
++                                            .buffer = texture,
++                                            .displayIdVariant = DisplayIdVariant{pacesetterId},
++                                            .reqBufferSize = targetSize,
++                                            .sdrWhitePointNits = 500.0f,
++                                            .displayBrightnessNits = 500.0f,
++                                            .targetBrightness = 1.0f,
++                                            .layerAlpha = 0.0f,
++                                            .disableBlur = false,
++                                            .treat170mAsSrgb = mTreat170mAsSrgb,
++                                            .dimInGammaSpaceForEnhancedScreenshots = false,
++                                            // This is a trusted, direct composition target
++                                            // owned by Droidloom/Denial, not an app-visible
++                                            // capture. Secure layers must retain their real
++                                            // contents on this output.
++                                            .isSecure = true,
++                                            .enableLocalTonemapping = false,
++                                            .debugName = base::StringPrintf(
++                                                    "Droidloom task %d", task)});
++            std::vector<sp<compositionengine::LayerFE>> taskLayers;
++            taskLayers.reserve(frame.layers.size());
++            for (auto& [_, layer] : frame.layers) taskLayers.push_back(std::move(layer));
++            compositionengine::CompositionRefreshArgs taskRefresh{
++                    .outputs = {output},
++                    .layers = std::move(taskLayers),
++                    .updatingOutputGeometryThisFrame = true,
++                    .updatingGeometryThisFrame = true,
++            };
++            compositionEngine->present(taskRefresh);
++            const sp<Fence>& renderFence =
++                    output->getRenderSurface()->getClientTargetAcquireFence();
++            const int readyFence = renderFence != Fence::NO_FENCE ? renderFence->dup() : -1;
++            status = nativeWindow->queueBuffer(nativeWindow, nativeBuffer, readyFence);
++            if (status != NO_ERROR) {
++                ALOGE("Failed to present Android task %d: %d", task, status);
++            }
++        }
++    }
+ 
+     mCompositionEngine->present(refreshArgs);
+ 
+@@ -4404,8 +4620,18 @@ sp<DisplayDevice> SurfaceFlinger::setupNewDisplayDeviceInternal(
+         creationArgs.supportedPerFrameMetadata = getHwComposer().getSupportedPerFrameMetadata(*id);
+     }
+ 
+-    compositionSurface->allocateBuffers();
+-    sp<ANativeWindow> nativeWindow = compositionSurface;
++    sp<ANativeWindow> nativeWindow;
++    if (state.isPhysical() &&
++        base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_direct", false)) {
++        const auto& physical = state.getPhysical();
++        const ui::Size resolution = physical.activeMode->getResolution();
++        nativeWindow = DroidloomNativeWindow::create(resolution.width, resolution.height);
++        LOG_ALWAYS_FATAL_IF(!nativeWindow,
++                            "Droidloom direct SurfaceFlinger render window is unavailable");
++    } else {
++        compositionSurface->allocateBuffers();
++        nativeWindow = compositionSurface;
++    }
+     creationArgs.nativeWindow = nativeWindow;
+ 
+     // Make sure that composition can never be stalled by a virtual display
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+new file mode 100644
+index 0000000..668d264
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -0,0 +1,679 @@
++/*
++ * Copyright 2026 The Droidloom Authors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ * This file is part of Droidloom and is licensed under GNU GPL version 3
++ * or, at your option, any later version. See Droidloom's LICENSE.
++ *
++ *      https://www.gnu.org/licenses/gpl-3.0.html
++ */
++
++#include "DroidloomNativeWindow.h"
++
++#include <cutils/native_handle.h>
++#include <log/log.h>
++#include <sync/sync.h>
++#include <utils/Errors.h>
++
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/syscall.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <climits>
++#include <cstddef>
++#include <cstring>
++#include <inttypes.h>
++#include <thread>
++#include <vector>
++
++namespace android {
++namespace {
++
++constexpr char kSocketPath[] = "/dev/socket/droidloom-surfaceflinger";
++constexpr std::array<uint8_t, 4> kMagic{'D', 'L', 'S', 'F'};
++constexpr uint16_t kVersion = 3;
++constexpr size_t kHeaderBytes = 16;
++constexpr size_t kMaxRecordBytes = 128;
++constexpr size_t kMaxPlanes = 4;
++constexpr size_t kMaxFds = kMaxPlanes + 1;
++constexpr uint64_t kGrallocMetadataBytes = 16 * 1024;
++constexpr uint32_t kCrosGrallocMagic = 0xABCDDCBA;
++constexpr uint32_t makeFourcc(char a, char b, char c, char d) {
++    return static_cast<uint32_t>(a) | static_cast<uint32_t>(b) << 8 |
++            static_cast<uint32_t>(c) << 16 | static_cast<uint32_t>(d) << 24;
++}
++constexpr uint32_t kDrmFormatArgb8888 = makeFourcc('A', 'R', '2', '4');
++constexpr uint32_t kDrmFormatXrgb8888 = makeFourcc('X', 'R', '2', '4');
++
++// The native-handle ABI consumed by the minigbm mapper. Keep this private to
++// the Droidloom window so SurfaceFlinger does not gain a build dependency on
++// minigbm's otherwise private implementation header.
++struct CrosGrallocHandle : public native_handle_t {
++    int32_t fds[kMaxFds];
++    uint32_t strides[kMaxPlanes];
++    uint32_t offsets[kMaxPlanes];
++    uint32_t sizes[kMaxPlanes];
++    uint32_t id;
++    uint32_t width;
++    uint32_t height;
++    uint32_t format;
++    uint32_t tiling;
++    uint64_t format_modifier;
++    uint64_t use_flags;
++    uint32_t magic;
++    uint32_t pixel_stride;
++    int32_t droid_format;
++    int64_t usage;
++    uint32_t num_planes;
++    uint64_t reserved_region_size;
++    uint64_t total_size;
++} __attribute__((packed));
++
++enum class Opcode : uint16_t {
++    ClientHello = 1,
++    ServerHello = 2,
++    Acquire = 3,
++    Target = 4,
++    Present = 5,
++    Cancel = 6,
++    Ack = 7,
++    Error = 8,
++    Retire = 9,
++};
++
++struct ReceivedRecord {
++    std::array<uint8_t, kMaxRecordBytes> bytes{};
++    size_t length = 0;
++    std::vector<base::unique_fd> descriptors;
++};
++
++uint16_t readU16(const uint8_t* bytes) {
++    return static_cast<uint16_t>(static_cast<uint16_t>(bytes[0]) |
++                                 static_cast<uint16_t>(bytes[1]) << 8);
++}
++
++uint32_t readU32(const uint8_t* bytes) {
++    return static_cast<uint32_t>(bytes[0]) | static_cast<uint32_t>(bytes[1]) << 8 |
++            static_cast<uint32_t>(bytes[2]) << 16 | static_cast<uint32_t>(bytes[3]) << 24;
++}
++
++uint64_t readU64(const uint8_t* bytes) {
++    return static_cast<uint64_t>(readU32(bytes)) |
++            static_cast<uint64_t>(readU32(bytes + 4)) << 32;
++}
++
++void appendU16(std::vector<uint8_t>& bytes, uint16_t value) {
++    bytes.push_back(static_cast<uint8_t>(value));
++    bytes.push_back(static_cast<uint8_t>(value >> 8));
++}
++
++void appendU32(std::vector<uint8_t>& bytes, uint32_t value) {
++    for (unsigned shift = 0; shift < 32; shift += 8) {
++        bytes.push_back(static_cast<uint8_t>(value >> shift));
++    }
++}
++
++void appendU64(std::vector<uint8_t>& bytes, uint64_t value) {
++    appendU32(bytes, static_cast<uint32_t>(value));
++    appendU32(bytes, static_cast<uint32_t>(value >> 32));
++}
++
++std::vector<uint8_t> makeRecord(Opcode opcode, const std::vector<uint8_t>& payload,
++                                uint32_t descriptorCount) {
++    std::vector<uint8_t> bytes;
++    bytes.reserve(kHeaderBytes + payload.size());
++    bytes.insert(bytes.end(), kMagic.begin(), kMagic.end());
++    appendU16(bytes, kVersion);
++    appendU16(bytes, static_cast<uint16_t>(opcode));
++    appendU32(bytes, static_cast<uint32_t>(payload.size()));
++    appendU32(bytes, descriptorCount);
++    bytes.insert(bytes.end(), payload.begin(), payload.end());
++    return bytes;
++}
++
++status_t sendRecord(int socket, const std::vector<uint8_t>& bytes, int descriptor) {
++    iovec iov{.iov_base = const_cast<uint8_t*>(bytes.data()), .iov_len = bytes.size()};
++    msghdr message{};
++    message.msg_iov = &iov;
++    message.msg_iovlen = 1;
++    std::array<uint8_t, CMSG_SPACE(sizeof(int))> control{};
++    if (descriptor >= 0) {
++        message.msg_control = control.data();
++        message.msg_controllen = control.size();
++        cmsghdr* header = CMSG_FIRSTHDR(&message);
++        header->cmsg_level = SOL_SOCKET;
++        header->cmsg_type = SCM_RIGHTS;
++        header->cmsg_len = CMSG_LEN(sizeof(int));
++        std::memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
++    }
++    const ssize_t sent = TEMP_FAILURE_RETRY(sendmsg(socket, &message, MSG_NOSIGNAL));
++    if (sent < 0) return -errno;
++    return static_cast<size_t>(sent) == bytes.size() ? NO_ERROR : -EIO;
++}
++
++status_t receiveRecord(int socket, ReceivedRecord* record) {
++    iovec iov{.iov_base = record->bytes.data(), .iov_len = record->bytes.size()};
++    std::array<uint8_t, CMSG_SPACE(sizeof(int) * kMaxPlanes)> control{};
++    msghdr message{};
++    message.msg_iov = &iov;
++    message.msg_iovlen = 1;
++    message.msg_control = control.data();
++    message.msg_controllen = control.size();
++    const ssize_t received = TEMP_FAILURE_RETRY(recvmsg(socket, &message, MSG_CMSG_CLOEXEC));
++    if (received == 0) return DEAD_OBJECT;
++    if (received < 0) return -errno;
++    if ((message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) return -EMSGSIZE;
++    record->length = static_cast<size_t>(received);
++    record->descriptors.clear();
++    for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr;
++         header = CMSG_NXTHDR(&message, header)) {
++        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
++            header->cmsg_len < CMSG_LEN(0)) {
++            return BAD_VALUE;
++        }
++        const size_t bytes = header->cmsg_len - CMSG_LEN(0);
++        if (bytes % sizeof(int) != 0) return BAD_VALUE;
++        const size_t count = bytes / sizeof(int);
++        const int* descriptors = reinterpret_cast<const int*>(CMSG_DATA(header));
++        for (size_t index = 0; index < count; ++index) {
++            if (record->descriptors.size() == kMaxPlanes) return -EMFILE;
++            record->descriptors.emplace_back(descriptors[index]);
++        }
++    }
++    if (record->length < kHeaderBytes ||
++        !std::equal(kMagic.begin(), kMagic.end(), record->bytes.begin()) ||
++        readU16(record->bytes.data() + 4) != kVersion ||
++        kHeaderBytes + readU32(record->bytes.data() + 8) != record->length ||
++        readU32(record->bytes.data() + 12) != record->descriptors.size()) {
++        return BAD_VALUE;
++    }
++    return NO_ERROR;
++}
++
++status_t connectBroker(base::unique_fd* socket) {
++    base::unique_fd fd(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
++    if (!fd.ok()) return -errno;
++    sockaddr_un address{};
++    address.sun_family = AF_UNIX;
++    static_assert(sizeof(kSocketPath) <= sizeof(address.sun_path));
++    std::memcpy(address.sun_path, kSocketPath, sizeof(kSocketPath));
++    const socklen_t length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
++                                                    sizeof(kSocketPath));
++    if (TEMP_FAILURE_RETRY(connect(fd.get(), reinterpret_cast<sockaddr*>(&address), length)) != 0) {
++        return -errno;
++    }
++    *socket = std::move(fd);
++    return NO_ERROR;
++}
++
++uint32_t planeSize(int fd, uint32_t offset, uint32_t stride, uint32_t height) {
++    const off_t size = lseek(fd, 0, SEEK_END);
++    if (size > 0 && static_cast<uint64_t>(size) <= UINT32_MAX) {
++        return static_cast<uint32_t>(size);
++    }
++    const uint64_t fallback = static_cast<uint64_t>(offset) +
++            static_cast<uint64_t>(stride) * static_cast<uint64_t>(height);
++    return fallback <= UINT32_MAX ? static_cast<uint32_t>(fallback) : 0;
++}
++
++int createGrallocMetadataFd() {
++    const int fd = static_cast<int>(syscall(__NR_memfd_create, "Droidloom gralloc metadata",
++                                            FD_CLOEXEC));
++    if (fd < 0) return -errno;
++    if (ftruncate(fd, static_cast<off_t>(kGrallocMetadataBytes)) != 0) {
++        const int error = errno;
++        close(fd);
++        return -error;
++    }
++    return fd;
++}
++
++PixelFormat androidFormat(uint32_t fourcc) {
++    switch (fourcc) {
++        case kDrmFormatArgb8888:
++        case kDrmFormatXrgb8888:
++            // Skia's GL AHardwareBuffer path does not classify Android's
++            // legacy BGRA enum as renderable.  The minigbm handle still
++            // carries the authoritative DRM fourcc (AR24/XR24), which Mesa
++            // uses for EGLImage import, so advertise the equivalent
++            // renderable RGBA8 storage class to Skia here.
++            return PIXEL_FORMAT_RGBA_8888;
++        default:
++            return PIXEL_FORMAT_UNKNOWN;
++    }
++}
++
++} // namespace
++
++sp<DroidloomNativeWindow> DroidloomNativeWindow::create(uint32_t expectedWidth,
++                                                         uint32_t expectedHeight) {
++    auto window = sp<DroidloomNativeWindow>::make(uint64_t{0}, expectedWidth, expectedHeight);
++    if (const status_t status = window->initialize(); status != NO_ERROR) {
++        ALOGE("Failed to initialize direct render window: %d (%s)", status, strerror(-status));
++        return nullptr;
++    }
++    return window;
++}
++
++sp<DroidloomNativeWindow> DroidloomNativeWindow::createForTask(uint64_t task,
++                                                                status_t* outStatus) {
++    if (outStatus == nullptr) return nullptr;
++    if (task == 0 || task > INT32_MAX) {
++        *outStatus = BAD_VALUE;
++        return nullptr;
++    }
++    auto window = sp<DroidloomNativeWindow>::make(task, uint32_t{0}, uint32_t{0});
++    *outStatus = window->initialize();
++    if (*outStatus != NO_ERROR) {
++        if (*outStatus != NAME_NOT_FOUND && *outStatus != WOULD_BLOCK) {
++            ALOGE("Failed to initialize task %" PRIu64 " render window: %d (%s)", task,
++                  *outStatus, strerror(-*outStatus));
++        }
++        return nullptr;
++    }
++    return window;
++}
++
++DroidloomNativeWindow::DroidloomNativeWindow(uint64_t task, uint32_t expectedWidth,
++                                               uint32_t expectedHeight)
++      : mTask(task), mExpectedWidth(expectedWidth), mExpectedHeight(expectedHeight) {
++    ANativeWindow::setSwapInterval = hookSetSwapInterval;
++    ANativeWindow::dequeueBuffer = hookDequeueBuffer;
++    ANativeWindow::queueBuffer = hookQueueBuffer;
++    ANativeWindow::cancelBuffer = hookCancelBuffer;
++    ANativeWindow::query = hookQuery;
++    ANativeWindow::perform = hookPerform;
++    ANativeWindow::dequeueBuffer_DEPRECATED = hookDequeueBufferDeprecated;
++    ANativeWindow::queueBuffer_DEPRECATED = hookQueueBufferDeprecated;
++    ANativeWindow::cancelBuffer_DEPRECATED = hookCancelBufferDeprecated;
++    ANativeWindow::lockBuffer_DEPRECATED = hookLockBufferDeprecated;
++    const_cast<int&>(ANativeWindow::minSwapInterval) = 0;
++    const_cast<int&>(ANativeWindow::maxSwapInterval) = 1;
++}
++
++DroidloomNativeWindow::~DroidloomNativeWindow() {
++    std::lock_guard lock(mMutex);
++    if (mTask == 0 || mDisplay == 0 || !mSocket.ok()) return;
++    std::vector<uint8_t> payload;
++    appendU64(payload, mDisplay);
++    if (sendRecord(mSocket.get(), makeRecord(Opcode::Retire, payload, 0), -1) == NO_ERROR) {
++        (void)receiveAck();
++    }
++}
++
++status_t DroidloomNativeWindow::initialize() {
++    status_t status = connectBroker(&mSocket);
++    if (status != NO_ERROR) return status;
++    std::vector<uint8_t> hello;
++    appendU64(hello, mTask);
++    status = sendRecord(mSocket.get(), makeRecord(Opcode::ClientHello, hello, 0), -1);
++    if (status != NO_ERROR) return status;
++    ReceivedRecord record;
++    status = receiveRecord(mSocket.get(), &record);
++    if (status != NO_ERROR) return status;
++    const Opcode opcode = static_cast<Opcode>(readU16(record.bytes.data() + 6));
++    if (opcode == Opcode::Error && record.length == kHeaderBytes + 4 &&
++        record.descriptors.empty()) {
++        const int32_t error = static_cast<int32_t>(readU32(record.bytes.data() + kHeaderBytes));
++        return error < 0 ? error : UNKNOWN_ERROR;
++    }
++    if (opcode != Opcode::ServerHello ||
++        record.length != kHeaderBytes + 16 || !record.descriptors.empty()) {
++        return BAD_VALUE;
++    }
++    const uint8_t* payload = record.bytes.data() + kHeaderBytes;
++    mDisplay = readU64(payload);
++    mWidth = readU32(payload + 8);
++    mHeight = readU32(payload + 12);
++    if (mDisplay == 0 || mWidth == 0 || mHeight == 0 ||
++        (mExpectedWidth != 0 && mWidth != mExpectedWidth) ||
++        (mExpectedHeight != 0 && mHeight != mExpectedHeight)) {
++        ALOGE("Broker display mismatch: HWC=%ux%u broker=%" PRIu64 " %ux%u", mExpectedWidth,
++              mExpectedHeight, mDisplay, mWidth, mHeight);
++        return BAD_VALUE;
++    }
++    ALOGI("Using Denial-owned targets for %s %" PRIu64 " on channel %" PRIu64 " at %ux%u",
++          mTask == 0 ? "built-in display" : "Android task", mTask, mDisplay, mWidth, mHeight);
++    return NO_ERROR;
++}
++
++int DroidloomNativeWindow::dequeueBuffer(ANativeWindowBuffer** output, int* fenceFd) {
++    if (output == nullptr || fenceFd == nullptr) return BAD_VALUE;
++    std::lock_guard lock(mMutex);
++
++    for (;;) {
++        status_t status = sendRequest(static_cast<uint16_t>(Opcode::Acquire), 0);
++        if (status != NO_ERROR) return status;
++        ReceivedRecord record;
++        status = receiveRecord(mSocket.get(), &record);
++        if (status != NO_ERROR) return status;
++        const Opcode opcode = static_cast<Opcode>(readU16(record.bytes.data() + 6));
++        if (opcode == Opcode::Error && record.length == kHeaderBytes + 4) {
++            const int32_t error = static_cast<int32_t>(readU32(record.bytes.data() + kHeaderBytes));
++            if (error == -EAGAIN) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                continue;
++            }
++            ALOGE("Broker acquire failed: %d with %zu buffers dequeued", error,
++                  mDequeued.size());
++            return error < 0 ? error : -EIO;
++        }
++        if (opcode != Opcode::Target || record.length != kHeaderBytes + 80) return BAD_VALUE;
++
++        const uint8_t* payload = record.bytes.data() + kHeaderBytes;
++        const uint64_t display = readU64(payload);
++        const uint64_t id = readU64(payload + 8);
++        const uint32_t serial = readU32(payload + 16);
++        const uint32_t width = readU32(payload + 20);
++        const uint32_t height = readU32(payload + 24);
++        const uint32_t fourcc = readU32(payload + 28);
++        const uint64_t modifier = readU64(payload + 32);
++        const uint32_t planeCount = readU32(payload + 40);
++        const auto failAcquired = [&](status_t failure) -> status_t {
++            if (id == 0) return failure;
++            status_t cancellation = sendRequest(static_cast<uint16_t>(Opcode::Cancel), id);
++            if (cancellation == NO_ERROR) cancellation = receiveAck();
++            if (cancellation != NO_ERROR) {
++                ALOGE("Failed to cancel rejected Denial target %" PRIu64 ": %d", id,
++                      cancellation);
++            }
++            return failure;
++        };
++        if (display != mDisplay || id == 0 || id > UINT32_MAX || serial == 0 || width == 0 ||
++            height == 0 || planeCount == 0 || planeCount > kMaxPlanes ||
++            record.descriptors.size() != planeCount) {
++            return failAcquired(BAD_VALUE);
++        }
++        if (width != mWidth || height != mHeight) {
++            ALOGI("Denial resized %s %" PRIu64 " on channel %" PRIu64 " from %ux%u to %ux%u",
++                  mTask == 0 ? "built-in display" : "Android task", mTask, mDisplay, mWidth,
++                  mHeight, width, height);
++            mWidth = width;
++            mHeight = height;
++        }
++
++        auto target = mTargets.find(id);
++        if (target == mTargets.end()) {
++            const PixelFormat format = androidFormat(fourcc);
++            if (format == PIXEL_FORMAT_UNKNOWN) return failAcquired(BAD_VALUE);
++            // Stable-C minigbm handles carry a gralloc metadata sidecar after
++            // their plane descriptors. It is required even when no client
++            // reserved region was requested: Mesa queries the default
++            // dataspace through it while constructing the EGLImage.
++            const int numFds = static_cast<int>(planeCount + 1);
++            const int numInts = static_cast<int>(
++                    (sizeof(CrosGrallocHandle) - sizeof(native_handle_t)) / sizeof(int)) -
++                    numFds;
++            native_handle_t* native = native_handle_create(numFds, numInts);
++            if (native == nullptr) return failAcquired(NO_MEMORY);
++            auto* handle = reinterpret_cast<CrosGrallocHandle*>(native);
++            std::memset(handle->fds, 0xff, sizeof(handle->fds));
++            std::memset(handle->strides, 0, sizeof(handle->strides));
++            std::memset(handle->offsets, 0, sizeof(handle->offsets));
++            std::memset(handle->sizes, 0, sizeof(handle->sizes));
++            uint64_t totalSize = 0;
++            for (uint32_t index = 0; index < planeCount; ++index) {
++                handle->fds[index] = record.descriptors[index].release();
++                handle->offsets[index] = readU32(payload + 48 + index * 4);
++                handle->strides[index] = readU32(payload + 64 + index * 4);
++                handle->sizes[index] = planeSize(handle->fds[index], handle->offsets[index],
++                                                  handle->strides[index], height);
++                totalSize += handle->sizes[index];
++            }
++            handle->fds[planeCount] = createGrallocMetadataFd();
++            if (handle->fds[planeCount] < 0) {
++                const status_t failure = handle->fds[planeCount];
++                native_handle_close(native);
++                native_handle_delete(native);
++                return failAcquired(failure);
++            }
++            // minigbm buffer identities are process-global, whereas Denial
++            // identities occupy a separate namespace and can collide with
++            // ordinary Android allocations already imported by SurfaceFlinger.
++            static std::atomic<uint32_t> nextGrallocId{0xd1000000U};
++            handle->id = nextGrallocId.fetch_add(1, std::memory_order_relaxed);
++            handle->width = width;
++            handle->height = height;
++            handle->format = fourcc;
++            handle->tiling = 0;
++            handle->format_modifier = modifier;
++            // Denial allocated these targets as GBM renderable scanout BOs.
++            handle->use_flags = (1ULL << 0) | (1ULL << 2);
++            handle->magic = kCrosGrallocMagic;
++            handle->pixel_stride = handle->strides[0] / 4;
++            handle->droid_format = format;
++            handle->usage = static_cast<int64_t>(mUsage);
++            handle->num_planes = planeCount;
++            handle->reserved_region_size = kGrallocMetadataBytes;
++            handle->total_size = totalSize + kGrallocMetadataBytes;
++            auto graphicBuffer = sp<GraphicBuffer>::make(
++                    native, GraphicBuffer::TAKE_UNREGISTERED_HANDLE, width, height, format, 1U,
++                    mUsage, handle->pixel_stride);
++            const status_t importStatus = graphicBuffer->initCheck();
++            if (importStatus != NO_ERROR) {
++                ALOGE("Failed to import Denial target %" PRIu64
++                      " as minigbm buffer %u: %d (fourcc=%#x modifier=%#" PRIx64
++                      " stride=%u)",
++                      id, handle->id, importStatus, fourcc, modifier, handle->strides[0]);
++                native_handle_close(native);
++                native_handle_delete(native);
++                return failAcquired(importStatus);
++            }
++            Target imported{.buffer = std::move(graphicBuffer)};
++            mBufferIds.emplace(imported.buffer->getNativeBuffer(), id);
++            target = mTargets.emplace(id, std::move(imported)).first;
++        }
++        mDequeued.insert(id);
++        ALOGV("Dequeued Denial target %" PRIu64 "; %zu buffers now dequeued", id,
++              mDequeued.size());
++        *output = target->second.buffer->getNativeBuffer();
++        *fenceFd = -1;
++        return NO_ERROR;
++    }
++}
++
++int DroidloomNativeWindow::queueBuffer(ANativeWindowBuffer* buffer, int fenceFd) {
++    std::lock_guard lock(mMutex);
++    base::unique_fd fence(fenceFd);
++    const auto found = mBufferIds.find(buffer);
++    if (found == mBufferIds.end() || mDequeued.count(found->second) == 0) return BAD_VALUE;
++    const uint64_t id = found->second;
++    status_t status = sendRequest(static_cast<uint16_t>(Opcode::Present), id, fence.get());
++    if (status == NO_ERROR) status = receiveAck();
++    mDequeued.erase(id);
++    ALOGV("Queued Denial target %" PRIu64 "; status=%d, %zu buffers remain dequeued", id,
++          status, mDequeued.size());
++    return status;
++}
++
++int DroidloomNativeWindow::cancelBuffer(ANativeWindowBuffer* buffer, int fenceFd) {
++    std::lock_guard lock(mMutex);
++    base::unique_fd fence(fenceFd);
++    const auto found = mBufferIds.find(buffer);
++    if (found == mBufferIds.end() || mDequeued.count(found->second) == 0) return BAD_VALUE;
++    if (fence.ok()) sync_wait(fence.get(), -1);
++    const uint64_t id = found->second;
++    status_t status = sendRequest(static_cast<uint16_t>(Opcode::Cancel), id);
++    if (status == NO_ERROR) status = receiveAck();
++    mDequeued.erase(id);
++    ALOGV("Cancelled Denial target %" PRIu64 "; status=%d, %zu buffers remain dequeued", id,
++          status, mDequeued.size());
++    return status;
++}
++
++int DroidloomNativeWindow::query(int what, int* value) const {
++    if (value == nullptr) return BAD_VALUE;
++    std::lock_guard lock(mMutex);
++    switch (what) {
++        case NATIVE_WINDOW_WIDTH:
++        case NATIVE_WINDOW_DEFAULT_WIDTH:
++            *value = static_cast<int>(mWidth);
++            return NO_ERROR;
++        case NATIVE_WINDOW_HEIGHT:
++        case NATIVE_WINDOW_DEFAULT_HEIGHT:
++            *value = static_cast<int>(mHeight);
++            return NO_ERROR;
++        case NATIVE_WINDOW_FORMAT:
++            *value = mFormat;
++            return NO_ERROR;
++        case NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS:
++            *value = 0;
++            return NO_ERROR;
++        case NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER:
++        case NATIVE_WINDOW_CONSUMER_RUNNING_BEHIND:
++        case NATIVE_WINDOW_BUFFER_AGE:
++            *value = 0;
++            return NO_ERROR;
++        case NATIVE_WINDOW_CONCRETE_TYPE:
++        case NATIVE_WINDOW_TRANSFORM_HINT:
++            *value = 0;
++            return NO_ERROR;
++        case NATIVE_WINDOW_IS_VALID:
++            *value = mSocket.ok() ? 1 : 0;
++            return NO_ERROR;
++        case NATIVE_WINDOW_DATASPACE:
++            *value = static_cast<int>(mDataspace);
++            return NO_ERROR;
++        case NATIVE_WINDOW_MAX_BUFFER_COUNT:
++            *value = 3;
++            return NO_ERROR;
++        default:
++            return NAME_NOT_FOUND;
++    }
++}
++
++int DroidloomNativeWindow::perform(int operation, va_list args) {
++    std::lock_guard lock(mMutex);
++    switch (operation) {
++        case NATIVE_WINDOW_API_CONNECT:
++            (void)va_arg(args, int);
++            if (mConnected) return -EINVAL;
++            mConnected = true;
++            return NO_ERROR;
++        case NATIVE_WINDOW_API_DISCONNECT:
++            (void)va_arg(args, int);
++            mConnected = false;
++            return NO_ERROR;
++        case NATIVE_WINDOW_SET_USAGE64:
++            mUsage = va_arg(args, uint64_t);
++            return NO_ERROR;
++        case NATIVE_WINDOW_SET_USAGE:
++            mUsage = static_cast<uint32_t>(va_arg(args, int));
++            return NO_ERROR;
++        case NATIVE_WINDOW_SET_BUFFERS_FORMAT:
++            (void)va_arg(args, int);
++            return NO_ERROR;
++        case NATIVE_WINDOW_SET_BUFFERS_DATASPACE:
++            mDataspace = static_cast<ui::Dataspace>(va_arg(args, int));
++            return NO_ERROR;
++        case NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS: {
++            const int width = va_arg(args, int);
++            const int height = va_arg(args, int);
++            // Denial owns the window geometry. The next acquired target is
++            // authoritative and updates mWidth/mHeight when its generation changes.
++            return width > 0 && height > 0 ? NO_ERROR : BAD_VALUE;
++        }
++        case NATIVE_WINDOW_SET_SURFACE_DAMAGE:
++            (void)va_arg(args, android_native_rect_t*);
++            (void)va_arg(args, size_t);
++            return NO_ERROR;
++        case NATIVE_WINDOW_ALLOCATE_BUFFERS:
++        case NATIVE_WINDOW_SET_PRODUCER_THROTTLING_ENABLED:
++            return NO_ERROR;
++        default:
++            return NAME_NOT_FOUND;
++    }
++}
++
++status_t DroidloomNativeWindow::sendRequest(uint16_t opcode, uint64_t buffer, int fenceFd) {
++    std::vector<uint8_t> payload;
++    appendU64(payload, mDisplay);
++    if (static_cast<Opcode>(opcode) == Opcode::Present ||
++        static_cast<Opcode>(opcode) == Opcode::Cancel) {
++        appendU64(payload, buffer);
++    }
++    const uint32_t descriptors = fenceFd >= 0 ? 1 : 0;
++    return sendRecord(mSocket.get(), makeRecord(static_cast<Opcode>(opcode), payload, descriptors),
++                      fenceFd);
++}
++
++status_t DroidloomNativeWindow::receiveAck() {
++    ReceivedRecord record;
++    status_t status = receiveRecord(mSocket.get(), &record);
++    if (status != NO_ERROR) return status;
++    const Opcode opcode = static_cast<Opcode>(readU16(record.bytes.data() + 6));
++    if (opcode == Opcode::Ack && record.length == kHeaderBytes && record.descriptors.empty()) {
++        return NO_ERROR;
++    }
++    if (opcode == Opcode::Error && record.length == kHeaderBytes + 4) {
++        const int32_t error = static_cast<int32_t>(readU32(record.bytes.data() + kHeaderBytes));
++        return error < 0 ? error : -EIO;
++    }
++    return BAD_VALUE;
++}
++
++int DroidloomNativeWindow::hookSetSwapInterval(ANativeWindow*, int) {
++    return NO_ERROR;
++}
++
++int DroidloomNativeWindow::hookDequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer,
++                                              int* fenceFd) {
++    return getSelf(window)->dequeueBuffer(buffer, fenceFd);
++}
++
++int DroidloomNativeWindow::hookQueueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer,
++                                            int fenceFd) {
++    return getSelf(window)->queueBuffer(buffer, fenceFd);
++}
++
++int DroidloomNativeWindow::hookCancelBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer,
++                                             int fenceFd) {
++    return getSelf(window)->cancelBuffer(buffer, fenceFd);
++}
++
++int DroidloomNativeWindow::hookQuery(const ANativeWindow* window, int what, int* value) {
++    return getSelf(window)->query(what, value);
++}
++
++int DroidloomNativeWindow::hookPerform(ANativeWindow* window, int operation, ...) {
++    va_list args;
++    va_start(args, operation);
++    const int result = getSelf(window)->perform(operation, args);
++    va_end(args);
++    return result;
++}
++
++int DroidloomNativeWindow::hookDequeueBufferDeprecated(ANativeWindow* window,
++                                                        ANativeWindowBuffer** buffer) {
++    int fence = -1;
++    const int result = getSelf(window)->dequeueBuffer(buffer, &fence);
++    if (result == NO_ERROR && fence >= 0) {
++        const int wait = sync_wait(fence, -1);
++        close(fence);
++        return wait == 0 ? NO_ERROR : -errno;
++    }
++    return result;
++}
++
++int DroidloomNativeWindow::hookQueueBufferDeprecated(ANativeWindow* window,
++                                                      ANativeWindowBuffer* buffer) {
++    return getSelf(window)->queueBuffer(buffer, -1);
++}
++
++int DroidloomNativeWindow::hookCancelBufferDeprecated(ANativeWindow* window,
++                                                       ANativeWindowBuffer* buffer) {
++    return getSelf(window)->cancelBuffer(buffer, -1);
++}
++
++int DroidloomNativeWindow::hookLockBufferDeprecated(ANativeWindow*, ANativeWindowBuffer*) {
++    return NO_ERROR;
++}
++
++} // namespace android
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+new file mode 100644
+index 0000000..99a0070
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -0,0 +1,82 @@
++/*
++ * Copyright 2026 The Droidloom Authors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ * This file is part of Droidloom and is licensed under GNU GPL version 3
++ * or, at your option, any later version. See Droidloom's LICENSE.
++ *
++ *      https://www.gnu.org/licenses/gpl-3.0.html
++ */
++
++#pragma once
++
++#include <android-base/unique_fd.h>
++#include <system/window.h>
++#include <ui/ANativeObjectBase.h>
++#include <ui/GraphicBuffer.h>
++#include <utils/RefBase.h>
++
++#include <cstdarg>
++#include <cstdint>
++#include <mutex>
++#include <unordered_set>
++#include <unordered_map>
++
++namespace android {
++
++// ANativeWindow backed by the cell-private Droidloom presentation broker.
++// RenderEngine writes the final SurfaceFlinger display composition directly
++// into Denial-owned DMA-BUFs returned by dequeueBuffer().
++class DroidloomNativeWindow final
++      : public ANativeObjectBase<ANativeWindow, DroidloomNativeWindow, RefBase> {
++public:
++    static sp<DroidloomNativeWindow> create(uint32_t expectedWidth, uint32_t expectedHeight);
++    static sp<DroidloomNativeWindow> createForTask(uint64_t task, status_t* outStatus);
++
++    DroidloomNativeWindow(uint64_t task, uint32_t expectedWidth, uint32_t expectedHeight);
++    ~DroidloomNativeWindow() override;
++
++private:
++    struct Target {
++        sp<GraphicBuffer> buffer;
++    };
++
++    status_t initialize();
++    int dequeueBuffer(ANativeWindowBuffer** buffer, int* fenceFd);
++    int queueBuffer(ANativeWindowBuffer* buffer, int fenceFd);
++    int cancelBuffer(ANativeWindowBuffer* buffer, int fenceFd);
++    int query(int what, int* value) const;
++    int perform(int operation, va_list args);
++
++    static int hookSetSwapInterval(ANativeWindow* window, int interval);
++    static int hookDequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd);
++    static int hookQueueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
++    static int hookCancelBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
++    static int hookQuery(const ANativeWindow* window, int what, int* value);
++    static int hookPerform(ANativeWindow* window, int operation, ...);
++    static int hookDequeueBufferDeprecated(ANativeWindow* window, ANativeWindowBuffer** buffer);
++    static int hookQueueBufferDeprecated(ANativeWindow* window, ANativeWindowBuffer* buffer);
++    static int hookCancelBufferDeprecated(ANativeWindow* window, ANativeWindowBuffer* buffer);
++    static int hookLockBufferDeprecated(ANativeWindow*, ANativeWindowBuffer*);
++
++    status_t sendRequest(uint16_t opcode, uint64_t buffer, int fenceFd = -1);
++    status_t receiveAck();
++
++    const uint64_t mTask;
++    const uint32_t mExpectedWidth;
++    const uint32_t mExpectedHeight;
++    uint32_t mWidth = 0;
++    uint32_t mHeight = 0;
++    uint64_t mDisplay = 0;
++    uint64_t mUsage = GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE;
++    int mFormat = HAL_PIXEL_FORMAT_RGBA_8888;
++    ui::Dataspace mDataspace = ui::Dataspace::UNKNOWN;
++    bool mConnected = false;
++    android::base::unique_fd mSocket;
++    std::unordered_map<uint64_t, Target> mTargets;
++    std::unordered_map<const ANativeWindowBuffer*, uint64_t> mBufferIds;
++    std::unordered_set<uint64_t> mDequeued;
++    mutable std::mutex mMutex;
++};
++
++} // namespace android

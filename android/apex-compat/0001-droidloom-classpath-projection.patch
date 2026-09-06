@@ -1,0 +1,66 @@
+diff --git a/rootdir/init.rc b/rootdir/init.rc
+index 5e26d12..be4a5dd 100644
+--- a/rootdir/init.rc
++++ b/rootdir/init.rc
+@@ -13,6 +13,18 @@ import /system/etc/init/hw/init.${ro.zygote}.rc
+ 
+ # Cgroups are mounted right before early-init using list from /etc/cgroups.json
+ on early-init
++    # The shared host kernel has no legacy Android ashmem device. Android's
++    # libcutils uses sealed memfd instead when this documented property is set.
++    setprop sys.use_memfd true
++
++    # This display-global warning is not owned by the application task and
++    # would become an invisible input-blocking modal in a multi-window host.
++    setprop debug.wm.disable_deprecated_target_sdk_dialog true
++
++    # Android init launches services from its exported environment, not the
++    # environment inherited by second-stage init itself.
++    export DROIDLOOM_CELL 1
++
+     # Allow bootchart to capture from the beginning of second-stage init.
+     mkdir /dev/bootchart 0755 root root
+     bootchart start
+@@ -231,7 +243,8 @@ on init
+ 
+     # Mount binderfs
+     mkdir /dev/binderfs
+-    mount binder binder /dev/binderfs stats=global
++    # Droidloom's namespace supervisor mounted this private instance and
++    # created its binder, hwbinder, and vndbinder nodes before second stage.
+     chmod 0755 /dev/binderfs
+ 
+     # Mount fusectl
+@@ -548,6 +561,10 @@ on late-init
+     trigger early-boot
+     trigger boot
+ 
++    # Droidloom supplies an already-mounted, unencrypted private /data image.
++    # No mount_all result exists to emit this event on the cell's behalf.
++    trigger nonencrypted
++
+ on early-fs
+     # Once metadata has been mounted, we'll need vold to deal with userdata checkpointing
+     start vold
+@@ -1046,7 +1063,7 @@ on post-fs-data
+ 
+     # Define and export *CLASSPATH variables
+     # Must start before 'odsign', as odsign depends on *CLASSPATH variables
+-    exec_start derive_classpath
++    exec_start droidloom_derive_classpath
+     load_exports /data/system/environ/classpath
+ 
+     # Start ART's oneshot boot service to propagate boot experiment flags to
+@@ -1318,3 +1335,12 @@ on property:sys.snapshotctl.map=requested
+ on property:sys.snapshotctl.unmap=requested
+     exec - root root system -- /system/bin/snapshotctl unmap
+     setprop sys.snapshotctl.unmap "finished"
++
++# Development-only bridge for a verified APEX classpath fragment whose EROFS
++# payload cannot be mounted by the shared host kernel. The wrapper mounts only
++# the read-only package projection and then invokes Android's derive_classpath.
++service droidloom_derive_classpath /droidloom/classpath-compat/bin/droidloom-classpath-wrapper /droidloom/classpath-compat/apex/com.android.virt com.android.virt --file-override /droidloom/classpath-compat/bin/netbpfload /apex/com.android.tethering/bin/netbpfload --file-override /droidloom/classpath-compat/lib64/libservice-connectivity.so /apex/com.android.tethering/lib64/libservice-connectivity.so --file-override /droidloom/classpath-compat/lib64/libandroid_net_connectivity_com_android_net_module_util_jni.so /apex/com.android.tethering/lib64/libandroid_net_connectivity_com_android_net_module_util_jni.so
++    user root
++    group root system reserved_disk
++    oneshot
++    disabled

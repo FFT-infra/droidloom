@@ -1,0 +1,17 @@
+[package]
+name = "droidloom-package-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "droidloom-package-helper"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+droidloom-supervisor = { path = "../droidloom-supervisor" }

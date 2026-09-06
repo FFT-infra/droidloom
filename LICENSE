@@ -1,0 +1,19 @@
+Droidloom
+Copyright (C) 2026 Doctor Logix
+
+Droidloom's original code, build tools and documentation are free software:
+you may redistribute them and/or modify them under the terms of the GNU
+General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version.
+
+Droidloom is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for details.
+
+The complete GNU General Public License version 3 text is included in
+LICENSES/GPL-3.0-or-later.txt. This notice grants the permission to use any
+later version. SPDX-License-Identifier: GPL-3.0-or-later
+
+Third-party code, protocol definitions, assets and dependencies retain their
+own copyright notices and licenses. This notice does not relicense upstream
+works. See THIRD_PARTY.md for the scope and retained notices.

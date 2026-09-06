@@ -1,0 +1,16 @@
+[Unit]
+Description=Droidloom Android cell lifecycle daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/droidloomd
+TimeoutStopSec=20s
+KillMode=mixed
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=droidloom
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

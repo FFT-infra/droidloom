@@ -1,0 +1,13 @@
+cc_library_shared {
+    name: "libdroidloom_selinux_compat",
+    vendor: true,
+    srcs: ["selinux_compat.c"],
+    include_dirs: ["external/selinux/libselinux/include"],
+    stl: "none",
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    version_script: "exported.map.txt",
+}

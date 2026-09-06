@@ -1,0 +1,22 @@
+[package]
+name = "droidloom-doctor"
+description = "Read-only Droidloom host capability probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+droidloom-contracts = { path = "../droidloom-contracts" }
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+

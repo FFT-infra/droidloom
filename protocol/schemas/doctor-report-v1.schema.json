@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://droidloom.org/schemas/doctor-report-v1.schema.json",
+  "title": "Droidloom doctor report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_unix_seconds",
+    "host",
+    "ready",
+    "blocker_count",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_unix_seconds": { "type": "integer", "minimum": 0 },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "kernel_release", "architecture", "user", "probe_root"],
+      "properties": {
+        "os": { "type": "string" },
+        "kernel_release": { "type": "string" },
+        "architecture": { "type": "string" },
+        "user": { "type": "string" },
+        "probe_root": { "type": "string" }
+      }
+    },
+    "ready": { "type": "boolean" },
+    "blocker_count": { "type": "integer", "minimum": 0 },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "status", "blocking", "evidence"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]+$" },
+          "title": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["pass", "warning", "fail", "unknown"] },
+          "blocking": { "type": "boolean" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "remediation": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
+

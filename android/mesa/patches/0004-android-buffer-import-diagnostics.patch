@@ -1,0 +1,40 @@
+diff --git a/src/egl/drivers/dri2/platform_android.c b/src/egl/drivers/dri2/platform_android.c
+--- a/src/egl/drivers/dri2/platform_android.c
++++ b/src/egl/drivers/dri2/platform_android.c
+@@ -82,13 +82,19 @@ droid_create_image_from_native_buffer(_EGLDisplay *disp,
+    };
+    struct dri_image *img = NULL;
+ 
+-   if (u_gralloc_get_buffer_basic_info(dri2_dpy->gralloc, &gr_handle,
+-                                       &buf_info))
++   int info_error = u_gralloc_get_buffer_basic_info(dri2_dpy->gralloc,
++                                                    &gr_handle, &buf_info);
++   if (info_error) {
++      _eglLog(_EGL_WARNING, "Android buffer metadata failed: %d", info_error);
+       return NULL;
++   }
+ 
+-   if (u_gralloc_get_buffer_color_info(dri2_dpy->gralloc, &gr_handle,
+-                                       &color_info))
++   info_error = u_gralloc_get_buffer_color_info(dri2_dpy->gralloc,
++                                                &gr_handle, &color_info);
++   if (info_error) {
++      _eglLog(_EGL_WARNING, "Android buffer color metadata failed: %d", info_error);
+       return NULL;
++   }
+ 
+    img = droid_create_image_from_buffer_info(dri2_dpy, buf->width, buf->height,
+                                              &buf_info, &color_info, priv);
+@@ -106,6 +112,12 @@ droid_create_image_from_native_buffer(_EGLDisplay *disp,
+          dri2_dpy, buf->width, buf->height, &buf_info, &color_info, priv);
+    }
+ 
++   if (!img)
++      _eglLog(_EGL_WARNING,
++              "Android DMA-BUF import failed: %dx%d fourcc=%08x planes=%u stride=%u",
++              buf->width, buf->height, buf_info.drm_fourcc,
++              buf_info.num_planes, buf_info.strides[0]);
++
+    return img;
+ }
+ 

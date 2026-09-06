@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "x86_64_vendor_product_implementation_pending_build_validation",
+  "product": "droidloom_x86_64",
+  "architecture": "x86_64",
+  "shared_kernel": true,
+  "base": {
+    "source": "android/manifest/source-lock-x86_64.json#aosp_ci_base",
+    "reused_read_only_partitions": ["system", "system_ext", "product"],
+    "excluded_cuttlefish_partitions": [
+      "vendor", "odm", "boot", "init_boot", "vendor_boot",
+      "vendor_dlkm", "odm_dlkm"
+    ]
+  },
+  "built_by_droidloom": {
+    "partition": "vendor",
+    "filesystem": "ext4",
+    "graphics": "native AMD minigbm, RadeonSI EGL/GLES, and RADV Vulkan",
+    "display_transport": "Droidloom-composed DMA-BUFs delivered to Denial",
+    "forbidden_fallbacks": ["gfxstream", "virgl", "llvmpipe", "DRM card node"]
+  }
+}

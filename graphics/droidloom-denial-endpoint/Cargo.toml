@@ -1,0 +1,21 @@
+[package]
+name = "droidloom-denial-endpoint"
+description = "Denial-side task and presentation endpoint for Droidloom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+droidloom-denial-ipc = { path = "../droidloom-denial-ipc" }
+droidloom-denial-protocol = { path = "../droidloom-denial-protocol" }
+droidloom-syncobj = { path = "../droidloom-syncobj" }
+droidloom-transport = { path = "../droidloom-transport" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

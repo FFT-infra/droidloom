@@ -1,0 +1,10 @@
+#!/system/bin/sh
+
+if [ -r /droidloom/ime/droidloom-input-bridge.jar ]; then
+    export CLASSPATH=/droidloom/ime/droidloom-input-bridge.jar
+elif [ -r /droidloom/classpath-compat/javalib/droidloom-input-bridge.jar ]; then
+    export CLASSPATH=/droidloom/classpath-compat/javalib/droidloom-input-bridge.jar
+else
+    export CLASSPATH=/vendor/framework/droidloom-input-bridge.jar
+fi
+exec app_process /system/bin com.android.droidloom.input.InputBridge "$@"

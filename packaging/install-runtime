@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+payload="${1:?payload directory is required}"
+artifact_id="${2:?artifact identity is required}"
+host_uid="${3:?host UID is required}"
+host_user="${4:?host user is required}"
+
+startup="${5:-manual}"
+case "$startup" in manual|auto) ;; *) echo "startup must be manual or auto" >&2; exit 2 ;; esac
+
+case "$artifact_id" in
+    (*[!0-9a-f]*|'') echo "invalid artifact identity: $artifact_id" >&2; exit 2 ;;
+esac
+case "$host_uid" in
+    (*[!0-9]*|'') echo "invalid host UID: $host_uid" >&2; exit 2 ;;
+esac
+case "$host_user" in
+    (*[!a-zA-Z0-9_-]*|'') echo "invalid host user: $host_user" >&2; exit 2 ;;
+esac
+[[ "$(id -u "$host_user")" == "$host_uid" ]] || {
+    echo "host user $host_user does not own UID $host_uid" >&2
+    exit 2
+}
+
+for required in \
+    "$payload/usr/bin/droidloomd" \
+    "$payload/usr/bin/droidloomctl" \
+    "$payload/usr/bin/droidloom-applications" \
+    "$payload/usr/bin/droidloom-supervisor" \
+    "$payload/usr/bin/droidloom-wayland" \
+    "$payload/usr/lib/systemd/user/droidloom-applications.service" \
+    "$payload/usr/lib/systemd/user/droidloom.service" \
+    "$payload/usr/lib/systemd/system/droidloomd.service" \
+    "$payload/usr/lib/environment.d/60-droidloom.conf" \
+    "$payload/usr/lib/droidloom/runtime/bin/droidloom-android-init" \
+    "$payload/var/lib/droidloom/images/images/system.img" \
+    "$payload/var/lib/droidloom/images/images/system_ext.img" \
+    "$payload/var/lib/droidloom/images/images/product.img" \
+    "$payload/var/lib/droidloom/images/images/vendor.raw.img" \
+    "$payload/var/lib/droidloom/users/$host_uid/data/data.img" \
+    "$payload/var/lib/droidloom/users/$host_uid/data/metadata.img" \
+    "$payload/etc/droidloom/cell.json"; do
+    [[ -f "$required" ]] || {
+        echo "incomplete Droidloom payload: $required" >&2
+        exit 2
+    }
+done
+
+# Validate every declared runtime input before changing the installed runtime.
+python3 - "$payload" "$host_uid" <<'PYCODE'
+import json, pathlib, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+spec = json.loads((root / 'etc/droidloom/cell.json').read_text())
+catalog = root / 'usr/lib/droidloom/runtime/framework/droidloom-input-bridge.jar'
+with zipfile.ZipFile(catalog) as jar:
+    dex = b''.join(jar.read(name) for name in jar.namelist() if name.endswith('.dex'))
+if b'Lcom/android/droidloom/catalog/ApplicationCatalog;' not in dex:
+    raise SystemExit('payload is missing the Android application catalog class')
+if spec['host_uid'] != int(sys.argv[2]):
+    raise SystemExit('payload cell owner does not match installation user')
+paths = [entry['source'] for entry in spec.get('android_file_overrides', [])]
+paths += [entry['source'] for entry in spec.get('android_runtime_directories', [])]
+if spec.get('android_init'):
+    paths.append(spec['android_init'])
+for source in paths:
+    source = source.replace('/usr/lib/droidloom/current/', '/usr/lib/droidloom/runtime/')
+    path = root / source.lstrip('/')
+    if not path.exists():
+        raise SystemExit(f'incomplete runtime input: {path}')
+PYCODE
+
+# Mandatory before stopping any service or writing any installed file.
+python3 "$(dirname -- "$0")/verify-bundle" verify "$payload"
+
+if [[ -S "/run/user/$host_uid/bus" ]]; then
+    runuser -u "$host_user" -- env XDG_RUNTIME_DIR="/run/user/$host_uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$host_uid/bus" \
+        systemctl --user stop droidloom.service || true
+fi
+if systemctl is-active --quiet droidloomd.service; then
+    systemctl stop droidloomd.service
+fi
+
+runtime_final="/usr/lib/droidloom/artifacts/$artifact_id"
+runtime_incoming="/usr/lib/droidloom/artifacts/.incoming-$artifact_id"
+images_final="/var/lib/droidloom/images/$artifact_id"
+images_incoming="/var/lib/droidloom/images/.incoming-$artifact_id"
+# Host-only upgrades reuse the byte-identical immutable Android image set.
+image_link="$artifact_id"
+if [[ -d /var/lib/droidloom/images/current ]] && \
+    diff -qr "$payload/var/lib/droidloom/images" /var/lib/droidloom/images/current >/dev/null; then
+    images_final="$(readlink -f /var/lib/droidloom/images/current)"
+    image_link="$(basename "$images_final")"
+fi
+
+install -d -m 0755 /usr/lib/droidloom/artifacts /usr/lib/droidloom/lib
+if [[ -f "$payload/usr/lib/droidloom/storage/vold" ]]; then
+    install -D -m 0755 "$payload/usr/lib/droidloom/storage/vold" /usr/lib/droidloom/storage/vold
+fi
+install -d -m 0755 /var/lib/droidloom/images "/var/lib/droidloom/users/$host_uid"
+install -d -m 0700 "/var/lib/droidloom/users/$host_uid/data"
+host_gid="$(id -g "$host_user")"
+install -d -m 2770 -o "$host_uid" -g "$host_gid" \
+    "/var/lib/droidloom/users/$host_uid/shared-probe"
+
+if [[ ! -d "$runtime_final" ]]; then
+    rm -rf -- "$runtime_incoming"
+    cp -a -- "$payload/usr/lib/droidloom/runtime" "$runtime_incoming"
+    chown -R root:root "$runtime_incoming"
+    mv -T -- "$runtime_incoming" "$runtime_final"
+fi
+if [[ ! -d "$images_final" ]]; then
+    rm -rf -- "$images_incoming"
+    cp -a -- "$payload/var/lib/droidloom/images" "$images_incoming"
+    chown -R root:root "$images_incoming"
+    mv -T -- "$images_incoming" "$images_final"
+fi
+
+if [[ ! -e "/var/lib/droidloom/users/$host_uid/data/data.img" ]]; then
+    cp -a -- "$payload/var/lib/droidloom/users/$host_uid/data/." \
+        "/var/lib/droidloom/users/$host_uid/data/"
+fi
+chown -R root:root "/var/lib/droidloom/users/$host_uid/data"
+chmod 0700 "/var/lib/droidloom/users/$host_uid/data"
+
+for pending_link in \
+    /usr/lib/droidloom/.current-new \
+    /var/lib/droidloom/images/.current-new; do
+    if [[ -e "$pending_link" && ! -L "$pending_link" ]]; then
+        echo "refusing non-symlink activation path: $pending_link" >&2
+        exit 2
+    fi
+    rm -f -- "$pending_link"
+done
+ln -s -- "artifacts/$artifact_id" /usr/lib/droidloom/.current-new
+mv -Tf -- /usr/lib/droidloom/.current-new /usr/lib/droidloom/current
+ln -s -- "$image_link" /var/lib/droidloom/images/.current-new
+mv -Tf -- /var/lib/droidloom/images/.current-new /var/lib/droidloom/images/current
+
+for binary in droidloomd droidloomctl droidloom-applications droidloom-supervisor droidloom-wayland; do
+    install -m 0755 "$payload/usr/bin/$binary" "/usr/bin/$binary"
+done
+install -D -m 0644 "$payload/etc/droidloom/cell.json" /etc/droidloom/cell.json
+install -D -m 0644 "$payload/usr/lib/systemd/system/droidloomd.service" \
+    /usr/lib/systemd/system/droidloomd.service
+install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom.service" \
+    /usr/lib/systemd/user/droidloom.service
+install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-applications.service" \
+    /usr/lib/systemd/user/droidloom-applications.service
+install -D -m 0644 "$payload/usr/lib/environment.d/60-droidloom.conf" \
+    /usr/lib/environment.d/60-droidloom.conf
+
+# Remove Droidloom's obsolete compositor-plugin integration. A running
+# compositor is deliberately left alone; this takes effect at its next normal
+# session start while the new presenter can connect as an ordinary client now.
+rm -f -- \
+    /usr/lib/droidloom/lib/libdroidloom_denial_plugin.so \
+    /usr/lib/droidloom/libdroidloom_denial_plugin.so \
+    /usr/lib/systemd/user/droidloom-wayland.service \
+    /etc/systemd/system/denial.service.d/50-droidloom-native-app-plugin.conf
+
+systemctl daemon-reload
+# Authorize only the configured local user and this exact lifecycle unit.
+install -d -m 0755 /etc/polkit-1/rules.d
+cat > /etc/polkit-1/rules.d/49-droidloom.rules <<EOF
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        subject.user === "$host_user" &&
+        action.lookup("unit") === "droidloomd.service" &&
+        ["start", "stop"].indexOf(action.lookup("verb")) !== -1) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+chmod 0644 /etc/polkit-1/rules.d/49-droidloom.rules
+systemctl disable --now droidloomd.service
+systemctl --global disable droidloom.service
+
+if [[ -S "/run/user/$host_uid/bus" ]]; then
+    runuser -u "$host_user" -- env \
+        XDG_RUNTIME_DIR="/run/user/$host_uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$host_uid/bus" \
+        systemctl --user daemon-reload
+    runuser -u "$host_user" -- env \
+        XDG_RUNTIME_DIR="/run/user/$host_uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$host_uid/bus" \
+        systemctl --user disable --now droidloom.service
+    if [[ "$startup" == auto ]]; then
+        runuser -u "$host_user" -- env \
+            XDG_RUNTIME_DIR="/run/user/$host_uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$host_uid/bus" \
+            systemctl --user enable --now droidloom.service
+    fi
+fi
+
+printf 'installed Droidloom artifact %s for %s (%s)\n' \
+    "$artifact_id" "$host_user" "$host_uid"

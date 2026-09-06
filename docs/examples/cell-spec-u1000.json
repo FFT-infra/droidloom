@@ -1,0 +1,30 @@
+{
+  "host_uid": 1000,
+  "subordinate_uids": {
+    "start": 200000,
+    "count": 100000
+  },
+  "subordinate_gids": {
+    "start": 300000,
+    "count": 100000
+  },
+  "image_dir": "/var/lib/droidloom/images/current",
+  "vendor_image": "/var/lib/droidloom/images/current/images/vendor.raw.img",
+  "android_init": "/usr/lib/droidloom/android/init",
+  "android_file_overrides": [
+    {
+      "source": "/usr/lib/droidloom/android/lib64/libbinder.so",
+      "target": "/system/lib64/libbinder.so"
+    }
+  ],
+  "android_runtime_directories": [
+    {
+      "source": "/usr/lib/droidloom/android/runtime",
+      "target": "/droidloom/runtime"
+    }
+  ],
+  "data_dir": "/var/lib/droidloom/users/1000/data",
+  "runtime_dir": "/run/droidloom/cells/u1000",
+  "render_node": "/dev/dri/renderD128",
+  "denial_socket": "/run/user/1000/denial/native-bridge.sock"
+}

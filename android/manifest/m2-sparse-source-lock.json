@@ -1,0 +1,1965 @@
+{
+  "schema_version": 1,
+  "selected_at": "2026-08-15",
+  "status": "build_proven",
+  "remote_base": "https://android.googlesource.com/",
+  "superproject": {
+    "name": "platform/superproject",
+    "ref": "refs/heads/android-17.0.0_r1",
+    "commit": "28f0bbddc24d56c8ec5a8df5342ac7a292184039"
+  },
+  "policy": {
+    "allow_unrestricted_repo_sync": false,
+    "require_exact_commits": true,
+    "add_dependencies_only_from_superproject": true,
+    "base_partitions_come_from_aosp_ci_artifact": true
+  },
+  "links": [
+    {
+      "source": "build/make/CleanSpec.mk",
+      "target": "build/CleanSpec.mk"
+    },
+    {
+      "source": "build/make/buildspec.mk.default",
+      "target": "build/buildspec.mk.default"
+    },
+    {
+      "source": "build/make/core",
+      "target": "build/core"
+    },
+    {
+      "source": "build/make/envsetup.sh",
+      "target": "build/envsetup.sh"
+    },
+    {
+      "source": "build/make/target",
+      "target": "build/target"
+    },
+    {
+      "source": "build/make/tools",
+      "target": "build/tools"
+    },
+    {
+      "source": "build/soong/root.bp",
+      "target": "Android.bp"
+    },
+    {
+      "source": "build/soong/bootstrap.bash",
+      "target": "bootstrap.bash"
+    }
+  ],
+  "projects": [
+    {
+      "path": "art",
+      "name": "platform/art",
+      "commit": "b753cf97923c3695338d21466fa14c57b480a59a",
+      "purpose": "Pinned DEX file support required by Android unwind-stack linkage"
+    },
+    {
+      "path": "bionic",
+      "name": "platform/bionic",
+      "commit": "06356e41c5ed7b12220b24c05ba4fdb873b126a7",
+      "purpose": "Bionic headers and target runtime linkage"
+    },
+    {
+      "path": "dalvik",
+      "name": "platform/dalvik",
+      "commit": "5013071e756f89aa2cea97b437af12aacb8d4485",
+      "purpose": "Pinned dex dependency host tool required to package the upstream audio APEX",
+      "sparse_paths": [
+        "tools/dexdeps"
+      ]
+    },
+    {
+      "path": "bootable/recovery",
+      "name": "platform/bootable/recovery",
+      "commit": "080f671785c84ae1ac38797fe1fa7364d158fab4",
+      "purpose": "Pinned bootloader-message library required by init second stage"
+    },
+    {
+      "path": "build/blueprint",
+      "name": "platform/build/blueprint",
+      "commit": "7f2058de8155b05ea3c3f8317d33bfe732cacf8b",
+      "purpose": "Soong build graph"
+    },
+    {
+      "path": "build/make",
+      "name": "platform/build",
+      "commit": "5ce6f787337d0223710bf7d4a16dbe6d2a35f777",
+      "purpose": "Android product and image rules"
+    },
+    {
+      "path": "build/release",
+      "name": "platform/build/release",
+      "commit": "c85f4aebe46714235599a9bd6430a0fe30c6e8d5",
+      "purpose": "Android 17 release configuration selected by lunch"
+    },
+    {
+      "path": "build/soong",
+      "name": "platform/build/soong",
+      "commit": "6722dd8833db7482df1a2543ca3fcf67ddf0f7b1",
+      "purpose": "Android module build frontend"
+    },
+    {
+      "path": "cts",
+      "name": "platform/cts",
+      "commit": "3d1bf2a7eb2b7aaa4636c854ef481f256c40c2dd",
+      "purpose": "Pinned host JSON compatibility library required by the ProtoLog generator",
+      "sparse_paths": [
+        "libs/json"
+      ]
+    },
+    {
+      "path": "external/abseil-cpp",
+      "name": "platform/external/abseil-cpp",
+      "commit": "474258796bcf112de75a1f89d022ba80b6d0b746",
+      "purpose": "Pinned Abseil defaults and libraries required by the Protobuf host tool"
+    },
+    {
+      "path": "external/avb",
+      "name": "platform/external/avb",
+      "commit": "ba2dec4b035b0a3b61c5f8f8a74d86bcd450b1ee",
+      "purpose": "Pinned Android Verified Boot library required by init second stage"
+    },
+    {
+      "path": "external/bcc",
+      "name": "platform/external/bcc",
+      "commit": "79791945c2f1db4a6b2a1443524f3f5d19338609",
+      "purpose": "Pinned Android BPF client library required by the memory-event client"
+    },
+    {
+      "path": "external/boringssl",
+      "name": "platform/external/boringssl",
+      "commit": "0cd1f6a94b670e6b61af95a06e71e690ae8e3262",
+      "purpose": "Pinned host crypto library required by the HIDL generator"
+    },
+    {
+      "path": "external/bouncycastle",
+      "name": "platform/external/bouncycastle",
+      "commit": "c404048739e9a35cd51ad82906aadf910cca09dd",
+      "purpose": "Pinned Java crypto provider required by the host APK signing tool"
+    },
+    {
+      "path": "external/conscrypt",
+      "name": "platform/external/conscrypt",
+      "commit": "fd1a430323b5ab9945a15fce6c4a824aeffff685",
+      "purpose": "Pinned TLS provider and JNI library required by the host APK signing tool"
+    },
+    {
+      "path": "external/compiler-rt",
+      "name": "platform/external/compiler-rt",
+      "commit": "a36a1bcac7ec7ac9be29d8b0b5e669d53f7886f7",
+      "purpose": "Pinned CFI blocklist required by the Connectivity native library",
+      "sparse_paths": [
+        "lib/cfi"
+      ]
+    },
+    {
+      "path": "external/e2fsprogs",
+      "name": "platform/external/e2fsprogs",
+      "commit": "3eb17241db7cd4408cc1bce9d25b602465ace8ff",
+      "purpose": "Pinned ext4 filesystem tools required to create the Droidloom vendor image"
+    },
+    {
+      "path": "external/eigen",
+      "name": "platform/external/eigen",
+      "commit": "711c7cdce03a5e52d73f6f85bbe198324bfccc0b",
+      "purpose": "Pinned Eigen headers required by Android input motion prediction"
+    },
+    {
+      "path": "external/elfutils",
+      "name": "platform/external/elfutils",
+      "commit": "219c3a368b121307f2e05593cee89b8591cc40b9",
+      "purpose": "Pinned ELF support library required by the Mesa Android target build"
+    },
+    {
+      "path": "external/error_prone",
+      "name": "platform/external/error_prone",
+      "commit": "1667c79d1fe4211579c8210773961d65fc0d32a9",
+      "purpose": "Pinned Soong Error Prone plugin metadata required while analyzing Android virtualization compile defaults"
+    },
+    {
+      "path": "external/erofs-utils",
+      "name": "platform/external/erofs-utils",
+      "commit": "abbde14092ad3abd8908b864fa9b04685820577b",
+      "purpose": "Pinned host filesystem builder required to package the upstream audio APEX"
+    },
+    {
+      "path": "external/expat",
+      "name": "platform/external/expat",
+      "commit": "9cc7a1ca765061a58e196f101fc601d23845c89a",
+      "purpose": "Pinned XML parser required by the Mesa Android target build"
+    },
+    {
+      "path": "external/flatbuffers",
+      "name": "platform/external/flatbuffers",
+      "commit": "a321165845235e5fa63a5455ee866f4a5008b7c6",
+      "purpose": "Pinned FlatBuffers headers required by Android input event serialization"
+    },
+    {
+      "path": "external/javaparser",
+      "name": "platform/external/javaparser",
+      "commit": "c65eac405e7a34754245921eb50b1ee3932cb0e2",
+      "purpose": "Pinned Java parser required by the ProtoLog generator"
+    },
+    {
+      "path": "external/javapoet",
+      "name": "platform/external/javapoet",
+      "commit": "8c6c067900f2e80bbb561652820b6f3f038b3892",
+      "purpose": "Pinned Java source generator required by Android's system-feature tool"
+    },
+    {
+      "path": "external/guava",
+      "name": "platform/external/guava",
+      "commit": "f53eb3ca330b274507e184b4261e5284fd29b4b3",
+      "purpose": "Pinned Java utility library required by Android platform host tools"
+    },
+    {
+      "path": "external/kotlinc",
+      "name": "platform/external/kotlinc",
+      "commit": "200271076d3a9dc6b576497792a4a6fad78994fc",
+      "purpose": "Pinned Kotlin runtime required by the ProtoLog generator"
+    },
+    {
+      "path": "external/fec",
+      "name": "platform/external/fec",
+      "commit": "90857deb7973c0ca24c79b9c1809fc9667f32c4f",
+      "purpose": "Pinned Reed-Solomon library required by Android filesystem error correction"
+    },
+    {
+      "path": "external/f2fs-tools",
+      "name": "platform/external/f2fs-tools",
+      "commit": "c64468cb6397fb63bded0f549438b472f7e7cf88",
+      "purpose": "Pinned host filesystem builder required to package the upstream audio APEX"
+    },
+    {
+      "path": "external/fmtlib",
+      "name": "platform/external/fmtlib",
+      "commit": "e3bef0ad2e9d4ea38ba3b4b2b59e0514f7025fed",
+      "purpose": "Pinned formatting library required by the AIDL compiler's libbase dependency"
+    },
+    {
+      "path": "external/arm-optimized-routines",
+      "name": "platform/external/arm-optimized-routines",
+      "commit": "498b3de1a06e8cd87b2f9d49d1d8a23ebba5cc5a",
+      "purpose": "Pinned ARM math routines required by Bionic libm for the Composer AIDL Rust library"
+    },
+    {
+      "path": "external/libbpf",
+      "name": "platform/external/libbpf",
+      "commit": "9723b4de6459ab48b361aed3bae5df3c1bd20cb8",
+      "purpose": "Pinned BPF headers required by the Android memory-event programs"
+    },
+    {
+      "path": "external/libcap",
+      "name": "platform/external/libcap",
+      "commit": "9a2ead0b5a377a75849cb0656aa553b5452a7080",
+      "purpose": "Pinned Linux capability library required by Android init"
+    },
+    {
+      "path": "external/libchrome",
+      "name": "platform/external/libchrome",
+      "commit": "0aba0dccfcd93d8303678a4beb61594f7582c73c",
+      "purpose": "Pinned Chromium base utilities required by Android snapshot initialization"
+    },
+    {
+      "path": "external/libchrome-gestures",
+      "name": "platform/external/libchrome-gestures",
+      "commit": "6c2310952338e9f094a1aeb6a83f7356ff5d6042",
+      "purpose": "Pinned gesture interpretation dependency required by Android InputFlinger"
+    },
+    {
+      "path": "external/libevent",
+      "name": "platform/external/libevent",
+      "commit": "44754c0dfee5dc81723013498398034176e6d81e",
+      "purpose": "Pinned event library required by Android's Chromium base support library"
+    },
+    {
+      "path": "external/libphonenumber",
+      "name": "platform/external/libphonenumber",
+      "commit": "0b437881ecebeace98400b7c5d4874f5bff68692",
+      "purpose": "Pinned phone-number library required by the Android ext framework library"
+    },
+    {
+      "path": "external/libdrm",
+      "name": "platform/external/libdrm",
+      "commit": "12b44e2c3b5186a7e84a5f21830b077cb8587861",
+      "purpose": "DRM render-node and syncobj ABI"
+    },
+    {
+      "path": "external/libpalmrejection",
+      "name": "platform/external/libpalmrejection",
+      "commit": "8fed07868a7efb8cad6467119c3de47bace7999f",
+      "purpose": "Pinned palm-rejection dependency required by Android InputFlinger"
+    },
+    {
+      "path": "external/libpng",
+      "name": "platform/external/libpng",
+      "commit": "f3997b4b299d808f122ab1d999556d57abf5540d",
+      "purpose": "Pinned PNG library required by the generic AIDL Health service"
+    },
+    {
+      "path": "external/libpcap",
+      "name": "platform/external/libpcap",
+      "commit": "d50bbbacc6b05706a9f99e073eab8b251ce461fb",
+      "purpose": "Pinned packet-capture library linked by Android netd"
+    },
+    {
+      "path": "external/libxml2",
+      "name": "platform/external/libxml2",
+      "commit": "e57cff8da55134774646a521a797bb03d46babd8",
+      "purpose": "Pinned XML parser required by init's snapshot and storage libraries"
+    },
+    {
+      "path": "external/libtextclassifier",
+      "name": "platform/external/libtextclassifier",
+      "commit": "2973bcf11b21bcd40064f1751638d06cf6023e47",
+      "purpose": "Pinned text-classifier hash dependency required by Android InputFlinger"
+    },
+    {
+      "path": "external/go-cmp",
+      "name": "platform/external/go-cmp",
+      "commit": "2f92873cfcd27cbe5efa168d8399038980aef6be",
+      "purpose": "Pinned Soong bootstrap Go workspace dependency"
+    },
+    {
+      "path": "external/golang-protobuf",
+      "name": "platform/external/golang-protobuf",
+      "commit": "fcb969a6e0df55f1460721e1b9c4f2c4d2b5a47f",
+      "purpose": "Pinned Soong bootstrap protobuf implementation"
+    },
+    {
+      "path": "external/google-highway",
+      "name": "platform/external/google-highway",
+      "commit": "94b90ab8cb9df9b3719a64751ea2fcb62caa3391",
+      "purpose": "Pinned SIMD headers required by Android 17 Bionic portable string routines"
+    },
+    {
+      "path": "external/gwp_asan",
+      "name": "platform/external/gwp_asan",
+      "commit": "54826e96fc883088ac6cfc80240c094e671d6e24",
+      "purpose": "Pinned hardened allocator dependency of Bionic for the Composer AIDL Rust library"
+    },
+    {
+      "path": "external/googletest",
+      "name": "platform/external/googletest",
+      "commit": "9bcfc87429e9a9e02ccf2b8424b748f05c4842a5",
+      "purpose": "Pinned headers and host libraries required by the AIDL compiler"
+    },
+    {
+      "path": "external/icu",
+      "name": "platform/external/icu",
+      "commit": "00c713278f65a4db343c388f0c4f8501f70387b9",
+      "purpose": "Pinned ICU host libraries required by SQLite during native stub generation"
+    },
+    {
+      "path": "external/jarjar",
+      "name": "platform/external/jarjar",
+      "commit": "384ed55d6afe79ec6a143118c2cdd422e68c8e42",
+      "purpose": "Pinned Java bytecode repackager required to build the Droidloom Android input bridge"
+    },
+    {
+      "path": "external/jsoncpp",
+      "name": "platform/external/jsoncpp",
+      "commit": "97cca484243e0dadc1da054e63823a5ce7478e54",
+      "purpose": "Pinned host JSON library required by the HIDL generator"
+    },
+    {
+      "path": "external/llvm-libc",
+      "name": "platform/external/llvm-libc",
+      "commit": "95e08d1d4ccefa41921bc00a369008f7618b7101",
+      "purpose": "Pinned LLVM libc routines required by Android 17 Bionic"
+    },
+    {
+      "path": "external/ow2-asm",
+      "name": "platform/external/ow2-asm",
+      "commit": "e20c32fc7f8a49e712a907bcc827a6db074ea582",
+      "purpose": "Pinned Java bytecode library required by Android's JarJar packaging tool"
+    },
+    {
+      "path": "external/rappor",
+      "name": "platform/external/rappor",
+      "commit": "2abb31345f6c95944768b5222a9a5ed3fc68cc00",
+      "purpose": "Pinned privacy-preserving metrics library required by the Android ext framework library"
+    },
+    {
+      "path": "external/tagsoup",
+      "name": "platform/external/tagsoup",
+      "commit": "2f796dab146419542a7d44da9035bb3853fd6361",
+      "purpose": "Pinned HTML parser required by the Android ext framework library"
+    },
+    {
+      "path": "external/lz4",
+      "name": "platform/external/lz4",
+      "commit": "734e07032602e9a72fcc9701028b0aee45147fcd",
+      "purpose": "Pinned LZ4 library required by Android snapshot metadata"
+    },
+    {
+      "path": "external/lzma",
+      "name": "platform/external/lzma",
+      "commit": "ff4977aa409384e7622a53230323981a785e621d",
+      "purpose": "Pinned XZ/LZMA library required by Android unwind-stack linkage"
+    },
+    {
+      "path": "external/mesa3d",
+      "name": "platform/external/mesa3d",
+      "commit": "875160ed32cc5bc32777fa04870a0a57ed38c987",
+      "purpose": "AOSP Mesa build integration reference"
+    },
+    {
+      "path": "external/minigbm",
+      "name": "platform/external/minigbm",
+      "commit": "ce79bbee67b3e2ea7abb110e1415e9ceceaa6471",
+      "purpose": "GBM allocator and mapper reference"
+    },
+    {
+      "path": "external/modp_b64",
+      "name": "platform/external/modp_b64",
+      "commit": "5dac538059455079c873d306d25e0c6c75ea3845",
+      "purpose": "Pinned base64 codec required by Android's Chromium base support library"
+    },
+    {
+      "path": "external/pcre",
+      "name": "platform/external/pcre",
+      "commit": "0198d28487954eb6dff5e2d086b3a635a4aa6e26",
+      "purpose": "Pinned regular-expression library required by host SELinux support"
+    },
+    {
+      "path": "external/perfetto",
+      "name": "platform/external/perfetto",
+      "commit": "ece66975738007dd0978b911d8a2077e49b8f31e",
+      "purpose": "Pinned Perfetto C runtime required by Android servicemanager"
+    },
+    {
+      "path": "external/pogreb",
+      "name": "platform/external/pogreb",
+      "commit": "46b62444a3e31bf834331a78234deedee386ad88",
+      "purpose": "Pinned Soong Blueprint database dependency"
+    },
+    {
+      "path": "external/protobuf",
+      "name": "platform/external/protobuf",
+      "commit": "db06feae31e2a10ffc7ddaccd9e285ff7c13c0ab",
+      "purpose": "Pinned aprotoc host tool required by Android native stub generation"
+    },
+    {
+      "path": "external/python/six",
+      "name": "platform/external/python/six",
+      "commit": "d8b3ade33c59575efe12c2a009d7dcbdaa05ba4d",
+      "purpose": "Pinned Python six host library required by protobuf-generated fs-verity metadata"
+    },
+    {
+      "path": "external/python/mako",
+      "name": "platform/external/python/mako",
+      "commit": "b0e8e2239f9f6b4cee9cf42cab82391dc24f600e",
+      "purpose": "Pinned host template engine required by Mesa's source generators"
+    },
+    {
+      "path": "external/selinux",
+      "name": "platform/external/selinux",
+      "commit": "a8c5e74f85f869bf236a01ba24181b78f5e39a52",
+      "purpose": "Android policy build tools"
+    },
+    {
+      "path": "external/skia",
+      "name": "platform/external/skia",
+      "commit": "508606366e71a3daa933a4e08bc49b84e387ec18",
+      "purpose": "Pinned Skia RenderEngine backend required by the owned SurfaceFlinger build"
+    },
+    {
+      "path": "external/sqlite",
+      "name": "platform/external/sqlite",
+      "commit": "7961228217942c86f2b0bd2ae4115d00e157fc0b",
+      "purpose": "Pinned SQLite host library required by Android native stub generation"
+    },
+    {
+      "path": "external/speex",
+      "name": "platform/external/speex",
+      "commit": "1a255c4507c278c58b7bae5979d51de6c4bfb8fd",
+      "purpose": "Pinned silent-stream resampler dependency of the upstream audio service"
+    },
+    {
+      "path": "external/tinyalsa",
+      "name": "platform/external/tinyalsa",
+      "commit": "b6d92da6ee7890ce6b5bd9069937283fcc48812a",
+      "purpose": "Pinned tinyalsa ABI dependency of the upstream core audio service"
+    },
+    {
+      "path": "external/tinyalsa_new",
+      "name": "platform/external/tinyalsa_new",
+      "commit": "faac725f32811c68eb40e2d5956eadc51dbb8a60",
+      "purpose": "Pinned tinyalsav2 implementation required by the upstream core audio service"
+    },
+    {
+      "path": "external/rust/android-crates-io",
+      "name": "platform/external/rust/android-crates-io",
+      "commit": "1f5e95cd6e996995023c9c0f7df0f15a8a43269e",
+      "purpose": "Pinned serde and thiserror dependencies for Droidloom Rust vendor modules"
+    },
+    {
+      "path": "external/rust/crates/openssl",
+      "name": "platform/external/rust/crates/openssl",
+      "commit": "4dcd52051b37d6319ad67daa6aa9174d94d1015c",
+      "purpose": "Pinned Rust OpenSSL wrapper required by the nonsecure KeyMint reference service"
+    },
+    {
+      "path": "external/rust/cxx",
+      "name": "platform/external/rust/cxx",
+      "commit": "41972f6ebbe9c21eeed3fdf5c1b0805f2c8b824c",
+      "purpose": "Pinned Rust-to-C++ bridge crate required by Android aconfig image tooling"
+    },
+    {
+      "path": "external/scudo",
+      "name": "platform/external/scudo",
+      "commit": "15715589eebe155c799ce6fe27005bc8775b86ad",
+      "purpose": "Pinned Bionic allocator dependency for the Composer AIDL Rust library"
+    },
+    {
+      "path": "external/starlark-go",
+      "name": "platform/external/starlark-go",
+      "commit": "4947cdc739c985f6d86941e22894f5cefe7c9e9a",
+      "purpose": "Pinned Soong bootstrap Starlark implementation"
+    },
+    {
+      "path": "external/tinyxml2",
+      "name": "platform/external/tinyxml2",
+      "commit": "33ba115074c80a720826efffab1937d5b355c3b8",
+      "purpose": "Pinned XML parser required by host VINTF assembly"
+    },
+    {
+      "path": "external/FP16",
+      "name": "platform/external/FP16",
+      "commit": "e6ad60074cdb730af563c2d1553f472dc6115bf5",
+      "purpose": "Pinned half-precision headers required by TensorFlow Lite"
+    },
+    {
+      "path": "external/fft2d",
+      "name": "platform/external/fft2d",
+      "commit": "fa0ad63f8b666836f56a823de546390a6e4ff4b6",
+      "purpose": "Pinned FFT kernels required by TensorFlow Lite"
+    },
+    {
+      "path": "external/gemmlowp",
+      "name": "platform/external/gemmlowp",
+      "commit": "9304d9b673e827202f9526913d161e3cb49a1560",
+      "purpose": "Pinned low-precision matrix kernels required by TensorFlow Lite"
+    },
+    {
+      "path": "external/regex-re2",
+      "name": "platform/external/regex-re2",
+      "commit": "1b18ee77492041f7f0a7063ad8e02b5694aa6683",
+      "purpose": "Pinned regular-expression library required by TensorFlow Lite"
+    },
+    {
+      "path": "external/ruy",
+      "name": "platform/external/ruy",
+      "commit": "c165d6b0f1a1be9ddd2f904e8f87a4c1d9b38c43",
+      "purpose": "Pinned matrix multiplication kernels required by TensorFlow Lite"
+    },
+    {
+      "path": "external/tensorflow",
+      "name": "platform/external/tensorflow",
+      "commit": "d6bfb0bfab3e7565df0be176c3ebaa45ff9000ec",
+      "purpose": "Pinned TensorFlow Lite static runtime required by Android input motion prediction"
+    },
+    {
+      "path": "external/vulkan-headers",
+      "name": "platform/external/vulkan-headers",
+      "commit": "ee4343a1f27d9faca189b9ac2c064254e23ba2e2",
+      "purpose": "Pinned Vulkan API headers required by SurfaceFlinger RenderEngine"
+    },
+    {
+      "path": "external/zlib",
+      "name": "platform/external/zlib",
+      "commit": "8731e6760935ad5289fd64c37d28155a0fa289e3",
+      "purpose": "Pinned compression library required by host VINTF assembly"
+    },
+    {
+      "path": "external/zopfli",
+      "name": "platform/external/zopfli",
+      "commit": "eef2dd4266802ab1b7f26cb72cb1fc9b8ed3f55b",
+      "purpose": "Pinned zipalign compression dependency required to package the minimal audio APEX"
+    },
+    {
+      "path": "external/zstd",
+      "name": "platform/external/zstd",
+      "commit": "3c0442c12d0f0b612a8869754a3fdf22bf16ef33",
+      "purpose": "Pinned compression library required by Mesa's Android mapper integration"
+    },
+    {
+      "path": "frameworks/base",
+      "name": "platform/frameworks/base",
+      "commit": "94b4c163b7dfe5ce3607f7bb8456f9573f7de57d",
+      "purpose": "Pinned framework inputs required by libbinder and Droidloom task-scoped input injection",
+      "sparse_paths": [
+        "api",
+        "cmds/am/proto",
+        "cmds/idmap2",
+        "core",
+        "core/java/android/app/IActivityTaskManager.aidl",
+        "core/java/android/app/privatecompute",
+        "core/java/android/companion/virtual/flags",
+        "core/java/android/content/res",
+        "core/java/android/hardware/input/IInputManager.aidl",
+        "core/java/android/hardware/input/InputManagerGlobal.java",
+        "core/java/android/hardware/flags",
+        "core/java/android/net/flags.aconfig",
+        "core/java/android/os/binder",
+        "core/java/android/os/vibrator",
+        "core/java/android/window/flags",
+        "libs/androidfw",
+        "native/android",
+        "proto",
+        "services/core/java/com/android/server/display/feature",
+        "services/core/java/com/android/server/input/InputManagerService.java",
+        "services/core/java/com/android/server/input/NativeInputManagerService.java",
+        "services/core/java/com/android/server/wm/ActivityTaskManagerService.java",
+        "services/core/jni/com_android_server_input_InputManagerService.cpp",
+        "services",
+        "tools/aapt2",
+        "tools/protologtool",
+        "tools/systemfeatures",
+        "apex/blobstore/framework",
+        "apex/blobstore/service",
+        "apex/jobscheduler/framework",
+        "apex/jobscheduler/service",
+        "drm/java",
+        "errorprone",
+        "graphics/java",
+        "graphics/proto",
+        "identity/java",
+        "keystore/aaid/aidl",
+        "keystore/java",
+        "libs/WindowManager/Shell/aconfig",
+        "libs/securebox",
+        "location",
+        "media",
+        "mime",
+        "mms/java",
+        "omapi/aidl",
+        "omapi/java",
+        "opengl/java",
+        "packages/NeuralNetworks/service",
+        "packages/SettingsLib/DeviceStateRotationLock",
+        "packages/SettingsLib/DisplayUtils",
+        "packages/SettingsProvider",
+        "packages/services/PacProcessor",
+        "packages/services/Proxy",
+        "rs/java",
+        "sax/java",
+        "telephony/common",
+        "telephony/java",
+        "tools/locked_region_code_injection",
+        "wifi/java",
+        "telecomm/framework/aidl-export",
+        "libs/hwui/apex/java",
+        "packages/NeuralNetworks/framework",
+        "packages/SystemUI/aconfig",
+        "packages/SettingsLib/RestrictedLockUtils",
+        "tools/lint",
+        "tools/processors",
+        "packages/SettingsLib/LintChecker",
+        "telecomm/framework/java/android/telecom/Annotation.java",
+        "tools/sdkparcelables/src",
+        "tools/streaming_proto",
+        "packages/SettingsLib/aconfig",
+        "bluetooth/bluetooth.aconfig",
+        "packages/CrashRecovery/aconfig",
+        "libs/hwui/aconfig",
+        "nfc-non-updatable/flags",
+        "nfc-non-updatable/java"
+      ]
+    },
+    {
+      "path": "frameworks/av",
+      "name": "platform/frameworks/av",
+      "commit": "475269ec44acec82792be6b01fb8e16357d4d2c8",
+      "purpose": "Upstream no-hardware audio service and standard policy configuration"
+    },
+    {
+      "path": "frameworks/native",
+      "name": "platform/frameworks/native",
+      "commit": "ae266dcb706d083868578cfedce381ef44488a07",
+      "purpose": "Binder, graphics, and SurfaceFlinger-facing headers"
+    },
+    {
+      "path": "frameworks/proto_logging",
+      "name": "platform/frameworks/proto_logging",
+      "commit": "a07b791ea1e2a4dae1c535c8423235fdc22aaf02",
+      "purpose": "Pinned stats logging generator required by the Connectivity native library"
+    },
+    {
+      "path": "frameworks/libs/modules-utils",
+      "name": "platform/frameworks/libs/modules-utils",
+      "commit": "a11fa5c814cc3239217ce4d093bfc5c808f73785",
+      "purpose": "Pinned native SDK-level helper required by the Connectivity compatibility library",
+      "sparse_paths": [
+        "build",
+        "java"
+      ]
+    },
+    {
+      "path": "hardware/interfaces",
+      "name": "platform/hardware/interfaces",
+      "commit": "0162af698935100a590b7359581ac8b1b80693e5",
+      "purpose": "Frozen Composer and allocator AIDL interfaces",
+      "sparse_paths": [
+        "apexkey",
+        "audio/aidl",
+        "bluetooth/audio/aidl/aidl_api",
+        "bluetooth/audio/aidl/android",
+        "bluetooth/audio/aidl/default",
+        "bluetooth/audio/flags",
+        "bluetooth/audio/utils",
+        "common/aidl",
+        "common/fmq/aidl",
+        "common/support",
+        "drm/common/aidl",
+        "graphics/allocator/2.0",
+        "graphics/allocator/3.0",
+        "graphics/allocator/4.0",
+        "graphics/allocator/aidl",
+        "graphics/bufferqueue/1.0",
+        "graphics/bufferqueue/2.0",
+        "graphics/common/1.0",
+        "graphics/common/1.1",
+        "graphics/common/1.2",
+        "graphics/common/aidl",
+        "graphics/composer/2.1",
+        "graphics/composer/2.2",
+        "graphics/composer/2.3",
+        "graphics/composer/2.4",
+        "graphics/composer/aidl",
+        "graphics/mapper/2.0",
+        "graphics/mapper/2.1",
+        "graphics/mapper/3.0",
+        "graphics/mapper/4.0",
+        "graphics/mapper/stable-c",
+        "health",
+        "input/common",
+        "input/processor",
+        "media/1.0",
+        "power/1.0",
+        "power/1.1",
+        "power/1.2",
+        "power/1.3",
+        "power/aidl",
+        "security/keymint/aidl",
+        "security/keymint/support",
+        "boot",
+        "security/rkp/aidl",
+        "security/secureclock/aidl",
+        "security/sharedsecret/aidl",
+        "compatibility_matrices/exclude",
+        "compatibility_matrices/build",
+        "authsecret/1.0",
+        "authsecret/aidl",
+        "biometrics/face/1.0",
+        "biometrics/face/aidl",
+        "biometrics/fingerprint/2.3",
+        "biometrics/fingerprint/aidl",
+        "broadcastradio/2.0",
+        "broadcastradio/aidl",
+        "cas/1.0",
+        "cas/1.1",
+        "cas/1.2",
+        "cas/aidl",
+        "contexthub/1.0",
+        "contexthub/1.1",
+        "contexthub/1.2",
+        "contexthub/aidl",
+        "gnss/1.0",
+        "gnss/2.1",
+        "gnss/aidl",
+        "ir/aidl",
+        "light/aidl",
+        "oemlock/1.0",
+        "oemlock/aidl",
+        "power/stats/aidl",
+        "radio/1.6",
+        "radio/aidl",
+        "rebootescrow/aidl",
+        "security/authgraph/aidl",
+        "security/secretkeeper/aidl",
+        "soundtrigger/2.3",
+        "thermal/1.0",
+        "thermal/1.1",
+        "thermal/2.0",
+        "thermal/aidl",
+        "tv/cec/1.1",
+        "tv/hdmi/cec/aidl",
+        "tv/hdmi/connection/aidl",
+        "tv/hdmi/earc/aidl",
+        "tv/input/1.0",
+        "tv/input/aidl",
+        "tv/mediaquality/aidl",
+        "usb/1.0",
+        "usb/1.1",
+        "usb/1.2",
+        "usb/1.3",
+        "usb/aidl",
+        "usb/gadget/1.0",
+        "usb/gadget/1.1",
+        "usb/gadget/1.2",
+        "usb/gadget/aidl",
+        "vibrator/aidl",
+        "weaver/1.0",
+        "weaver/aidl",
+        "biometrics/common/aidl",
+        "keymaster/aidl",
+        "audio/common/2.0",
+        "biometrics/fingerprint/2.1",
+        "biometrics/fingerprint/2.2",
+        "gnss/1.1",
+        "gnss/2.0",
+        "gnss/measurement_corrections/1.0",
+        "gnss/measurement_corrections/1.1",
+        "gnss/visibility_control/1.0",
+        "radio/1.0",
+        "radio/1.1",
+        "radio/1.2",
+        "radio/1.3",
+        "radio/1.4",
+        "radio/1.5",
+        "soundtrigger/2.0",
+        "soundtrigger/2.1",
+        "soundtrigger/2.2",
+        "tv/cec/1.0",
+        "tv/tuner/aidl",
+        "soundtrigger/aidl"
+      ]
+    },
+    {
+      "path": "hardware/libhardware",
+      "name": "platform/hardware/libhardware",
+      "commit": "97ee3e33ec5ba48c0eca8341ed377ac4497a0678",
+      "purpose": "Pinned native hardware headers required by the minigbm allocator"
+    },
+    {
+      "path": "hardware/libhardware_legacy",
+      "name": "platform/hardware/libhardware_legacy",
+      "commit": "2a073cd42ec822914ed4e680e7b708485d3a172b",
+      "purpose": "Pinned legacy power compatibility headers required by SurfaceFlinger"
+    },
+    {
+      "path": "kernel/configs",
+      "name": "kernel/configs",
+      "commit": "553fd8d034110b4a63834e676533f5cc4c5e0089",
+      "purpose": "Soong rule definitions referenced by hardware interface compatibility matrices"
+    },
+    {
+      "path": "libcore",
+      "name": "platform/libcore",
+      "commit": "4ebfb391ee0109d16abe6e2bc965724b940928c5",
+      "purpose": "Pinned core Java libraries and exported flags required by the Android services build"
+    },
+    {
+      "path": "libnativehelper",
+      "name": "platform/libnativehelper",
+      "commit": "5b63a7e308ca88c5c4a2a74dfda9c73ed17cfebb",
+      "purpose": "Pinned JNI headers required by the host Conscrypt signing library"
+    },
+    {
+      "path": "packages/modules/Connectivity",
+      "name": "platform/packages/modules/Connectivity",
+      "commit": "347fbd34b368d19f0d87e908ea101eed3601a731",
+      "purpose": "Pinned BPF client headers required by the Android memory-event client",
+      "sparse_paths": [
+        "Vcn",
+        "bpf/dns_helper",
+        "bpf/headers",
+        "bpf/loader",
+        "bpf/netd",
+        "bpf/progs",
+        "bpf/syscall_wrappers",
+        "common",
+        "nearby",
+        "networksecurity",
+        "remoteauth",
+        "service",
+        "service-t",
+        "staticlibs",
+        "thread",
+        "Tethering/common/TetheringLib",
+        "framework"
+      ]
+    },
+    {
+      "path": "packages/modules/DnsResolver",
+      "name": "platform/packages/modules/DnsResolver",
+      "commit": "0aeaf9d222ec761b9e0443a01c7a06590b9d1b4f",
+      "purpose": "Pinned Android DNS resolver service library linked by netd"
+    },
+    {
+      "path": "packages/modules/Bluetooth",
+      "name": "platform/packages/modules/Bluetooth",
+      "commit": "c77db469de80f86660bc053bec4dee0c5d4b947c",
+      "purpose": "Pinned Bluetooth audio session library linked by the upstream core audio service",
+      "sparse_paths": [
+        "system/audio_bluetooth_hw",
+        "framework/aidl-export",
+        "flags"
+      ]
+    },
+    {
+      "path": "packages/modules/StatsD",
+      "name": "platform/packages/modules/StatsD",
+      "commit": "8129a553528b0ef83e87e00c9f2604ed8afb2949",
+      "purpose": "Pinned stats socket library required by the Connectivity compatibility library"
+    },
+    {
+      "path": "packages/modules/Virtualization",
+      "name": "platform/packages/modules/Virtualization",
+      "commit": "22f1c9ee92b146e10c8f5e71338618f77ab1631e",
+      "purpose": "Pinned Android virtualization compile defaults referenced by init second stage"
+    },
+    {
+      "path": "packages/modules/Gki",
+      "name": "platform/packages/modules/Gki",
+      "commit": "968142477afa61c98b9f7a1b9f4cce2d1ed5ca91",
+      "purpose": "Pinned kernel-release parser required by host VINTF assembly",
+      "sparse_paths": [
+        "libkver"
+      ]
+    },
+    {
+      "path": "packages/modules/common",
+      "name": "platform/packages/modules/common",
+      "commit": "2c5d816b30e439bdfaf3a52a94e4ee8fbf6d739c",
+      "purpose": "Pinned framework-module API-scope defaults required by Conscrypt source modules",
+      "sparse_paths": [
+        "sdk",
+        "proguard"
+      ]
+    },
+    {
+      "path": "prebuilts/build-tools",
+      "name": "platform/prebuilts/build-tools",
+      "commit": "9b6c8c6a2f582a9d7817fd8275c8014959c60cc4",
+      "purpose": "Pinned Android host build tools"
+    },
+    {
+      "path": "prebuilts/clang/host/linux-x86",
+      "name": "platform/prebuilts/clang/host/linux-x86",
+      "commit": "29182889399818f97baa65ea238c80e8117981eb",
+      "purpose": "Pinned Android target compiler"
+    },
+    {
+      "path": "prebuilts/go/linux-x86",
+      "name": "platform/prebuilts/go/linux-x86",
+      "commit": "05bc4bad6bdd9e5615c147c54e6f1a53bf04c375",
+      "purpose": "Soong host compiler"
+    },
+    {
+      "path": "prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8",
+      "name": "platform/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8",
+      "commit": "ae37c9849d97a20b97ff5ce93a5b171c6d5d02ab",
+      "purpose": "Pinned glibc sysroot for Android host C and C++ build tools"
+    },
+    {
+      "path": "prebuilts/jdk/jdk21",
+      "name": "platform/prebuilts/jdk/jdk21",
+      "commit": "ef5bcc92586b839ae3dbacc154127092fa4002ec",
+      "purpose": "Android build JDK"
+    },
+    {
+      "path": "prebuilts/jdk/jdk8",
+      "name": "platform/prebuilts/jdk/jdk8",
+      "commit": "6cd518be7a7147ed5b1053edfbf66379bf5a45f9",
+      "purpose": "Pinned legacy Java runtime jars required by the host Conscrypt signing library",
+      "sparse_paths": [
+        "linux-x86/jre/lib"
+      ]
+    },
+    {
+      "path": "prebuilts/misc",
+      "name": "platform/prebuilts/misc",
+      "commit": "be7c3a630b5dc5eb3260035d77a81b2f322754f8",
+      "purpose": "Pinned commons-cli Java prebuilt required by the XSD compiler",
+      "sparse_paths": [
+        "common/commons-cli"
+      ]
+    },
+    {
+      "path": "prebuilts/r8",
+      "name": "platform/prebuilts/r8",
+      "commit": "65fe8f9f5c6769d35f91fe67b786b767a2db5249",
+      "purpose": "Pinned Android DEX compiler required to package the Droidloom Android input bridge"
+    },
+    {
+      "path": "prebuilts/rust",
+      "name": "platform/prebuilts/rust",
+      "commit": "8e6eb737e844d18c50bfbee8f212f76755e04b24",
+      "purpose": "Android Rust crates"
+    },
+    {
+      "path": "prebuilts/rust-toolchain/linux-x86",
+      "name": "platform/prebuilts/rust-toolchain/linux-x86",
+      "commit": "fa2b1777b1f5c0471bb54ad4026feb1f6e94ea70",
+      "purpose": "Pinned Android Rust compiler"
+    },
+    {
+      "path": "prebuilts/sdk",
+      "name": "platform/prebuilts/sdk",
+      "commit": "0f07e8d60ab0aba46129e427101f96ba459a95c1",
+      "purpose": "Pinned Android 17 released API tracking required by full vendor-image graph validation",
+      "sparse_paths": [
+        "37.0/module-lib/api",
+        "37.0/public/api",
+        "37.0/system/api",
+        "37.0/test/api",
+        "current/public",
+        "tools/Android.bp",
+        "tools/core-lambda-stubs.jar",
+        "update_prebuilts",
+        "current/module-lib",
+        "current/system-server",
+        "current/system",
+        "current/core",
+        "current/androidx/m2repository/androidx/annotation/annotation-jvm/1.10.0",
+        "extensions/19/public",
+        "extensions/19/system",
+        "9/public",
+        "28/public",
+        "extensions/19/module-lib",
+        "extensions/19/system-server",
+        "37.0/system-server/api",
+        "30/public"
+      ]
+    },
+    {
+      "path": "prebuilts/siso",
+      "name": "platform/prebuilts/siso",
+      "commit": "41809b921e1888ff851d1094459b1a6875e7f155",
+      "purpose": "Pinned executor for the Soong build graph"
+    },
+    {
+      "path": "prebuilts/tools",
+      "name": "platform/prebuilts/tools",
+      "commit": "b157d1c3bff39161f34ccc44dffbe9568f3bece2",
+      "purpose": "Pinned Metalava fat jar required by focused platform Java API generation",
+      "sparse_paths": [
+        "common/metalava",
+        "common/m2/repository/org/checkerframework/checker-qual/2.8.1",
+        "common/m2/repository/com/github/ben-manes/caffeine/caffeine/3.2.2",
+        "common/m2/repository/org/checkerframework/dataflow-errorprone/3.39.0",
+        "common/m2/repository/org/jetbrains/annotations/13.0",
+        "common/m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.15.0",
+        "common/m2/repository/com/fasterxml/jackson/core/jackson-core/2.15.0",
+        "common/m2/repository/com/fasterxml/jackson/core/jackson-databind/2.15.0",
+        "common/m2/repository/com/fasterxml/jackson/dataformat/jackson-dataformat-xml/2.15.0",
+        "common/m2/repository/com/fasterxml/jackson/module/jackson-module-kotlin/2.15.0",
+        "common/m2/repository/com/fasterxml/woodstox/woodstox-core/6.5.1",
+        "common/m2/repository/com/github/ajalt/clikt/clikt-jvm/3.5.3",
+        "common/m2/repository/com/google/code/gson/gson/2.9.1",
+        "common/m2/repository/com/google/guava/guava/32.1.1-jre",
+        "common/m2/repository/com/google/turbine/turbine/0.14.0",
+        "common/m2/repository/javax/xml/bind/jaxb-api/2.2.12-b140109.1041",
+        "common/m2/repository/org/antlr/ST4/4.3.4",
+        "common/m2/repository/org/antlr/antlr-runtime/3.5.3",
+        "common/m2/repository/org/antlr/antlr4-runtime/4.13.1",
+        "common/m2/repository/org/antlr/antlr4/4.13.1",
+        "common/m2/repository/org/codehaus/woodstox/stax2-api/4.2.1",
+        "common/m2/repository/org/jetbrains/trove4j/trove4j/20160824",
+        "common/m2/repository/org/ow2/asm/asm-tree/9.7.1",
+        "common/m2/repository/org/ow2/asm/asm/9.7.1"
+      ]
+    },
+    {
+      "path": "system/apex",
+      "name": "platform/system/apex",
+      "commit": "ce2bb9f710183c864040401d859874b5723e44d8",
+      "purpose": "Pinned apex-info-list XSD generator input required by host VINTF assembly",
+      "sparse_paths": [
+        "apexer",
+        "apexd/apex-info-list-api",
+        "libs/libapexsupport",
+        "proto",
+        "tools",
+        "apexd/aidl"
+      ]
+    },
+    {
+      "path": "system/bpf",
+      "name": "platform/system/bpf",
+      "commit": "d68a263039127dc709114802395e57537a02babf",
+      "purpose": "Pinned BPF headers required by the Android memory-event client"
+    },
+    {
+      "path": "system/bpfprogs",
+      "name": "platform/system/bpfprogs",
+      "commit": "60f086effe11d1afb248ff3c9a2a780b66a34506",
+      "purpose": "Pinned Android BPF program feature flags required by netd's runtime dependency closure"
+    },
+    {
+      "path": "system/core",
+      "name": "platform/system/core",
+      "commit": "545d2487e38192a2ce25040897ced877cf6b4f53",
+      "purpose": "init, properties, and Android core libraries"
+    },
+    {
+      "path": "system/netd",
+      "name": "platform/system/netd",
+      "commit": "43c893c7f33de178d6edaf5be49aed0794b3a917",
+      "purpose": "Pinned native networking compile defaults required by the Connectivity compatibility library"
+    },
+    {
+      "path": "system/extras",
+      "name": "platform/system/extras",
+      "commit": "1289e9b3f282909eec6e80414e14dcc207bda439",
+      "purpose": "Pinned ext4 image-builder configuration required by the Droidloom vendor partition",
+      "sparse_paths": [
+        "ext4_utils",
+        "f2fs_utils",
+        "libfec",
+        "libfscrypt",
+        "profcollectd/binder"
+      ]
+    },
+    {
+      "path": "system/fs/casefolding_remover",
+      "name": "platform/system/fs/casefolding_remover",
+      "commit": "827aad0d89d0615bcdebc3dd93d1e8ae1c19f36d",
+      "purpose": "Pinned casefolding-remover Binder interface required by vold"
+    },
+    {
+      "path": "system/fs/fs_mgr",
+      "name": "platform/system/fs/fs_mgr",
+      "commit": "157112fcbaa00b6e84c63146cfde249c56cd652c",
+      "purpose": "Pinned filesystem, logical-partition, GSI, boot-message, and snapshot libraries required by init"
+    },
+    {
+      "path": "system/gsid",
+      "name": "platform/system/gsid",
+      "commit": "35a92d40f529b605fad8ff622691e76901044cc8",
+      "purpose": "Pinned Generic System Image library required by init and filesystem management"
+    },
+    {
+      "path": "system/hardware/interfaces",
+      "name": "platform/system/hardware/interfaces",
+      "commit": "9c3469aa3d4aeec5b2bc8e8ae8fdb4437dab4edb",
+      "purpose": "Pinned stable media audio types required by the upstream no-hardware audio service",
+      "sparse_paths": [
+        "media",
+        "net/netd",
+        "vold",
+        "keystore2",
+        "suspend/aidl"
+      ]
+    },
+    {
+      "path": "system/keymint",
+      "name": "platform/system/keymint",
+      "commit": "cfeefc94bf8c4f19d19dca193d376a1fc05e8e3e",
+      "purpose": "Pinned Rust KeyMint reference implementation required by the development cell"
+    },
+    {
+      "path": "system/libbase",
+      "name": "platform/system/libbase",
+      "commit": "fef4173e19d97cd4b4fc09a06bccbf800d0d3937",
+      "purpose": "Android native base library"
+    },
+    {
+      "path": "system/libfmq",
+      "name": "platform/system/libfmq",
+      "commit": "d525961b46fbebd138018a102e4ab983c9582045",
+      "purpose": "Pinned fast-message-queue base library required by the legacy Mapper compatibility interface"
+    },
+    {
+      "path": "system/libhidl",
+      "name": "platform/system/libhidl",
+      "commit": "061055fc4dad78e5d25a77d9217001794656f16b",
+      "purpose": "Pinned HIDL compatibility runtime required by the minigbm allocator"
+    },
+    {
+      "path": "system/libhwbinder",
+      "name": "platform/system/libhwbinder",
+      "commit": "2f5282448223b97c541181a5b94a05c2ac17ff17",
+      "purpose": "Pinned HIDL transport headers required by the HIDL generator"
+    },
+    {
+      "path": "system/libsysprop",
+      "name": "platform/system/libsysprop",
+      "commit": "feca0b466b9fa68a8e86a6e0b31579669e645f41",
+      "purpose": "Pinned platform-property bindings required by Android InputFlinger"
+    },
+    {
+      "path": "system/libprocinfo",
+      "name": "platform/system/libprocinfo",
+      "commit": "b58259e79c58deb1132e11d74ea90a2dc441d84f",
+      "purpose": "Pinned process-information helpers required by init second stage"
+    },
+    {
+      "path": "system/librustutils",
+      "name": "platform/system/librustutils",
+      "commit": "7fbb3e4aaf608e51eaa210cf6ba94df5cb782bbc",
+      "purpose": "Pinned no-std Rust allocation and panic providers required by Android init's Bionic linker"
+    },
+    {
+      "path": "system/libvintf",
+      "name": "platform/system/libvintf",
+      "commit": "df89ad736e14ac375f61d50fa543ae7cd746a140",
+      "purpose": "VINTF validation"
+    },
+    {
+      "path": "system/libziparchive",
+      "name": "platform/system/libziparchive",
+      "commit": "bdd41f9c99400f241363b035eb64ad3d5f063c82",
+      "purpose": "Pinned ZIP archive support required by the Android runtime linker"
+    },
+    {
+      "path": "system/logging",
+      "name": "platform/system/logging",
+      "commit": "d35ba620451b28512f46ebb5421f783fd77968d5",
+      "purpose": "Android native logging"
+    },
+    {
+      "path": "system/media",
+      "name": "platform/system/media",
+      "commit": "440eb272fd3da0ca7bdae932e61e7fd9be1fd324",
+      "purpose": "Pinned stable audio common types required by the upstream no-hardware audio service"
+    },
+    {
+      "path": "system/memory/libdmabufheap",
+      "name": "platform/system/memory/libdmabufheap",
+      "commit": "09fe72b6ce0feead1b97c2859979b125f815d9b0",
+      "purpose": "DMA-BUF heap allocation integration"
+    },
+    {
+      "path": "system/memory/libmeminfo",
+      "name": "platform/system/memory/libmeminfo",
+      "commit": "d59c960b1fb93377bf68664918031ea5fe709f89",
+      "purpose": "Pinned memory-event client loaded during Android system-server startup"
+    },
+    {
+      "path": "system/memory/lmkd",
+      "name": "platform/system/memory/lmkd",
+      "commit": "c3601e823bd07c9c190f67e2f9bc7486e4978328",
+      "purpose": "Pinned low-memory-killer utility library required by init second stage"
+    },
+    {
+      "path": "system/security",
+      "name": "platform/system/security",
+      "commit": "cbb2ef1617a94d6cdf2dc2ccb7a545575dbb20cb",
+      "purpose": "Pinned fs-verity digest metadata module required by vendor image releasetools",
+      "sparse_paths": [
+        "fsverity",
+        "keystore2/aidl",
+        "identity",
+        "keystore2/aconfig"
+      ]
+    },
+    {
+      "path": "system/incremental_delivery",
+      "name": "platform/system/incremental_delivery",
+      "commit": "6b853f9e5703a8c90648f82850a3a01d9763e619",
+      "purpose": "Pinned incremental-filesystem utility linked by the host Android resource packager",
+      "sparse_paths": [
+        "incfs",
+        "sysprop"
+      ]
+    },
+    {
+      "path": "system/sepolicy",
+      "name": "platform/system/sepolicy",
+      "commit": "e066568e98d86db31a9346d30977f3632fa7073c",
+      "purpose": "Droidloom Android SELinux policy"
+    },
+    {
+      "path": "system/server_configurable_flags",
+      "name": "platform/system/server_configurable_flags",
+      "commit": "5069ba739faebf91ae72096577ae17e13061af72",
+      "purpose": "Pinned platform flag library required by Android audio utilities"
+    },
+    {
+      "path": "system/tools/aidl",
+      "name": "platform/system/tools/aidl",
+      "commit": "9a94664f74536bf28010207fd1804b04c6435e2c",
+      "purpose": "Stable AIDL compiler and Rust backend"
+    },
+    {
+      "path": "system/tools/hidl",
+      "name": "platform/system/tools/hidl",
+      "commit": "5d0e05e6535fea94a674a359102bdd42944714f4",
+      "purpose": "HIDL package-root Soong rule referenced by hardware/interfaces metadata"
+    },
+    {
+      "path": "system/tools/mkbootimg",
+      "name": "platform/system/tools/mkbootimg",
+      "commit": "4a27dd13adf9846e12d585d6fe99a375ebb58396",
+      "purpose": "Pinned Android boot image headers required by init"
+    },
+    {
+      "path": "system/tools/sysprop",
+      "name": "platform/system/tools/sysprop",
+      "commit": "deead2d06508faeca98c236feea7e59bb4c43c8c",
+      "purpose": "Pinned host sysprop type checker required by vendor SELinux file-context validation"
+    },
+    {
+      "path": "system/tools/xsdc",
+      "name": "platform/system/tools/xsdc",
+      "commit": "f1f0c793dc404e716ac73beb1a8bef9cef97a40d",
+      "purpose": "XSD Soong rule referenced by VINTF and compatibility metadata"
+    },
+    {
+      "path": "system/unwinding",
+      "name": "platform/system/unwinding",
+      "commit": "31327c70da147fdc069598c4a5fd075aea8d3312",
+      "purpose": "Pinned native unwind stack library required by init second stage"
+    },
+    {
+      "path": "system/update_engine",
+      "name": "platform/system/update_engine",
+      "commit": "4591637f51644f5429f9e2fe589ab22b92f61842",
+      "purpose": "Pinned update-engine headers and metadata protos required by init second stage"
+    },
+    {
+      "path": "system/vold",
+      "name": "platform/system/vold",
+      "commit": "6d20a0078c2bcaa2499dc5d032f337bfe1182d9e",
+      "purpose": "Pinned filesystem-encryption headers and library required by init second stage"
+    },
+    {
+      "path": "test/vts-testcase/hal",
+      "name": "platform/test/vts-testcase/hal",
+      "commit": "61df1bdbc6b596dafeee213c04f5d2c8d7131b98",
+      "purpose": "Pinned host VINTF assembly support required by allocator manifest installation",
+      "sparse_paths": [
+        "treble/vintf/libvts_vintf_test_common"
+      ]
+    },
+    {
+      "path": "tools/apksig",
+      "name": "platform/tools/apksig",
+      "commit": "179f60df00d242f6bb22acf828b0884eac2d5f72",
+      "purpose": "Pinned APK signing library required by the vendor image packaging toolchain"
+    },
+    {
+      "path": "tools/metalava",
+      "name": "platform/tools/metalava",
+      "commit": "e33bb96bcd3279859f4d824ba3d17a36b56c2f68",
+      "purpose": "Pinned stub annotations required by Android platform Java API libraries",
+      "sparse_paths": [
+        "Android.bp",
+        "stub-annotations",
+        "metalava-model/src/main",
+        "metalava-model-text/src/main",
+        "metalava-reporter/src/main",
+        "metalava-model-psi/src/main",
+        "metalava-model-source/src/main",
+        "metalava-model-turbine/src/main",
+        "metalava/src/main",
+        "antlr",
+        "manual"
+      ]
+    },
+    {
+      "path": "toolchain/pgo-profiles",
+      "name": "toolchain/pgo-profiles",
+      "commit": "44bae3346df2d8657cde54a5ee069067d607e689",
+      "purpose": "Pinned Soong AFDO profile configuration"
+    },
+    {
+      "path": "tools/lint_checks",
+      "name": "platform/tools/lint_checks",
+      "commit": "d260e8254709bb2884c072dd595f63c9c8d22527",
+      "purpose": "AndroidGlobalLintChecker required by services Java build analysis",
+      "sparse_paths": [
+        "common",
+        "global",
+        "utils"
+      ]
+    },
+    {
+      "path": "external/libmonet",
+      "name": "platform/external/libmonet",
+      "commit": "f56ffa0d810eb127200cded0895c412a907dfa6d",
+      "purpose": "monet Java colors statically linked into services.core",
+      "sparse_paths": [
+        "blend",
+        "contrast",
+        "dislike",
+        "dynamiccolor",
+        "energy",
+        "hct",
+        "palettes",
+        "quantize",
+        "scheme",
+        "score",
+        "temperature",
+        "utils"
+      ]
+    },
+    {
+      "path": "external/apache-commons-compress",
+      "name": "platform/external/apache-commons-compress",
+      "commit": "65f18cb2abd2963bf5663e1f35d6aca08504f79d",
+      "purpose": "Archive support statically linked into services.core",
+      "sparse_paths": [
+        "src/main/java",
+        "src/stub/java"
+      ]
+    },
+    {
+      "path": "external/apache-commons-math",
+      "name": "platform/external/apache-commons-math",
+      "commit": "5b1a8fb3a14fdd9516c27236b1b48637e0a25423",
+      "purpose": "Math utilities statically linked into services.core",
+      "sparse_paths": [
+        "src/main/java"
+      ]
+    },
+    {
+      "path": "external/cbor-java",
+      "name": "platform/external/cbor-java",
+      "commit": "48f4d31b8c1944862c63151515585973cbd91c36",
+      "purpose": "CBOR encoding statically linked into services.core",
+      "sparse_paths": [
+        "src/main/java"
+      ]
+    },
+    {
+      "path": "external/tink-java",
+      "name": "platform/external/tink-java",
+      "commit": "e73e85f387715b27ad2a2b4bf3683bb088e3fddb",
+      "purpose": "Cryptography statically linked into services.lskfreset",
+      "sparse_paths": [
+        "src",
+        "src_android/main",
+        "proto"
+      ]
+    },
+    {
+      "path": "external/jacoco",
+      "name": "platform/external/jacoco",
+      "commit": "b2918806063b27668501eb728168277a7fbc7944",
+      "purpose": "jacocoagent referenced by services.coverage",
+      "sparse_paths": [
+        "org.jacoco.agent.rt/src",
+        "org.jacoco.core/src",
+        "org.jacoco.agent/src"
+      ]
+    },
+    {
+      "path": "external/jsr305",
+      "name": "platform/external/jsr305",
+      "commit": "2b168afb93e04776c7e185c7fcb8b00137121725",
+      "purpose": "JSR-305 annotations used by framework Java compilation",
+      "sparse_paths": [
+        "ri/src/main/java"
+      ]
+    },
+    {
+      "path": "external/okhttp",
+      "name": "platform/external/okhttp",
+      "commit": "7fec69d8a7874ed20e11a9211d04b9fca71dcd72",
+      "purpose": "HTTP Java sources referenced by core platform headers",
+      "sparse_paths": [
+        "repackaged/android/src/main/java",
+        "repackaged/okhttp/src/main/java",
+        "repackaged/okhttp-urlconnection/src/main/java",
+        "repackaged/okhttp-android-support/src/main/java",
+        "repackaged/okio/okio/src/main/java"
+      ]
+    },
+    {
+      "path": "tools/platform-compat",
+      "name": "tools/platform-compat",
+      "commit": "19ce1c9d406cec9feaf76618e7d772113883d73f",
+      "purpose": "Compatibility annotations and processors required by framework Java sources",
+      "sparse_paths": [
+        "java/android/compat/annotation",
+        "java/android/processor/compat",
+        "java/com/android/annotationvisitor",
+        "java/com/android/class2nonsdklist",
+        "java/com/android/javac"
+      ]
+    },
+    {
+      "path": "frameworks/libs/systemui",
+      "name": "platform/frameworks/libs/systemui",
+      "commit": "11e04f60f563aed48e4ec080bd7bde06bae1b2f3",
+      "purpose": "Shared SystemUI flags referenced by services.core",
+      "sparse_paths": [
+        "monet/src",
+        "aconfig"
+      ]
+    },
+    {
+      "path": "packages/apps/Launcher3",
+      "name": "platform/packages/apps/Launcher3",
+      "commit": "c612e6ece389f21c40f8cb9cd9a4b44239f00009",
+      "purpose": "Launcher flags referenced by WindowManager services; launcher application is not built",
+      "sparse_paths": [
+        "aconfig"
+      ]
+    },
+    {
+      "path": "system/memory/mmd",
+      "name": "platform/system/memory/mmd",
+      "commit": "cf66bc31a4002e6f786da7c5a45e4088d19530ed",
+      "purpose": "MmdProperties and memory manager flags referenced by services.core",
+      "sparse_paths": [
+        "aidl"
+      ]
+    },
+    {
+      "path": "external/brotli",
+      "name": "platform/external/brotli",
+      "commit": "a927860e79169483cd0ae4f8ad52937bd2c6d377",
+      "purpose": "Java Brotli decoder statically used by services archive compression",
+      "sparse_paths": [
+        "java/org/brotli/dec",
+        "java/org/brotli/wrapper/common",
+        "java/org/brotli/wrapper/dec",
+        "java/org/brotli/wrapper/enc",
+        "java/org/brotli/enc",
+        "c"
+      ]
+    },
+    {
+      "path": "external/xz-java",
+      "name": "platform/external/xz-java",
+      "commit": "c7be7f9413bfe9ccd270dd75c79c04ddef288550",
+      "purpose": "Java XZ decoder statically used by services archive compression",
+      "sparse_paths": [
+        "src"
+      ]
+    },
+    {
+      "path": "external/gson",
+      "name": "platform/external/gson",
+      "commit": "31bf8505d546aa682b84f742aced9af1cf93eeb9",
+      "purpose": "JSON implementation statically required by services Tink library",
+      "sparse_paths": [
+        "gson/src/main/java",
+        "gson/src/main/java-templates"
+      ]
+    },
+    {
+      "path": "external/truth",
+      "name": "platform/external/truth",
+      "commit": "376bc673f686d4eb0310813a938cb839147ad29b",
+      "purpose": "Tink Java static dependency declared by the pinned services LSKF library",
+      "sparse_paths": [
+        "core/src/main/java"
+      ]
+    },
+    {
+      "path": "external/rust/beto-rust",
+      "name": "platform/external/rust/beto-rust",
+      "commit": "7e58deea80bb81100bf42c5530f5038c0c4966f9",
+      "purpose": "Java JNI bindings for companion UKey2, Submerge and trust-token services; reuse existing native runtime",
+      "sparse_paths": [
+        "nearby/connections/ukey2/ukey2_jni/java/src/main",
+        "betosync/submerge/submerge_java/lib/src/main/java",
+        "trust_token/jni/java/lib/src/main",
+        "common",
+        "nearby",
+        "betosync",
+        "trust_token"
+      ]
+    },
+    {
+      "path": "external/auto",
+      "name": "platform/external/auto",
+      "commit": "d97ec6e9cc1ad7f282cdc14bddcbe4dd64cc0d1c",
+      "purpose": "AutoValue Java processor and annotations required by the Truth library",
+      "sparse_paths": [
+        "value/src/main",
+        "common/src/main",
+        "service/annotations/src/main",
+        "android-annotation-stubs",
+        "service/processor/src/main/java"
+      ]
+    },
+    {
+      "path": "external/jspecify",
+      "name": "platform/external/jspecify",
+      "commit": "af61f8ce0b6851abd4fc230ab2c1861c16b4fe56",
+      "purpose": "Nullness annotations required by Truth",
+      "sparse_paths": [
+        "src/main"
+      ]
+    },
+    {
+      "path": "external/junit",
+      "name": "platform/external/junit",
+      "commit": "03edf7d5a0d9c3fb8d4043d029dd3099e6f0f6b0",
+      "purpose": "JUnit classes referenced by the pinned Truth static library",
+      "sparse_paths": [
+        "src/main/java"
+      ]
+    },
+    {
+      "path": "external/mime-support",
+      "name": "platform/external/mime-support",
+      "commit": "9d71d482603aac054815958c9834ae1cd036f024",
+      "purpose": "MIME database used by the framework mimemap generator",
+      "sparse_paths": [
+        "Android.bp"
+      ]
+    },
+    {
+      "path": "frameworks/hardware/interfaces",
+      "name": "platform/frameworks/hardware/interfaces",
+      "commit": "9de6d032a248523c22d0bd86e224d1762355c41e",
+      "purpose": "Framework Java AIDL interfaces for device state, altitude and vibrator services",
+      "sparse_paths": [
+        "devicestate/aidl",
+        "location/altitude/aidl",
+        "vibrator/aidl"
+      ]
+    },
+    {
+      "path": "packages/modules/Wifi",
+      "name": "platform/packages/modules/Wifi",
+      "commit": "67beff9acf0e91046d2a9a36a68cb06ef263d1f1",
+      "purpose": "Framework Wi-Fi annotations used by framework headers",
+      "sparse_paths": [
+        "framework/java/android/net/wifi/WifiAnnotations.java"
+      ]
+    },
+    {
+      "path": "packages/modules/Profiling",
+      "name": "platform/packages/modules/Profiling",
+      "commit": "8b3abe8eebc0e97890977d9658038f4966aa7df6",
+      "purpose": "Profiling flags used by system-server services",
+      "sparse_paths": [
+        "flags",
+        "anomaly-detector/flags"
+      ]
+    },
+    {
+      "path": "packages/modules/ConfigInfrastructure",
+      "name": "platform/packages/modules/ConfigInfrastructure",
+      "commit": "333bc8067efc529ef4d197fec2f4f2cae1ad2ece",
+      "purpose": "Configuration flags used by system-server services",
+      "sparse_paths": [
+        "aconfigd/proto"
+      ]
+    },
+    {
+      "path": "packages/modules/CrashRecovery",
+      "name": "platform/packages/modules/CrashRecovery",
+      "commit": "02451209cebd4648fd54ad3757f1a85ee9cd628b",
+      "purpose": "Crash recovery stats generation used by system-server services",
+      "sparse_paths": [
+        "service/Android.bp"
+      ]
+    },
+    {
+      "path": "packages/modules/NetworkStack",
+      "name": "platform/packages/modules/NetworkStack",
+      "commit": "928a826ae4887ce0e5d3c7209870e238cacbf548",
+      "purpose": "NetworkStack client library used by services.net",
+      "sparse_paths": [
+        "common/networkstackclient"
+      ]
+    },
+    {
+      "path": "packages/services/CrossDeviceSync",
+      "name": "platform/packages/services/CrossDeviceSync",
+      "commit": "e11258b65bdf0091dfc440c2b2e2c782778688c3",
+      "purpose": "Cross-device synchronization flags referenced by companion services",
+      "sparse_paths": [
+        "src/com/android/crossdevicesync/flags"
+      ]
+    },
+    {
+      "path": "frameworks/opt/telephony",
+      "name": "platform/frameworks/opt/telephony",
+      "commit": "aef289516bea6118d88cd45c63742cd4abe2c596",
+      "purpose": "Telephony flag declarations used by the platform framework",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "path": "packages/apps/Settings",
+      "name": "platform/packages/apps/Settings",
+      "commit": "213829fb67f5e070029e0513a088f31bc8f5c1ed",
+      "purpose": "Settings flag declarations referenced by services.core",
+      "sparse_paths": [
+        "aconfig"
+      ]
+    },
+    {
+      "path": "packages/modules/NeuralNetworks",
+      "name": "platform/packages/modules/NeuralNetworks",
+      "commit": "a44a9032ab9a8438c0e13aca765d6ee4edebba2c",
+      "purpose": "Platform on-device intelligence implementation required by framework headers",
+      "sparse_paths": [
+        "framework",
+        "flags"
+      ]
+    },
+    {
+      "path": "packages/modules/Media",
+      "name": "platform/packages/modules/Media",
+      "commit": "efe6c6621fe6a6faee106a1230b010c32cb30c35",
+      "purpose": "Media AIDL definitions referenced by framework headers",
+      "sparse_paths": [
+        "apex/aidl/stable",
+        "mediametrics/media_metrics"
+      ]
+    },
+    {
+      "path": "system/usb",
+      "name": "platform/system/usb",
+      "commit": "4a587a2ffcf50a483ae93eab2221c0ba692c0b15",
+      "purpose": "USB accessory Java interface referenced by services.usb",
+      "sparse_paths": [
+        "aoa"
+      ]
+    },
+    {
+      "path": "external/hamcrest",
+      "name": "platform/external/hamcrest",
+      "commit": "9580841c6c1546d56fcb22ef41a9f560a5e9ba42",
+      "purpose": "Matcher classes referenced by JUnit used in the pinned Truth library",
+      "sparse_paths": [
+        "hamcrest-core/src/main/java"
+      ]
+    },
+    {
+      "path": "external/escapevelocity",
+      "name": "platform/external/escapevelocity",
+      "commit": "03b11f293548ad5fd65b5164b46aca08a96968f5",
+      "purpose": "Template interpreter statically used by AutoValue processor",
+      "sparse_paths": [
+        "src/main/java"
+      ]
+    },
+    {
+      "path": "prebuilts/bazel/common",
+      "name": "platform/prebuilts/bazel/common",
+      "commit": "e24e8ba7c6deed0e2e9c36ad6f255437acd98e0d",
+      "purpose": "Pinned Java resource processor used to build framework resource headers for services.jar",
+      "sparse_paths": [
+        "android_tools/android_tools/all_android_tools_deploy.jar"
+      ]
+    },
+    {
+      "path": "external/gflags",
+      "name": "platform/external/gflags",
+      "commit": "9e187e1e29654d52867626553ce23096994c95c0",
+      "purpose": "Flag parser for the framework express stats catalog generator",
+      "sparse_paths": [
+        "src",
+        "android"
+      ]
+    },
+    {
+      "path": "external/java-diff-utils",
+      "name": "platform/external/java-diff-utils",
+      "commit": "5f49ae74dac240ea886d38ab09ac1d382e5fa8d0",
+      "purpose": "Java diff API statically used by the framework Error Prone checker",
+      "sparse_paths": [
+        "java-diff-utils/src/main/java"
+      ]
+    },
+    {
+      "path": "external/jsr330",
+      "name": "platform/external/jsr330",
+      "commit": "2360bfd8d364aa446599981df8cf83cdc5eafb34",
+      "purpose": "Injection annotations used by the framework Error Prone checker",
+      "sparse_paths": [
+        "src"
+      ]
+    },
+    {
+      "path": "external/google-java-format",
+      "name": "platform/external/google-java-format",
+      "commit": "2c19037fdc89d385f66b702705610bec74f3b349",
+      "purpose": "Formatter API statically used by the framework Error Prone checker",
+      "sparse_paths": [
+        "core/src/main/java",
+        "android-annotation-stubs/src"
+      ]
+    },
+    {
+      "path": "external/pcollections",
+      "name": "platform/external/pcollections",
+      "commit": "70927ace9a591d3692f8a531290889d64e2751fd",
+      "purpose": "Persistent collections used by the framework Error Prone checker",
+      "sparse_paths": [
+        "src/main/java"
+      ]
+    },
+    {
+      "path": "external/kotlinx.metadata",
+      "name": "platform/external/kotlinx.metadata",
+      "commit": "b3c5df9e5590c600147c8df849e5ad7de3ceb2dd",
+      "purpose": "Kotlin metadata parser used by the AutoValue Java processor",
+      "sparse_paths": [
+        "Android.bp"
+      ]
+    },
+    {
+      "path": "packages/modules/DeviceLock",
+      "name": "platform/packages/modules/DeviceLock",
+      "commit": "4a67922f3276adcdd46642957ba6e53114a3625a",
+      "purpose": "Device lock flag declarations required for framework resource IDs",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "path": "packages/modules/Uwb",
+      "name": "platform/packages/modules/Uwb",
+      "commit": "7c9e03046ff41cc28cf794cc2eda306fbc40279e",
+      "purpose": "Ranging flag declarations required for framework resource IDs",
+      "sparse_paths": [
+        "ranging/flags"
+      ]
+    },
+    {
+      "path": "packages/modules/AppSearch",
+      "name": "platform/packages/modules/AppSearch",
+      "commit": "85ee215beafd0236559a12b8764d6f78421db215",
+      "purpose": "AppSearch flag declarations required for framework resource IDs",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "path": "packages/modules/NpuManager",
+      "name": "platform/packages/modules/NpuManager",
+      "commit": "d194f8ada2cab31b8487fb3aaac6fd383fc7e07f",
+      "purpose": "NPU flag declarations required for framework resource IDs",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "path": "packages/modules/Nfc",
+      "name": "platform/packages/modules/Nfc",
+      "commit": "940212c440f57032a19cf0f90c7faa8eca48d546",
+      "purpose": "NFC flag declarations required for framework resource IDs",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "path": "sdk",
+      "name": "platform/sdk",
+      "commit": "4d155d6c08932904384ba2f5198dcc984e32501b",
+      "purpose": "Android SDK annotations statically required by the framework Error Prone checker",
+      "sparse_paths": [
+        "annotations"
+      ]
+    },
+    {
+      "path": "packages/services/Telecomm",
+      "name": "platform/packages/services/Telecomm",
+      "commit": "2353977dc28ff88d3cdc1ec636fa9c3251d2ff86",
+      "purpose": "Telecom flag declarations required for framework resource IDs",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "path": "prebuilts/gradle-plugin",
+      "name": "platform/prebuilts/gradle-plugin",
+      "commit": "4192576c02f73eeac2e705cd6604cd3079969605",
+      "purpose": "Pinned PSI/UAST dependencies needed to build the Android 17 Metalava compiler",
+      "sparse_paths": [
+        "com/android/tools/external/com-intellij/intellij-core/31.10.0-alpha06",
+        "com/android/tools/lint/lint-api/32.0.0-beta03",
+        "com/android/tools/lint/lint-checks/32.0.0-beta03",
+        "com/android/tools/lint/lint/32.0.0-beta03",
+        "com/android/tools/lint/lint-gradle/32.0.0-beta03",
+        "com/android/tools/lint/lint-model/32.0.0-beta03",
+        "com/android/tools/lint/lint-typedef-remover/32.0.0-beta03",
+        "com/android/tools/common/32.0.0-beta03",
+        "com/android/tools/sdk-common/32.0.0-beta03",
+        "com/android/tools/sdklib/32.0.0-beta03",
+        "com/android/tools/external/org-jetbrains/uast/32.0.0-beta03",
+        "com/android/tools/external/com-intellij/intellij-core/32.0.0-beta03",
+        "com/android/tools/external/com-intellij/kotlin-compiler/32.0.0-beta03",
+        "com/android/tools/repository/32.0.0-beta03",
+        "com/android/tools/build/manifest-merger/32.0.0-beta03"
+      ]
+    },
+    {
+      "path": "external/kotlin.metadata",
+      "name": "platform/external/kotlin.metadata",
+      "commit": "d707f76e54bfaa2c04e7fc6fd320e0738ba36eac",
+      "purpose": "Kotlin metadata parser used by the Android 17 Metalava compiler",
+      "sparse_paths": [
+        "org/jetbrains/kotlin/kotlin-metadata-jvm/2.2.0"
+      ]
+    },
+    {
+      "name": "platform/system/chre",
+      "path": "system/chre",
+      "commit": "17b4a35a8c2b9f27e7f1b382b7d714aced928ce4",
+      "purpose": "Context Hub API flag declarations consumed by framework headers",
+      "sparse_paths": [
+        "chre_flags.aconfig"
+      ]
+    },
+    {
+      "name": "platform/system/connectivity/wificond",
+      "path": "system/connectivity/wificond",
+      "commit": "fefad78738af9d9753bb0acbafcf458691f8627c",
+      "purpose": "Wi-Fi control AIDL interfaces consumed by framework headers",
+      "sparse_paths": [
+        "aidl"
+      ]
+    },
+    {
+      "name": "platform/packages/modules/WebApp",
+      "path": "packages/modules/WebApp",
+      "commit": "551872e35de50df9fa39fa871129db512c18565b",
+      "purpose": "Exported WebApp API flag declarations consumed by framework headers",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "name": "platform/packages/modules/AdServices",
+      "path": "packages/modules/AdServices",
+      "commit": "4bf3dbecdfbe7a8d7b1f9721aae72565bed1dedd",
+      "purpose": "Exported SDK sandbox API flag declarations consumed by framework headers",
+      "sparse_paths": [
+        "sdksandbox/flags"
+      ]
+    },
+    {
+      "name": "platform/packages/apps/EyeDropper",
+      "path": "packages/apps/EyeDropper",
+      "commit": "225af0c6253316198738699de9041d1f28d0df44",
+      "purpose": "EyeDropper API flag declarations consumed by framework headers",
+      "sparse_paths": [
+        "flags"
+      ]
+    },
+    {
+      "name": "platform/packages/modules/Telephony",
+      "path": "packages/modules/Telephony",
+      "commit": "d83f23a96fbe6d68942d8d7245dbd3db91e9c711",
+      "purpose": "Exported Telecom API flag declarations consumed by framework headers",
+      "sparse_paths": [
+        "flags",
+        "telecom/flags"
+      ]
+    },
+    {
+      "name": "platform/packages/modules/Permission",
+      "path": "packages/modules/Permission",
+      "commit": "1093eca7407576c72e51b1a88550ee0667a6e5dc",
+      "purpose": "Pinned Permission API source required for the framework dependency-installer role constant omitted by released SDK stubs",
+      "sparse_paths": [
+        "framework-s/api"
+      ]
+    },
+    {
+      "path": "external/libfuse",
+      "name": "platform/external/libfuse",
+      "commit": "47f83ca03e9ce8f8dc014605d059e3377ad2eafe",
+      "purpose": "FUSE headers required by fuseMedia BPF dependency of the Droidloom vendor image"
+    }
+  ]
+}

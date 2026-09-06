@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="denial_frame_timeline_v1">
+  <copyright>
+    Copyright 2026 Droidloom contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+  </copyright>
+
+  <description summary="compositor-issued exact frame timeline">
+    This protocol lets a compositor grant future presentation opportunities
+    and lets an ordinary wl_surface target exactly one granted opportunity.
+
+    Epoch and sequence form the immutable identity. Timestamps are scheduling
+    estimates in the compositor's wp_presentation clock domain and must not be
+    used to recover or relabel identity. A targeted commit is used only for its
+    named opportunity; it is discarded if it misses that opportunity.
+  </description>
+
+  <interface name="denial_frame_timeline_manager_v1" version="1">
+    <description summary="frame timeline factory">
+      The global is optional. Clients requiring exact presentation must fail
+      closed when it is absent rather than synthesize another clock.
+    </description>
+
+    <request name="get_timeline">
+      <description summary="subscribe to one output timeline">
+        The new timeline starts disarmed. set_active controls grant delivery.
+      </description>
+      <arg name="id" type="new_id" interface="denial_output_frame_timeline_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+
+    <request name="get_surface_timeline">
+      <description summary="add exact targeting to an ordinary surface">
+        Creating this object does not alter the surface's role, input routing,
+        scene ownership, or presentation-feedback behavior.
+      </description>
+      <arg name="id" type="new_id" interface="denial_surface_frame_timeline_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+
+    <request name="destroy" type="destructor"/>
+  </interface>
+
+  <interface name="denial_output_frame_timeline_v1" version="1">
+    <description summary="demand-driven grants for one output"/>
+
+    <enum name="error">
+      <entry name="invalid_active" value="1" summary="active is neither zero nor one"/>
+    </enum>
+
+    <request name="set_active">
+      <description summary="arm or disarm grant delivery">
+        Disarming aborts all grants not yet latched. Re-arming begins with the
+        current epoch and future opportunities; grants are never replayed.
+      </description>
+      <arg name="active" type="uint" summary="zero to disarm, one to arm"/>
+    </request>
+
+    <request name="destroy" type="destructor"/>
+
+    <event name="grant">
+      <description summary="one future presentation opportunity">
+        latch_* is the last compositor scheduling boundary at which a ready
+        targeted commit can be accepted. target_* is the predicted physical
+        presentation time. period_ns is the nominal refresh period.
+      </description>
+      <arg name="epoch_hi" type="uint"/>
+      <arg name="epoch_lo" type="uint"/>
+      <arg name="sequence_hi" type="uint"/>
+      <arg name="sequence_lo" type="uint"/>
+      <arg name="latch_sec_hi" type="uint"/>
+      <arg name="latch_sec_lo" type="uint"/>
+      <arg name="latch_nsec" type="uint"/>
+      <arg name="target_sec_hi" type="uint"/>
+      <arg name="target_sec_lo" type="uint"/>
+      <arg name="target_nsec" type="uint"/>
+      <arg name="period_ns_hi" type="uint"/>
+      <arg name="period_ns_lo" type="uint"/>
+    </event>
+
+    <event name="epoch">
+      <description summary="invalidate all identities from prior epochs">
+        This event is sent before any grant in the named epoch. Clients must
+        abort queued work from every other epoch.
+      </description>
+      <arg name="epoch_hi" type="uint"/>
+      <arg name="epoch_lo" type="uint"/>
+    </event>
+  </interface>
+
+  <interface name="denial_surface_frame_timeline_v1" version="1">
+    <description summary="exact target for an ordinary wl_surface commit">
+      set_target is double-buffered surface state and applies to the next
+      wl_surface.commit. It is consumed by that commit. An expired, unissued,
+      inactive-epoch, or regressing target discards that buffer update while
+      retaining the prior surface buffer; it does not disconnect the client.
+      Cross-client object references remain protocol errors.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_identity" value="1" summary="zero or malformed identity"/>
+      <entry name="target_regression" value="2" summary="target is not newer than prior target"/>
+    </enum>
+
+    <request name="set_target">
+      <arg name="timeline" type="object" interface="denial_output_frame_timeline_v1"/>
+      <arg name="epoch_hi" type="uint"/>
+      <arg name="epoch_lo" type="uint"/>
+      <arg name="sequence_hi" type="uint"/>
+      <arg name="sequence_lo" type="uint"/>
+    </request>
+
+    <request name="destroy" type="destructor"/>
+  </interface>
+</protocol>

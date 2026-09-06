@@ -1,0 +1,60 @@
+diff --git a/sysmeminfo.cpp b/sysmeminfo.cpp
+index c014987..26f9bcd 100644
+--- a/sysmeminfo.cpp
++++ b/sysmeminfo.cpp
+@@ -411,10 +411,27 @@ bool ReadDmabufHeapTotalExportedKb(
+     return true;
+ }
+ 
++[[maybe_unused]] static bool isDroidloomCellWithoutGpuAccounting(const char* map_path) {
++    if (getenv("DROIDLOOM_CELL") == nullptr) return false;
++    if (access(map_path, F_OK) == 0) return false;
++    return errno == ENOENT;
++}
++
+ bool ReadPerProcessGpuMem([[maybe_unused]] std::unordered_map<uint32_t, uint64_t>* out) {
+ #if defined(__ANDROID__) && !defined(__ANDROID_APEX__) && !defined(__ANDROID_VNDK__)
+     static constexpr const char kBpfGpuMemTotalMap[] = "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map";
+ 
++    if (!out) {
++        LOG(ERROR) << "ReadPerProcessGpuMem: out param is null";
++        return false;
++    }
++    out->clear();
++
++    // Droidloom's current cell exposes no kernel GPU accounting tracepoint.
++    // An absent map therefore represents a real zero-sized accounting set,
++    // not a malformed BPF object. Never relax map validation when it exists.
++    if (isDroidloomCellWithoutGpuAccounting(kBpfGpuMemTotalMap)) return true;
++
+     // Use the read-only wrapper BpfMapRO to properly retrieve the read-only map.
+     auto map = bpf::BpfMapRO<uint64_t, uint64_t>(kBpfGpuMemTotalMap);
+     if (!map.isValid()) {
+@@ -422,12 +439,6 @@ bool ReadPerProcessGpuMem([[maybe_unused]] std::unordered_map<uint32_t, uint64_t
+         return false;
+     }
+ 
+-    if (!out) {
+-        LOG(ERROR) << "ReadPerProcessGpuMem: out param is null";
+-        return false;
+-    }
+-    out->clear();
+-
+     auto map_key = map.getFirstKey();
+     if (!map_key.ok()) {
+         return true;
+@@ -464,6 +475,14 @@ bool ReadProcessGpuUsageKb([[maybe_unused]] uint32_t pid, [[maybe_unused]] uint3
+ #if defined(__ANDROID__) && !defined(__ANDROID_APEX__) && !defined(__ANDROID_VNDK__)
+     static constexpr const char kBpfGpuMemTotalMap[] = "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map";
+ 
++    // The compositor owns the real GPU buffers outside this Android cell, and
++    // no per-process GPU accounting map is installed here yet. Report the
++    // unavailable metric as zero instead of constructing an aborting BpfMapRO.
++    if (isDroidloomCellWithoutGpuAccounting(kBpfGpuMemTotalMap)) {
++        if (size) *size = 0;
++        return true;
++    }
++
+     uint64_t gpu_mem;
+ 
+     // BPF Key [32-bits GPU ID | 32-bits PID]

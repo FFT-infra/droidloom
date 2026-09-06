@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Seal and verify complete Droidloom payloads without executing target binaries."""
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import stat
+import sys
+import zipfile
+
+MANIFEST = 'droidloom-bundle.json'
+MARKER = re.compile(rb'DROIDLOOM_INPUT_ABI=([0-9]{1,5});')
+RUNTIME = pathlib.Path('usr/lib/droidloom/runtime')
+COMPOSER = RUNTIME / 'bin/android.hardware.graphics.composer3-service.droidloom'
+BRIDGE = RUNTIME / 'framework/droidloom-input-bridge.jar'
+
+
+def abi(data, label):
+    versions = {int(v) for v in MARKER.findall(data)}
+    if len(versions) != 1:
+        raise ValueError(f'{label}: missing or ambiguous build compatibility metadata; rebuild this component')
+    return versions.pop()
+
+
+def compatibility(root):
+    binary = (root / COMPOSER).read_bytes()
+    if binary[:4] != b'\x7fELF' or len(binary) < 20 or binary[5] != 1:
+        raise ValueError('Composer must be a little-endian ELF executable')
+    machine = int.from_bytes(binary[18:20], 'little')
+    arch = {62: 'x86_64', 183: 'aarch64'}.get(machine)
+    if not arch:
+        raise ValueError(f'unsupported Composer ELF architecture: {machine}')
+    sender = abi(binary, str(COMPOSER))
+    jars = sorted((root / RUNTIME).rglob('droidloom-input-bridge.jar'))
+    if root / BRIDGE not in jars:
+        raise ValueError('missing primary Android input bridge')
+    for jar in jars:
+        with zipfile.ZipFile(jar) as archive:
+            dex = b''.join(archive.read(n) for n in archive.namelist()
+                           if n.startswith('classes') and n.endswith('.dex'))
+        receiver = abi(dex, str(jar.relative_to(root)))
+        if sender != receiver:
+            raise ValueError(f'input protocol mismatch: Composer v{sender}, {jar.relative_to(root)} v{receiver}')
+    for name in ['droidloomd', 'droidloomctl', 'droidloom-supervisor',
+                 'droidloom-wayland', 'droidloom-applications']:
+        with (root / 'usr/bin' / name).open('rb') as source:
+            header = source.read(20)
+        if header[:4] != b'\x7fELF' or header[5:6] != b'\x01' or int.from_bytes(header[18:20], 'little') != machine:
+            raise ValueError(f'{name}: host and Android architectures do not match')
+    return {'architecture': arch, 'input_protocol': sender}
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob('*')):
+        relative = str(path.relative_to(root))
+        if relative == MANIFEST:
+            continue
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            # Do not let checksums follow input paths outside the package.
+            if not path.resolve().is_relative_to(root.resolve()) or not path.exists():
+                raise ValueError(f'unsafe or dangling package symlink: {relative}')
+            result[relative] = {'link': str(path.readlink())}
+        elif stat.S_ISREG(mode):
+            with path.open('rb') as source:
+                digest = hashlib.file_digest(source, 'sha256').hexdigest()
+            result[relative] = {'sha256': digest, 'mode': stat.S_IMODE(mode)}
+        elif not stat.S_ISDIR(mode):
+            raise ValueError(f'unsupported package file type: {relative}')
+    return result
+
+
+def seal(root):
+    # Read ABI claims from the compiled artifacts, never from today's sources.
+    contract = compatibility(root)
+    manifest = {'schema': 1, 'compatibility': contract, 'files': inventory(root)}
+    (root / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    return contract
+
+
+def verify(root):
+    manifest = json.loads((root / MANIFEST).read_text())
+    if set(manifest) != {'schema', 'compatibility', 'files'} or manifest['schema'] != 1:
+        raise ValueError('unsupported bundle manifest')
+    actual = inventory(root)
+    if actual != manifest['files']:
+        changed = sorted(k for k in set(actual) | set(manifest['files'])
+                         if actual.get(k) != manifest['files'].get(k))
+        raise ValueError('bundle files changed after sealing: ' + ', '.join(changed[:8]))
+    contract = compatibility(root)
+    if contract != manifest['compatibility']:
+        raise ValueError('bundle compatibility metadata disagrees with compiled artifacts')
+    return contract
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation', choices=['seal', 'verify'])
+    parser.add_argument('payload', type=pathlib.Path)
+    args = parser.parse_args()
+    try:
+        contract = (seal if args.operation == 'seal' else verify)(args.payload.resolve())
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
+        parser.exit(1, f'Droidloom bundle rejected: {error}\n')
+    print(json.dumps(contract, sort_keys=True))
+
+
+if __name__ == '__main__':
+    main()

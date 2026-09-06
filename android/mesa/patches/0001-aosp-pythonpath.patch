@@ -1,0 +1,30 @@
+From: Droidloom <droidloom@localhost>
+Subject: [PATCH 1/2] android: use AOSP's pinned Mako for Meson generators
+
+The Android build runs behind AOSP's PATH interposer. Use the source-pinned
+Mako module with the first supported system Python instead of depending on an
+untracked host Python installation.
+
+--- a/android/mesa3d_cross.mk
++++ b/android/mesa3d_cross.mk
+@@ -82,8 +82,10 @@ MESA3D_GLES_BINS := \
+     $($(M_TARGET_PREFIX)MESA3D_LIBGLESV1_BIN) \
+     $($(M_TARGET_PREFIX)MESA3D_LIBGLESV2_BIN) \
+ 
++MESA3D_PYTHONPATH := $(AOSP_ABSOLUTE_PATH)/external/python/mako
++
+ MESON_GEN_NINJA := \
+-	cd $(MESON_OUT_DIR) && PATH=/usr/bin:/usr/local/bin:$$PATH meson ./build     \
++	cd $(MESON_OUT_DIR) && PYTHONPATH=$(MESA3D_PYTHONPATH) PATH=/usr/bin:/usr/local/bin:$$PATH meson ./build     \
+ 	--cross-file $(call relative-to-absolute,$(MESON_GEN_DIR))/aosp_cross        \
+ 	--buildtype=release                                                          \
+ 	-Dplatforms=android                                                          \
+@@ -99,7 +101,7 @@ MESON_GEN_NINJA := \
+ 	-Dandroid-libbacktrace=disabled                                              \
+ 	$(BOARD_MESA3D_MESON_ARGS)                                                   \
+ 
+-MESON_BUILD := PATH=/usr/bin:/bin:/sbin:$$PATH ninja -C $(MESON_OUT_DIR)/build
++MESON_BUILD := PYTHONPATH=$(MESA3D_PYTHONPATH) PATH=/usr/bin:/bin:/sbin:$$PATH ninja -C $(MESON_OUT_DIR)/build
+ 
+ $(MESON_GEN_FILES_TARGET): MESON_CPU_FAMILY := $(subst arm64,aarch64,$(TARGET_$(M_TARGET_PREFIX)ARCH))
+ 

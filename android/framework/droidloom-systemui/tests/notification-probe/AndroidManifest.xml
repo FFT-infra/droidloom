@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.android.droidloom.notificationprobe">
+    <uses-sdk android:minSdkVersion="37" android:targetSdkVersion="37" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application android:label="Droidloom notification test" android:icon="@android:drawable/ic_dialog_info" android:testOnly="true" android:allowBackup="false">
+        <receiver android:name=".Probe" android:exported="true" android:permission="android.permission.DUMP" />
+        <receiver android:name=".ClickReceiver" android:exported="false" />
+    </application>
+</manifest>

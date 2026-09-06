@@ -1,0 +1,17 @@
+# Droidloom development-only first-pixels policy.
+#
+# The stock Android 17 lmkd exits in libmemevents while entering a shared-kernel
+# cell. ActivityManager synchronously waits for its control socket while holding
+# the global activity lock, so leaving the socket disconnected makes every app
+# process time out during attach. The narrow Rust endpoint drains process-score
+# updates and returns zero/success for synchronous commands, but never kills a
+# process. Production memory policy remains owned by the enclosing runtime.
+
+service lmkd /vendor/bin/droidloom-lmkd-compat
+    class core
+    user lmkd
+    group lmkd system readproc
+    capabilities DAC_OVERRIDE KILL IPC_LOCK SYS_NICE SYS_RESOURCE
+    socket lmkd seqpacket+passcred 0660 system system
+    task_profiles ServiceCapacityLow
+    stdio_to_kmsg

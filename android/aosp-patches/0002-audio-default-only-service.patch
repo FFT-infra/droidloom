@@ -1,0 +1,165 @@
+diff --git a/audio/aidl/default/Android.bp b/audio/aidl/default/Android.bp
+index 86ccf258..08445d1f 100644
+--- a/audio/aidl/default/Android.bp
++++ b/audio/aidl/default/Android.bp
+@@ -128,6 +128,85 @@ cc_library {
+     }),
+ }
+ 
++// Droidloom uses only the default module with BUS endpoints. Keep the upstream
++// implementation, but do not link Bluetooth, USB, remote-submix, or effects
++// implementations that cannot be reached from its audio policy.
++cc_library_static {
++    name: "libaudioservicedroidloomimpl",
++    defaults: [
++        "aidlaudioservice_defaults",
++        "latest_android_media_audio_common_types_ndk_shared",
++        "latest_android_hardware_audio_core_ndk_shared",
++        "latest_android_hardware_audio_core_sounddose_ndk_shared",
++        "latest_android_hardware_bluetooth_audio_ndk_shared",
++    ],
++    export_include_dirs: ["include"],
++    srcs: [
++        "AidlConversionXsdc.cpp",
++        "AudioPolicyConfigXmlConverter.cpp",
++        "CapEngineConfigXmlConverter.cpp",
++        "Config.cpp",
++        "Configuration.cpp",
++        "EngineConfigXmlConverter.cpp",
++        "Module.cpp",
++        "ModulePrimary.cpp",
++        "SoundDose.cpp",
++        "Stream.cpp",
++        "Telephony.cpp",
++        "XsdcConversion.cpp",
++        "alsa/Mixer.cpp",
++        "alsa/StreamAlsa.cpp",
++        "alsa/StreamAlsaBase.cpp",
++        "alsa/StreamAlsaMonoPipe.cpp",
++        "alsa/UtilsAlsa.cpp",
++        "primary/PrimaryMixer.cpp",
++        "primary/StreamPrimary.cpp",
++        "stub/ApeHeader.cpp",
++        "stub/DriverStubImpl.cpp",
++        "stub/MpegAudioHeader.cpp",
++        "stub/StreamMmapStub.cpp",
++        "stub/StreamOffloadStub.cpp",
++        "stub/StreamStub.cpp",
++    ],
++    generated_sources: [
++        "audio_policy_capengine_configuration_aidl_default",
++        "audio_policy_configuration_aidl_default",
++        "audio_policy_engine_configuration_aidl_default",
++    ],
++    generated_headers: [
++        "audio_policy_capengine_configuration_aidl_default",
++        "audio_policy_configuration_aidl_default",
++        "audio_policy_engine_configuration_aidl_default",
++    ],
++    export_generated_headers: [
++        "audio_policy_capengine_configuration_aidl_default",
++        "audio_policy_configuration_aidl_default",
++        "audio_policy_engine_configuration_aidl_default",
++    ],
++    shared_libs: [
++        "libaudio_aidl_conversion_common_ndk",
++        "libaudioutils",
++        "liblog",
++        "libmedia_helper",
++        "libmediautils_vendor",
++        "libstagefright_foundation",
++    ],
++    export_shared_lib_headers: [
++        "libaudio_aidl_conversion_common_ndk",
++    ],
++    cflags: [
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++        "-Wthread-safety",
++        "-DBACKEND_NDK",
++        "-DDROIDLOOM_AUDIO_DEFAULT_ONLY",
++    ] + select(release_flag("RELEASE_HARDWARE_AUDIO_USE_CAP_AIDL"), {
++        true: [],
++        default: ["-DDISABLE_CAP_AIDL"],
++    }),
++}
++
+ cc_library {
+     name: "libeffectconfig",
+     srcs: [
+@@ -208,6 +287,36 @@ cc_binary {
+     installable: false, //installed in apex com.android.hardware.audio
+ }
+ 
++cc_binary {
++    name: "android.hardware.audio.service-aidl.droidloom",
++    relative_install_path: "hw",
++    defaults: [
++        "aidlaudioservice_defaults",
++        "latest_android_hardware_audio_core_sounddose_ndk_shared",
++        "latest_android_hardware_audio_core_ndk_shared",
++        "latest_android_hardware_bluetooth_audio_ndk_shared",
++        "latest_android_media_audio_common_types_ndk_shared",
++    ],
++    static_libs: [
++        "libaudioservicedroidloomimpl",
++    ],
++    shared_libs: [
++        "libaudio_aidl_conversion_common_ndk",
++        "liblog",
++        "libmedia_helper",
++        "libstagefright_foundation",
++    ],
++    srcs: ["main.cpp"],
++    cflags: [
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++        "-Wthread-safety",
++        "-DBACKEND_NDK",
++    ],
++    installable: false,
++}
++
+ cc_test {
+     name: "audio_policy_config_xml_converter_tests",
+     vendor_available: true,
+diff --git a/audio/aidl/default/Module.cpp b/audio/aidl/default/Module.cpp
+index 7f658bec..5991aaf8 100644
+--- a/audio/aidl/default/Module.cpp
++++ b/audio/aidl/default/Module.cpp
+@@ -26,11 +26,13 @@
+ 
+ #include "core-impl/Configuration.h"
+ #include "core-impl/Module.h"
+-#include "core-impl/ModuleBluetooth.h"
+ #include "core-impl/ModulePrimary.h"
++#ifndef DROIDLOOM_AUDIO_DEFAULT_ONLY
++#include "core-impl/ModuleBluetooth.h"
+ #include "core-impl/ModuleRemoteSubmix.h"
+ #include "core-impl/ModuleStub.h"
+ #include "core-impl/ModuleUsb.h"
++#endif
+ #include "core-impl/SoundDose.h"
+ #include "core-impl/utils.h"
+ 
+@@ -115,6 +117,10 @@ std::shared_ptr<Module> Module::createInstance(Type type, std::unique_ptr<Configu
+     switch (type) {
+         case Type::DEFAULT:
+             return ndk::SharedRefBase::make<ModulePrimary>(std::move(config));
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++        default:
++            return nullptr;
++#else
+         case Type::R_SUBMIX:
+             return ndk::SharedRefBase::make<ModuleRemoteSubmix>(std::move(config));
+         case Type::STUB:
+@@ -124,6 +130,7 @@ std::shared_ptr<Module> Module::createInstance(Type type, std::unique_ptr<Configu
+         case Type::BLUETOOTH:
+             return ndk::SharedRefBase::make<ModuleBluetooth>(std::move(config));
++#endif
+     }
+ }
+ 
+ // static

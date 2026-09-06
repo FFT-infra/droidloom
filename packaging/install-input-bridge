@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Replace only the input bridge, including the runtime copy used by its wrapper.
+set -Eeuo pipefail
+stage="${1:?staging directory required}"
+boot_id="${2:?verified boot identity required}"
+test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot_id"
+test "$(uname -m)" = aarch64
+test "$(tr '\000' '\n' </proc/device-tree/compatible | head -n1)" = oneplus,aston
+test "$(id -u logix)" = 1001
+cd "$stage"
+sha256sum -c SHA256SUMS
+backup="$(mktemp -d "$stage/backup.XXXXXXXX")"
+cp -a /etc/droidloom/cell.json "$backup/"
+python3 - "$stage" "$backup" <<'PY'
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+stage = os.path.realpath(sys.argv[1])
+backup = sys.argv[2]
+if not stage.startswith('/var/lib/droidloom/input-bridge-updates/'):
+    raise SystemExit('unexpected input bridge bundle location')
+with open('/etc/droidloom/cell.json') as source:
+    spec = json.load(source)
+jar = os.path.join(stage, 'droidloom-input-bridge.jar')
+target = '/vendor/framework/droidloom-input-bridge.jar'
+overrides = spec['android_file_overrides']
+matches = [entry for entry in overrides if entry['target'] == target]
+if len(matches) > 1:
+    raise SystemExit('ambiguous input bridge override')
+if matches:
+    matches[0]['source'] = jar
+else:
+    overrides.append({'source': jar, 'target': target})
+# The wrapper prefers /droidloom/ime, then the classpath compatibility copy.
+# Copy each affected directory so every other installed runtime file is preserved.
+for index, entry in enumerate(spec.get('android_runtime_directories', [])):
+    relative = {'/droidloom/ime': 'droidloom-input-bridge.jar',
+                '/droidloom/classpath-compat': 'javalib/droidloom-input-bridge.jar'
+                }.get(entry['target'])
+    if relative is None or not os.path.isfile(os.path.join(entry['source'], relative)):
+        continue
+    destination = os.path.join(backup, 'runtime-' + str(index))
+    subprocess.run(['cp', '-a', '--reflink=auto', entry['source'], destination], check=True)
+    replacement = os.path.join(destination, relative)
+    os.unlink(replacement)
+    shutil.copyfile(jar, replacement)
+    os.chmod(replacement, 0o644)
+    entry['source'] = destination
+with open(os.path.join(backup, 'updated-cell.json'), 'w') as destination:
+    json.dump(spec, destination, indent=2)
+    destination.write('\n')
+PY
+/usr/bin/droidloom-supervisor development-validate --spec "$backup/updated-cell.json"
+user_service() {
+    runuser -u logix -- env XDG_RUNTIME_DIR=/run/user/1001 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus systemctl --user "$@"
+}
+rollback() {
+    trap - ERR
+    user_service stop droidloom.service || true
+    systemctl stop droidloomd.service || true
+    install -m 0644 "$backup/cell.json" /etc/droidloom/cell.json
+    systemctl start droidloomd.service || true
+    user_service start droidloom.service || true
+    echo "input bridge update failed; restored $backup" >&2
+    exit 1
+}
+trap rollback ERR
+user_service stop droidloom.service
+systemctl stop droidloomd.service
+install -m 0644 "$backup/updated-cell.json" /etc/droidloom/cell.json
+systemctl start droidloomd.service
+user_service start droidloom.service
+for attempt in $(seq 1 120); do
+    if user_service is-active --quiet droidloom.service && \
+            test -S /run/user/1001/droidloom/native-bridge.sock; then
+        break
+    fi
+    sleep 0.25
+done
+user_service is-active droidloom.service
+test -S /run/user/1001/droidloom/native-bridge.sock
+droidloomctl --json status
+trap - ERR
+printf 'Input bridge updated; previous cell specification preserved in %s\n' "$backup"

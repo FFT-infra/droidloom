@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://droidloom.org/schemas/image-manifest-v1.schema.json",
+  "title": "Droidloom image manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "image_id",
+    "image_version",
+    "runtime_abi",
+    "architecture",
+    "aosp",
+    "mesa",
+    "denial_protocol",
+    "denial_protocol_version",
+    "artifacts",
+    "features"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "image_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "image_version": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "runtime_abi": { "type": "integer", "minimum": 1 },
+    "architecture": { "enum": ["aarch64", "x86_64"] },
+    "aosp": { "$ref": "#/$defs/git_source" },
+    "mesa": { "$ref": "#/$defs/archive_source" },
+    "denial_protocol": { "const": "denial_droidloom_native" },
+    "denial_protocol_version": { "const": 1 },
+    "artifacts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/artifact" },
+      "allOf": [
+        { "contains": { "properties": { "role": { "const": "system" } }, "required": ["role"] } },
+        { "contains": { "properties": { "role": { "const": "vendor" } }, "required": ["role"] } },
+        { "contains": { "properties": { "role": { "const": "product" } }, "required": ["role"] } }
+      ]
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "composer_aidl",
+        "dmabuf_allocator",
+        "flattened_apex"
+      ],
+      "properties": {
+        "composer_aidl": { "const": true },
+        "dmabuf_allocator": { "const": true },
+        "freedreno_gles": { "type": "boolean" },
+        "turnip_vulkan": { "type": "boolean" },
+        "radeonsi_gles": { "type": "boolean" },
+        "radv_vulkan": { "type": "boolean" },
+        "flattened_apex": { "const": true }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "architecture": { "const": "aarch64" } } },
+      "then": {
+        "properties": {
+          "features": {
+            "required": ["freedreno_gles", "turnip_vulkan"],
+            "properties": {
+              "freedreno_gles": { "const": true },
+              "turnip_vulkan": { "const": true }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "architecture": { "const": "x86_64" } } },
+      "then": {
+        "properties": {
+          "features": {
+            "required": ["radeonsi_gles", "radv_vulkan"],
+            "properties": {
+              "radeonsi_gles": { "const": true },
+              "radv_vulkan": { "const": true }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "git_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "tag", "commit"],
+      "properties": {
+        "url": { "type": "string", "pattern": "^https://" },
+        "tag": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "archive_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "version", "sha256"],
+      "properties": {
+        "url": { "type": "string", "pattern": "^https://" },
+        "version": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "path", "sha256", "read_only"],
+      "properties": {
+        "role": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "read_only": { "type": "boolean" }
+      }
+    }
+  }
+}

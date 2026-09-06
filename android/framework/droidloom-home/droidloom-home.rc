@@ -1,0 +1,10 @@
+service droidloom-home-setup /system/bin/sh /droidloom/ime/home-setup
+    class late_start
+    user shell
+    group shell
+    disabled
+    oneshot
+    stdio_to_kmsg
+
+on property:sys.boot_completed=1
+    start droidloom-home-setup

@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+source_tree="${1:-$repo_root/.work/aosp-m2-source}"
+source_tree="$(readlink -f -- "$source_tree")"
+lock="$repo_root/android/manifest/m2-sparse-source-lock.json"
+manifest="$source_tree/.droidloom-source-manifest.json"
+product="${DROIDLOOM_ANDROID_PRODUCT:-droidloom_arm64}"
+case "$product" in
+    droidloom_arm64|droidloom_x86_64) ;;
+    *)
+        echo "unsupported Droidloom Android product: $product" >&2
+        exit 2
+        ;;
+esac
+mesa_lock="${DROIDLOOM_SOURCE_LOCK:-$repo_root/android/manifest/source-lock.json}"
+mesa_version="$(jq -er '.mesa.version' "$mesa_lock")"
+mesa_archive="${DROIDLOOM_MESA_ARCHIVE:-$repo_root/.work/mesa-$mesa_version.tar.xz}"
+mesa_prepared="$repo_root/.work/mesa-prepared/$mesa_version"
+base_build_number="$(jq -er '.aosp_ci_base.build_number' "$mesa_lock")"
+framework_res="${DROIDLOOM_FRAMEWORK_RES:-$repo_root/.work/compat-$base_build_number/system/system/framework/framework-res.apk}"
+framework_res_expected_size="$(jq -er '.aosp_ci_base.framework_res.size' "$mesa_lock")"
+framework_res_expected_hash="$(jq -er '.aosp_ci_base.framework_res.sha256' "$mesa_lock")"
+framework_res_projection="$source_tree/vendor/droidloom/android/prebuilts/framework-res.apk"
+proto_placeholder="$source_tree/frameworks/base/core/proto/droidloom/sparse-build-placeholder.proto"
+proto_fixture="$repo_root/android/manifest/sparse-build-placeholder.proto"
+instrumentation_placeholder="$source_tree/frameworks/base/core/java/android/os/instrumentation/IDroidloomSparseBuildInstrumentation.aidl"
+instrumentation_fixture="$repo_root/android/manifest/sparse-build-instrumentation-placeholder.aidl"
+rkp_placeholder="$source_tree/frameworks/base/core/java/android/security/rkp/IDroidloomSparseBuildRkp.aidl"
+rkp_fixture="$repo_root/android/manifest/sparse-build-rkp-placeholder.aidl"
+hardware_interfaces_checkout="$source_tree/hardware/interfaces"
+audio_patch="$repo_root/android/aosp-patches/0002-audio-default-only-service.patch"
+audio_patch_applied=false
+frameworks_base_checkout="$source_tree/frameworks/base"
+vendor_only_ext_patch="$repo_root/android/aosp-patches/0005-frameworks-base-vendor-only-ext.patch"
+vendor_only_ext_patch_applied=false
+minigbm_checkout="$source_tree/external/minigbm"
+minigbm_amdgpu_patch="$repo_root/android/aosp-patches/0007-minigbm-amdgpu-platform.patch"
+minigbm_amdgpu_patch_applied=false
+
+if [[ "$source_tree" == "/" || "$source_tree" == "$repo_root" ]]; then
+    echo "refusing unsafe source tree: $source_tree" >&2
+    exit 2
+fi
+
+for required in \
+    "$source_tree/build/envsetup.sh" \
+    "$source_tree/build/soong" \
+    "$source_tree/prebuilts/sdk/37.0/public/api" \
+    "$source_tree/prebuilts/sdk/37.0/system/api" \
+    "$source_tree/prebuilts/sdk/37.0/module-lib/api" \
+    "$hardware_interfaces_checkout/audio/aidl/default/Module.cpp" \
+    "$audio_patch" \
+    "$frameworks_base_checkout/Android.bp" \
+    "$vendor_only_ext_patch" \
+    "$minigbm_checkout/Android.bp" \
+    "$minigbm_amdgpu_patch" \
+    "$framework_res" \
+    "$mesa_archive" \
+    "$manifest"; do
+    if [[ ! -e "$required" ]]; then
+        echo "missing vendor-image input: $required" >&2
+        exit 2
+    fi
+done
+
+framework_res_actual_size="$(stat -c '%s' -- "$framework_res")"
+framework_res_actual_hash="$(sha256sum -- "$framework_res" | cut -d ' ' -f 1)"
+if [[ "$framework_res_actual_size" != "$framework_res_expected_size" || \
+      "$framework_res_actual_hash" != "$framework_res_expected_hash" ]]; then
+    echo "pinned framework-res.apk identity mismatch: $framework_res" >&2
+    exit 2
+fi
+
+expected_lock_hash="$(sha256sum "$lock" | cut -d ' ' -f 1)"
+materialized_lock_hash="$(jq -er '.source_lock_sha256' "$manifest")"
+if [[ "$expected_lock_hash" != "$materialized_lock_hash" ]]; then
+    echo "materialized source manifest does not match the current lock" >&2
+    echo "run droidloom-source reconcile before this image build" >&2
+    exit 2
+fi
+
+cargo run --offline --quiet \
+    --manifest-path "$repo_root/Cargo.toml" \
+    -p droidloom-source -- \
+    verify-materialized --lock "$lock" --output "$source_tree"
+
+cargo run --offline --quiet \
+    --manifest-path "$repo_root/Cargo.toml" \
+    -p droidloom-mesa -- \
+    prepare \
+    --lock "$mesa_lock" \
+    --archive "$mesa_archive" \
+    --patches "$repo_root/android/mesa/patches" \
+    --output "$mesa_prepared"
+
+# The sparse tree contains unrelated service/test graphs whose module types or
+# ownership metadata live outside Droidloom's exact build closure. None is
+# reachable from the vendor product, so omit them from this bounded projection.
+markers=(
+    "$source_tree/frameworks/native/services/serialservice/.find-ignore"
+    "$source_tree/frameworks/base/tools/aapt2/integration-tests/.find-ignore"
+    "$source_tree/frameworks/base/api/.find-ignore"
+    "$source_tree/frameworks/base/core/tests/.find-ignore"
+    "$source_tree/frameworks/base/services/.find-ignore"
+    "$source_tree/art/test/.find-ignore"
+    "$source_tree/art/libartservice/service/.find-ignore"
+    "$source_tree/packages/modules/Virtualization/libs/framework-virtualization/.find-ignore"
+    "$source_tree/packages/modules/Virtualization/guest/trusty/test_vm/.find-ignore"
+    "$source_tree/packages/modules/Virtualization/guest/trusty/test_vm_os/.find-ignore"
+)
+for marker in "${markers[@]}"; do
+    if [[ -e "$marker" ]]; then
+        echo "refusing pre-existing Finder projection marker: $marker" >&2
+        exit 2
+    fi
+done
+if [[ -e "$proto_placeholder" ]]; then
+    echo "refusing pre-existing sparse-build placeholder: $proto_placeholder" >&2
+    exit 2
+fi
+for placeholder in "$instrumentation_placeholder" "$rkp_placeholder"; do
+    if [[ -e "$placeholder" ]]; then
+        echo "refusing pre-existing sparse-build placeholder: $placeholder" >&2
+        exit 2
+    fi
+done
+if [[ -e "$framework_res_projection" ]]; then
+    echo "refusing pre-existing framework resource projection: $framework_res_projection" >&2
+    exit 2
+fi
+
+cleanup() {
+    if [[ "$minigbm_amdgpu_patch_applied" == true ]]; then
+        git -C "$minigbm_checkout" apply -R "$minigbm_amdgpu_patch"
+    fi
+    if [[ "$vendor_only_ext_patch_applied" == true ]]; then
+        git -C "$frameworks_base_checkout" apply -R "$vendor_only_ext_patch"
+    fi
+    if [[ "$audio_patch_applied" == true ]]; then
+        git -C "$hardware_interfaces_checkout" apply -R "$audio_patch"
+    fi
+    for marker in "${markers[@]}"; do
+        rm -f -- "$marker"
+    done
+    rm -f -- "$proto_placeholder"
+    rm -f -- "$instrumentation_placeholder" "$rkp_placeholder"
+    rm -f -- "$framework_res_projection"
+    rmdir -- "$(dirname -- "$framework_res_projection")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$proto_placeholder")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$(dirname -- "$proto_placeholder")")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$instrumentation_placeholder")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$rkp_placeholder")" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+git -C "$hardware_interfaces_checkout" apply --check "$audio_patch"
+git -C "$hardware_interfaces_checkout" apply "$audio_patch"
+audio_patch_applied=true
+git -C "$frameworks_base_checkout" apply --check "$vendor_only_ext_patch"
+git -C "$frameworks_base_checkout" apply "$vendor_only_ext_patch"
+vendor_only_ext_patch_applied=true
+git -C "$minigbm_checkout" apply --check "$minigbm_amdgpu_patch"
+git -C "$minigbm_checkout" apply "$minigbm_amdgpu_patch"
+minigbm_amdgpu_patch_applied=true
+for marker in "${markers[@]}"; do
+    touch "$marker"
+done
+mkdir -p -- "$(dirname -- "$proto_placeholder")"
+install -m 0644 -- "$proto_fixture" "$proto_placeholder"
+mkdir -p -- "$(dirname -- "$instrumentation_placeholder")" "$(dirname -- "$rkp_placeholder")"
+install -m 0644 -- "$instrumentation_fixture" "$instrumentation_placeholder"
+install -m 0644 -- "$rkp_fixture" "$rkp_placeholder"
+
+mkdir -p "$source_tree/vendor/droidloom"
+mkdir -p "$source_tree/vendor/droidloom/mesa3d"
+rsync -a --delete "$mesa_prepared/" "$source_tree/vendor/droidloom/mesa3d/"
+(
+    cd "$repo_root"
+    rsync -aR \
+        Android.bp \
+        ./graphics/droidloom-composer-aidl \
+        ./graphics/droidloom-composer-service \
+        ./graphics/droidloom-composer \
+        ./graphics/droidloom-denial-ipc \
+        ./graphics/droidloom-denial-protocol \
+        ./graphics/droidloom-input-protocol \
+        ./graphics/droidloom-minigbm \
+        ./graphics/droidloom-syncobj \
+        ./graphics/droidloom-task-control \
+        ./graphics/droidloom-transport \
+        ./android/framework/droidloom-task-launcher \
+        ./android/framework/droidloom-input-bridge \
+        ./android/lmkd-compat \
+        ./android/runtime/droidloom-classpath-wrapper \
+        ./android/selinux-compat \
+        "./android/device/$product" \
+        "./device/$product" \
+        "$source_tree/vendor/droidloom/"
+)
+
+mkdir -p -- "$(dirname -- "$framework_res_projection")"
+install -m 0644 -- "$framework_res" "$framework_res_projection"
+
+(
+    cd "$source_tree"
+    source build/envsetup.sh >/dev/null
+    lunch "$product" cp2a userdebug >/dev/null
+    SOONG_INCREMENTAL_ANALYSIS=false ALLOW_MISSING_DEPENDENCIES=true m vendorimage
+)

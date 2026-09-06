@@ -1,0 +1,26 @@
+From: Droidloom development build
+Subject: [PATCH] libbinder: omit context-manager SID requests in a cell
+
+The shared host kernel can provide private Binder contexts without providing
+Android SELinux transaction security contexts. Requesting a security context
+for every transaction to the context manager makes the Binder driver reject
+otherwise valid transactions with EOPNOTSUPP.
+
+Scope the development compatibility behavior to the DROIDLOOM_CELL marker
+inherited from the package-owned init. The host sandbox remains the security
+boundary; Android SELinux enforcement is restored separately before the
+production runtime is declared secure.
+
+--- a/frameworks/native/libs/binder/ProcessState.cpp
++++ b/frameworks/native/libs/binder/ProcessState.cpp
+@@ -236,7 +236,9 @@ bool ProcessState::becomeContextManager()
+     std::unique_lock<std::mutex> _l(mLock);
+ 
+     flat_binder_object obj {
+-        .flags = FLAT_BINDER_FLAG_TXN_SECURITY_CTX,
++        .flags = static_cast<uint32_t>(getenv("DROIDLOOM_CELL") == nullptr
++                                               ? FLAT_BINDER_FLAG_TXN_SECURITY_CTX
++                                               : 0),
+     };
+ 
+     int result = ioctl(mDriverFD, BINDER_SET_CONTEXT_MGR_EXT, &obj);

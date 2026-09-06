@@ -1,0 +1,16 @@
+[package]
+name = "droidloom-composer"
+description = "Safe single-client-target core for the Droidloom Composer AIDL adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+droidloom-denial-protocol = { path = "../droidloom-denial-protocol" }
+droidloom-transport = { path = "../droidloom-transport" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Update only the Wayland presenter; lifecycle remains owned by droidloom.service.
+set -Eeuo pipefail
+stage="${1:?staging directory required}"
+boot_id="${2:?verified boot identity required}"
+test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot_id"
+test "$(uname -m)" = aarch64
+test "$(tr '\000' '\n' </proc/device-tree/compatible | head -n1)" = oneplus,aston
+test "$(id -u logix)" = 1001
+cd "$stage"
+sha256sum -c SHA256SUMS
+backup="$(mktemp -d "$stage/backup.XXXXXXXX")"
+cp -a /usr/bin/droidloom-wayland "$backup/"
+user_service() {
+    runuser -u logix -- env XDG_RUNTIME_DIR=/run/user/1001 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus systemctl --user "$@"
+}
+replace_presenter() {
+    local candidate
+    candidate="$(mktemp /usr/bin/.droidloom-wayland.XXXXXXXX)"
+    install -m 0755 "$1" "$candidate"
+    mv -f "$candidate" /usr/bin/droidloom-wayland
+}
+rollback() {
+    trap - ERR
+    replace_presenter "$backup/droidloom-wayland"
+    user_service restart droidloom.service || true
+    echo "presenter update failed; restored $backup" >&2
+    exit 1
+}
+trap rollback ERR
+replace_presenter "$stage/droidloom-wayland"
+user_service restart droidloom.service
+user_service is-active droidloom.service
+presenter_pid="$(user_service show droidloom.service -p MainPID --value)"
+test "$presenter_pid" -gt 0
+test "$(sha256sum "/proc/$presenter_pid/exe" | cut -d' ' -f1)" = \
+    "$(sha256sum "$stage/droidloom-wayland" | cut -d' ' -f1)"
+test -S /run/user/1001/droidloom/native-bridge.sock
+droidloomctl --json status
+trap - ERR
+printf 'Presenter updated and running; previous binary preserved in %s\n' "$backup"

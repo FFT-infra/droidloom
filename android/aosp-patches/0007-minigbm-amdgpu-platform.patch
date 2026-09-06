@@ -1,0 +1,311 @@
+diff --git a/Android.bp b/Android.bp
+index 71e6c62..0a4fe84 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -39,6 +39,7 @@ filegroup {
+         "amdgpu.c",
+         "backend_mock.c",
+         "dma_heap.c",
++        "dri.c",
+         "drv.c",
+         "drv_array_helpers.c",
+         "drv_helpers.c",
+@@ -71,8 +72,16 @@ filegroup {
+ }
+ 
+ generic_cflags = ["-DHAS_DMABUF_SYSTEM_HEAP"]
++amd_cflags = [
++    "-DDRV_AMDGPU",
++    "-DDRI_DRIVER_DIR=/vendor/lib64/dri",
++    "-DDROIDLOOM_MESA_PIPE_DRI_FORMATS",
++    "-DHAS_DMABUF_SYSTEM_HEAP",
++]
+ intel_cflags = [
+     "-DDRV_I915",
+     "-DDRV_XE",
+ ]
++droidloom_x86_cflags = amd_cflags + intel_cflags
++
+ meson_cflags = ["-DDRV_MESON"]
+@@ -89,6 +98,11 @@ mediatek_cflags = [
+ 
+ cc_defaults {
+     name: "minigbm_defaults",
++    include_dirs: [
++        "external/libdrm/amdgpu",
++        "vendor/droidloom/mesa3d/include",
++        "vendor/droidloom/mesa3d/src",
++    ],
+ 
+     cflags: [
+         "-D_FILE_OFFSET_BITS=64",
+@@ -101,6 +115,8 @@ cc_defaults {
+         "-Wsign-compare",
+     ] + select(soong_config_variable("minigbm", "platform"), {
+         "generic": generic_cflags,
++        "amd": amd_cflags,
++        "droidloom_x86": droidloom_x86_cflags,
+         "intel": intel_cflags,
+         "meson": meson_cflags,
+         "msm": msm_cflags,
+@@ -142,6 +158,7 @@ cc_defaults {
+ 
+     shared_libs: [
+         "libcutils",
++        "libdl",
+         "libdmabufheap",
+         "libdrm",
+         "libgralloctypes",
+@@ -194,6 +211,7 @@ cc_library {
+         android: {
+             shared_libs: [
+                 "libcutils",
++                "libdl",
+                 "liblog",
+             ],
+             static_libs: [
+diff --git a/amdgpu.c b/amdgpu.c
+index be84519..b780aa8 100644
+--- a/amdgpu.c
++++ b/amdgpu.c
+@@ -365,6 +365,7 @@ static int amdgpu_init(struct driver *drv)
+ 	drmVersionPtr drm_version;
+ 	struct format_metadata metadata;
+ 	uint64_t use_flags = BO_USE_RENDER_MASK;
++	int ret;
+ 
+ 	priv = calloc(1, sizeof(struct amdgpu_priv));
+ 	if (!priv)
+@@ -381,7 +382,9 @@ static int amdgpu_init(struct driver *drv)
+ 
+ 	drv->priv = priv;
+ 
+-	if (query_dev_info(drv_get_fd(drv), &priv->dev_info)) {
++	ret = query_dev_info(drv_get_fd(drv), &priv->dev_info);
++	if (ret) {
++		drv_loge("AMDGPU_INFO_DEV_INFO failed: %d (%s)\n", ret, strerror(errno));
+ 		free(priv);
+ 		drv->priv = NULL;
+ 		return -ENODEV;
+@@ -389,9 +392,8 @@ static int amdgpu_init(struct driver *drv)
+ 
+ 	priv->dri = dri_init(drv, DRI_PATH, "radeonsi");
+ 	if (!priv->dri) {
+-		free(priv);
+-		drv->priv = NULL;
+-		return -ENODEV;
++		drv_loge("radeonsi DRI initialization failed from %s\n", DRI_PATH);
++		drv_logi("using native linear AMD GEM allocations without legacy DRI\n");
+ 	}
+ 
+ 	/* Continue on failure, as we can still succesfully map things without SDMA. */
+@@ -444,6 +446,15 @@ static int amdgpu_init(struct driver *drv)
+ 				   BO_USE_HW_VIDEO_ENCODER | BO_USE_GPU_DATA_BUFFER |
+ 				   BO_USE_SENSOR_DIRECT_DATA);
+ 
++	/*
++	 * Mesa's Android dril target does not implement the legacy image-allocation
++	 * DRI ABI consumed below. Droidloom can still use minigbm's native AMD GEM
++	 * path with linear DMA-BUFs; all combinations registered above resolve to
++	 * TILE_TYPE_LINEAR and therefore never call through the absent DRI object.
++	 */
++	if (!priv->dri)
++		return 0;
++
+ 	/*
+ 	 * The following formats will be allocated by the DRI backend and may be potentially tiled.
+ 	 * Since format modifier support hasn't been implemented fully yet, it's not
+@@ -514,7 +525,8 @@ static void amdgpu_close(struct driver *drv)
+ 	struct amdgpu_priv *priv = drv->priv;
+ 
+ 	sdma_finish(priv, drv_get_fd(drv));
+-	dri_close(priv->dri);
++	if (priv->dri)
++		dri_close(priv->dri);
+ 	free(priv);
+ 
+ 	drv->priv = NULL;
+@@ -662,6 +674,9 @@ static int amdgpu_create_bo_with_modifiers(struct bo *bo, uint32_t width, uint32
+ 	if (only_use_linear)
+ 		return amdgpu_create_bo_linear(bo, width, height, format, BO_USE_SCANOUT);
+ 
++	if (!priv->dri)
++		return -ENOTSUP;
++
+ 	return dri_bo_create_with_modifiers(priv->dri, bo, width, height, format, 0, modifiers,
+ 					    count);
+ }
+@@ -679,8 +694,14 @@ static int amdgpu_import_bo(struct bo *bo, struct drv_import_fd_data *data)
+ 		dri_tiling = combo->metadata.tiling != TILE_TYPE_LINEAR;
+ 	}
+ 
+-	bo->meta.num_planes =
+-	    dri_num_planes_from_modifier(priv->dri, data->format, data->format_modifier);
++	if (!priv->dri) {
++		/* Preserve explicit modifier metadata while PRIME imports the GEM object;
++		 * Mesa's Android EGL path consumes the modifier independently. */
++		bo->meta.num_planes = drv_num_planes_from_format(data->format);
++		return drv_prime_bo_import(bo, data);
++	}
++	bo->meta.num_planes =
++	    dri_num_planes_from_modifier(priv->dri, data->format, data->format_modifier);
+ 
+ 	if (dri_tiling)
+ 		return dri_bo_import(priv->dri, bo, data);
+@@ -848,6 +869,8 @@ static size_t amdgpu_num_planes_from_modifier(struct driver *drv, uint32_t forma
+ 					      uint64_t modifier)
+ {
+ 	struct amdgpu_priv *priv = drv->priv;
++	if (!priv->dri)
++		return drv_num_planes_from_format(format);
+ 	return dri_num_planes_from_modifier(priv->dri, format, modifier);
+ }
+ 
+diff --git a/dri.c b/dri.c
+index bf980be..c45e39c 100644
+--- a/dri.c
++++ b/dri.c
+@@ -27,6 +27,23 @@
+ #include "GL/internal/dri_interface.h"
+ #undef GL_GLEXT_LEGACY
+ 
++#ifdef DROIDLOOM_MESA_PIPE_DRI_FORMATS
++#undef DIV_ROUND_UP
++#include "util/format/u_formats.h"
++#define __DRI_IMAGE_FORMAT_R8 PIPE_FORMAT_R8_UNORM
++#define __DRI_IMAGE_FORMAT_GR88 PIPE_FORMAT_R8G8_UNORM
++#define __DRI_IMAGE_FORMAT_RGB565 PIPE_FORMAT_B5G6R5_UNORM
++#define __DRI_IMAGE_FORMAT_XRGB8888 PIPE_FORMAT_B8G8R8X8_UNORM
++#define __DRI_IMAGE_FORMAT_ARGB8888 PIPE_FORMAT_B8G8R8A8_UNORM
++#define __DRI_IMAGE_FORMAT_XBGR8888 PIPE_FORMAT_R8G8B8X8_UNORM
++#define __DRI_IMAGE_FORMAT_ABGR8888 PIPE_FORMAT_R8G8B8A8_UNORM
++#define __DRI_IMAGE_FORMAT_XRGB2101010 PIPE_FORMAT_B10G10R10X2_UNORM
++#define __DRI_IMAGE_FORMAT_XBGR2101010 PIPE_FORMAT_R10G10B10X2_UNORM
++#define __DRI_IMAGE_FORMAT_ARGB2101010 PIPE_FORMAT_B10G10R10A2_UNORM
++#define __DRI_IMAGE_FORMAT_ABGR2101010 PIPE_FORMAT_R10G10B10A2_UNORM
++#define __DRI_IMAGE_FORMAT_ABGR16161616F PIPE_FORMAT_R16G16B16A16_FLOAT
++#endif
++
+ struct dri_driver {
+ 	int fd;
+ 	void *driver_handle;
+@@ -192,54 +209,76 @@ struct dri_driver *dri_init(struct driver *drv, const char *dri_so_path, const c
+ 		return NULL;
+ 
+ 	char *node_name = drmGetRenderDeviceNameFromFd(drv_get_fd(drv));
+-	if (!node_name)
++	if (!node_name) {
++		drv_loge("DRI could not resolve the render node from fd %d\n", drv_get_fd(drv));
+ 		goto free_dri;
++	}
+ 
+ 	dri->fd = open(node_name, O_RDWR);
++	if (dri->fd < 0)
++		drv_loge("DRI could not open %s: %s\n", node_name, strerror(errno));
+ 	free(node_name);
+ 	if (dri->fd < 0)
+ 		goto free_dri;
+ 
+ 	dri->driver_handle = dri_dlopen(dri_so_path);
+-	if (!dri->driver_handle)
++	if (!dri->driver_handle) {
++		drv_loge("DRI could not load %s: %s\n", dri_so_path, dlerror());
+ 		goto close_dri_fd;
++	}
+ 
+ 	snprintf(fname, sizeof(fname), __DRI_DRIVER_GET_EXTENSIONS "_%s", driver_suffix);
+ 	get_extensions = dlsym(dri->driver_handle, fname);
+-	if (!get_extensions)
++	if (!get_extensions) {
++		drv_loge("DRI could not resolve %s from %s: %s\n", fname, dri_so_path, dlerror());
+ 		goto free_handle;
++	}
+ 
+ 	dri->extensions = get_extensions();
+-	if (!dri->extensions)
++	if (!dri->extensions) {
++		drv_loge("DRI driver %s returned no extensions\n", driver_suffix);
+ 		goto free_handle;
++	}
+ 
+ 	if (!lookup_extension(dri->extensions, __DRI_CORE, 2,
+-			      (const __DRIextension **)&dri->core_extension))
++			      (const __DRIextension **)&dri->core_extension)) {
++		drv_loge("DRI driver %s has no compatible core extension\n", driver_suffix);
+ 		goto free_handle;
++	}
+ 
+ 	/* Version 4 for createNewScreen2 */
+ 	if (!lookup_extension(dri->extensions, __DRI_DRI2, 4,
+-			      (const __DRIextension **)&dri->dri2_extension))
++			      (const __DRIextension **)&dri->dri2_extension)) {
++		drv_loge("DRI driver %s has no compatible DRI2 extension\n", driver_suffix);
+ 		goto free_handle;
++	}
+ 
+ 	dri->device = dri->dri2_extension->createNewScreen2(0, dri->fd, loader_extensions,
+ 							    dri->extensions, &dri->configs, NULL);
+-	if (!dri->device)
++	if (!dri->device) {
++		drv_loge("DRI driver %s could not create a screen\n", driver_suffix);
+ 		goto free_handle;
++	}
+ 
+ 	dri->context =
+ 	    dri->dri2_extension->createNewContext(dri->device, *dri->configs, NULL, NULL);
+ 
+-	if (!dri->context)
++	if (!dri->context) {
++		drv_loge("DRI driver %s could not create a context\n", driver_suffix);
+ 		goto free_screen;
++	}
+ 
+ 	if (!lookup_extension(dri->core_extension->getExtensions(dri->device), __DRI_IMAGE, 12,
+-			      (const __DRIextension **)&dri->image_extension))
++			      (const __DRIextension **)&dri->image_extension)) {
++		drv_loge("DRI driver %s has no compatible image extension\n", driver_suffix);
+ 		goto free_context;
++	}
+ 
+ 	if (!lookup_extension(dri->core_extension->getExtensions(dri->device), __DRI2_FLUSH, 4,
+-			      (const __DRIextension **)&dri->flush_extension))
++			      (const __DRIextension **)&dri->flush_extension)) {
++		drv_loge("DRI driver %s has no compatible flush extension\n", driver_suffix);
+ 		goto free_context;
++	}
+ 
+ 	return dri;
+ 
+diff --git a/drv.c b/drv.c
+index b74ed99..d7abfdc 100644
+--- a/drv.c
++++ b/drv.c
+@@ -100,8 +100,10 @@ static const struct backend *drv_get_backend(int fd)
+ 
+ 	drm_version = drmGetVersion(fd);
+ 
+-	if (!drm_version)
++	if (!drm_version) {
++		drv_loge("drmGetVersion failed while selecting a minigbm backend\n");
+ 		return NULL;
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(drv_backend_list); i++) {
+ 		const struct backend *b = drv_backend_list[i];
+@@ -111,6 +113,7 @@ static const struct backend *drv_get_backend(int fd)
+ 		}
+ 	}
+ 
++	drv_loge("no minigbm backend for DRM driver '%s'\n", drm_version->name);
+ 	drmFreeVersion(drm_version);
+ 	return NULL;
+ }
+@@ -159,6 +162,8 @@ struct driver *drv_create(int fd, const struct backend *backend)
+ 		/* this might update drv->backend to point to another sub-backend */
+ 		ret = drv->backend->init(drv);
+ 		if (ret) {
++			drv_loge("minigbm backend '%s' initialization failed: %d\n",
++				 drv->backend->name, ret);
+ 			drv_array_destroy(drv->combos);
+ 			goto free_mappings;
+ 		}

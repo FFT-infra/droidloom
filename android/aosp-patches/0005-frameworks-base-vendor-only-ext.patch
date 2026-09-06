@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000005 Mon Sep 17 00:00:00 2001
+From: Droidloom <droidloom@localhost>
+Date: Sat, 15 Aug 2026 21:15:00 +0200
+Subject: [PATCH] frameworks/base: do not install ext in vendor-only builds
+
+Droidloom reuses the exact ext.jar from its pinned official system image and
+builds only a matching vendor partition.  Mark the local sparse-tree copy
+uninstallable so Kati does not require a dex artifact for this unrelated
+system module whose transitive source projects are deliberately absent.
+---
+ Android.bp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index 1d3afb341f43..fcfd994e4df8 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -726,7 +726,7 @@ filegroup {
+ // ============================================================
+ java_library {
+     name: "ext",
+-    installable: true,
++    installable: false,
+     sdk_version: "core_platform",
+     static_libs: [
+         "libphonenumber-platform",
+-- 
+2.51.0

@@ -1,0 +1,63 @@
+diff --git a/bpf/headers/include/bpf/BpfUtils.h b/bpf/headers/include/bpf/BpfUtils.h
+index 5ca52c6..722b399 100644
+--- a/bpf/headers/include/bpf/BpfUtils.h
++++ b/bpf/headers/include/bpf/BpfUtils.h
+@@ -196,6 +196,16 @@ static inline int synchronizeKernelRCU() {
+ 
+     if (pfSocket < 0) {
+         const int err = errno;
++        // The current Droidloom development target lacks AF_KEY. Its boot
++        // path installs the initial networking-BPF maps before publishing
++        // the cell interface, so this startup synchronization has no old
++        // cell traffic readers to drain. This library is a Droidloom-owned
++        // cell projection; production runtime map rotation still needs a
++        // real RCU primitive.
++        if (err == EAFNOSUPPORT) {
++            ALOGI("Droidloom cell bootstrap: AF_KEY RCU trigger is unavailable");
++            return 0;
++        }
+         ALOGE("create PF_KEY socket failed: %s", strerror(err));
+         return -err;
+     }
+diff --git a/staticlibs/native/bpfmapjni/com_android_net_module_util_Bpf.cpp b/staticlibs/native/bpfmapjni/com_android_net_module_util_Bpf.cpp
+--- a/staticlibs/native/bpfmapjni/com_android_net_module_util_Bpf.cpp
++++ b/staticlibs/native/bpfmapjni/com_android_net_module_util_Bpf.cpp
+@@ -139,7 +139,18 @@ static jboolean com_android_net_module_util_BpfMap_nativeFindMapEntry(JNIEnv *en
+ static jint com_android_net_module_util_BpfMap_nativeSynchronizeKernelRCU(JNIEnv *env,
+                                                                           jclass clazz) {
+     const int pfSocket = socket(AF_KEY, SOCK_RAW | SOCK_CLOEXEC, PF_KEY_V2);
+-    if (pfSocket < 0) return -errno;
++    if (pfSocket < 0) {
++        const int err = errno;
++        // The current development target omits AF_KEY. Droidloom installs
++        // the initial maps before publishing the cell interface, so no old
++        // cell traffic reader exists during bootstrap. Runtime map rotation
++        // needs a real RCU primitive before this becomes production policy.
++        // This replacement library is mounted only in a Droidloom cell.
++        if (err == EAFNOSUPPORT) {
++            return 0;
++        }
++        return -err;
++    }
+     // On Linux close() will always close the fd, any error it returns is a previous pending error.
+     if (close(pfSocket)) return -errno;  // in practice cannot fail
+     return 0;
+diff --git a/service/Android.bp b/service/Android.bp
+--- a/service/Android.bp
++++ b/service/Android.bp
+@@ -87,13 +87,14 @@ cc_library_shared {
+     ],
+     static_libs: [
+         "libnet_utils_device_common_bpfjni",
+         "libnet_utils_device_common_bpfutils",
++        "libnativehelper_compat_libc++",
+     ],
+     shared_libs: [
+         "liblog",
+-        "libnativehelper",
+     ],
+     apex_available: [
++        "//apex_available:platform",
+         "com.android.tethering",
+     ],
+ }

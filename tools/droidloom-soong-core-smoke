@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+source_tree="${1:-$repo_root/.work/aosp-m2-source}"
+source_tree="$(readlink -f -- "$source_tree")"
+lock="$repo_root/android/manifest/m2-sparse-source-lock.json"
+manifest="$source_tree/.droidloom-source-manifest.json"
+product="${DROIDLOOM_ANDROID_PRODUCT:-droidloom_arm64}"
+case "$product" in
+    droidloom_arm64)
+        connectivity_variant="android_arm64_armv8-a_shared"
+        ;;
+    droidloom_x86_64)
+        connectivity_variant="android_x86_64_shared"
+        ;;
+    *)
+        echo "unsupported Droidloom Android product: $product" >&2
+        exit 2
+        ;;
+esac
+proto_placeholder="$source_tree/frameworks/base/core/proto/droidloom/sparse-build-placeholder.proto"
+proto_fixture="$repo_root/android/manifest/sparse-build-placeholder.proto"
+instrumentation_placeholder="$source_tree/frameworks/base/core/java/android/os/instrumentation/IDroidloomSparseBuildInstrumentation.aidl"
+instrumentation_fixture="$repo_root/android/manifest/sparse-build-instrumentation-placeholder.aidl"
+rkp_placeholder="$source_tree/frameworks/base/core/java/android/security/rkp/IDroidloomSparseBuildRkp.aidl"
+rkp_fixture="$repo_root/android/manifest/sparse-build-rkp-placeholder.aidl"
+display_flags_projection="$source_tree/frameworks/base/droidloom-sparse-display-flags"
+display_flags_bp_fixture="$repo_root/android/manifest/sparse-build-display-flags.bp"
+display_flags_fixture="$repo_root/android/manifest/sparse-build-display-flags.aconfig"
+prebuilt_turbine="$source_tree/prebuilts/build-tools/common/framework/turbine.jar"
+connectivity_checkout="$source_tree/packages/modules/Connectivity"
+netbpfload_patch="$repo_root/android/aosp-patches/0001-netbpfload-tolerate-shared-kernel-bpf-ids.patch"
+netbpfload_patch_applied=false
+offline_rcu_patch="$repo_root/android/aosp-patches/0003-connectivity-offline-rcu.patch"
+offline_rcu_patch_applied=false
+netd_checkout="$source_tree/system/netd"
+netd_cell_policy_patch="$repo_root/android/aosp-patches/0006-netd-cell-kernel-policy.patch"
+netd_cell_policy_patch_applied=false
+hardware_interfaces_checkout="$source_tree/hardware/interfaces"
+audio_patch="$repo_root/android/aosp-patches/0002-audio-default-only-service.patch"
+audio_patch_applied=false
+libmeminfo_checkout="$source_tree/system/memory/libmeminfo"
+libmeminfo_patch="$repo_root/android/aosp-patches/0004-libmeminfo-offline-gpu-accounting.patch"
+libmeminfo_patch_applied=false
+frameworks_native_checkout="$source_tree/frameworks/native"
+surfaceflinger_patch="$repo_root/android/surfaceflinger/0001-droidloom-direct-denial-render-surface.patch"
+surfaceflinger_patch_applied=false
+surfaceflinger_input_patch="$repo_root/android/surfaceflinger/0002-droidloom-task-input-token.patch"
+surfaceflinger_input_patch_applied=false
+inputflinger_patch="$repo_root/android/inputflinger/0001-application-token-targeted-injection.patch"
+inputflinger_patch_applied=false
+inputflinger_binder_patch="$repo_root/android/inputflinger/0002-droidloom-targeted-injection-binder.patch"
+inputflinger_binder_patch_applied=false
+binder_context_manager_patch="$repo_root/android/binder-compat/0001-droidloom-context-manager-without-kernel-sid.patch"
+binder_context_manager_patch_applied=false
+servicemanager_context_patch="$repo_root/android/binder-compat/0002-droidloom-servicemanager-pid-context-fallback.patch"
+servicemanager_context_patch_applied=false
+binder_caller_context_patch="$repo_root/android/binder-compat/0003-droidloom-cell-caller-context-fallback.patch"
+binder_caller_context_patch_applied=false
+system_core_checkout="$source_tree/system/core"
+init_cell_patch="$repo_root/android/init-compat/0001-droidloom-cell-namespace.patch"
+init_cell_patch_applied=false
+minigbm_checkout="$source_tree/external/minigbm"
+minigbm_amdgpu_patch="$repo_root/android/aosp-patches/0007-minigbm-amdgpu-platform.patch"
+minigbm_amdgpu_patch_applied=false
+vold_checkout="$source_tree/system/vold"
+vold_storage_patch="$repo_root/android/aosp-patches/0008-vold-preserve-shared-storage-submounts.patch"
+vold_storage_patch_applied=false
+frameworks_base_checkout="$source_tree/frameworks/base"
+navigation_insets_patch="$repo_root/android/framework/0001-droidloom-bottom-navigation-insets.patch"
+navigation_insets_patch_applied=false
+framework_app_projection_backup=""
+
+if [[ "$source_tree" == "/" || "$source_tree" == "$repo_root" ]]; then
+    echo "refusing unsafe source tree: $source_tree" >&2
+    exit 2
+fi
+
+for required in \
+    "$source_tree/build/envsetup.sh" \
+    "$source_tree/build/soong" \
+    "$display_flags_bp_fixture" \
+    "$display_flags_fixture" \
+    "$prebuilt_turbine" \
+    "$source_tree/frameworks/native/services/serialservice" \
+    "$source_tree/external/icu/android_icu4j" \
+    "$connectivity_checkout/bpf/loader/NetBpfLoad.cpp" \
+    "$connectivity_checkout/service/jni/com_android_server_connectivity_ClatCoordinator.cpp" \
+    "$netbpfload_patch" \
+    "$offline_rcu_patch" \
+    "$netd_checkout/server/Controllers.cpp" \
+    "$netd_cell_policy_patch" \
+    "$hardware_interfaces_checkout/audio/aidl/default/Module.cpp" \
+    "$audio_patch" \
+    "$libmeminfo_checkout/sysmeminfo.cpp" \
+    "$libmeminfo_patch" \
+    "$frameworks_native_checkout/libs/binder/Binder.cpp" \
+    "$frameworks_native_checkout/services/inputflinger/dispatcher/InputDispatcher.cpp" \
+    "$frameworks_native_checkout/services/inputflinger/InputManager.cpp" \
+    "$frameworks_native_checkout/services/surfaceflinger/SurfaceFlinger.cpp" \
+    "$surfaceflinger_patch" \
+    "$surfaceflinger_input_patch" \
+    "$inputflinger_patch" \
+    "$inputflinger_binder_patch" \
+    "$binder_context_manager_patch" \
+    "$servicemanager_context_patch" \
+    "$binder_caller_context_patch" \
+    "$system_core_checkout/init/mount_namespace.cpp" \
+    "$init_cell_patch" \
+    "$minigbm_checkout/Android.bp" \
+    "$minigbm_amdgpu_patch" \
+    "$manifest"; do
+    if [[ ! -e "$required" ]]; then
+        echo "missing focused-build input: $required" >&2
+        exit 2
+    fi
+done
+
+expected_lock_hash="$(sha256sum "$lock" | cut -d ' ' -f 1)"
+materialized_lock_hash="$(jq -er '.source_lock_sha256' "$manifest")"
+if [[ "$expected_lock_hash" != "$materialized_lock_hash" ]]; then
+    echo "materialized source manifest does not match the current lock" >&2
+    echo "run droidloom-source reconcile before this smoke build" >&2
+    exit 2
+fi
+
+cargo run --offline --quiet \
+    --manifest-path "$repo_root/Cargo.toml" \
+    -p droidloom-source -- \
+    verify-materialized --lock "$lock" --output "$source_tree"
+
+markers=(
+    "$source_tree/frameworks/base/tools/aapt2/integration-tests/.find-ignore"
+    "$source_tree/frameworks/base/core/tests/.find-ignore"
+    "$source_tree/frameworks/base/media/tests/.find-ignore"
+    "$source_tree/art/test/.find-ignore"
+    "$source_tree/art/libartservice/service/.find-ignore"
+    "$source_tree/packages/modules/Virtualization/guest/trusty/test_vm/.find-ignore"
+    "$source_tree/packages/modules/Virtualization/guest/trusty/test_vm_os/.find-ignore"
+    "$source_tree/packages/modules/Connectivity/framework/.find-ignore"
+    "$source_tree/packages/modules/Connectivity/Tethering/common/TetheringLib/.find-ignore"
+)
+if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" != "1" ]]; then
+    markers+=("$source_tree/frameworks/native/services/serialservice/.find-ignore")
+    markers+=("$source_tree/packages/modules/Virtualization/libs/framework-virtualization/.find-ignore")
+    markers+=("$source_tree/frameworks/base/services/.find-ignore")
+else
+    # The focused services artifact does not need Ravenwood/device test graphs.
+    markers+=("$source_tree/frameworks/base/services/tests/.find-ignore")
+    markers+=("$source_tree/frameworks/base/services/robotests/.find-ignore")
+fi
+
+for marker in "${markers[@]}"; do
+    if [[ -e "$marker" ]]; then
+        echo "refusing pre-existing Finder projection marker: $marker" >&2
+        exit 2
+    fi
+done
+if [[ -e "$proto_placeholder" ]]; then
+    echo "refusing pre-existing sparse-build placeholder: $proto_placeholder" >&2
+    exit 2
+fi
+for placeholder in "$instrumentation_placeholder" "$rkp_placeholder"; do
+    if [[ -e "$placeholder" ]]; then
+        echo "refusing pre-existing sparse-build placeholder: $placeholder" >&2
+        exit 2
+    fi
+done
+if [[ -e "$display_flags_projection" ]]; then
+    echo "refusing pre-existing sparse-build display-flags projection: $display_flags_projection" >&2
+    exit 2
+fi
+
+cleanup() {
+    if [[ -n "$framework_app_projection_backup" ]]; then
+        cp -a "$framework_app_projection_backup/." "$source_tree/"
+        rm -rf -- "$framework_app_projection_backup"
+        framework_app_projection_backup=""
+    fi
+    if [[ "$navigation_insets_patch_applied" == true ]]; then
+        git -C "$frameworks_base_checkout" apply -R "$navigation_insets_patch"
+    fi
+    if [[ "$vold_storage_patch_applied" == true ]]; then
+        git -C "$vold_checkout" apply --reverse "$vold_storage_patch"
+    fi
+    if [[ "$surfaceflinger_input_patch_applied" == true ]]; then
+        git -C "$frameworks_native_checkout" apply -R "$surfaceflinger_input_patch"
+    fi
+    if [[ "$surfaceflinger_patch_applied" == true ]]; then
+        git -C "$frameworks_native_checkout" apply -R "$surfaceflinger_patch"
+    fi
+    if [[ "$inputflinger_binder_patch_applied" == true ]]; then
+        git -C "$frameworks_native_checkout" apply -R "$inputflinger_binder_patch"
+    fi
+    if [[ "$inputflinger_patch_applied" == true ]]; then
+        git -C "$frameworks_native_checkout" apply -R "$inputflinger_patch"
+    fi
+    if [[ "$init_cell_patch_applied" == true ]]; then
+        git -C "$source_tree" apply -R "$init_cell_patch"
+    fi
+    if [[ "$minigbm_amdgpu_patch_applied" == true ]]; then
+        git -C "$minigbm_checkout" apply -R "$minigbm_amdgpu_patch"
+    fi
+    if [[ "$netd_cell_policy_patch_applied" == true ]]; then
+        git -C "$netd_checkout" apply -R "$netd_cell_policy_patch"
+    fi
+    if [[ "$binder_caller_context_patch_applied" == true ]]; then
+        git -C "$source_tree" apply -R "$binder_caller_context_patch"
+    fi
+    if [[ "$servicemanager_context_patch_applied" == true ]]; then
+        git -C "$source_tree" apply -R "$servicemanager_context_patch"
+    fi
+    if [[ "$binder_context_manager_patch_applied" == true ]]; then
+        git -C "$source_tree" apply -R "$binder_context_manager_patch"
+    fi
+    if [[ "$libmeminfo_patch_applied" == true ]]; then
+        git -C "$libmeminfo_checkout" apply -R "$libmeminfo_patch"
+    fi
+    if [[ "$audio_patch_applied" == true ]]; then
+        git -C "$hardware_interfaces_checkout" apply -R "$audio_patch"
+    fi
+    if [[ "$netbpfload_patch_applied" == true ]]; then
+        git -C "$connectivity_checkout" apply -R "$netbpfload_patch"
+    fi
+    if [[ "$offline_rcu_patch_applied" == true ]]; then
+        git -C "$connectivity_checkout" apply -R "$offline_rcu_patch"
+    fi
+    for marker in "${markers[@]}"; do
+        rm -f -- "$marker"
+    done
+    rm -f -- "$proto_placeholder"
+    rm -f -- "$instrumentation_placeholder" "$rkp_placeholder"
+    rm -f -- "$display_flags_projection/Android.bp" \
+        "$display_flags_projection/display_flags.aconfig"
+    rmdir -- "$display_flags_projection" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$proto_placeholder")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$(dirname -- "$proto_placeholder")")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$instrumentation_placeholder")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$rkp_placeholder")" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+# These parents are present only to reach required flags/interfaces. Their
+# app generators require app sources that focused builds do not consume.
+# Keep this projection in every mode so source expansion preserves vendor builds.
+framework_app_projection_backup="$(mktemp -d)"
+python3 - "$source_tree" "$framework_app_projection_backup" <<'PY'
+from pathlib import Path
+import re
+import shutil
+import sys
+
+root, backup = map(Path, sys.argv[1:])
+for relative in (
+    "frameworks/base/libs/WindowManager/Shell/Android.bp",
+    "frameworks/base/packages/SystemUI/Android.bp",
+    "packages/apps/Launcher3/Android.bp",
+    "packages/apps/Settings/Android.bp",
+    "frameworks/native/services/serialservice/Android.bp",
+    "packages/modules/ConfigInfrastructure/aconfigd/Android.bp",
+    "packages/modules/Permission/framework-s/Android.bp",
+):
+    source = root / relative
+    target = backup / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    original = source.read_text()
+    metadata = re.findall(r"^(?:package|license) \{.*?^\}", original, re.M | re.S)
+    if not metadata:
+        raise SystemExit(f"missing package metadata in {relative}")
+    source.write_text("// Temporary Droidloom focused-build projection.\n" + "\n\n".join(metadata) + "\n")
+
+# Permission's released SDK omits flagged role constants that this platform
+# source uses. Generate its complete API stubs from the pinned signatures,
+# retaining their actual values without rebuilding the Permission runtime.
+source = root / "packages/modules/Permission/framework-s/Android.bp"
+contributions = []
+modules = []
+for scope, filename in (("public", "current.txt"), ("system", "system-current.txt"),
+                        ("module-lib", "module-lib-current.txt")):
+    name = "droidloom-permission-s-" + scope + "-api"
+    contributions.append(name)
+    modules.append('java_api_contribution {\n'
+        f'    name: "{name}",\n'
+        f'    api_surface: "{scope}",\n'
+        f'    api_file: "api/{filename}",\n'
+        '}\n')
+modules.append('java_api_library {\n'
+    '    name: "droidloom-permission-s-api-stubs",\n'
+    '    api_surface: "module-lib",\n'
+    '    api_contributions: [' + ', '.join('"' + name + '"' for name in contributions) + '],\n'
+    '    sdk_version: "module_current",\n'
+    '    libs: ["stub-annotations"],\n'
+    '    stubs_type: "everything",\n'
+    # These are immutable API snapshots, with no local implementation build
+    # against which Soong could regenerate/check the same signatures.
+    '    enable_validation: false,\n'
+    '    visibility: ["//prebuilts/sdk:__pkg__"],\n'
+    '}\n')
+source.write_text(source.read_text() + '\n'.join(modules))
+
+# Compile-only API imports avoid rebuilding the unmodified Mainline modules and
+# regenerating the Android SDK. All jars are in the verified SDK checkout.
+relative = "prebuilts/sdk/Android.bp"
+source = root / relative
+target = backup / relative
+target.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(source, target)
+imports = []
+scopes = {
+    "public": ("", "current", "android_stubs_current"),
+    "system": (".system", "system_current", "android_system_stubs_current"),
+    "module-lib": (".module_lib", "module_current", "android_module_lib_stubs_current"),
+    "system-server": (".system_server", "system_server_current", "android_system_server_stubs_current"),
+}
+for scope, (suffix, sdk, combined) in scopes.items():
+    for jar in sorted((source.parent / "current" / scope).glob("*.jar")):
+        if jar.stem == "android":
+            names = [combined, combined + "_exportable"]
+        elif jar.stem in ("android-non-updatable", "android.net.ipsec.ike") or jar.stem.startswith(("framework-", "service-")):
+            names = [jar.stem + ".stubs" + suffix,
+                     jar.stem + ".stubs.exportable" + suffix]
+        else:
+            continue
+        for name in names:
+            if jar.stem == "framework-permission-s" and scope == "module-lib":
+                imports.append('java_library {\n'
+                    f'    name: "{name}",\n'
+                    '    static_libs: ["droidloom-permission-s-api-stubs"],\n'
+                    f'    sdk_version: "{sdk}",\n'
+                    '    is_stubs_module: true,\n'
+                    '    installable: false,\n'
+                    '    visibility: ["//visibility:public"],\n'
+                    '}\n')
+                continue
+            imports.append('java_import {\n'
+                f'    name: "{name}",\n'
+                f'    jars: ["{jar.relative_to(source.parent)}"],\n'
+                f'    sdk_version: "{sdk}",\n'
+                '    prefer: true,\n'
+                '    is_stubs_module: true,\n'
+                '    installable: false,\n'
+                '    visibility: ["//visibility:public"],\n'
+                '}\n')
+source.write_text(source.read_text() + "\n// Droidloom compile-only SDK imports.\n" + "\n".join(imports))
+PY
+if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" == "1" ]]; then
+    git -C "$frameworks_base_checkout" apply --check "$navigation_insets_patch"
+    git -C "$frameworks_base_checkout" apply "$navigation_insets_patch"
+    navigation_insets_patch_applied=true
+fi
+
+git -C "$connectivity_checkout" apply --check "$netbpfload_patch"
+git -C "$connectivity_checkout" apply "$netbpfload_patch"
+netbpfload_patch_applied=true
+git -C "$vold_checkout" apply --check "$vold_storage_patch"
+git -C "$vold_checkout" apply "$vold_storage_patch"
+vold_storage_patch_applied=true
+git -C "$connectivity_checkout" apply --check "$offline_rcu_patch"
+git -C "$connectivity_checkout" apply "$offline_rcu_patch"
+offline_rcu_patch_applied=true
+git -C "$netd_checkout" apply --check "$netd_cell_policy_patch"
+git -C "$netd_checkout" apply "$netd_cell_policy_patch"
+netd_cell_policy_patch_applied=true
+git -C "$hardware_interfaces_checkout" apply --check "$audio_patch"
+git -C "$hardware_interfaces_checkout" apply "$audio_patch"
+audio_patch_applied=true
+git -C "$libmeminfo_checkout" apply --check "$libmeminfo_patch"
+git -C "$libmeminfo_checkout" apply "$libmeminfo_patch"
+libmeminfo_patch_applied=true
+git -C "$source_tree" apply --check "$binder_context_manager_patch"
+git -C "$source_tree" apply "$binder_context_manager_patch"
+binder_context_manager_patch_applied=true
+git -C "$source_tree" apply --check "$servicemanager_context_patch"
+git -C "$source_tree" apply "$servicemanager_context_patch"
+servicemanager_context_patch_applied=true
+git -C "$source_tree" apply --check "$binder_caller_context_patch"
+git -C "$source_tree" apply "$binder_caller_context_patch"
+binder_caller_context_patch_applied=true
+git -C "$frameworks_native_checkout" apply --check "$surfaceflinger_patch"
+git -C "$frameworks_native_checkout" apply "$surfaceflinger_patch"
+surfaceflinger_patch_applied=true
+git -C "$frameworks_native_checkout" apply --check "$surfaceflinger_input_patch"
+git -C "$frameworks_native_checkout" apply "$surfaceflinger_input_patch"
+surfaceflinger_input_patch_applied=true
+git -C "$frameworks_native_checkout" apply --check "$inputflinger_patch"
+git -C "$frameworks_native_checkout" apply "$inputflinger_patch"
+inputflinger_patch_applied=true
+git -C "$frameworks_native_checkout" apply --check "$inputflinger_binder_patch"
+git -C "$frameworks_native_checkout" apply "$inputflinger_binder_patch"
+inputflinger_binder_patch_applied=true
+git -C "$source_tree" apply --check "$init_cell_patch"
+git -C "$source_tree" apply "$init_cell_patch"
+init_cell_patch_applied=true
+git -C "$minigbm_checkout" apply --check "$minigbm_amdgpu_patch"
+git -C "$minigbm_checkout" apply "$minigbm_amdgpu_patch"
+minigbm_amdgpu_patch_applied=true
+
+for marker in "${markers[@]}"; do
+    touch "$marker"
+done
+if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" != "1" ]]; then
+    # Services consumes the complete locked framework sources and needs no
+    # synthetic inputs for the formerly empty vendor-only framework globs.
+    mkdir -p -- "$(dirname -- "$proto_placeholder")"
+    install -m 0644 -- "$proto_fixture" "$proto_placeholder"
+    mkdir -p -- "$(dirname -- "$instrumentation_placeholder")" "$(dirname -- "$rkp_placeholder")"
+    install -m 0644 -- "$instrumentation_fixture" "$instrumentation_placeholder"
+    install -m 0644 -- "$rkp_fixture" "$rkp_placeholder"
+    mkdir -p -- "$display_flags_projection"
+    install -m 0644 -- "$display_flags_bp_fixture" "$display_flags_projection/Android.bp"
+    install -m 0644 -- "$display_flags_fixture" "$display_flags_projection/display_flags.aconfig"
+fi
+
+mkdir -p "$source_tree/vendor/droidloom"
+(
+    cd "$repo_root"
+    rsync -aR \
+        Android.bp \
+        LICENSE LICENSES \
+        ./graphics/droidloom-composer-aidl \
+        ./graphics/droidloom-composer-service \
+        ./graphics/droidloom-composer \
+        ./graphics/droidloom-denial-ipc \
+        ./graphics/droidloom-denial-protocol \
+        ./graphics/droidloom-input-protocol \
+        ./graphics/droidloom-minigbm \
+        ./graphics/droidloom-surface-bridge \
+        ./graphics/droidloom-syncobj \
+        ./graphics/droidloom-task-control \
+        ./graphics/droidloom-transport \
+        ./android/framework/droidloom-task-launcher \
+        ./android/framework/droidloom-input-bridge \
+        ./android/framework/droidloom-ime \
+        ./android/framework/droidloom-home \
+        ./android/framework/droidloom-systemui \
+        ./android/lmkd-compat \
+        ./android/runtime/droidloom-classpath-wrapper \
+        ./android/selinux-compat \
+        "./android/device/$product" \
+        "./device/$product" \
+        "$source_tree/vendor/droidloom/"
+)
+(
+    cd "$source_tree"
+    source build/envsetup.sh >/dev/null
+    lunch "$product" cp2a userdebug >/dev/null
+    export JAVA_HOME="$source_tree/prebuilts/jdk/jdk21/linux-x86"
+    # SOONG_ONLY omits Make's copy of pinned host framework tools. Java source
+    # targets still reference Turbine through HOST_OUT_JAVA_LIBRARIES, so stage
+    # that immutable prebuilt at the standard output path before Ninja runs.
+    install -D -m 0644 -- "$prebuilt_turbine" out/host/linux-x86/framework/turbine.jar
+    if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" == "1" ]]; then
+        # Explicit framework build: the ordinary vendor/HAL build continues to
+        # reuse the official system partitions. Never fetch an unlocked closure.
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m -k 20 out/soong/.intermediates/frameworks/base/services/services/android_common/aligned/services.jar
+        install -D -m 0644 \
+            out/soong/.intermediates/frameworks/base/services/services/android_common/aligned/services.jar \
+            "out/target/product/$product/system/framework/services.jar"
+        "$repo_root/tools/droidloom-navigation-services" stamp \
+            "out/target/product/$product/system/framework/services.jar"
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_TASK_LAUNCHER_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m droidloom-task-launcher
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_FRAMEWORK_BRIDGE_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m android.hardware.graphics.composer3-service.droidloom \
+            droidloom-task-launcher \
+            droidloom-input-bridge
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_INPUT_BRIDGE_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m droidloom-input-bridge
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_SELINUX_COMPAT_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m libdroidloom_selinux_compat
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_INPUTFLINGER_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m libinputflinger droidloom-input-bridge
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_TARGETED_INPUT_ONLY:-}" == "1" ]]; then
+        # SurfaceFlinger resolves task IDs to native application tokens and
+        # InputFlinger dispatches directly to that token. system_server and the
+        # boot framework remain stock.
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m surfaceflinger libinputflinger droidloom-input-bridge
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_COMPOSER_TEST_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m droidloom-composer-aidl-tests
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_GRAPHICS_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m libdroidloom_surface_bridge \
+            android.hardware.graphics.composer3-service.droidloom \
+            droidloom-task-launcher \
+            droidloom-input-bridge \
+            android.hardware.graphics.allocator-service.minigbm \
+            mapper.minigbm \
+            surfaceflinger
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_NETD_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m netd
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_IME_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m DroidloomIME DroidloomHome droidloom-input-bridge droidloom-task-launcher \
+                android.hardware.graphics.composer3-service.droidloom
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_LAUNCHER_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m droidloom-task-launcher
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_VOLD_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m "out/target/product/$product/system/bin/vold"
+        exit
+    fi
+    if [[ "${DROIDLOOM_SOONG_CONNECTIVITY_ONLY:-}" == "1" ]]; then
+        SOONG_ONLY=true \
+            SOONG_INCREMENTAL_ANALYSIS=false \
+            ALLOW_MISSING_DEPENDENCIES=true \
+            m libandroid_net_connectivity_com_android_net_module_util_jni \
+            "out/soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/$connectivity_variant/libservice-connectivity.so"
+        exit
+    fi
+    SOONG_ONLY=true \
+        SOONG_INCREMENTAL_ANALYSIS=false \
+        ALLOW_MISSING_DEPENDENCIES=true \
+        m libdroidloom_transport \
+        libdroidloom_denial_protocol \
+        libdroidloom_denial_ipc \
+        libdroidloom_input_protocol \
+        libdroidloom_syncobj \
+        libdroidloom_surface_bridge \
+        libdroidloom_task_control \
+        libdroidloom_task_launcher \
+        libdroidloom_selinux_compat \
+        libdroidloom_composer \
+        libdroidloom_minigbm \
+        libdroidloom_composer_aidl \
+        droidloom-composer-aidl-tests \
+        android.hardware.graphics.composer3-service.droidloom \
+        droidloom-task-launcher \
+        droidloom-input-bridge \
+        DroidloomIME DroidloomHome DroidloomSystemUI \
+        droidloom-lmkd-compat \
+        droidloom-classpath-wrapper \
+        netbpfload \
+        init_second_stage \
+        netd \
+        "out/target/product/$product/system/bin/vold" \
+        libandroid_net_connectivity_com_android_net_module_util_jni \
+        "out/soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/$connectivity_variant/libservice-connectivity.so" \
+        android.hardware.health-service.example \
+        android.hardware.power-service.example \
+        com.android.hardware.audio.droidloom \
+        libmeminfo \
+        libmemevents \
+        libbinder \
+        servicemanager \
+        android.hardware.graphics.allocator-service.minigbm \
+        mapper.minigbm \
+        libinputflinger \
+        surfaceflinger
+)

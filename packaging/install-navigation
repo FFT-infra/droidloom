@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Activate a verified services jar while preserving the installed runtime/data.
+set -Eeuo pipefail
+stage="${1:?staging directory required}"
+boot_id="${2:?verified boot identity required}"
+test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot_id"
+test "$(uname -m)" = aarch64
+test "$(tr '\000' '\n' </proc/device-tree/compatible | head -n1)" = oneplus,aston
+test "$(id -u logix)" = 1001
+cd "$stage"
+sha256sum -c SHA256SUMS
+backup="$(mktemp -d "$stage/backup.XXXXXXXX")"
+cp -a /etc/droidloom/cell.json "$backup/"
+python3 - "$stage" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+stage = os.path.realpath(sys.argv[1])
+if not stage.startswith('/var/lib/droidloom/navigation-updates/'):
+    raise SystemExit('refusing unexpected navigation bundle location')
+with open(os.path.join(stage, 'services.jar.droidloom-navigation.json')) as source:
+    provenance = json.load(source)
+with open(os.path.join(stage, 'services.jar'), 'rb') as source:
+    digest = hashlib.sha256(source.read()).hexdigest()
+if provenance.get('schema_version') != 1 or provenance.get('services_jar_sha256') != digest:
+    raise SystemExit('services jar does not match verified provenance')
+with open('/etc/droidloom/cell.json') as source:
+    spec = json.load(source)
+overrides = spec['android_file_overrides']
+target = '/system/framework/services.jar'
+matches = [entry for entry in overrides if entry['target'] == target]
+if len(matches) > 1:
+    raise SystemExit('ambiguous services jar override')
+replacement = {'source': os.path.join(stage, 'services.jar'), 'target': target}
+if matches:
+    matches[0].update(replacement)
+else:
+    overrides.append(replacement)
+with open(os.path.join(stage, 'cell.json'), 'w') as destination:
+    json.dump(spec, destination, indent=2)
+    destination.write('\n')
+PY
+user_service() {
+    runuser -u logix -- env XDG_RUNTIME_DIR=/run/user/1001 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus systemctl --user "$@"
+}
+rollback() {
+    trap - ERR
+    user_service stop droidloom.service || true
+    systemctl stop droidloomd.service || true
+    install -m 0644 "$backup/cell.json" /etc/droidloom/cell.json
+    systemctl start droidloomd.service || true
+    user_service start droidloom.service || true
+    echo "navigation update failed; restored $backup" >&2
+    exit 1
+}
+trap rollback ERR
+user_service stop droidloom.service
+systemctl stop droidloomd.service
+install -m 0644 "$stage/cell.json" /etc/droidloom/cell.json
+systemctl start droidloomd.service
+user_service start droidloom.service
+for attempt in $(seq 1 120); do
+    if user_service is-active --quiet droidloom.service && \
+            test -S /run/user/1001/droidloom/native-bridge.sock; then
+        break
+    fi
+    sleep 0.25
+done
+user_service is-active droidloom.service
+test -S /run/user/1001/droidloom/native-bridge.sock
+droidloomctl --json status
+trap - ERR
+printf 'Navigation services updated; previous cell specification preserved in %s\n' "$backup"

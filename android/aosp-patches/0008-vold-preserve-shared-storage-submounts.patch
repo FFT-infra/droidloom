@@ -1,0 +1,45 @@
+diff --git a/Utils.cpp b/Utils.cpp
+index a55a57e..5fe6fd9 100644
+--- a/Utils.cpp
++++ b/Utils.cpp
+@@ -1680,7 +1680,16 @@ status_t MountUserFuse(userid_t user_id, const std::string& absolute_lower_path,
+         return BindMount(sdcardfs_path, pass_through_path);
+     } else {
+         LOG(INFO) << "Bind mounting " << absolute_lower_path << " to " << pass_through_path;
+-        return BindMount(absolute_lower_path, pass_through_path);
++        // Droidloom collections are idmapped submounts. Preserve them in the
++        // lower view used by MediaProvider; a plain bind hides the collections.
++        auto status = UnmountTree(pass_through_path);
++        if (status != OK) return status;
++        if (TEMP_FAILURE_RETRY(mount(absolute_lower_path.c_str(), pass_through_path.c_str(),
++                                    nullptr, MS_BIND | MS_REC, nullptr)) < 0) {
++            PLOG(ERROR) << "Failed to recursively bind " << absolute_lower_path;
++            return -errno;
++        }
++        return OK;
+     }
+ }
+ 
+@@ -1706,7 +1715,7 @@ status_t UnmountUserFuse(userid_t user_id, const std::string& absolute_lower_pat
+     rmdir(fuse_path.c_str());
+ 
+     LOG(INFO) << "Unmounting pass_through_path " << pass_through_path;
+-    auto status = ForceUnmount(pass_through_path);
++    auto status = UnmountTree(pass_through_path);
+     if (status != android::OK) {
+         LOG(ERROR) << "Failed to unmount " << pass_through_path;
+     }
+@@ -1775,7 +1784,12 @@ status_t UnmountUserFuseEnhanced(userid_t user_id, const std::string& absolute_l
+ 
+     std::string pass_through_path(
+             StringPrintf("/mnt/pass_through/%d/%s", user_id, relative_upper_path.c_str()));
+-    paths_to_unmount.push_back(pass_through_path);
++    // Detach the lower tree including its collection submounts. MediaProvider
++    // may retain references while the FUSE upper mount is being torn down.
++    if (UnmountTree(pass_through_path) != OK) {
++        return -errno;
++    }
++    rmdir(pass_through_path.c_str());
+ 
+     auto start_time = std::chrono::steady_clock::now();
+     LOG(INFO) << "Unmounting fuse paths";

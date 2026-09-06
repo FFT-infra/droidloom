@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+stage="${1:?staging directory required}"
+boot_id="${2:?verified boot identity required}"
+test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot_id"
+test "$(uname -m)" = aarch64
+test "$(tr '\000' '\n' </proc/device-tree/compatible | head -n1)" = oneplus,aston
+test "$(id -u logix)" = 1001
+cd "$stage"
+sha256sum -c SHA256SUMS
+backup="$(mktemp -d "$stage/backup.XXXXXXXX")"
+cp -a /etc/droidloom/cell.json /usr/bin/droidloomd /usr/bin/droidloomctl \
+    /usr/bin/droidloom-supervisor /usr/bin/droidloom-wayland "$backup/"
+python3 - "$stage" <<'PY'
+import json
+import os
+import sys
+stage = os.path.realpath(sys.argv[1])
+if not stage.startswith('/var/lib/droidloom/ime-updates/'):
+    raise SystemExit('unexpected IME bundle location')
+with open('/etc/droidloom/cell.json') as source:
+    spec = json.load(source)
+for target, filename in {
+    '/vendor/bin/droidloom-input-bridge': 'droidloom-input-bridge',
+    '/vendor/etc/init/droidloom-input-bridge.rc': 'droidloom-input-bridge.rc',
+    '/vendor/framework/droidloom-input-bridge.jar': 'droidloom-input-bridge.jar',
+    '/vendor/bin/droidloom-task-launcher': 'droidloom-task-launcher',
+    '/vendor/lib64/libdroidloom_task_launcher.dylib.so': 'libdroidloom_task_launcher.dylib.so',
+    '/vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom': 'android.hardware.graphics.composer3-service.droidloom',
+    '/vendor/lib64/libdroidloom_composer_aidl.dylib.so': 'libdroidloom_composer_aidl.dylib.so',
+}.items():
+    spec['android_file_overrides'] = [entry for entry in spec['android_file_overrides'] if entry['target'] != target]
+    spec['android_file_overrides'].append({'source': os.path.join(stage, 'ime', filename), 'target': target})
+# Import HOME from an existing vendor init file: override targets must exist.
+composer = next(entry for entry in spec['android_file_overrides'] if entry['target'] == '/vendor/etc/init/droidloom-composer.rc')
+with open(composer['source']) as source:
+    composer_rc = source.read()
+if 'import /droidloom/ime/droidloom-home.rc' not in composer_rc:
+    composer_rc = 'import /droidloom/ime/droidloom-home.rc\n\n' + composer_rc
+composer['source'] = os.path.join(stage, 'ime', 'droidloom-composer.rc')
+with open(composer['source'], 'w') as destination:
+    destination.write(composer_rc)
+spec['android_runtime_directories'] = [entry for entry in spec.get('android_runtime_directories', []) if entry['target'] != '/droidloom/ime']
+spec['android_runtime_directories'].append({'source': os.path.join(stage, 'ime'), 'target': '/droidloom/ime'})
+with open(os.path.join(stage, 'cell.json'), 'w') as output:
+    json.dump(spec, output, indent=2)
+    output.write('\n')
+PY
+./droidloom-supervisor development-validate --spec "$stage/cell.json"
+user_service() {
+    runuser -u logix -- env XDG_RUNTIME_DIR=/run/user/1001 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus systemctl --user "$@"
+}
+rollback() {
+    trap - ERR
+    user_service stop droidloom.service || true
+    systemctl stop droidloomd.service || true
+    for binary in droidloomd droidloomctl droidloom-supervisor droidloom-wayland; do
+        install -m 0755 "$backup/$binary" "/usr/bin/$binary"
+    done
+    install -m 0644 "$backup/cell.json" /etc/droidloom/cell.json
+    systemctl start droidloomd.service
+    user_service start droidloom.service
+    echo "IME update failed; restored $backup" >&2
+    exit 1
+}
+trap rollback ERR
+user_service stop droidloom.service
+systemctl stop droidloomd.service
+for binary in droidloomd droidloomctl droidloom-supervisor droidloom-wayland; do
+    install -m 0755 "$stage/$binary" "/usr/bin/$binary"
+done
+install -m 0644 "$stage/cell.json" /etc/droidloom/cell.json
+systemctl start droidloomd.service
+user_service start droidloom.service
+user_service is-active droidloom.service
+droidloomctl --json status
+trap - ERR
+printf 'IME bridge installed; previous files preserved in %s\n' "$backup"

@@ -1,0 +1,5 @@
+// Temporary sparse-tree Soong analysis input. The build tools project this
+// valid empty schema into framework glob paths and remove it on exit.
+syntax = "proto2";
+
+package droidloom.sparse_build;

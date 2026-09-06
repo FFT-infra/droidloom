@@ -1,0 +1,318 @@
+diff --git a/services/inputflinger/dispatcher/InjectionState.cpp b/services/inputflinger/dispatcher/InjectionState.cpp
+index f693dcf..ff1590f 100644
+--- a/services/inputflinger/dispatcher/InjectionState.cpp
++++ b/services/inputflinger/dispatcher/InjectionState.cpp
+@@ -20,8 +20,10 @@
+ 
+ namespace android::inputdispatcher {
+ 
+-InjectionState::InjectionState(const std::optional<gui::Uid>& targetUid, bool isAsync)
++InjectionState::InjectionState(const std::optional<gui::Uid>& targetUid,
++                               const sp<IBinder>& targetApplicationToken, bool isAsync)
+       : targetUid(targetUid),
++        targetApplicationToken(targetApplicationToken),
+         injectionIsAsync(isAsync),
+         injectionResult(android::os::InputEventInjectionResult::PENDING),
+         pendingForegroundDispatches(0) {}
+diff --git a/services/inputflinger/dispatcher/InjectionState.h b/services/inputflinger/dispatcher/InjectionState.h
+index 8225dec..49740f3 100644
+--- a/services/inputflinger/dispatcher/InjectionState.h
++++ b/services/inputflinger/dispatcher/InjectionState.h
+@@ -25,11 +25,13 @@ namespace inputdispatcher {
+ 
+ struct InjectionState {
+     const std::optional<gui::Uid> targetUid;
++    const sp<IBinder> targetApplicationToken;
+     const bool injectionIsAsync; // set to true if injection is not waiting for the result
+     android::os::InputEventInjectionResult injectionResult; // initially PENDING
+     int32_t pendingForegroundDispatches; // the number of foreground dispatches in progress
+ 
+-    explicit InjectionState(const std::optional<gui::Uid>& targetUid, bool isAsync);
++    explicit InjectionState(const std::optional<gui::Uid>& targetUid,
++                            const sp<IBinder>& targetApplicationToken, bool isAsync);
+ };
+ 
+ } // namespace inputdispatcher
+diff --git a/services/inputflinger/dispatcher/InputDispatcher.cpp b/services/inputflinger/dispatcher/InputDispatcher.cpp
+index 0d27a09..0cee0b6 100644
+--- a/services/inputflinger/dispatcher/InputDispatcher.cpp
++++ b/services/inputflinger/dispatcher/InputDispatcher.cpp
+@@ -611,16 +611,24 @@ bool isWindowOwnedBy(const sp<WindowInfoHandle>& windowHandle, gui::Pid pid, gui
+ // entry is a targeted injection whose uid target doesn't match the window owner.
+ std::optional<std::string> verifyTargetedInjection(const sp<WindowInfoHandle>& window,
+                                                    const EventEntry& entry) {
+-    if (entry.injectionState == nullptr || !entry.injectionState->targetUid) {
++    if (entry.injectionState == nullptr ||
++        (!entry.injectionState->targetUid &&
++         entry.injectionState->targetApplicationToken == nullptr)) {
+         // The event was not injected, or the injected event does not target a window.
+         return {};
+     }
+-    const auto uid = *entry.injectionState->targetUid;
+     if (window == nullptr) {
+-        return StringPrintf("No valid window target for injection into uid %s.",
+-                            uid.toString().c_str());
++        return "No valid window target for targeted injection.";
+     }
+-    if (entry.injectionState->targetUid != window->getInfo()->ownerUid) {
++    if (entry.injectionState->targetApplicationToken != nullptr &&
++        window->getApplicationToken() != entry.injectionState->targetApplicationToken) {
++        return StringPrintf("Injected event targeted at an application token would be dispatched "
++                            "to window '%s' belonging to another application token.",
++                            window->getName().c_str());
++    }
++    if (entry.injectionState->targetUid &&
++        entry.injectionState->targetUid != window->getInfo()->ownerUid) {
++        const auto uid = *entry.injectionState->targetUid;
+         return StringPrintf("Injected event targeted at uid %s would be dispatched to window '%s' "
+                             "owned by uid %s.",
+                             uid.toString().c_str(), window->getName().c_str(),
+@@ -1513,13 +1521,18 @@ void InputDispatcher::addRecentEventLocked(std::shared_ptr<const EventEntry> ent
+ 
+ sp<WindowInfoHandle> InputDispatcher::DispatcherWindowInfo::findTouchedWindowAt(
+         ui::LogicalDisplayId displayId, float x, float y, bool isStylus,
+-        const sp<android::gui::WindowInfoHandle> ignoreWindow) const {
++        const sp<android::gui::WindowInfoHandle> ignoreWindow,
++        const sp<IBinder>& targetApplicationToken) const {
+     // Traverse windows from front to back to find touched window.
+     const auto& windowHandles = getWindowHandlesForDisplay(displayId);
+     for (const sp<WindowInfoHandle>& windowHandle : windowHandles) {
+         if (ignoreWindow && haveSameToken(windowHandle, ignoreWindow)) {
+             continue;
+         }
++        if (targetApplicationToken != nullptr &&
++            windowHandle->getApplicationToken() != targetApplicationToken) {
++            continue;
++        }
+ 
+         const WindowInfo& info = *windowHandle->getInfo();
+         if (!info.isSpy() && windowAcceptsTouchAt(info, displayId, x, y, isStylus)) {
+@@ -1529,6 +1542,20 @@ sp<WindowInfoHandle> InputDispatcher::DispatcherWindowInfo::findTouchedWindowAt(
+     return nullptr;
+ }
+ 
++sp<WindowInfoHandle> InputDispatcher::DispatcherWindowInfo::findWindowByApplicationToken(
++        ui::LogicalDisplayId displayId, const sp<IBinder>& targetApplicationToken) const {
++    for (const sp<WindowInfoHandle>& windowHandle : getWindowHandlesForDisplay(displayId)) {
++        const WindowInfo& info = *windowHandle->getInfo();
++        if (windowHandle->getApplicationToken() == targetApplicationToken && !info.isSpy() &&
++            !info.inputConfig.test(WindowInfo::InputConfig::NOT_VISIBLE) &&
++            !info.inputConfig.test(WindowInfo::InputConfig::NOT_FOCUSABLE) &&
++            !info.inputConfig.test(WindowInfo::InputConfig::NO_INPUT_CHANNEL)) {
++            return windowHandle;
++        }
++    }
++    return nullptr;
++}
++
+ std::vector<InputTarget> InputDispatcher::DispatcherTouchState::findOutsideTargets(
+         ui::LogicalDisplayId displayId, const sp<gui::WindowInfoHandle>& touchedWindow,
+         int32_t pointerId, std::function<void()> dump) {
+@@ -2442,9 +2469,23 @@ Result<sp<WindowInfoHandle>, InputEventInjectionResult>
+ InputDispatcher::findFocusedWindowTargetLocked(nsecs_t currentTime, const EventEntry& entry,
+                                                nsecs_t& nextWakeupTime) {
+     ui::LogicalDisplayId displayId = getTargetDisplayId(entry);
+-    sp<WindowInfoHandle> focusedWindowHandle = getFocusedWindowHandleLocked(displayId);
++    const sp<IBinder> targetApplicationToken = entry.injectionState != nullptr
++            ? entry.injectionState->targetApplicationToken
++            : nullptr;
++    sp<WindowInfoHandle> focusedWindowHandle = targetApplicationToken != nullptr
++            ? mWindowInfos.findWindowByApplicationToken(displayId, targetApplicationToken)
++            : getFocusedWindowHandleLocked(displayId);
+     std::shared_ptr<InputApplicationHandle> focusedApplicationHandle =
+-            getValueByKey(mFocusedApplicationHandlesByDisplay, displayId);
++            targetApplicationToken != nullptr
++            ? nullptr
++            : getValueByKey(mFocusedApplicationHandlesByDisplay, displayId);
++
++    if (targetApplicationToken != nullptr && focusedWindowHandle == nullptr) {
++        ALOGW("Dropping targeted injected event because its application has no input window on "
++              "display %s.",
++              displayId.toString().c_str());
++        return injectionError(InputEventInjectionResult::TARGET_MISMATCH);
++    }
+ 
+     // If there is no currently focused window and no focused application
+     // then drop the event.
+@@ -2520,7 +2561,7 @@ InputDispatcher::findFocusedWindowTargetLocked(nsecs_t currentTime, const EventE
+     // often anticipate pending UI changes when typing on a keyboard.
+     // To obtain this behavior, we must serialize key events with respect to all
+     // prior input events.
+-    if (entry.type == EventEntry::Type::KEY) {
++    if (entry.type == EventEntry::Type::KEY && targetApplicationToken == nullptr) {
+         if (shouldWaitToSendKeyLocked(currentTime, focusedWindowHandle->getName().c_str())) {
+             nextWakeupTime = std::min(nextWakeupTime, *mKeyIsWaitingForEventsTimeout);
+             return injectionError(InputEventInjectionResult::PENDING);
+@@ -2592,10 +2633,14 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+         // Outside targets should be added upon first dispatched DOWN event. That means, this should
+         // be a pointer that would generate ACTION_DOWN, *and* touch should not already be down.
+         const bool isStylus = isPointerFromStylus(entry, pointerIndex);
++        const sp<IBinder> targetApplicationToken = entry.injectionState != nullptr
++                ? entry.injectionState->targetApplicationToken
++                : nullptr;
+         sp<WindowInfoHandle> newTouchedWindowHandle =
+-                mWindowInfos.findTouchedWindowAt(displayId, x, y, isStylus);
++                mWindowInfos.findTouchedWindowAt(displayId, x, y, isStylus,
++                                                 /*ignoreWindow=*/nullptr, targetApplicationToken);
+ 
+-        if (isDown) {
++        if (isDown && targetApplicationToken == nullptr) {
+             targets += findOutsideTargets(displayId, newTouchedWindowHandle, pointer.id, dump);
+         }
+         LOG_IF(INFO, newTouchedWindowHandle == nullptr)
+@@ -2626,8 +2671,11 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+             }
+         }
+ 
+-        std::vector<sp<WindowInfoHandle>> newTouchedWindows =
+-                findTouchedSpyWindowsAt(displayId, x, y, isStylus, entry.deviceId, mWindowInfos);
++        std::vector<sp<WindowInfoHandle>> newTouchedWindows;
++        if (targetApplicationToken == nullptr) {
++            newTouchedWindows = findTouchedSpyWindowsAt(displayId, x, y, isStylus, entry.deviceId,
++                                                        mWindowInfos);
++        }
+         if (newTouchedWindowHandle != nullptr) {
+             // Process the foreground window first so that it is the first to receive the event.
+             newTouchedWindows.insert(newTouchedWindows.begin(), newTouchedWindowHandle);
+@@ -2679,7 +2727,8 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+                 // SCROLL because the wallpaper engine only supports touch events.  We would need to
+                 // add a mechanism similar to View.onGenericMotionEvent to enable wallpapers to
+                 // handle these events.
+-                if (isDownOrPointerDown && targetFlags.test(InputTarget::Flags::FOREGROUND) &&
++                if (targetApplicationToken == nullptr && isDownOrPointerDown &&
++                    targetFlags.test(InputTarget::Flags::FOREGROUND) &&
+                     windowHandle->getInfo()->inputConfig.test(
+                             gui::WindowInfo::InputConfig::DUPLICATE_TOUCH_TO_WALLPAPER)) {
+                     sp<WindowInfoHandle> wallpaper =
+@@ -2752,8 +2801,13 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+             sp<WindowInfoHandle> oldTouchedWindowHandle =
+                     tempTouchState.getFirstForegroundWindowHandle(entry.deviceId);
+             LOG_ALWAYS_FATAL_IF(oldTouchedWindowHandle == nullptr);
++            const sp<IBinder> targetApplicationToken = entry.injectionState != nullptr
++                    ? entry.injectionState->targetApplicationToken
++                    : nullptr;
+             sp<WindowInfoHandle> newTouchedWindowHandle =
+-                    mWindowInfos.findTouchedWindowAt(displayId, x, y, isStylus);
++                    mWindowInfos.findTouchedWindowAt(displayId, x, y, isStylus,
++                                                     /*ignoreWindow=*/nullptr,
++                                                     targetApplicationToken);
+ 
+             // Verify targeted injection.
+             if (const auto err = verifyTargetedInjection(newTouchedWindowHandle, entry); err) {
+@@ -2846,9 +2900,9 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+             if (err) errs += "\n  - " + *err;
+         }
+         if (!errs.empty()) {
+-            ALOGW("Dropping targeted injection: At least one touched window is not owned by uid "
+-                  "%s:%s",
+-                  entry.injectionState->targetUid->toString().c_str(), errs.c_str());
++            ALOGW("Dropping targeted injection because a touched window does not match its "
++                  "declared target:%s",
++                  errs.c_str());
+             return injectionError(InputEventInjectionResult::TARGET_MISMATCH);
+         }
+     }
+@@ -4943,11 +4997,19 @@ bool InputDispatcher::shouldRejectInjectedMotionLocked(const MotionEvent& motion
+     return false;
+ }
+ 
+ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* event,
+                                                             std::optional<gui::Uid> targetUid,
+                                                             InputEventInjectionSync syncMode,
+                                                             std::chrono::milliseconds timeout,
+                                                             uint32_t policyFlags) {
++    return injectInputEventToApplication(event, targetUid, syncMode, timeout, policyFlags,
++                                         nullptr);
++}
++
++InputEventInjectionResult InputDispatcher::injectInputEventToApplication(
++        const InputEvent* event, std::optional<gui::Uid> targetUid,
++        InputEventInjectionSync syncMode, std::chrono::milliseconds timeout, uint32_t policyFlags,
++        const sp<IBinder>& targetApplicationToken) {
+     Result<void> eventValidation = validateInputEvent(*event);
+     if (!eventValidation.ok()) {
+         LOG(INFO) << "Injection failed: invalid event: " << eventValidation.error();
+@@ -4974,7 +5036,8 @@ InputEventInjectionResult InputDispatcher::injectInputEventToApplication(
+     }
+ 
+     const bool isAsync = syncMode == InputEventInjectionSync::NONE;
+-    auto injectionState = std::make_shared<InjectionState>(targetUid, isAsync);
++    auto injectionState =
++            std::make_shared<InjectionState>(targetUid, targetApplicationToken, isAsync);
+ 
+     std::queue<std::unique_ptr<EventEntry>> injectedEntries;
+     switch (event->getType()) {
+@@ -5593,20 +5656,31 @@ bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
+         return false;
+     }
+ 
+-    // Drop events that can't be trusted due to occlusion
+-    const auto [x, y] = resolveTouchedPosition(motionEntry);
+-    DispatcherWindowInfo::TouchOcclusionInfo occlusionInfo =
+-            mWindowInfos.computeTouchOcclusionInfo(window, x, y);
+-    if (!mWindowInfos.isTouchTrusted(occlusionInfo)) {
+-        if (DEBUG_TOUCH_OCCLUSION) {
+-            ALOGD("Stack of obscuring windows during untrusted touch (%.1f, %.1f):", x, y);
+-            for (const auto& log : occlusionInfo.debugInfo) {
+-                ALOGD("%s", log.c_str());
++    // Ordinary Android input must honor Android's own stacking and occlusion
++    // policy. A Droidloom event is different: Denial has already hit-tested
++    // its native window and supplied the exact application token. Android's
++    // flattened full-screen stack is not the visible host z-order, so applying
++    // it here would reject legitimate input to every Droidloom window except
++    // whichever Android task happens to be internally topmost.
++    const bool hasExternalApplicationTarget =
++            motionEntry.injectionState != nullptr &&
++            motionEntry.injectionState->targetApplicationToken != nullptr;
++    if (!hasExternalApplicationTarget) {
++        const auto [x, y] = resolveTouchedPosition(motionEntry);
++        DispatcherWindowInfo::TouchOcclusionInfo occlusionInfo =
++                mWindowInfos.computeTouchOcclusionInfo(window, x, y);
++        if (!mWindowInfos.isTouchTrusted(occlusionInfo)) {
++            if (DEBUG_TOUCH_OCCLUSION) {
++                ALOGD("Stack of obscuring windows during untrusted touch (%.1f, %.1f):", x, y);
++                for (const auto& log : occlusionInfo.debugInfo) {
++                    ALOGD("%s", log.c_str());
++                }
+             }
++            ALOGW("Dropping untrusted touch event due to %s/%s",
++                  occlusionInfo.obscuringPackage.c_str(),
++                  occlusionInfo.obscuringUid.toString().c_str());
++            return false;
+         }
+-        ALOGW("Dropping untrusted touch event due to %s/%s", occlusionInfo.obscuringPackage.c_str(),
+-              occlusionInfo.obscuringUid.toString().c_str());
+-        return false;
+     }
+ 
+     // Drop touch events if requested by input feature
+diff --git a/services/inputflinger/dispatcher/InputDispatcher.h b/services/inputflinger/dispatcher/InputDispatcher.h
+index a53f492..ad4066b 100644
+--- a/services/inputflinger/dispatcher/InputDispatcher.h
++++ b/services/inputflinger/dispatcher/InputDispatcher.h
+@@ -114,6 +114,11 @@ public:
+     android::os::InputEventInjectionResult injectInputEvent(
+             const InputEvent* event, std::optional<gui::Uid> targetUid,
+             android::os::InputEventInjectionSync syncMode, std::chrono::milliseconds timeout,
+             uint32_t policyFlags) override;
++
++    android::os::InputEventInjectionResult injectInputEventToApplication(
++            const InputEvent* event, std::optional<gui::Uid> targetUid,
++            android::os::InputEventInjectionSync syncMode, std::chrono::milliseconds timeout,
++            uint32_t policyFlags, const sp<IBinder>& targetApplicationToken);
+ 
+     std::unique_ptr<VerifiedInputEvent> verifyInputEvent(const InputEvent& event) override;
+@@ -341,7 +346,12 @@ private:
+         // Returns the touched window at the given location, excluding the ignoreWindow if provided.
+         sp<android::gui::WindowInfoHandle> findTouchedWindowAt(
+                 ui::LogicalDisplayId displayId, float x, float y, bool isStylus = false,
+-                const sp<android::gui::WindowInfoHandle> ignoreWindow = nullptr) const;
++                const sp<android::gui::WindowInfoHandle> ignoreWindow = nullptr,
++                const sp<IBinder>& targetApplicationToken = nullptr) const;
++
++        // Returns the frontmost input window belonging to the given application token.
++        sp<android::gui::WindowInfoHandle> findWindowByApplicationToken(
++                ui::LogicalDisplayId displayId, const sp<IBinder>& targetApplicationToken) const;
+ 
+         TouchOcclusionInfo computeTouchOcclusionInfo(
+                 const sp<android::gui::WindowInfoHandle>& windowHandle, float x, float y) const;

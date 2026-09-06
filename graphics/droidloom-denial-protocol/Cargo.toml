@@ -1,0 +1,15 @@
+[package]
+name = "droidloom-denial-protocol"
+description = "Versioned Denial-native task and DMA-BUF protocol for Droidloom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+droidloom-transport = { path = "../droidloom-transport" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,56 @@
+From: Droidloom development build
+Subject: [PATCH] libbinder: fall back when transaction SIDs are unavailable
+
+The shared host kernel can provide private Binder contexts without an active
+Android SELinux LSM. Binder nodes which request transaction security contexts
+are therefore unusable: security_secid_to_secctx() returns EOPNOTSUPP and the
+driver rejects the transaction before it reaches the service.
+
+In a package-owned development cell, omit per-node transaction SID requests
+and expose the same synthetic context supplied by Droidloom's libselinux
+compatibility layer. This lets services such as Keystore keep their normal
+permission-checking control flow while the host sandbox remains the effective
+security boundary. Keep upstream behavior unchanged outside DROIDLOOM_CELL.
+
+--- a/frameworks/native/libs/binder/Binder.cpp
++++ b/frameworks/native/libs/binder/Binder.cpp
+@@ -36,6 +36,7 @@
+ 
+ #include <inttypes.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #ifdef __linux__
+ #include <linux/sched.h>
+@@ -666,6 +667,10 @@ bool BBinder::isRequestingSid()
+ 
+ void BBinder::setRequestingSid(bool requestingSid)
+ {
++    if (requestingSid && getenv("DROIDLOOM_CELL") != nullptr) {
++        return;
++    }
++
+     LOG_ALWAYS_FATAL_IF(wasParceled(),
+                         "setRequestingSid() should not be called after a binder object "
+                         "is parceled/sent to another process");
+--- a/frameworks/native/libs/binder/IPCThreadState.cpp
++++ b/frameworks/native/libs/binder/IPCThreadState.cpp
+@@ -43,6 +43,7 @@
+ #include <sched.h>
+ #include <signal.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <sys/resource.h>
+ #include <unistd.h>
+@@ -453,6 +454,10 @@ pid_t IPCThreadState::getCallingPid() const
+ 
+ const char* IPCThreadState::getCallingSid() const
+ {
++    static constexpr char kDroidloomCellContext[] = "u:r:droidloom_unconfined:s0";
++    if (mCallingSid == nullptr && getenv("DROIDLOOM_CELL") != nullptr) {
++        return kDroidloomCellContext;
++    }
+     checkContextIsBinderForUse(__func__);
+     return mCallingSid;
+ }

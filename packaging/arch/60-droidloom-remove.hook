@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = droidloom-runtime
+
+[Action]
+Description = Stopping Droidloom and removing its desktop integration; retaining Android data...
+When = PreTransaction
+Exec = /usr/lib/droidloom/droidloom-package-helper before-remove
+AbortOnFail

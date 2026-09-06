@@ -1,0 +1,85 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3459,6 +3459,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             Rect sourceCrop;
+             bool hasCrop = false;
+             bool hasBuffer = false;
++            sp<IBinder> applicationToken;
+         };
+         struct DirectTaskOutput {
+             sp<DroidloomNativeWindow> window;
+@@ -3490,8 +3491,12 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             if (task <= 0) continue;
+             liveTasks[task] = true;
+             if (!snapshot->isVisible) continue;
+ 
+             auto& frame = taskFrames[task];
++            if (snapshot->inputInfo.applicationInfo.token != nullptr) {
++                // Layers are traversed in Z order, so the topmost visible activity wins.
++                frame.applicationToken = snapshot->inputInfo.applicationInfo.token;
++            }
+             Rect bounds{snapshot->transformedBounds};
+             Rect clipped;
+             if (!displayBounds.isEmpty() && bounds.intersect(displayBounds, &clipped)) {
+@@ -3514,4 +3519,15 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             frame.layers.emplace_back(owner, std::move(copy));
+         }
+ 
++        std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
++        for (const auto& [task, frame] : taskFrames) {
++            if (frame.applicationToken != nullptr) {
++                taskInputTokens.emplace(task, frame.applicationToken);
++            }
++        }
++        {
++            std::lock_guard lock(mDroidloomTaskInputMutex);
++            mDroidloomTaskInputTokens = std::move(taskInputTokens);
++        }
++
+         // A task output owns exactly one Denial window. Keep it across short
+@@ -7484,4 +7500,31 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* reply,
+                                     uint32_t flags) {
++    static constexpr uint32_t kDroidloomGetTaskInputTokenTransaction = 0x00444c01;
++    if (code == kDroidloomGetTaskInputTokenTransaction) {
++        CHECK_INTERFACE(ISurfaceComposer, data, reply);
++        const uid_t uid = IPCThreadState::self()->getCallingUid();
++        if (uid != AID_ROOT && uid != AID_SYSTEM) {
++            ALOGE("Permission Denial: Droidloom task-token query from uid=%d", uid);
++            return PERMISSION_DENIED;
++        }
++        if (reply == nullptr || data.dataAvail() != sizeof(int32_t)) {
++            return BAD_VALUE;
++        }
++        const int32_t taskId = data.readInt32();
++        if (taskId <= 0 || data.dataAvail() != 0) {
++            return BAD_VALUE;
++        }
++        sp<IBinder> applicationToken;
++        {
++            std::lock_guard lock(mDroidloomTaskInputMutex);
++            const auto it = mDroidloomTaskInputTokens.find(taskId);
++            if (it != mDroidloomTaskInputTokens.end()) {
++                applicationToken = it->second;
++            }
++        }
++        reply->writeNoException();
++        return reply->writeStrongBinder(applicationToken);
++    }
++
+     if (const status_t error = CheckTransactCodeCredentials(code); error != OK) {
+         return error;
+     }
+diff --git a/services/surfaceflinger/SurfaceFlinger.h b/services/surfaceflinger/SurfaceFlinger.h
+--- a/services/surfaceflinger/SurfaceFlinger.h
++++ b/services/surfaceflinger/SurfaceFlinger.h
+@@ -1417,6 +1417,9 @@ private:
+     // - write access from the main thread must lock mStateLock, since another
+     // thread may be reading these variables.
+     mutable Mutex mStateLock;
++    mutable std::mutex mDroidloomTaskInputMutex;
++    std::unordered_map<int32_t, sp<IBinder>> mDroidloomTaskInputTokens
++            GUARDED_BY(mDroidloomTaskInputMutex);
+     State mCurrentState;
+     std::atomic<int32_t> mTransactionFlags = 0;
+     std::atomic<uint32_t> mUniqueTransactionId = 1;

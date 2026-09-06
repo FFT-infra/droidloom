@@ -1,0 +1,35 @@
+LIBC {
+  global:
+    readlink;
+};
+
+LIBSELINUX_R {
+  global:
+    fgetfilecon;
+    fsetfilecon;
+    getcon;
+    getfilecon;
+    getpeercon;
+    getpidcon;
+    getprevcon;
+    is_selinux_enabled;
+    lgetfilecon;
+    lsetfilecon;
+    security_compute_create;
+    security_getenforce;
+    security_setenforce;
+    selinux_android_restorecon;
+    selinux_android_restorecon_pkgdir;
+    selinux_android_seapp_context_init;
+    selinux_android_setcon;
+    selinux_android_setcontext;
+    selinux_check_access;
+    selinux_status_open;
+    selinux_status_updated;
+    setcon;
+    setexeccon;
+    setfilecon;
+    setfscreatecon;
+    setsockcreatecon;
+  local: *;
+};

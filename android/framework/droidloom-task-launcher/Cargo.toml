@@ -1,0 +1,18 @@
+[package]
+name = "droidloom-task-launcher"
+description = "Privileged Android task launcher for one Droidloom logical display"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+droidloom-denial-ipc = { path = "../../../graphics/droidloom-denial-ipc" }
+droidloom-task-control = { path = "../../../graphics/droidloom-task-control" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

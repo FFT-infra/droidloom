@@ -1,0 +1,12 @@
+[Unit]
+Description=Droidloom native application catalog
+PartOf=droidloom.service
+After=droidloom.service
+ConditionPathExists=/etc/droidloom/cell.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/droidloom-applications
+Restart=on-failure
+RestartSec=2
+

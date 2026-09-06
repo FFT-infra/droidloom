@@ -1,0 +1,11 @@
+// Focused-build stand-ins for source projects deliberately absent from the
+// Droidloom sparse checkout. Both names are compile-time-only dependencies;
+// neither artifact is installed into the Android runtime.
+
+// Soong unconditionally attaches this host tool to lint-enabled Java modules.
+// Droidloom's focused build does not run platform lint, so a valid inert jar is
+// sufficient to close the graph without fetching the Android tools checkout.
+java_import_host {
+    name: "AndroidGlobalLintChecker",
+    jars: ["core-lambda-stubs.jar"],
+}

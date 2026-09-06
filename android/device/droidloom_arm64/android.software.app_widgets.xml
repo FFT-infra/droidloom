@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <!--
+      Droidloom presents a handheld Android runtime. Declaring the standard
+      app-widget feature makes SystemServer publish AOSP's AppWidget service,
+      which ordinary phone applications may query even when Denial itself has
+      no widget-host integration.
+    -->
+    <feature name="android.software.app_widgets" />
+</permissions>

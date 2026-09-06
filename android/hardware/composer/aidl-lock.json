@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "source": {
+    "project": "platform/hardware/interfaces",
+    "commit": "0162af698935100a590b7359581ac8b1b80693e5"
+  },
+  "composer": {
+    "interface": "android.hardware.graphics.composer3",
+    "version": 5,
+    "hash": "07c2ff93a65553c0f274ab0f688fd55f42402fac",
+    "stability": "vintf",
+    "backend": "rust",
+    "imports": [
+      "android.hardware.graphics.common-V7",
+      "android.hardware.common-V2",
+      "android.hardware.drm.common-V1"
+    ]
+  },
+  "allocator": {
+    "interface": "android.hardware.graphics.allocator",
+    "version": 3,
+    "hash": "b061131f0ee5260aa8f779bf3569dfc861a1b89c",
+    "stability": "vintf",
+    "backend": "ndk",
+    "imports": [
+      "android.hardware.graphics.common-V7",
+      "android.hardware.common-V2"
+    ]
+  },
+  "mapper": {
+    "module": "libimapper_stablec",
+    "abi": 5
+  }
+}

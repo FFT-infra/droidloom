@@ -1,0 +1,11 @@
+[package]
+name = "droidloom-classpath-wrapper"
+description = "Development-only Android classpath projection activator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

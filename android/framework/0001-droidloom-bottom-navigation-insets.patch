@@ -1,0 +1,287 @@
+From: Droidloom <droidloom@localhost>
+Subject: [PATCH] wm: always expose host system bars in Droidloom app windows
+
+Baseline: frameworks/base 94b4c163b7dfe5ce3607f7bb8456f9573f7de57d.
+
+Freeform policy strips system bar sources and Android apps cannot otherwise
+observe the host bars. Add per-app sources after policy and to WindowMetrics,
+without Android bar windows or control leashes. The read-only Droidloom
+product marker confines this to Droidloom cells.
+
+--- a/services/core/java/com/android/server/wm/InsetsPolicy.java
++++ b/services/core/java/com/android/server/wm/InsetsPolicy.java
+@@ -44,6 +44,7 @@
+ import android.content.res.Resources;
+ import android.os.Handler;
+ import android.os.IBinder;
++import android.os.SystemProperties;
+ import android.util.SparseArray;
+ import android.view.DisplayCutout;
+ import android.util.proto.ProtoOutputStream;
+@@ -75,6 +76,12 @@
+  * Policy that implements who gets control over the windows generating insets.
+  */
+ class InsetsPolicy {
++
++    // This existing read-only product marker identifies Droidloom's task windows.
++    // Keep ordinary Android products on their stock system-bar policy.
++    @VisibleForTesting
++    boolean mDroidloomSystemBars = SystemProperties.getBoolean(
++            "ro.vendor.droidloom.surfaceflinger_tasks", false);
+ 
+     public static final int CONTROLLABLE_TYPES = WindowInsets.Type.statusBars()
+             | WindowInsets.Type.navigationBars()
+@@ -352,7 +359,13 @@
+         }
+         state = adjustVisibilityForIme(target, state, state == originalState);
+         state = mPolicy.replaceInsetsSourcesIfNeeded(state, state == originalState);
+-        return adjustInsetsForRoundedCorners(target.mToken, state, state == originalState);
++        state = adjustInsetsForRoundedCorners(target.mToken, state, state == originalState);
++        // Apply after freeform filtering, transient visibility and IME adjustments.
++        // Host system bars are always present and has no Android control leash.
++        if (mDroidloomSystemBars && target.mActivityRecord != null) {
++            state = DroidloomSystemBarInsets.apply(state, target.getConfiguration().densityDpi);
++        }
++        return state;
+     }
+ 
+     @NonNull
+@@ -377,6 +390,10 @@
+             }
+         }
+         adjustInsetsForRoundedCorners(token, outInsetsState, false /* copyState */);
++        if (mDroidloomSystemBars && token != null && token.asActivityRecord() != null) {
++            outInsetsState.set(DroidloomSystemBarInsets.apply(
++                    outInsetsState, token.getConfiguration().densityDpi));
++        }
+         if (token != null && token.hasSizeCompatBounds()) {
+             outInsetsState.scale(1f / token.getCompatScale());
+         }
+diff --git a/services/core/java/com/android/server/wm/DroidloomSystemBarInsets.java b/services/core/java/com/android/server/wm/DroidloomSystemBarInsets.java
+new file mode 100644
+--- /dev/null
++++ b/services/core/java/com/android/server/wm/DroidloomSystemBarInsets.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2026 Droidloom
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++package com.android.server.wm;
++
++import android.graphics.Insets;
++import android.util.DisplayMetrics;
++import android.view.InsetsSource;
++import android.view.InsetsState;
++import android.view.WindowInsets.Type;
++
++/** Insets for the host's status bar and gesture navigation indicator, independent of Android SystemUI. */
++final class DroidloomSystemBarInsets {
++    private static final float NAVIGATION_HEIGHT_DP = 24 * 0.7f;
++    private static final float STATUS_HEIGHT_DP = 33.6f;
++    private static final Object SOURCE_OWNER = new Object();
++    private static final int STATUS_ID = InsetsSource.createId(
++            SOURCE_OWNER, 0, Type.statusBars());
++    private static final int NAVIGATION_ID = InsetsSource.createId(
++            SOURCE_OWNER, 0, Type.navigationBars());
++    private static final int GESTURE_ID = InsetsSource.createId(
++            SOURCE_OWNER, 0, Type.mandatorySystemGestures());
++
++    private DroidloomSystemBarInsets() {}
++
++    static InsetsState apply(InsetsState original, int densityDpi) {
++        final InsetsState state = new InsetsState(original);
++        // A stale/hidden Android source of the same type could overwrite the public
++        // visibility bit. Replace host bar sources only in this app's copy.
++        for (int i = state.sourceSize() - 1; i >= 0; --i) {
++            final InsetsSource source = state.sourceAt(i);
++            if ((source.getType() & (Type.statusBars() | Type.navigationBars()
++                    | Type.mandatorySystemGestures())) != 0) {
++                state.removeSource(source.getId());
++            }
++        }
++        final int dpi = densityDpi > 0 ? densityDpi : DisplayMetrics.DENSITY_DEFAULT;
++        final int height = Math.max(1, Math.round(
++                NAVIGATION_HEIGHT_DP * (dpi / (float) DisplayMetrics.DENSITY_DEFAULT)));
++        final int statusHeight = Math.max(1, Math.round(
++                STATUS_HEIGHT_DP * (dpi / (float) DisplayMetrics.DENSITY_DEFAULT)));
++        final Insets bottom = Insets.of(0, 0, 0, height);
++        // Android 17's attached insets use the recipient's bounds at calculation
++        // time. This follows freeform resize/rotation and both current and maximum
++        // WindowMetrics, without tying an app's indicator to the global display.
++        state.addSource(new InsetsSource(STATUS_ID, Type.statusBars())
++                .setAttachedInsets(Insets.of(0, statusHeight, 0, 0)).setVisible(true)
++                .setFlags(InsetsSource.FLAG_SUPPRESS_SCRIM));
++        state.addSource(new InsetsSource(NAVIGATION_ID, Type.navigationBars())
++                .setAttachedInsets(bottom).setVisible(true)
++                .setFlags(InsetsSource.FLAG_SUPPRESS_SCRIM));
++        // Android also exposes mandatory gestures through Type.systemGestures().
++        // No tappable-element inset: this represents gesture navigation.
++        state.addSource(new InsetsSource(GESTURE_ID, Type.mandatorySystemGestures())
++                .setAttachedInsets(bottom).setVisible(true));
++        return state;
++    }
++}
+diff --git a/services/tests/wmtests/src/com/android/server/wm/DroidloomSystemBarInsetsTest.java b/services/tests/wmtests/src/com/android/server/wm/DroidloomSystemBarInsetsTest.java
+new file mode 100644
+--- /dev/null
++++ b/services/tests/wmtests/src/com/android/server/wm/DroidloomSystemBarInsetsTest.java
+@@ -0,0 +1,159 @@
++/*
++ * Copyright (C) 2026 Droidloom
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++package com.android.server.wm;
++
++import static android.app.WindowConfiguration.ACTIVITY_TYPE_STANDARD;
++import static android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM;
++import static android.view.WindowInsets.Type.ime;
++import static android.view.WindowInsets.Type.mandatorySystemGestures;
++import static android.view.WindowInsets.Type.navigationBars;
++import static android.view.WindowInsets.Type.statusBars;
++import static android.view.WindowInsets.Type.systemGestures;
++import static android.view.WindowInsets.Type.tappableElement;
++import static android.view.WindowManager.LayoutParams.TYPE_APPLICATION;
++import static android.view.WindowManager.LayoutParams.TYPE_INPUT_METHOD;
++import static android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import android.graphics.Insets;
++import android.graphics.Rect;
++import android.view.InsetsSource;
++import android.view.InsetsState;
++import android.view.WindowInsets;
++
++import androidx.test.filters.SmallTest;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++/** atest WmTests:DroidloomSystemBarInsetsTest */
++@SmallTest
++@RunWith(WindowTestRunner.class)
++public class DroidloomSystemBarInsetsTest extends WindowTestsBase {
++    @Before
++    public void setup() {
++        mWm.mAnimator.ready();
++    }
++
++    private static WindowInsets calculate(InsetsState state, Rect bounds) {
++        return state.calculateInsets(bounds, bounds, null, false,
++                SOFT_INPUT_ADJUST_NOTHING, 0, 0, TYPE_APPLICATION,
++                ACTIVITY_TYPE_STANDARD, null);
++    }
++
++    private static void assertIndicator(WindowInsets insets, int bottom, int top) {
++        assertTrue(insets.isVisible(statusBars()));
++        assertEquals(Insets.of(0, top, 0, 0), insets.getInsets(statusBars()));
++        assertEquals(insets.getInsets(statusBars()),
++                insets.getInsetsIgnoringVisibility(statusBars()));
++        assertEquals(Insets.of(0, top, 0, bottom),
++                insets.getInsets(WindowInsets.Type.systemBars()));
++        assertTrue(insets.isVisible(navigationBars()));
++        assertEquals(Insets.of(0, 0, 0, bottom), insets.getInsets(navigationBars()));
++        assertEquals(insets.getInsets(navigationBars()),
++                insets.getInsetsIgnoringVisibility(navigationBars()));
++        assertEquals(bottom, insets.getInsets(mandatorySystemGestures()).bottom);
++        assertEquals(bottom, insets.getInsets(systemGestures()).bottom);
++    }
++
++    @Test
++    public void densityAndRecipientBounds() {
++        final int[] densities = {0, 160, 240, 320, 420};
++        final int[] heights = {17, 17, 25, 34, 44};
++        final int[] statusHeights = {34, 34, 50, 67, 88};
++        final Rect[] bounds = {
++                new Rect(0, 0, 400, 800), new Rect(80, 40, 880, 440),
++                new Rect(0, 0, 1440, 2560),
++        };
++        for (int i = 0; i < densities.length; ++i) {
++            final InsetsState state = DroidloomSystemBarInsets.apply(
++                    new InsetsState(), densities[i]);
++            for (Rect frame : bounds) {
++                final WindowInsets insets = calculate(state, frame);
++                assertIndicator(insets, heights[i], statusHeights[i]);
++                assertEquals(Insets.NONE, insets.getInsets(tappableElement()));
++            }
++        }
++    }
++
++    @Test
++    public void replacesHiddenBarsWithoutMutatingOtherSources() {
++        final InsetsState original = new InsetsState();
++        final int navId = InsetsSource.createId(null, 0, navigationBars());
++        original.getOrCreateSource(navId, navigationBars())
++                .setFrame(0, 700, 400, 800).setVisible(false);
++        original.getOrCreateSource(InsetsSource.ID_IME, ime())
++                .setFrame(0, 500, 400, 800).setVisible(true);
++        final int statusId = InsetsSource.createId(null, 0, statusBars());
++        original.getOrCreateSource(statusId, statusBars())
++                .setFrame(0, 0, 400, 20).setVisible(false);
++        final InsetsState before = new InsetsState(original, true);
++        final InsetsState state = DroidloomSystemBarInsets.apply(original, 160);
++        final WindowInsets insets = calculate(state, new Rect(0, 0, 400, 800));
++        assertIndicator(insets, 17, 34);
++        assertEquals(300, insets.getInsets(ime()).bottom);
++        assertEquals(before, original);
++        assertEquals(state, DroidloomSystemBarInsets.apply(state, 160));
++    }
++
++    @Test
++    public void subWindowOnlyReceivesOverlappingBars() {
++        final InsetsState state = DroidloomSystemBarInsets.apply(new InsetsState(), 160);
++        final WindowInsets insets = state.calculateInsets(new Rect(100, 100, 300, 300),
++                new Rect(0, 0, 400, 800), null, false, SOFT_INPUT_ADJUST_NOTHING,
++                0, 0, TYPE_APPLICATION, ACTIVITY_TYPE_STANDARD, null);
++        assertTrue(insets.isVisible(statusBars() | navigationBars()));
++        assertEquals(Insets.NONE, insets.getInsets(WindowInsets.Type.systemBars()));
++    }
++
++    @Test
++    public void freeformImmersiveAndWindowMetrics() {
++        final InsetsPolicy policy = mDisplayContent.getInsetsPolicy();
++        policy.mDroidloomSystemBars = true;
++        final WindowState app = newWindowBuilder("app", TYPE_APPLICATION)
++                .setActivityType(ACTIVITY_TYPE_STANDARD)
++                .setWindowingMode(WINDOWING_MODE_FREEFORM)
++                .setDisplay(mDisplayContent).build();
++        app.getTask().setBounds(new Rect(40, 60, 440, 860));
++        app.setRequestedVisibleTypes(0); // An immersive app hiding all bars.
++        final int dpi = app.getConfiguration().densityDpi;
++        final int height = Math.round(16.8f * ((dpi > 0 ? dpi : 160) / 160f));
++        final int statusHeight = Math.round(33.6f * ((dpi > 0 ? dpi : 160) / 160f));
++        final InsetsState state = app.getInsetsState();
++        assertIndicator(calculate(state, app.getBounds()), height, statusHeight);
++
++        final InsetsState metrics = new InsetsState();
++        policy.getInsetsForWindowMetrics(app.mToken, metrics);
++        assertIndicator(calculate(metrics, app.getBounds()), height, statusHeight);
++        assertIndicator(calculate(metrics, new Rect(0, 0, 1440, 2560)), height, statusHeight);
++        // Synthetic sources have no surface and never grant hide/show control.
++        for (int i = 0; i < state.sourceSize(); ++i) {
++            final InsetsSource source = state.sourceAt(i);
++            if ((source.getType() & WindowInsets.Type.systemBars()) != 0) {
++                assertNull(mDisplayContent.getInsetsStateController()
++                        .getSourceProviders().get(source.getId()));
++            }
++        }
++    }
++
++    @Test
++    public void stockProductAndNonAppWindowsKeepTheirPolicy() {
++        final InsetsPolicy policy = mDisplayContent.getInsetsPolicy();
++        policy.mDroidloomSystemBars = false;
++        final WindowState app = newWindowBuilder("app", TYPE_APPLICATION)
++                .setActivityType(ACTIVITY_TYPE_STANDARD)
++                .setWindowingMode(WINDOWING_MODE_FREEFORM)
++                .setDisplay(mDisplayContent).build();
++        assertEquals(Insets.NONE, calculate(app.getInsetsState(),
++                new Rect(0, 0, 400, 800)).getInsets(navigationBars()));
++        policy.mDroidloomSystemBars = true;
++        final WindowState imeWindow = newWindowBuilder("ime", TYPE_INPUT_METHOD)
++                .setDisplay(mDisplayContent).build();
++        final InsetsState empty = new InsetsState();
++        assertEquals(0, policy.adjustInsetsForWindow(imeWindow, empty).sourceSize());
++    }
++}

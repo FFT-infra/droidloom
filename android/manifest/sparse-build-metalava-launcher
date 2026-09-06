@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$tool_dir/../../../../prebuilts/jdk/jdk21/linux-x86/bin/java" \
+    -Xmx2g -jar "$tool_dir/../framework/metalava.jar" "$@"

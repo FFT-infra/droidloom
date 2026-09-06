@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "selected_at": "2026-08-14",
+  "architecture": "aarch64",
+  "aosp": {
+    "url": "https://android.googlesource.com/platform/manifest",
+    "tag": "android-17.0.0_r1",
+    "tag_object": "7a9e46ba6ed424f922a3457f4964e67e0b966201",
+    "commit": "5bc9a7ce1cd78dd53613bbfd0ebf506e1e4adb0f"
+  },
+  "aosp_ci_base": {
+    "service": "Android Continuous Integration",
+    "branch": "aosp-android-latest-release",
+    "target": "aosp_cf_arm64_only_phone-userdebug",
+    "build_number": "15885347",
+    "build_id": "CP2A.260605.016",
+    "android_release": "17",
+    "sdk": 37,
+    "security_patch": "2026-06-05",
+    "cpu_abi": "arm64-v8a",
+    "artifact_page_url": "https://ci.android.com/builds/submitted/15885347/aosp_cf_arm64_only_phone-userdebug/latest/aosp_cf_arm64_only_phone-img-15885347.zip",
+    "artifact_name": "aosp_cf_arm64_only_phone-img-15885347.zip",
+    "artifact_size": 1101172766,
+    "artifact_sha256": "7317b694b6b2db5624f5a50a3fd00b03c7e576f49d1b05fb61d353f26513aabf",
+    "framework_res": {
+      "path": "system/framework/framework-res.apk",
+      "size": 38012749,
+      "sha256": "b5b5756e6d93680f1086417d764d18c9e67c8e884879cb894849bec12f20a9ec"
+    },
+    "partitions": {
+      "system_a": "7f55209f19dcad75f68e86322484b6c63a389d2b9e6a911ecec4515113644327",
+      "system_ext_a": "ae33e66aea99f1381810c640a63d0e6dfc6015d6dad67c736351210ff68beb20",
+      "product_a": "376a439a8ce38d74f0f5993ce679f2cc13059d91f10270abe6da8f6ff7fe7513"
+    },
+    "usage": "system, system_ext, and product are reusable base inputs; the Cuttlefish vendor, ODM, kernel, and boot images are inspection-only"
+  },
+  "mesa": {
+    "url": "https://archive.mesa3d.org/mesa-26.1.7.tar.xz",
+    "version": "26.1.7",
+    "sha256": "25e0a669e6638c3563e7be32a0a09f1888317e6eed0d047dc41d49dc8de26c7d",
+    "sha512": "9acc75c3d6386f90cf761dfa42e72b1c36d399a6905127d18aa3eb84d665502da7c3cebead82fdbca91ad510673ba7e296b5e148602d6db7e79172d6155f3ec5"
+  }
+}

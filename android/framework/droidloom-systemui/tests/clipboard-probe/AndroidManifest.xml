@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.android.droidloom.clipboardprobe">
+    <uses-sdk android:minSdkVersion="37" android:targetSdkVersion="37" />
+    <uses-permission android:name="android.permission.READ_CLIPBOARD_IN_BACKGROUND" />
+    <application android:label="Droidloom clipboard test" android:testOnly="true" android:allowBackup="false">
+        <receiver android:name=".Probe" android:exported="true" android:permission="android.permission.DUMP" />
+        <provider android:name=".Files" android:authorities="com.android.droidloom.clipboardprobe" android:exported="false" android:grantUriPermissions="true" />
+        <activity android:name=".Focus" android:exported="true" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+    </application>
+</manifest>
