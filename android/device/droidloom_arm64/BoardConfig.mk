@@ -23,19 +23,17 @@ BOARD_VENDORIMAGE_PARTITION_SIZE := 1073741824
 
 BOARD_AVB_ENABLE := false
 
-# Milestone 2 targets the Qualcomm/Adreno ARM64 host. The pinned minigbm
-# allocator and stable-C mapper must compile their MSM backend so Android GPU
-# buffers are native DMA-BUFs from the same render-node family used by Denial.
+# Keep the native MSM allocator. Split display/render hosts explicitly select
+# the portable linear DMA-heap image backend at cell construction time.
 SOONG_CONFIG_NAMESPACES += minigbm
 SOONG_CONFIG_minigbm += platform
 SOONG_CONFIG_minigbm_platform := msm
 
-# The Android Mesa release build uses AOSP's target flags and link inputs to
-# produce Bionic libraries. Keep both drivers on the MSM render-node KMD: the
-# Gallium Freedreno driver supplies EGL/GLES and Mesa's Vulkan Freedreno driver
-# is Turnip. No KGSL path or software renderer is part of this product.
+# Bionic hardware rendering supports both mainline MSM and downstream KGSL.
+# Native Freedreno remains the default; KGSL cells explicitly select Zink
+# over Turnip. No software renderer is included.
 BOARD_MESA3D_USES_MESON_BUILD := true
-BOARD_MESA3D_GALLIUM_DRIVERS := freedreno
+BOARD_MESA3D_GALLIUM_DRIVERS := freedreno zink
 BOARD_MESA3D_VULKAN_DRIVERS := freedreno
 BOARD_MESA3D_BUILD_LIBGBM := false
-BOARD_MESA3D_MESON_ARGS := -Dfreedreno-kmds=msm
+BOARD_MESA3D_MESON_ARGS := -Dfreedreno-kmds=msm,kgsl

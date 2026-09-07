@@ -5,6 +5,7 @@
 mod clipboard;
 mod notifications;
 mod insets;
+mod presentation_audit;
 mod text_input;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -12,12 +13,13 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use drm_fourcc::DrmFourcc;
 use droidloom_denial_endpoint::{
@@ -32,7 +34,7 @@ use droidloom_denial_protocol::{
 use droidloom_syncobj::{SyncobjDevice, WaylandTimeline};
 use droidloom_window_policy::{LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore};
 use gbm::{BufferObject, Device as GbmDevice, Modifier};
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{
@@ -78,7 +80,7 @@ use wayland_protocols::wp::viewporter::client::{
 
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
-const POLL_TIMEOUT_MILLIS: i32 = 4;
+const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const LEFT_BUTTON: u32 = 0x110;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
@@ -128,16 +130,53 @@ struct RenderTarget {
     metadata: BufferMetadata,
     planes: Vec<OwnedFd>,
     wayland: Option<wl_buffer::WlBuffer>,
+    sync: Option<BufferSync>,
     _allocation: Option<BufferObject<()>>,
     host_owned: bool,
     retired: bool,
     busy: bool,
 }
 
+// Timeline progress implies completion of every earlier point. Each buffer
+// therefore owns its timeline: neither a newer buffer's acquire fence nor an
+// out-of-order compositor release may satisfy this buffer's release point.
+struct BufferSync {
+    timeline: WaylandTimeline,
+    proxy: WpLinuxDrmSyncobjTimelineV1,
+    next_point: u64,
+    release_wakeup: Option<OwnedFd>,
+}
+
+impl BufferSync {
+    fn arm_release_wakeup(&mut self, point: u64) -> Result<(), PresenterError> {
+        let Some(event) = self.release_wakeup.as_ref() else { return Ok(()); };
+        match self.timeline.notify_when_signalled(point, event.as_fd()) {
+            Ok(()) => Ok(()),
+            Err(droidloom_syncobj::SyncobjError::Drm { source, .. })
+                if matches!(source.raw_os_error(), Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::EINVAL)) =>
+            {
+                // Older timeline-capable kernels still use the bounded poll
+                // fallback. Never replace an unsupported wakeup with a release.
+                self.release_wakeup = None;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for BufferSync {
+    fn drop(&mut self) {
+        self.proxy.destroy();
+    }
+}
+
 struct PendingFrame {
     frame: FrameId,
     buffer: BufferId,
     release_point: u64,
+    submitted_nanos: u64,
+    trace: Option<presentation_audit::FrameTrace>,
 }
 
 struct TaskWindow {
@@ -147,17 +186,19 @@ struct TaskWindow {
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
-    timeline_proxy: Option<WpLinuxDrmSyncobjTimelineV1>,
-    timeline: Option<WaylandTimeline>,
     logical_size: Option<(u32, u32)>,
     buffer_size: (u32, u32),
     preferred_scale_120: u32,
     configure_serial: u32,
     refresh_millihz: u32,
-    next_sync_point: u64,
+    entered_outputs: Vec<wl_output::WlOutput>,
+    presentation_output: Option<wl_output::WlOutput>,
     targets: BTreeMap<BufferId, RenderTarget>,
     pending: VecDeque<PendingFrame>,
     presentation_feedback: Vec<(WpPresentationFeedback, FrameId)>,
+    presentation_audit: Option<presentation_audit::Audit>,
+    content_opaque: bool,
+    applied_opaque: Option<bool>,
     focused: bool,
     unmap_requested: bool,
     closing: bool,
@@ -248,15 +289,51 @@ impl App {
         })
     }
 
-    fn refresh_millihz(&self) -> u32 {
-        self.output_state
-            .outputs()
-            .filter_map(|output| self.output_state.info(&output))
-            .flat_map(|info| info.modes)
-            .filter(|mode| mode.current && mode.refresh_rate > 0)
-            .filter_map(|mode| u32::try_from(mode.refresh_rate).ok())
-            .max()
-            .unwrap_or(60_000)
+    fn task_refresh_millihz(&self, object: TaskObjectId) -> u32 {
+        let Some(task) = self.tasks.get(&object) else { return 60_000; };
+        if task.package == BOOTSTRAP_PACKAGE {
+            // Android's shared scheduler must accommodate active task outputs,
+            // but an unrelated faster monitor must not drive its cadence.
+            return self.tasks.iter().filter(|(_, task)| task.package != BOOTSTRAP_PACKAGE
+                    && !task.closing && !task.entered_outputs.is_empty())
+                .map(|(object, _)| self.task_refresh_millihz(*object))
+                .max().unwrap_or(60_000);
+        }
+        select_surface_refresh(
+            &task.entered_outputs,
+            task.presentation_output.as_ref(),
+            |output| self.output_state.info(output).and_then(|info| {
+                info.modes.iter()
+                    .find(|mode| mode.current && mode.refresh_rate > 0)
+                    .and_then(|mode| u32::try_from(mode.refresh_rate).ok())
+            }),
+        )
+    }
+
+    fn update_task_refresh(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        let refresh = self.task_refresh_millihz(object);
+        let task = self.tasks.get_mut(&object).ok_or(PresenterError::UnknownTask(object))?;
+        if task.configure_serial == 0 || task.refresh_millihz == refresh { return Ok(()); }
+        // A cadence change preserves the configure's allocation generation.
+        // Existing targets and in-flight frames still satisfy its dimensions.
+        self.endpoint.as_mut()
+            .ok_or(PresenterError::Configuration("endpoint disappeared"))?
+            .send_configure(object, task.configure_serial, task.buffer_size.0,
+                task.buffer_size.1, task.preferred_scale_120,
+                FRACTIONAL_SCALE_DENOMINATOR, Transform::Normal, refresh)?;
+        task.refresh_millihz = refresh;
+        if task.package != BOOTSTRAP_PACKAGE {
+            let bootstrap = self.tasks.iter()
+                .find_map(|(object, task)| (task.package == BOOTSTRAP_PACKAGE).then_some(*object));
+            if let Some(bootstrap) = bootstrap { self.update_task_refresh(bootstrap)?; }
+        }
+        Ok(())
+    }
+
+    fn update_output_refreshes(&mut self) -> Result<(), PresenterError> {
+        let objects = self.tasks.keys().copied().collect::<Vec<_>>();
+        for object in objects { self.update_task_refresh(object)?; }
+        Ok(())
     }
 
     fn host_canvas_size(&self) -> Option<(u32, u32)> {
@@ -364,9 +441,9 @@ impl App {
         if !headless && let Err(error) = self.window_policy.reload_policy() {
             eprintln!("Droidloom kept the last valid window policy: {error}");
         }
-        let (window, viewport, fractional_scale, sync_surface, timeline_proxy, timeline) =
+        let (window, viewport, fractional_scale, sync_surface) =
             if headless {
-                (None, None, None, None, None, None)
+                (None, None, None, None)
             } else {
                 let surface = self.compositor.create_surface(qh);
                 let window = self
@@ -389,19 +466,12 @@ impl App {
                     object,
                 );
                 let sync_surface = self.sync_manager.get_surface(window.wl_surface(), qh, ());
-                let timeline = WaylandTimeline::create(&self.syncobj)?;
-                let descriptor = timeline.export_descriptor()?;
-                let timeline_proxy = self
-                    .sync_manager
-                    .import_timeline(descriptor.as_fd(), qh, ());
                 window.commit();
                 (
                     Some(window),
                     Some(viewport),
                     Some(fractional_scale),
                     Some(sync_surface),
-                    Some(timeline_proxy),
-                    Some(timeline),
                 )
             };
         self.tasks.insert(
@@ -413,17 +483,20 @@ impl App {
                 viewport,
                 fractional_scale,
                 sync_surface,
-                timeline_proxy,
-                timeline,
                 logical_size: None,
                 buffer_size: (0, 0),
                 preferred_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
                 configure_serial: 0,
-                refresh_millihz: self.refresh_millihz(),
-                next_sync_point: 0,
+                refresh_millihz: 60_000,
+            entered_outputs: Vec::new(),
+            presentation_output: None,
                 targets: BTreeMap::new(),
                 pending: VecDeque::new(),
                 presentation_feedback: Vec::new(),
+                content_opaque: false,
+                applied_opaque: None,
+                presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref() == Some(std::ffi::OsStr::new("1")))
+                    .then(presentation_audit::Audit::default),
                 focused: false,
                 unmap_requested: false,
                 closing: false,
@@ -512,13 +585,14 @@ impl App {
             targets.push(target);
         }
 
-        let refresh = self.refresh_millihz();
+        let refresh = self.task_refresh_millihz(object);
         {
             let task = self
                 .tasks
                 .get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.logical_size = Some((width, height));
+            task.applied_opaque = None;
             task.buffer_size = (buffer_width, buffer_height);
             task.configure_serial = serial;
             task.refresh_millihz = refresh;
@@ -548,7 +622,7 @@ impl App {
                 Transform::Normal,
                 refresh,
             )?;
-        Ok(())
+        self.update_output_refreshes()
     }
 
     fn allocate_buffer_id(&mut self) -> Result<BufferId, PresenterError> {
@@ -614,6 +688,7 @@ impl App {
             metadata,
             planes,
             wayland,
+            sync: None,
             _allocation: Some(allocation),
             host_owned: true,
             retired: false,
@@ -716,6 +791,7 @@ impl App {
                 metadata,
                 planes,
                 wayland,
+                sync: None,
                 _allocation: None,
                 host_owned: false,
                 retired: false,
@@ -732,6 +808,8 @@ impl App {
         acquire_fence: &OwnedFd,
     ) -> Result<(), PresenterError> {
         let object = frame.object;
+        let mut frame_trace = presentation_audit::FrameTrace::new(
+            object.0, frame.frame.0, frame.buffer.0, acquire_fence.as_fd());
         if !self
             .tasks
             .get(&object)
@@ -764,11 +842,25 @@ impl App {
             })?;
         if target.wayland.is_none() {
             let buffer = self.create_wayland_buffer(qh, &target.metadata, &target.planes)?;
-            self.tasks
+            let timeline = WaylandTimeline::create(&self.syncobj)?;
+            let descriptor = timeline.export_descriptor()?;
+            let proxy = self.sync_manager.import_timeline(descriptor.as_fd(), qh, ());
+            let target = self.tasks
                 .get_mut(&object)
                 .and_then(|task| task.targets.get_mut(&frame.buffer))
-                .expect("target was just checked")
-                .wayland = Some(buffer);
+                .expect("target was just checked");
+            target.wayland = Some(buffer);
+            // SAFETY: eventfd has no pointer arguments; a nonnegative return
+            // value is a new descriptor uniquely owned below.
+            let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if event < 0 { return Err(io::Error::last_os_error().into()); }
+            target.sync = Some(BufferSync {
+                timeline,
+                proxy,
+                next_point: 0,
+                // SAFETY: ownership of the successful eventfd transfers once.
+                release_wakeup: Some(unsafe { OwnedFd::from_raw_fd(event) }),
+            });
         }
         let task = self
             .tasks
@@ -778,6 +870,23 @@ impl App {
             .surface()
             .cloned()
             .expect("accepts_present guaranteed a mapped window");
+        if task.applied_opaque != Some(task.content_opaque) {
+            if task.content_opaque {
+                let (width, height) = task.logical_size
+                    .ok_or(PresenterError::Configuration("opaque target has no logical size"))?;
+                let region = Region::new(&self.compositor)?;
+                region.add(0, 0, i32::try_from(width).map_err(|_| PresenterError::Configuration("opaque width exceeds Wayland"))?,
+                    i32::try_from(height).map_err(|_| PresenterError::Configuration("opaque height exceeds Wayland"))?);
+                surface.set_opaque_region(Some(region.wl_region()));
+            } else {
+                surface.set_opaque_region(None);
+            }
+            task.applied_opaque = Some(task.content_opaque);
+            if droidloom_syncobj::frame_trace::enabled() {
+                eprintln!("Droidloom content state: object={} frame={} opaque={} source=android monotonic_ns={}",
+                    object.0, frame.frame.0, task.content_opaque, droidloom_syncobj::frame_trace::now_ns());
+            }
+        }
         let target = task
             .targets
             .get_mut(&frame.buffer)
@@ -790,8 +899,10 @@ impl App {
                 "presented buffer is unavailable",
             ));
         }
+        let sync = target.sync.as_mut()
+            .ok_or(PresenterError::Configuration("buffer timeline is absent"))?;
         let acquire_point =
-            task.next_sync_point
+            sync.next_point
                 .checked_add(1)
                 .ok_or(PresenterError::Configuration(
                     "Wayland sync point exhausted",
@@ -801,27 +912,20 @@ impl App {
             .ok_or(PresenterError::Configuration(
                 "Wayland sync point exhausted",
             ))?;
-        task.next_sync_point = release_point;
-        task.timeline
-            .as_mut()
-            .ok_or(PresenterError::Configuration("window timeline is absent"))?
+        sync.next_point = release_point;
+        sync.timeline
             .import_acquire_fence(acquire_point, acquire_fence.as_fd())?;
+        sync.arm_release_wakeup(release_point)?;
         let sync_surface = task
             .sync_surface
             .as_ref()
             .ok_or(PresenterError::Configuration(
                 "window sync surface is absent",
             ))?;
-        let timeline_proxy = task
-            .timeline_proxy
-            .as_ref()
-            .ok_or(PresenterError::Configuration(
-                "window timeline proxy is absent",
-            ))?;
         let (acquire_hi, acquire_lo) = split_point(acquire_point);
         let (release_hi, release_lo) = split_point(release_point);
-        sync_surface.set_acquire_point(timeline_proxy, acquire_hi, acquire_lo);
-        sync_surface.set_release_point(timeline_proxy, release_hi, release_lo);
+        sync_surface.set_acquire_point(&sync.proxy, acquire_hi, acquire_lo);
+        sync_surface.set_release_point(&sync.proxy, release_hi, release_lo);
         let feedback = self.presentation_time.feedback(&surface, qh)?;
         surface.attach(target.wayland.as_ref(), 0, 0);
         for damage in &frame.damage {
@@ -832,12 +936,16 @@ impl App {
                 i32::try_from(damage.height).unwrap_or(i32::MAX),
             );
         }
+        let submitted_nanos = if task.presentation_audit.is_some() { monotonic_timestamp_nanos()? } else { 0 };
+        if let Some(trace) = frame_trace.as_mut() { trace.commit(); }
         surface.commit();
         target.busy = true;
         task.pending.push_back(PendingFrame {
             frame: frame.frame,
             buffer: frame.buffer,
             release_point,
+            submitted_nanos,
+            trace: frame_trace,
         });
         task.presentation_feedback.push((feedback, frame.frame));
         Ok(())
@@ -846,18 +954,38 @@ impl App {
     fn release_ready_frames(&mut self) -> Result<(), PresenterError> {
         let mut ready = Vec::new();
         for (object, task) in &mut self.tasks {
-            let Some(timeline) = task.timeline.as_ref() else {
-                continue;
-            };
-            let signalled = timeline.signalled_point()?;
-            while task.pending.front().is_some_and(|pending| {
-                pending.release_point <= signalled
-                    && !task
+            // Diagnostic observation only: retain the existing release policy.
+            // Inspect sampled frames independently so FIFO head blocking is visible.
+            for pending in &mut task.pending {
+                if let Some(trace) = pending.trace.as_mut() {
+                    if !trace.release_observed {
+                        if let Some(sync) = task.targets.get(&pending.buffer).and_then(|t| t.sync.as_ref()) {
+                            if let Ok(point) = sync.timeline.signalled_point() {
+                                if point >= pending.release_point {
+                                    trace.release_ready(task.presentation_feedback.iter()
+                                        .any(|(_, frame)| *frame == pending.frame));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            while let Some(pending) = task.pending.front() {
+                let sync = task.targets.get(&pending.buffer)
+                    .and_then(|target| target.sync.as_ref())
+                    .ok_or(PresenterError::Configuration("pending buffer timeline is absent"))?;
+                if pending.release_point > sync.timeline.signalled_point()?
+                    || task
                         .presentation_feedback
                         .iter()
                         .any(|(_, frame)| *frame == pending.frame)
-            }) {
+                {
+                    break;
+                }
                 let pending = task.pending.pop_front().expect("front was present");
+                if let Some(audit) = task.presentation_audit.as_mut() {
+                    audit.released(pending.submitted_nanos, monotonic_timestamp_nanos()?);
+                }
                 ready.push((*object, pending));
             }
         }
@@ -866,6 +994,7 @@ impl App {
                 .as_mut()
                 .ok_or(PresenterError::Configuration("endpoint disappeared"))?
                 .finish_release(object, pending.frame)?;
+            if let Some(mut trace) = pending.trace { trace.returned(); }
             let (retired, closing) = {
                 let task = self
                     .tasks
@@ -921,9 +1050,6 @@ impl App {
             if let Some(surface) = task.sync_surface.take() {
                 surface.destroy();
             }
-            if let Some(timeline) = task.timeline_proxy.take() {
-                timeline.destroy();
-            }
             for (_, target) in task.targets {
                 if let Some(buffer) = target.wayland {
                     buffer.destroy();
@@ -938,6 +1064,9 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
+        if self.endpoint.is_some() {
+            if let Err(error) = self.update_output_refreshes() { self.fail(&error); }
+        }
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
@@ -964,9 +1093,6 @@ impl App {
         }
         if let Some(sync_surface) = task.sync_surface.take() {
             sync_surface.destroy();
-        }
-        if let Some(timeline) = task.timeline_proxy.take() {
-            timeline.destroy();
         }
         // Window is reference counted by SCTK. Taking our handle below does
         // not guarantee that WindowInner is dropped here, so relying on Drop
@@ -1035,8 +1161,11 @@ impl App {
             | EndpointAction::ConfigureAcknowledged { .. }
             | EndpointAction::SupersededPresentDiscarded { .. }
             | EndpointAction::Pong { .. }
-            | EndpointAction::SetContentState { .. }
             | EndpointAction::SetFrameRate { .. } => {}
+            EndpointAction::SetContentState { object, flags } => {
+                self.tasks.get_mut(&object).ok_or(PresenterError::UnknownTask(object))?
+                    .content_opaque = flags & droidloom_denial_protocol::content_state::OPAQUE != 0;
+            }
             EndpointAction::BindTask { object, task } => {
                 if let Some(window) = self.tasks.get_mut(&object) {
                     window.android_task = Some(task.0);
@@ -1244,21 +1373,24 @@ impl CompositorHandler for App {
     }
 
     fn surface_enter(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface, output: &wl_output::WlOutput,
     ) {
+        let Some(object) = self.task_for_surface(surface) else { return; };
+        let task = self.tasks.get_mut(&object).expect("surface has a task");
+        if !task.entered_outputs.contains(output) { task.entered_outputs.push(output.clone()); }
+        if let Err(error) = self.update_task_refresh(object) { self.fail(&error); }
     }
 
     fn surface_leave(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface, output: &wl_output::WlOutput,
     ) {
+        let Some(object) = self.task_for_surface(surface) else { return; };
+        let task = self.tasks.get_mut(&object).expect("surface has a task");
+        task.entered_outputs.retain(|entered| entered != output);
+        if task.presentation_output.as_ref() == Some(output) { task.presentation_output = None; }
+        if let Err(error) = self.update_task_refresh(object) { self.fail(&error); }
     }
 }
 
@@ -1428,7 +1560,7 @@ impl OutputHandler for App {
         qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        if let Err(error) = self.reconfigure_bootstrap(qh) {
+        if let Err(error) = self.reconfigure_bootstrap(qh).and_then(|()| self.update_output_refreshes()) {
             self.fail(&error);
         }
     }
@@ -1439,7 +1571,7 @@ impl OutputHandler for App {
         qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        if let Err(error) = self.reconfigure_bootstrap(qh) {
+        if let Err(error) = self.reconfigure_bootstrap(qh).and_then(|()| self.update_output_refreshes()) {
             self.fail(&error);
         }
     }
@@ -1448,9 +1580,13 @@ impl OutputHandler for App {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
-        if let Err(error) = self.reconfigure_bootstrap(qh) {
+        for task in self.tasks.values_mut() {
+            task.entered_outputs.retain(|entered| entered != &output);
+            if task.presentation_output.as_ref() == Some(&output) { task.presentation_output = None; }
+        }
+        if let Err(error) = self.reconfigure_bootstrap(qh).and_then(|()| self.update_output_refreshes()) {
             self.fail(&error);
         }
     }
@@ -1467,7 +1603,7 @@ impl PresentationTimeHandler for App {
         _qh: &QueueHandle<Self>,
         feedback: &WpPresentationFeedback,
         surface: &wl_surface::WlSurface,
-        _outputs: Vec<wl_output::WlOutput>,
+        outputs: Vec<wl_output::WlOutput>,
         time: PresentTime,
         refresh: u32,
         sequence: u64,
@@ -1476,6 +1612,18 @@ impl PresentationTimeHandler for App {
         let Some(object) = self.task_for_surface(surface) else {
             return;
         };
+        let task = self.tasks.get_mut(&object).expect("surface has a task");
+        // Presentation feedback identifies the timing output for overlapping
+        // surfaces. Ignore late feedback from an output already left.
+        if let Some(output) = outputs.into_iter().find(|output| task.entered_outputs.contains(output)) {
+            if task.presentation_output.as_ref() != Some(&output) {
+                task.presentation_output = Some(output);
+                if let Err(error) = self.update_task_refresh(object) {
+                    self.fail(&error);
+                    return;
+                }
+            }
+        }
         let result = (|| {
             if time.clk_id != u32::try_from(libc::CLOCK_MONOTONIC).unwrap_or_default() {
                 return Err(PresenterError::Configuration(
@@ -1498,6 +1646,17 @@ impl PresentationTimeHandler for App {
                 (frame, task.refresh_millihz)
             };
             let timestamp_nanos = presentation_timestamp_nanos(time.tv_sec, time.tv_nsec)?;
+            let task = self.tasks.get_mut(&object).expect("task was just checked");
+            if let Some(trace) = task.pending.iter_mut().find(|pending| pending.frame == frame)
+                .and_then(|pending| pending.trace.as_mut()) {
+                trace.presented(timestamp_nanos, refresh, sequence);
+            }
+            if let Some(audit) = task.presentation_audit.as_mut() {
+                if let Some(pending) = task.pending.iter().find(|pending| pending.frame == frame) {
+                    audit.presented(object.0, pending.submitted_nanos, timestamp_nanos,
+                        monotonic_timestamp_nanos()?, task.pending.len());
+                }
+            }
             let refresh_period_nanos = presentation_refresh_period(refresh, advertised_refresh)?;
             let protocol_flags = if matches!(
                 flags,
@@ -1543,6 +1702,9 @@ impl PresentationTimeHandler for App {
             .iter()
             .position(|(candidate, _)| candidate == feedback)
         {
+            let frame = task.presentation_feedback[index].1;
+            if let Some(trace) = task.pending.iter_mut().find(|pending| pending.frame == frame)
+                .and_then(|pending| pending.trace.as_mut()) { trace.discarded(); }
             task.presentation_feedback.swap_remove(index);
         }
     }
@@ -2130,16 +2292,24 @@ fn poll_sources(
     event_queue: &mut EventQueue<App>,
     app: &mut App,
 ) -> Result<(), PresenterError> {
-    match event_queue.flush() {
-        Ok(()) => {}
-        Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+    let write_blocked = match event_queue.flush() {
+        Ok(()) => {
+            for pending in app.tasks.values_mut().flat_map(|task| task.pending.iter_mut()) {
+                if let Some(trace) = pending.trace.as_mut() { trace.flushed(); }
+            }
+            false
+        }
+        Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => true,
         Err(error) => return Err(PresenterError::Wayland(error.to_string())),
-    }
-    let read_guard = event_queue.prepare_read();
+    };
+    // Pending Wayland events must be dispatched before sleeping. The previous
+    // fixed timeout masked a missed wakeup here when the socket was drained
+    // by another reader but our event queue still contained callbacks.
+    let Some(read_guard) = event_queue.prepare_read() else { return Ok(()); };
     let mut descriptors = vec![
         libc::pollfd {
             fd: conn.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
+            events: libc::POLLIN | if write_blocked { libc::POLLOUT } else { 0 },
             revents: 0,
         },
         libc::pollfd {
@@ -2162,13 +2332,33 @@ fn poll_sources(
             revents: 0,
         });
     }
+    let wakeups_start = descriptors.len();
+    let mut release_fallback = false;
+    for target in app.tasks.values().flat_map(|task| task.targets.values()) {
+        if target.busy {
+            if let Some(event) = target.sync.as_ref().and_then(|sync| sync.release_wakeup.as_ref()) {
+                descriptors.push(libc::pollfd {
+                    fd: event.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            } else {
+                // Only kernels without timeline eventfd support need periodic
+                // checks, and only while an actual release is outstanding.
+                release_fallback = true;
+            }
+        }
+    }
+    let clipboard_deadline = (!app.clipboard_inputs.is_empty())
+        .then(|| app.clipboard.unblock_deadline()).flatten();
+    let timeout = poll_timeout_millis(release_fallback, clipboard_deadline, Instant::now());
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
         libc::poll(
             descriptors.as_mut_ptr(),
             libc::nfds_t::try_from(descriptors.len()).unwrap_or(libc::nfds_t::MAX),
-            POLL_TIMEOUT_MILLIS,
+            timeout,
         )
     };
     if result < 0 {
@@ -2178,18 +2368,47 @@ fn poll_sources(
         }
     }
     app.clipboard.notify_ready(&descriptors);
-    if descriptors[0].revents & libc::POLLIN != 0 {
-        if let Some(read_guard) = read_guard {
-            match read_guard.read() {
-                Ok(_) => {}
-                Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(PresenterError::Wayland(error.to_string())),
+    for event in &descriptors[wakeups_start..] {
+        if event.revents & libc::POLLIN != 0 {
+            let mut count = 0_u64;
+            // SAFETY: all entries in this slice borrow live nonblocking
+            // eventfds; count is writable storage for the required eight bytes.
+            let result = unsafe {
+                libc::read(event.fd, std::ptr::from_mut(&mut count).cast(), size_of::<u64>())
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
+                    return Err(error.into());
+                }
             }
+            // The next loop checks the real timeline and presentation feedback.
+            // Draining here prevents spinning while feedback is still pending.
+        }
+    }
+    if descriptors[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        match read_guard.read() {
+            Ok(_) => {}
+            Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(PresenterError::Wayland(error.to_string())),
         }
     } else {
         drop(read_guard);
     }
     Ok(())
+}
+
+fn poll_timeout_millis(release_fallback: bool, deadline: Option<Instant>, now: Instant) -> i32 {
+    let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
+    let timeout = if release_fallback {
+        Some(timeout.map_or(RELEASE_POLL_FALLBACK, |timeout| timeout.min(RELEASE_POLL_FALLBACK)))
+    } else {
+        timeout
+    };
+    // Round up so sub-millisecond deadlines cannot turn into a busy loop.
+    timeout.map_or(-1, |duration| {
+        i32::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+    })
 }
 
 fn split_point(point: u64) -> (u32, u32) {
@@ -2396,9 +2615,51 @@ fn listener_would_block(error: &EndpointListenerError) -> bool {
     )
 }
 
+// Use the presentation clock's output when known. Until feedback arrives,
+// the most recently entered output is deterministic; unmapped tasks use 60 Hz.
+fn select_surface_refresh<T: PartialEq>(
+    entered: &[T], presented: Option<&T>, mut refresh: impl FnMut(&T) -> Option<u32>,
+) -> u32 {
+    presented.filter(|output| entered.contains(output))
+        .and_then(&mut refresh)
+        .or_else(|| entered.iter().rev().find_map(refresh))
+        .unwrap_or(60_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_tracks_surface_membership_presentation_moves_and_mode_changes() {
+        let mode = |output: &u8| match output { 1 => Some(240_000), 2 => Some(143_973), _ => None };
+        assert_eq!(select_surface_refresh(&[2], None, mode), 143_973);
+        assert_eq!(select_surface_refresh(&[1, 2], Some(&1), mode), 240_000);
+        assert_eq!(select_surface_refresh(&[1, 2], Some(&2), mode), 143_973);
+        assert_eq!(select_surface_refresh(&[2], Some(&1), mode), 143_973);
+        assert_eq!(select_surface_refresh(&[1, 2], None, mode), 143_973);
+        assert_eq!(select_surface_refresh(&[2], Some(&2), |_| Some(120_000)), 120_000);
+        assert_eq!(select_surface_refresh(&[2], Some(&2), |_| None), 60_000);
+        assert_eq!(select_surface_refresh(&[], Some(&1), mode), 60_000);
+    }
+
+    #[test]
+    fn idle_wait_has_no_periodic_timer_but_release_fallback_remains_bounded() {
+        let now = Instant::now();
+        assert_eq!(poll_timeout_millis(false, None, now), -1);
+        assert_eq!(poll_timeout_millis(true, None, now), 4);
+        let deadline = Some(now + Duration::from_secs(10));
+        assert_eq!(poll_timeout_millis(false, deadline, now), 10_000);
+        assert_eq!(poll_timeout_millis(true, deadline, now), 4);
+    }
+
+    #[test]
+    fn clipboard_deadline_wakes_even_without_socket_traffic() {
+        let now = Instant::now();
+        assert_eq!(poll_timeout_millis(false, Some(now), now), 0);
+        assert_eq!(poll_timeout_millis(true, Some(now + Duration::from_micros(50)), now), 1);
+        assert_eq!(poll_timeout_millis(false, Some(now - Duration::from_millis(1)), now), 0);
+    }
 
     #[test]
     fn touch_tap_releases_at_down_position_without_motion() {

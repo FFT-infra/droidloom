@@ -1,0 +1,133 @@
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
+index 27f791f..b48b3f0 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
+@@ -102,6 +102,13 @@ struct CompositionRefreshArgs {
+ 
+     // System time for when frame refresh starts. Used for stats.
+     nsecs_t refreshStartTime = 0;
++
++    // Droidloom's bootstrap display has no visible host surface. Task outputs
++    // have already rendered its visible layers; reuse their merged completion
++    // fence for the bootstrap's ordinary HWC and layer-release bookkeeping.
++    // A null display leaves normal and screen-capture outputs unchanged.
++    std::optional<PhysicalDisplayId> droidloomHeadlessDisplay;
++    sp<Fence> droidloomHeadlessFence;
+ };
+ 
+ } // namespace android::compositionengine
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+index 1b7b2e0..cf1c348 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+@@ -200,6 +200,9 @@ private:
+     std::unique_ptr<planner::Planner> mPlanner;
+     std::unique_ptr<HwcAsyncWorker> mHwComposerAsyncWorker;
+ 
++    // Null disables the headless path; Fence::NO_FENCE is a valid empty frame.
++    sp<Fence> mDroidloomHeadlessFence;
++
+     bool mPredictCompositionStrategy = false;
+     bool mOffloadPresent = false;
+ 
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index d43679d..fae2f01 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -449,6 +449,12 @@ void Output::prepare(const compositionengine::CompositionRefreshArgs& refreshArg
+ 
+ ftl::Future<std::monostate> Output::present(
+         const compositionengine::CompositionRefreshArgs& refreshArgs) {
++    mDroidloomHeadlessFence.clear();
++    const auto physicalId = getDisplayIdVariant().and_then(asPhysicalDisplayId);
++    if (physicalId && refreshArgs.droidloomHeadlessDisplay &&
++        *physicalId == *refreshArgs.droidloomHeadlessDisplay) {
++        mDroidloomHeadlessFence = refreshArgs.droidloomHeadlessFence;
++    }
+     std::optional<panopticon::ExclusiveToken> exclusive;
+     if (auto displayId = getDisplayId(); displayId) {
+         exclusive.emplace(panopticon::exclusive(std::to_string(displayId->value)));
+@@ -1426,6 +1432,33 @@ std::optional<base::unique_fd> Output::composeSurfaces(
+                                               clientCompositionLayersFE);
+     appendRegionFlashRequests(debugRegion, clientCompositionLayers);
+ 
++    if (mDroidloomHeadlessFence) {
++        // The bootstrap target is discarded by the host. Preserve all normal
++        // present/release operations, but do not render the same task layers a
++        // second time. Their real GPU completion fence protects source reuse.
++        sp<Fence> ready = mDroidloomHeadlessFence;
++        bool valid = true;
++        if (fd.get() >= 0) {
++            const auto previous = sp<Fence>::make(dup(fd.get()));
++            valid = previous->isValid();
++            if (valid) {
++                ready = Fence::merge("DroidloomHeadless", ready, previous);
++                valid = ready->isValid();
++            }
++        }
++        base::unique_fd exported(ready->dup());
++        if (valid && (!ready->isValid() || exported.get() >= 0)) {
++            SFTRACE_NAME("DroidloomHeadlessFenceOnly");
++            setExpensiveRenderingExpected(false);
++            for (auto* layer : clientCompositionLayersFE) {
++                layer->setWasClientComposed(ready);
++            }
++            return exported;
++        }
++        // FD exhaustion or a failed merge must retain the ordinary rendering
++        // path, never turn an outstanding GPU read into an immediate release.
++    }
++
+     OutputCompositionState& outputCompositionState = editState();
+     // Check if the client composition requests were rendered into the provided graphic buffer. If
+     // so, we can reuse the buffer and avoid client composition.
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index acc36f9..7a3d4bc 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3454,6 +3454,10 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+     // output remains active during bring-up so Android keeps its ordinary
+     // scheduling and release-fence path while this split is validated.
+     if (base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++        // Retain outstanding reads across idle/visibility transitions too:
++        // a frame with no task draw must not release the preceding GPU work.
++        static sp<Fence> taskCompletion = Fence::NO_FENCE;
++        static bool taskFencesValid = true;
+         struct DirectTaskFrame {
+             std::vector<std::pair<Layer*, sp<LayerFE>>> layers;
+             Rect sourceCrop;
+@@ -3653,12 +3657,34 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             compositionEngine->present(taskRefresh);
+             const sp<Fence>& renderFence =
+                     output->getRenderSurface()->getClientTargetAcquireFence();
++            if (renderFence->isValid()) {
++                if (!taskCompletion->isValid()) {
++                    taskCompletion = renderFence;
++                } else {
++                    auto merged = Fence::merge("DroidloomTasks", taskCompletion, renderFence);
++                    if (merged->isValid()) {
++                        taskCompletion = std::move(merged);
++                    } else {
++                        taskFencesValid = false;
++                    }
++                }
++            }
+             const int readyFence = renderFence != Fence::NO_FENCE ? renderFence->dup() : -1;
+             status = nativeWindow->queueBuffer(nativeWindow, nativeBuffer, readyFence);
+             if (status != NO_ERROR) {
+                 ALOGE("Failed to present Android task %d: %d", task, status);
+             }
+         }
++        // The direct bootstrap native window has no visible Wayland surface.
++        // Retain its normal HWC scheduling and release-fence path, using the
++        // actual task reads instead of another full-canvas GPU composition.
++        // This switch is live so the same process supports controlled A/B tests.
++        if (taskFencesValid &&
++            base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_direct", false) &&
++            base::GetBoolProperty("persist.vendor.droidloom.elide_bootstrap", false)) {
++            refreshArgs.droidloomHeadlessDisplay = pacesetterId;
++            refreshArgs.droidloomHeadlessFence = taskCompletion;
++        }
+     }
+ 
+     mCompositionEngine->present(refreshArgs);

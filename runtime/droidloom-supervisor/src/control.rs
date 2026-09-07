@@ -26,6 +26,9 @@ use crate::development::{DevelopmentCell, recover_development_cell, start_develo
 #[path = "diagnostics.rs"]
 mod diagnostics;
 
+#[path = "apk.rs"]
+mod apk;
+
 /// Default root-owned lifecycle socket.
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/droidloom/control.sock";
 /// Default package-installed cell specification.
@@ -55,6 +58,11 @@ const APPLICATION_CATALOG_ENV: &str = "CLASSPATH=/vendor/framework/droidloom-inp
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlRequest {
+    /// Install a standalone APK supplied as a file descriptor on this connection.
+    Install {
+        /// Android user identifier.
+        user: u32,
+    },
     /// Start the cell if it is not already running.
     Start {
         /// Cell specification to validate and activate.
@@ -236,18 +244,27 @@ impl Daemon {
         Ok(())
     }
 
-    fn handle(&mut self, peer_uid: u32, request: ControlRequest) -> ControlResponse {
+    fn handle(
+        &mut self,
+        peer_uid: u32,
+        request: ControlRequest,
+        file: Option<fs::File>,
+    ) -> ControlResponse {
         if let Err(error) = self.poll() {
             return self.failure(error.to_string());
         }
         let result = match request {
+            ControlRequest::Install { user } => self.install(peer_uid, user, file),
             ControlRequest::Start { spec } => self.start(peer_uid, &spec),
             ControlRequest::Stop => self.stop(peer_uid),
             ControlRequest::Restart { spec } => self.restart(peer_uid, &spec),
             ControlRequest::Status => self.status(peer_uid),
-            ControlRequest::Diagnostics { package, user, lines, crashes } => {
-                self.diagnostics(peer_uid, package.as_deref(), user, lines, crashes)
-            }
+            ControlRequest::Diagnostics {
+                package,
+                user,
+                lines,
+                crashes,
+            } => self.diagnostics(peer_uid, package.as_deref(), user, lines, crashes),
             ControlRequest::Launch {
                 spec,
                 package,
@@ -407,6 +424,28 @@ impl Daemon {
         })
     }
 
+    fn install(
+        &self,
+        peer_uid: u32,
+        user: u32,
+        file: Option<fs::File>,
+    ) -> Result<ControlResponse, ControlError> {
+        validate_android_user(user)?;
+        let active = self.require_active_cell(peer_uid, None)?;
+        let file = file.ok_or_else(|| {
+            ControlError::Invalid(
+                "install requires an APK file descriptor; update both droidloomctl and droidloomd"
+                    .into(),
+            )
+        })?;
+        apk::validate(&file)?;
+        let pid = wait_for_android_init(&active.spec)?;
+        apk::install(pid, user, file)?;
+        Ok(self.success(
+            "APK installed successfully; the application catalog will refresh automatically",
+        ))
+    }
+
     fn application_icon(
         &self,
         peer_uid: u32,
@@ -533,14 +572,20 @@ impl Daemon {
         }
         validate_android_user(user)?;
         if !(1..=2000).contains(&lines) {
-            return Err(ControlError::Invalid("log line count must be between 1 and 2000".into()));
+            return Err(ControlError::Invalid(
+                "log line count must be between 1 and 2000".into(),
+            ));
         }
         // Diagnostics must remain available during a failed/incomplete boot.
         let pid = android_init_pid(&active.spec)?.ok_or_else(|| {
             ControlError::Invalid("Android init is not available for diagnostics".into())
         })?;
         let report = diagnostics::collect(pid, package, user, lines, crashes)?;
-        let mut response = self.success(if crashes { "Android crash report" } else { "Android logs" });
+        let mut response = self.success(if crashes {
+            "Android crash report"
+        } else {
+            "Android logs"
+        });
         response.diagnostics = Some(report);
         Ok(response)
     }
@@ -608,7 +653,7 @@ fn run_loop(
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let response = match receive_request(&mut stream) {
-                    Ok((peer_uid, request)) => daemon.handle(peer_uid, request),
+                    Ok((peer_uid, request, file)) => daemon.handle(peer_uid, request, file),
                     Err(error) => daemon.failure(error.to_string()),
                 };
                 // Closing a diagnostic client must not tear down Android.
@@ -655,10 +700,39 @@ fn wait_for_client(listener: &UnixListener) -> Result<(), ControlError> {
 ///
 /// Returns connection, I/O, size-bound, or JSON failures.
 pub fn request(socket: &Path, request: &ControlRequest) -> Result<ControlResponse, ControlError> {
+    request_with_file(socket, request, None)
+}
+
+/// Install a standalone APK opened with the calling user's permissions.
+///
+/// # Errors
+/// Returns invalid-file, transport, or protocol failures. Android failures are
+/// returned in the control response.
+pub fn install_apk(socket: &Path, path: &Path, user: u32) -> Result<ControlResponse, ControlError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    validate_android_user(user)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|source| io_error(&format!("open APK {}", path.display()), source))?;
+    apk::validate(&file)?;
+    request_with_file(socket, &ControlRequest::Install { user }, Some(&file))
+}
+
+fn request_with_file(
+    socket: &Path,
+    request: &ControlRequest,
+    file: Option<&fs::File>,
+) -> Result<ControlResponse, ControlError> {
     let mut stream =
         UnixStream::connect(socket).map_err(|source| io_error("connect to droidloomd", source))?;
     stream
-        .set_read_timeout(Some(ANDROID_READY_TIMEOUT + CLIENT_TIMEOUT))
+        .set_read_timeout(Some(if file.is_some() {
+            ANDROID_READY_TIMEOUT + Duration::from_secs(120)
+        } else {
+            ANDROID_READY_TIMEOUT + CLIENT_TIMEOUT
+        }))
         .map_err(|source| io_error("set lifecycle response timeout", source))?;
     let encoded = serde_json::to_vec(request)?;
     if encoded.len() as u64 > MAX_MESSAGE_BYTES {
@@ -666,8 +740,14 @@ pub fn request(socket: &Path, request: &ControlRequest) -> Result<ControlRespons
             "lifecycle request is too large".into(),
         ));
     }
+    let remaining = if let Some(file) = file {
+        apk::send_file(&stream, encoded[0], file)?;
+        &encoded[1..]
+    } else {
+        &encoded[..]
+    };
     stream
-        .write_all(&encoded)
+        .write_all(remaining)
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
         .map_err(|source| io_error("send lifecycle request", source))?;
     let mut response = Vec::new();
@@ -722,12 +802,15 @@ fn bind_listener(socket: &Path) -> Result<UnixListener, ControlError> {
     Ok(listener)
 }
 
-fn receive_request(stream: &mut UnixStream) -> Result<(u32, ControlRequest), ControlError> {
+fn receive_request(
+    stream: &mut UnixStream,
+) -> Result<(u32, ControlRequest, Option<fs::File>), ControlError> {
     stream
         .set_read_timeout(Some(CLIENT_TIMEOUT))
         .map_err(|source| io_error("set lifecycle request timeout", source))?;
     let peer_uid = peer_uid(stream)?;
-    let mut encoded = Vec::new();
+    let (first, file) = apk::receive_file(stream)?;
+    let mut encoded = vec![first];
     stream
         .take(MAX_MESSAGE_BYTES + 1)
         .read_to_end(&mut encoded)
@@ -737,7 +820,13 @@ fn receive_request(stream: &mut UnixStream) -> Result<(u32, ControlRequest), Con
             "lifecycle request is too large".into(),
         ));
     }
-    Ok((peer_uid, serde_json::from_slice(&encoded)?))
+    let request = serde_json::from_slice(&encoded)?;
+    if file.is_some() && !matches!(request, ControlRequest::Install { .. }) {
+        return Err(ControlError::Invalid(
+            "only install accepts a file descriptor".into(),
+        ));
+    }
+    Ok((peer_uid, request, file))
 }
 
 fn send_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<(), ControlError> {
@@ -977,8 +1066,12 @@ fn android_runtime_ready(init_pid: u32) -> Result<bool, ControlError> {
 
 fn android_properties_ready(properties: &[u8]) -> bool {
     let properties = String::from_utf8_lossy(properties);
-    properties.lines().any(|line| line == "[sys.boot_completed]: [1]")
-        && properties.lines().any(|line| line == "[init.svc.droidloom-input-bridge]: [running]")
+    properties
+        .lines()
+        .any(|line| line == "[sys.boot_completed]: [1]")
+        && properties
+            .lines()
+            .any(|line| line == "[init.svc.droidloom-input-bridge]: [running]")
 }
 
 fn android_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
@@ -1196,6 +1289,51 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn install_transport_delivers_open_file_and_preserves_android_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("install.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let path = directory.path().join("app with spaces.apk");
+        fs::write(&path, b"PK\x03\x04test payload").unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (_, request, file) = receive_request(&mut stream).unwrap();
+            assert_eq!(request, ControlRequest::Install { user: 10 });
+            assert_eq!(apk::validate(&file.unwrap()).unwrap(), 16);
+            send_response(
+                &mut stream,
+                &ControlResponse {
+                    ok: false,
+                    state: CellState::Running,
+                    message: "Failure [INSTALL_FAILED_NO_MATCHING_ABIS]".into(),
+                    host_pid: None,
+                    launch: None,
+                    applications: None,
+                    application_icon: None,
+                    diagnostics: None,
+                },
+            )
+            .unwrap();
+        });
+        let response = install_apk(&socket, &path, 10).unwrap();
+        assert!(!response.ok);
+        assert!(response.message.contains("INSTALL_FAILED_NO_MATCHING_ABIS"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn install_missing_file_fails_before_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = install_apk(
+            &directory.path().join("absent.sock"),
+            &directory.path().join("absent.apk"),
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("open APK"));
+    }
+
+    #[test]
     fn protocol_round_trip_is_explicit() {
         let request = ControlRequest::Launch {
             spec: "/etc/droidloom/cell.json".into(),
@@ -1228,8 +1366,12 @@ mod tests {
     #[test]
     fn boot_complete_does_not_hide_a_failed_input_service() {
         assert!(!android_properties_ready(b"[sys.boot_completed]: [1]\n"));
-        assert!(!android_properties_ready(b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [restarting]\n"));
-        assert!(android_properties_ready(b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n"));
+        assert!(!android_properties_ready(
+            b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [restarting]\n"
+        ));
+        assert!(android_properties_ready(
+            b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n"
+        ));
     }
     #[test]
     fn application_catalog_protocol_round_trip_is_explicit() {
@@ -1316,12 +1458,22 @@ mod tests {
         let status = request(&socket, &ControlRequest::Status).unwrap();
         assert!(status.ok);
         assert_eq!(status.state, CellState::Stopped);
+        let apk_path = directory.path().join("app.apk");
+        fs::write(&apk_path, b"PK\x03\x04test payload").unwrap();
+        let install = install_apk(&socket, &apk_path, 0).unwrap();
+        assert!(!install.ok);
+        assert!(install.message.contains("not running"));
         // A cancelled report does not stop the daemon, nor start a cold cell.
         let diagnostics = ControlRequest::Diagnostics {
-            package: None, user: 0, lines: 200, crashes: true,
+            package: None,
+            user: 0,
+            lines: 200,
+            crashes: true,
         };
         let mut cancelled = UnixStream::connect(&socket).unwrap();
-        cancelled.write_all(&serde_json::to_vec(&diagnostics).unwrap()).unwrap();
+        cancelled
+            .write_all(&serde_json::to_vec(&diagnostics).unwrap())
+            .unwrap();
         cancelled.shutdown(std::net::Shutdown::Both).unwrap();
         drop(cancelled);
         let report = request(&socket, &diagnostics).unwrap();

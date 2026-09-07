@@ -172,6 +172,25 @@ impl VsyncScheduler {
         Ok(())
     }
 
+    fn update_period(&self, display: DisplayId, period_nanos: u64) -> binder::Result<()> {
+        if period_nanos == 0 {
+            return Err(service_error(ErrorCode::BadConfig));
+        }
+        let now = monotonic_timestamp_nanos()?;
+        let mut schedule = lock(&self.shared.schedule)?;
+        if let Some(active) = schedule.displays.get_mut(&display) {
+            if active.period_nanos == period_nanos {
+                return Ok(());
+            }
+            active.period_nanos = period_nanos;
+            active.next_nanos = now.saturating_add(period_nanos);
+        }
+        // A configure must not enable a clock disabled by SurfaceFlinger.
+        drop(schedule);
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
     fn disable(&self, display: DisplayId) {
         if let Ok(mut schedule) = self.shared.schedule.lock() {
             schedule.displays.remove(&display);
@@ -606,8 +625,20 @@ impl ComposerLifecycle {
         if !lock(&self.connected)?.contains(&display) {
             return Err(service_error(ErrorCode::BadDisplay));
         }
+        let configure = lock(&self.session)?
+            .windows()
+            .composer_for_display(display)
+            .map_err(|_| service_error(ErrorCode::BadDisplay))?
+            .latest_configure()
+            .ok_or_else(|| service_error(ErrorCode::BadConfig))?;
+        self.vsync.update_period(display, configure_refresh_period(configure)?)?;
         let display = i64::try_from(display.0).map_err(|_| service_error(ErrorCode::BadDisplay))?;
         if let Some(callback) = lock(&self.callback)?.as_ref() {
+            // SurfaceFlinger caches physical display modes. onRefresh alone
+            // redraws layers without rereading the changed vsync period.
+            // Reannounce this existing display so it reloads the mode while
+            // preserving its identity; only changed host configures get here.
+            callback.onHotplugEvent(display, DisplayHotplugEvent::CONNECTED)?;
             callback.onRefresh(display)?;
         }
         Ok(())

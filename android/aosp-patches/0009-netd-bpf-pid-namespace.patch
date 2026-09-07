@@ -1,0 +1,76 @@
+--- a/bpf/netd/BpfHandler.cpp
++++ b/bpf/netd/BpfHandler.cpp
+@@ -20,6 +20,9 @@
+ 
+ #include <linux/bpf.h>
+ #include <inttypes.h>
++#include <stdlib.h>
++#include <sys/syscall.h>
++#include <unistd.h>
+ 
+ #include <android-base/result.h>
+ #include <android-base/unique_fd.h>
+@@ -483,6 +486,41 @@
+     unique_fd fd9(bpf::mapRetrieveWO(m1));          if (!fd9.ok()) abort();  // grabs exclusive lock
+ }
+ 
++// BPF helpers report TGIDs in the initial PID namespace. Android normally
++// runs there, but a Droidloom cell's getpid() is namespace-local. Ask an
++// unattached, three-instruction BPF program for the same identity used by
++// netd.c's is_netd(); keep its root/TGID checks unchanged.
++static Result<uint32_t> netdBpfPid() {
++    if (getenv("DROIDLOOM_CELL") == nullptr) return static_cast<uint32_t>(getpid());
++
++    const bpf_insn insns[] = {
++        {.code = BPF_JMP | BPF_CALL, .dst_reg = 0, .src_reg = 0, .off = 0,
++         .imm = BPF_FUNC_get_current_pid_tgid},
++        {.code = BPF_ALU64 | BPF_RSH | BPF_K, .dst_reg = BPF_REG_0, .src_reg = 0,
++         .off = 0, .imm = 32},
++        {.code = BPF_JMP | BPF_EXIT, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0},
++    };
++    static constexpr char license[] = "Apache 2.0";
++    union bpf_attr load = {};
++    load.prog_type = BPF_PROG_TYPE_SYSCALL;
++    load.prog_flags = BPF_F_SLEEPABLE;
++    load.insn_cnt = sizeof(insns) / sizeof(insns[0]);
++    load.insns = reinterpret_cast<uint64_t>(insns);
++    load.license = reinterpret_cast<uint64_t>(license);
++    unique_fd prog(syscall(__NR_bpf, BPF_PROG_LOAD, &load, sizeof(load)));
++    if (!prog.ok()) return Error(errno) << "Loading netd BPF PID query";
++
++    union bpf_attr run = {};
++    run.test.prog_fd = prog.get();
++    if (syscall(__NR_bpf, BPF_PROG_TEST_RUN, &run, sizeof(run))) {
++        return Error(errno) << "Running netd BPF PID query";
++    }
++    if (!run.test.retval) return Error() << "BPF returned an invalid netd PID";
++    ALOGI("Droidloom netd PID: namespace=%d BPF=%u", getpid(), run.test.retval);
++    return run.test.retval;
++}
++
++
+ Result<void> BpfHandler::initMaps() {
+     // bpfLock() requires bpfGetFdMapId which is only available on 4.14+ kernels.
+     if (bpf::lockingEnabled && isAtLeastKernelVersion(4, 14)) mapLockTest();
+@@ -498,7 +536,9 @@
+     RETURN_IF_NOT_OK(mCookieTagMap.init(COOKIE_TAG_MAP_PATH));
+ 
+     const uint32_t zero = 0;
+-    const uint32_t my_pid = getpid();
++    auto pid = netdBpfPid();
++    if (!pid.ok()) return pid.error();
++    const uint32_t my_pid = pid.value();
+     RETURN_IF_NOT_OK(mNetdPidMap.writeValue(zero, my_pid, BPF_ANY));
+ 
+     return {};
+--- a/bpf/netd/Android.bp
++++ b/bpf/netd/Android.bp
+@@ -53,7 +53,7 @@
+     sanitize: {
+         cfi: true,
+     },
+-    apex_available: ["com.android.tethering"],
++    apex_available: ["//apex_available:platform", "com.android.tethering"],
+     min_sdk_version: "apex_inherit",
+ }
+ 

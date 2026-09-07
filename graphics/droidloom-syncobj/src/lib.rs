@@ -10,6 +10,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod frame_trace;
+
 use std::fs::File;
 use std::io;
 use std::mem::size_of;
@@ -142,12 +144,14 @@ impl AsFd for SyncobjDevice {
 impl drm::Device for SyncobjDevice {}
 impl ControlDevice for SyncobjDevice {}
 
-/// One timeline exported to a Wayland compositor for acquire/release points.
+/// One buffer's timeline exported to a Wayland compositor for acquire/release points.
 ///
 /// A presenter imports each Android acquire fence at an odd point and asks the
 /// compositor to signal the following even point after it has finished using
-/// the committed buffer. One timeline is used per surface so releases remain
-/// ordered exactly like that surface's commits.
+/// the committed buffer. Different buffers must use separate timelines:
+/// signaling any point also satisfies earlier points, and compositor releases
+/// need not follow surface commit order. A buffer's next acquire point may
+/// only be imported after its preceding release point has completed.
 #[derive(Debug)]
 pub struct WaylandTimeline {
     timeline: Timeline,
@@ -199,6 +203,22 @@ impl WaylandTimeline {
             .syncobj_timeline_query(&[self.timeline.handle()], &mut point, false)
             .map_err(|source| drm_error("query Wayland release timeline", source))?;
         Ok(point[0])
+    }
+
+    /// Wake an eventfd when this point completes, including points whose
+    /// fences have not yet been submitted. Availability alone must not wake it.
+    ///
+    /// # Errors
+    /// Propagates unsupported-kernel and DRM registration failures.
+    pub fn notify_when_signalled(
+        &self,
+        point: u64,
+        event: BorrowedFd<'_>,
+    ) -> Result<(), SyncobjError> {
+        require_newer(0, point)?;
+        self.timeline.device
+            .syncobj_eventfd(self.timeline.handle(), point, event, false)
+            .map_err(|source| drm_error("register Wayland release wakeup", source))
     }
 }
 
@@ -573,6 +593,84 @@ mod tests {
     use std::time::Duration;
 
     use super::{SyncobjError, deadline_from_parts, require_newer};
+
+    #[test]
+    #[ignore = "requires a DRM render node; set DROIDLOOM_TEST_DRM_NODE"]
+    fn per_buffer_timeline_does_not_release_neighbors() {
+        use std::{fs::OpenOptions, os::fd::AsFd};
+        use drm::control::Device;
+        use super::{SyncobjDevice, WaylandTimeline};
+
+        let node = std::env::var("DROIDLOOM_TEST_DRM_NODE").unwrap();
+        let open = || OpenOptions::new().read(true).write(true).open(&node).unwrap();
+        let producer = SyncobjDevice::from_file(open());
+        let consumer = SyncobjDevice::from_file(open());
+        let complete = producer.create_syncobj(true).unwrap();
+        let ready = producer.syncobj_to_fd(complete, true).unwrap();
+
+        // Reproduce the old layout: the second acquire makes the first
+        // release appear complete even though the consumer never released it.
+        let mut shared = WaylandTimeline::create(&producer).unwrap();
+        shared.import_acquire_fence(1, ready.as_fd()).unwrap();
+        assert!(shared.signalled_point().unwrap() < 2);
+        shared.import_acquire_fence(3, ready.as_fd()).unwrap();
+        assert!(shared.signalled_point().unwrap() >= 2);
+
+        let mut first = WaylandTimeline::create(&producer).unwrap();
+        let mut second = WaylandTimeline::create(&producer).unwrap();
+        let first_fd = first.export_descriptor().unwrap();
+        let second_fd = second.export_descriptor().unwrap();
+        let first_handle = consumer.fd_to_syncobj(first_fd.as_fd(), false).unwrap();
+        let second_handle = consumer.fd_to_syncobj(second_fd.as_fd(), false).unwrap();
+        for cycle in 0..128 {
+            let acquire = cycle * 2 + 1;
+            let release = acquire + 1;
+            first.import_acquire_fence(acquire, ready.as_fd()).unwrap();
+            second.import_acquire_fence(acquire, ready.as_fd()).unwrap();
+            assert!(first.signalled_point().unwrap() < release);
+            // The later buffer is discarded/released first. The earlier
+            // buffer must remain unavailable until its own release arrives.
+            consumer.syncobj_timeline_signal(&[second_handle], &[release]).unwrap();
+            assert!(second.signalled_point().unwrap() >= release);
+            assert!(first.signalled_point().unwrap() < release);
+            consumer.syncobj_timeline_signal(&[first_handle], &[release]).unwrap();
+            assert!(first.signalled_point().unwrap() >= release);
+        }
+        consumer.destroy_syncobj(first_handle).unwrap();
+        consumer.destroy_syncobj(second_handle).unwrap();
+        producer.destroy_syncobj(complete).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a DRM render node; set DROIDLOOM_TEST_DRM_NODE"]
+    fn release_wakeup_tracks_only_its_completed_point() {
+        use std::{fs::{File, OpenOptions}, io::Read, os::fd::{AsFd, FromRawFd}};
+        use drm::control::Device;
+        use super::{SyncobjDevice, WaylandTimeline};
+        let node = std::env::var("DROIDLOOM_TEST_DRM_NODE").unwrap();
+        let device = SyncobjDevice::from_file(OpenOptions::new().read(true).write(true).open(node).unwrap());
+        let timeline = WaylandTimeline::create(&device).unwrap();
+        // SAFETY: no pointer arguments; successful eventfd ownership moves to File once.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0);
+        let mut event = unsafe { File::from_raw_fd(fd) };
+        let mut value = [0_u8; 8];
+        for point in 1..=128 {
+            timeline.notify_when_signalled(point, event.as_fd()).unwrap();
+            // The point does not exist yet: registration must be nonblocking,
+            // and the event must remain unreadable until actual completion.
+            assert_eq!(event.read(&mut value).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            device.syncobj_timeline_signal(&[timeline.timeline.handle()], &[point]).unwrap();
+            event.read_exact(&mut value).unwrap();
+            assert_eq!(u64::from_ne_bytes(value), 1);
+            assert_eq!(event.read(&mut value).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+        // Registering after completion must also wake immediately, avoiding
+        // a race between the presenter's query and its next poll.
+        timeline.notify_when_signalled(128, event.as_fd()).unwrap();
+        event.read_exact(&mut value).unwrap();
+        assert_eq!(u64::from_ne_bytes(value), 1);
+    }
 
     #[test]
     fn point_zero_is_reserved() {

@@ -59,7 +59,7 @@ index 5e26d12..be4a5dd 100644
 +# Development-only bridge for a verified APEX classpath fragment whose EROFS
 +# payload cannot be mounted by the shared host kernel. The wrapper mounts only
 +# the read-only package projection and then invokes Android's derive_classpath.
-+service droidloom_derive_classpath /droidloom/classpath-compat/bin/droidloom-classpath-wrapper /droidloom/classpath-compat/apex/com.android.virt com.android.virt --file-override /droidloom/classpath-compat/bin/netbpfload /apex/com.android.tethering/bin/netbpfload --file-override /droidloom/classpath-compat/lib64/libservice-connectivity.so /apex/com.android.tethering/lib64/libservice-connectivity.so --file-override /droidloom/classpath-compat/lib64/libandroid_net_connectivity_com_android_net_module_util_jni.so /apex/com.android.tethering/lib64/libandroid_net_connectivity_com_android_net_module_util_jni.so
++service droidloom_derive_classpath /droidloom/classpath-compat/bin/droidloom-classpath-wrapper /droidloom/classpath-compat/apex/com.android.virt com.android.virt --file-override /droidloom/classpath-compat/bin/netbpfload /apex/com.android.tethering/bin/netbpfload --file-override /droidloom/classpath-compat/lib64/libservice-connectivity.so /apex/com.android.tethering/lib64/libservice-connectivity.so --file-override /droidloom/classpath-compat/lib64/libnetd_updatable.so /apex/com.android.tethering/lib64/libnetd_updatable.so --file-override /droidloom/classpath-compat/lib64/libandroid_net_connectivity_com_android_net_module_util_jni.so /apex/com.android.tethering/lib64/libandroid_net_connectivity_com_android_net_module_util_jni.so
 +    user root
 +    group root system reserved_disk
 +    oneshot

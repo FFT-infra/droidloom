@@ -1,0 +1,183 @@
+--- a/dma_heap.c
++++ b/dma_heap.c
+@@ -11,6 +11,7 @@
+ #include <stdio.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include "drv_helpers.h"
+@@ -163,6 +164,122 @@
+ 	.bo_export = dma_heap_bo_export,
+ 	.bo_map = dma_heap_bo_map,
+ 	.bo_unmap = drv_bo_munmap,
++	.bo_invalidate = dma_heap_bo_invalidate,
++	.bo_flush = dma_heap_bo_flush,
++	.resolve_format_and_use_flags = drv_resolve_format_and_use_flags_helper,
++};
++
++/* Opt-in image allocator for renderers importing standard linear DMA-BUFs.
++ * Keep the existing blob backend unchanged for its native sub-driver users.
++ * BO_USE_SCANOUT here means Android HWC composition, not physical scanout:
++ * the enclosing compositor allocates its own presentation targets.
++ */
++static const uint32_t dma_heap_image_formats[] = {
++	DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_RGB565, DRM_FORMAT_ABGR2101010, DRM_FORMAT_ABGR16161616F,
++	DRM_FORMAT_R8, DRM_FORMAT_NV12, DRM_FORMAT_NV21,
++	DRM_FORMAT_YVU420, DRM_FORMAT_YVU420_ANDROID, DRM_FORMAT_P010,
++};
++
++static const uint64_t dma_heap_image_use_flags =
++    BO_USE_LINEAR | BO_USE_SW_MASK | BO_USE_RENDERING | BO_USE_TEXTURE |
++    BO_USE_SCANOUT | BO_USE_CAMERA_READ | BO_USE_CAMERA_WRITE |
++    BO_USE_HW_VIDEO_DECODER | BO_USE_HW_VIDEO_ENCODER | BO_USE_RENDERSCRIPT |
++    BO_USE_GPU_DATA_BUFFER | BO_USE_SENSOR_DIRECT_DATA;
++
++#define DMA_HEAP_MAX_IMAGE_DIMENSION 16384u
++#define DMA_HEAP_MAX_ALLOCATION (1u << 30)
++
++static bool image_is_supported(const struct bo *bo)
++{
++	bool format_found = false;
++	for (size_t i = 0; i < ARRAY_SIZE(dma_heap_image_formats); i++)
++		format_found |= bo->meta.format == dma_heap_image_formats[i];
++	if (!format_found || !bo->meta.width || !bo->meta.height ||
++	    (bo->meta.use_flags & ~dma_heap_image_use_flags))
++		return false;
++	if (bo->meta.format == DRM_FORMAT_R8 && bo->meta.height == 1)
++		return bo->meta.width <= DMA_HEAP_MAX_ALLOCATION;
++	return bo->meta.width <= DMA_HEAP_MAX_IMAGE_DIMENSION &&
++	       bo->meta.height <= DMA_HEAP_MAX_IMAGE_DIMENSION;
++}
++
++static int dma_heap_image_compute_metadata(struct bo *bo, uint32_t width, uint32_t height,
++					   uint32_t format, uint64_t use_flags,
++					   const uint64_t *modifiers, uint32_t count)
++{
++	if (!image_is_supported(bo) ||
++	    (count && !drv_has_modifier(modifiers, count, DRM_FORMAT_MOD_LINEAR)))
++		return -EINVAL;
++	/* The dimension bounds make all layout-helper arithmetic fit uint32_t.
++	 * Android YV12 needs chroma strides aligned to 16, unlike the RGB pitch.
++	 */
++	uint32_t stride = ALIGN(drv_stride_from_format(format, width, 0), 64);
++	if ((uint64_t)stride * height > DMA_HEAP_MAX_ALLOCATION)
++		return -EINVAL;
++	int ret = drv_bo_from_format(bo, stride,
++				     format == DRM_FORMAT_YVU420_ANDROID ? 16 : 1,
++				     height, format);
++	if (ret || !bo->meta.total_size || bo->meta.total_size > DMA_HEAP_MAX_ALLOCATION)
++		return -EINVAL;
++	bo->meta.format_modifier = DRM_FORMAT_MOD_LINEAR;
++	return 0;
++}
++
++static int dma_heap_image_import(struct bo *bo, struct drv_import_fd_data *data)
++{
++	if (!image_is_supported(bo) || data->format_modifier != DRM_FORMAT_MOD_LINEAR ||
++	    data->offsets[0] != 0)
++		return -EINVAL;
++	struct stat first;
++	if (fstat(data->fds[0], &first))
++		return -errno;
++	off_t length = lseek(data->fds[0], 0, SEEK_END);
++	if (length <= 0 || length > DMA_HEAP_MAX_ALLOCATION)
++		return -EINVAL;
++	lseek(data->fds[0], 0, SEEK_SET);
++	for (size_t p = 0; p < bo->meta.num_planes; p++) {
++		struct stat current;
++		if (fstat(data->fds[p], &current))
++			return -errno;
++		/* One shared allocation, with non-overlapping planes. A handle's
++		 * plane descriptors may be dup()s of the same DMA-BUF.
++		 */
++		if (current.st_dev != first.st_dev || current.st_ino != first.st_ino ||
++		    data->strides[p] < drv_stride_from_format(data->format, data->width, p) ||
++		    (uint64_t)data->strides[p] * data->height > DMA_HEAP_MAX_ALLOCATION)
++			return -EINVAL;
++		uint64_t end = (uint64_t)data->offsets[p] +
++		    drv_size_from_format(data->format, data->strides[p], data->height, p);
++		uint64_t limit = p + 1 < bo->meta.num_planes ? data->offsets[p + 1] : length;
++		if (end > limit || limit > (uint64_t)length)
++			return -EINVAL;
++	}
++	int fd = fcntl(data->fds[0], F_DUPFD_CLOEXEC, 0);
++	if (fd < 0)
++		return -errno;
++	bo->handle.fd = fd;
++	return 0;
++}
++
++static int dma_heap_images_init(struct driver *drv)
++{
++	drv_add_combinations(drv, dma_heap_image_formats, ARRAY_SIZE(dma_heap_image_formats),
++			     &LINEAR_METADATA, dma_heap_image_use_flags);
++	return 0;
++}
++
++const struct backend backend_dma_heap_images = {
++	.name = "dma_heap_images",
++	.init = dma_heap_images_init,
++	.bo_compute_metadata = dma_heap_image_compute_metadata,
++	.bo_create_from_metadata = dma_heap_bo_create_from_metadata,
++	.bo_destroy = dma_heap_bo_destroy,
++	.bo_import = dma_heap_image_import,
++	.bo_export = dma_heap_bo_export,
++	.bo_map = dma_heap_bo_map,
++	.bo_unmap = drv_bo_munmap,
+ 	.bo_invalidate = dma_heap_bo_invalidate,
+ 	.bo_flush = dma_heap_bo_flush,
+ 	.resolve_format_and_use_flags = drv_resolve_format_and_use_flags_helper,
+--- a/drv_helpers.h
++++ b/drv_helpers.h
+@@ -19,6 +19,7 @@
+ struct format_metadata;
+ 
+ extern const struct backend backend_dma_heap;
++extern const struct backend backend_dma_heap_images;
+ 
+ uint32_t drv_height_from_format(uint32_t format, uint32_t height, size_t plane);
+ uint32_t drv_vertical_subsampling_from_format(uint32_t format, size_t plane);
+--- a/cros_gralloc/cros_gralloc_driver.cc
++++ b/cros_gralloc/cros_gralloc_driver.cc
+@@ -118,6 +118,20 @@
+ 
+ static struct driver *init_try_nodes()
+ {
++	// Explicitly selected by the enclosing cell after validating its GPU and
++	// DMA-heap sharing path. Never silently replace a native DRM allocator.
++	const char *allocator = drv_get_os_option("vendor.minigbm.allocator");
++	if (allocator && !strcmp(allocator, "dma_heap_images")) {
++		int fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
++		if (fd < 0)
++			return nullptr;
++		struct driver *drv = drv_create(fd, &backend_dma_heap_images);
++		if (!drv)
++			close(fd);
++		else
++			ALOGI("Using explicit linear DMA-heap image allocator");
++		return drv;
++	}
+ 	/*
+ 	 * Create a driver from render nodes first, then try card
+ 	 * nodes.
+@@ -231,6 +245,16 @@
+ 	if (!get_resolved_format_and_use_flags(descriptor, &resolved_format, &resolved_use_flags))
+ 		return false;
+ 
++	if (!strcmp(drv_get_name(drv_.get()), "dma_heap_images")) {
++		// Match allocation's dimension/size checks without allocating memory.
++		struct bo *test = drv_bo_create(drv_.get(), descriptor->width, descriptor->height,
++			resolved_format, resolved_use_flags | BO_USE_TEST_ALLOC);
++		if (!test)
++			return false;
++		drv_bo_destroy(test);
++		return true;
++	}
++
+ 	// Allow blob buffers to go beyond the limit.
+ 	if (descriptor->droid_format == HAL_PIXEL_FORMAT_BLOB)
+ 		return true;

@@ -76,7 +76,7 @@ restart, PID reuse or incomplete setup invalidates the cache.
 
 The unified pacman build targets x86_64 with AMD/Intel graphics. NVIDIA rendering,
 ARM-only APK compatibility and unified ARM64 packaging are not established
-features. There is no dedicated APK installation CLI yet.
+features. Install standalone APKs with `droidloomctl install /path/to/application.apk`.
 
 For apps needing explicit activity selection, use
 `droidloomctl launch PACKAGE --component PACKAGE/ACTIVITY`.

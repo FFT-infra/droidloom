@@ -189,6 +189,10 @@ impl Clipboard {
             .is_some_and(|s| s.elapsed() < Duration::from_secs(10))
             && self.peer.is_some()
     }
+    pub fn unblock_deadline(&self) -> Option<Instant> {
+        self.peer.as_ref()?;
+        self.pending_since.map(|since| since + Duration::from_secs(10))
+    }
     pub fn fds(&self) -> [(RawFd, i16); 2] {
         [
             (self.listener.as_raw_fd(), libc::POLLIN),

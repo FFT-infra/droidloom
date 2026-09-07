@@ -9,19 +9,22 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 - **No ARM translation.** The packaged Android userspace supports x86_64 native
   code and apps that need no native libraries. ARM64-only and 32-bit native APKs
   are unsupported. ARM64 translation has not been demonstrated in Droidloom.
-- **Fruit Ninja first launch.** The tested 2.8.9 x86_64 APK switches to an age
-  screen during startup. Task discovery can fail even though Android opened that
-  screen. Repeat the normal launch command once to attach its window. A
-  successful CLI response alone does not prove a visible desktop window.
+- **Fruit Ninja first launch on revisions through 10.** A launcher-to-game or
+  age-screen handoff could defeat task discovery; a later successful launch
+  could still have no window because SurfaceFlinger permanently abandoned the
+  task after six seconds. Revision 11 follows an unambiguous visible same-app
+  successor and retries late registration with bounded backoff. User-owned
+  visual validation remains required; a CLI response alone does not prove a
+  visible desktop window.
 - **Legacy app layouts.** Revision 7 enables Android's force-resizable setting
   so non-resizable apps can enter desktop windowing mode. This does not guarantee
   that every game handles arbitrary window sizes or desktop input correctly.
 - **App services.** Google Play Store / Google Play Services are not supplied as
   an installation step by this preview. Installing an APK does not establish that
   its account, billing, integrity checks or other service dependencies will work.
-- **Manual APK installation.** There is no `droidloomctl install` command or
-  drag-and-drop installer. The documented procedure handles standalone APKs;
-  split bundles and separate game assets need additional installation work.
+- **Standalone APKs only.** `droidloomctl install` accepts one standalone APK.
+  Split bundles, drag-and-drop installation and separate game assets are not
+  supported by the command. Older preview packages need an update to provide it.
 
 ## Desktop and runtime
 

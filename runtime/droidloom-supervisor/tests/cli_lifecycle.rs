@@ -95,6 +95,11 @@ fn explicit_mode_reaches_service_and_restart_preserves_it() {
 fn lifecycle_rejects_a_symlink_runtime_directory() {
     let runtime = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
+    // Package-installed hosts reload the user manager before validating this
+    // path. Keep that preparatory command isolated, as in the lifecycle tests.
+    let systemctl = runtime.path().join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(target.path(), fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink(target.path(), runtime.path().join("droidloom")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_droidloomctl"))

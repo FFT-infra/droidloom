@@ -1,0 +1,68 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index e53c912..8c92dee 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3483,7 +3483,6 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             bool invalidated = true;
+             nsecs_t retryAfter = 0;
+             uint32_t retryAttempts = 0;
+-            bool retired = false;
+             nsecs_t missingSince = 0;
+         };
+         static std::unordered_map<int32_t, DirectTaskOutput> taskOutputs;
+@@ -3601,32 +3600,37 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                                      entry.first) == taskOutput.layerOrder.end();
+                 });
+             }
+-            if (taskOutput.retired) continue;
+             if (!taskOutput.window) {
+                 if (systemTime() < taskOutput.retryAfter) continue;
+                 status_t initializationStatus = NO_ERROR;
+                 taskOutput.window =
+                         DroidloomNativeWindow::createForTask(task, &initializationStatus);
+                 if (!taskOutput.window) {
+-                    if (initializationStatus == NAME_NOT_FOUND &&
+-                        ++taskOutput.retryAttempts >= 24) {
+-                        // WindowManager also tags hidden HOME/system tasks. They are
+-                        // deliberately absent from Composer's explicit task allowlist;
+-                        // permanently retire them after a six-second window that still
+-                        // covers the launcher-to-SurfaceFlinger registration race.
+-                        taskOutput.retired = true;
+-                        ALOGI("Retired unregistered Android task %d from Denial output", task);
++                    const bool unregistered = initializationStatus == NAME_NOT_FOUND;
++                    if (unregistered) {
++                        taskOutput.retryAttempts = std::min(taskOutput.retryAttempts + 1, 24u);
+                     } else {
+-                        if (initializationStatus != NAME_NOT_FOUND) {
+-                            taskOutput.retryAttempts = 0;
+-                        }
+-                        const nsecs_t delay =
+-                                initializationStatus == NAME_NOT_FOUND ||
+-                                        initializationStatus == WOULD_BLOCK
+-                                ? 250'000'000
+-                                : 5'000'000'000;
+-                        taskOutput.retryAfter = systemTime() + delay;
++                        taskOutput.retryAttempts = 0;
+                     }
++                    // Missing from the export allowlist means "not registered
++                    // yet", not "will never be registered". Slow down for HOME
++                    // and system tasks, but retain recovery after a late app
++                    // registration or an activity handoff during launch.
++                    const nsecs_t delay =
++                            (unregistered && taskOutput.retryAttempts < 24) ||
++                                    initializationStatus == WOULD_BLOCK
++                            ? 250'000'000
++                            : 5'000'000'000;
++                    taskOutput.retryAfter = systemTime() + delay;
++                    // An idle app may not produce another frame on its own.
++                    // Keep one delayed retry per failed connection, and avoid
++                    // waking composition for a destroyed or connected task.
++                    static_cast<void>(mScheduler->scheduleDelayed([this, task] {
++                        const auto found = taskOutputs.find(task);
++                        if (found != taskOutputs.end() && !found->second.window) {
++                            scheduleComposite(FrameHint::kNone);
++                        }
++                    }, delay));
+                     continue;
+                 }
+                 taskOutput.retryAttempts = 0;

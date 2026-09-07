@@ -106,6 +106,27 @@ impl IdRange {
     }
 }
 
+/// Explicit rendering/allocator pairing for the host's graphics architecture.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicsBackend {
+    /// Native DRM rendering and allocation; retains existing cell behavior.
+    #[default]
+    Drm,
+    /// Turnip KGSL rendering, Zink GLES and linear system DMA-heap images.
+    KgslDmaHeap,
+}
+
+impl GraphicsBackend {
+    /// Additional bounded device paths needed by this pairing.
+    pub fn auxiliary_devices(self) -> &'static [&'static str] {
+        match self {
+            Self::Drm => &[],
+            Self::KgslDmaHeap => &["/dev/kgsl-3d0", "/dev/dma_heap/system"],
+        }
+    }
+}
+
 /// Immutable inputs required to construct one cell.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +164,9 @@ pub struct CellSpec {
     pub runtime_dir: PathBuf,
     /// The only DRM device exposed to Android.
     pub render_node: PathBuf,
+    /// Host-validated graphics pairing. Omission uses native DRM.
+    #[serde(default)]
+    pub graphics_backend: GraphicsBackend,
     /// Authenticated Denial endpoint exposed at the fixed Android path.
     pub denial_socket: PathBuf,
 }
@@ -650,8 +674,25 @@ mod tests {
             data_dir: "/var/lib/droidloom/users/1000/data".into(),
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),
+            graphics_backend: GraphicsBackend::default(),
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
+    }
+
+    #[test]
+    fn graphics_backend_is_explicit_and_bounded() {
+        let original = spec();
+        let mut json = serde_json::to_value(&original).unwrap();
+        json.as_object_mut().unwrap().remove("graphics_backend");
+        let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.graphics_backend, GraphicsBackend::Drm);
+        assert!(decoded.graphics_backend.auxiliary_devices().is_empty());
+        json["graphics_backend"] = serde_json::json!("kgsl_dma_heap");
+        let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.graphics_backend.auxiliary_devices(),
+                   &["/dev/kgsl-3d0", "/dev/dma_heap/system"]);
+        json["graphics_backend"] = serde_json::json!("/dev/dri/card0");
+        assert!(serde_json::from_value::<CellSpec>(json).is_err());
     }
 
     #[test]

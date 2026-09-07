@@ -88,6 +88,35 @@ transactions against an older pair.
 
 ## Rebuilds and troubleshooting
 
+For a change confined to host components, increase the release in
+`packaging/arch/version.json`, then select the component instead of compiling
+Android again:
+
+```console
+cargo run --locked -j 1 -p droidloom-package -- build --component droidloom-supervisor
+```
+
+This compiles the selected Cargo package and its Rust dependencies. Selecting
+`droidloom-supervisor` updates `droidloomctl`, `droidloomd` and the supervisor
+together. Other supported components are `droidloom-wayland`,
+`droidloom-applications`, `droidloom-doctor`, and `droidloom-package-support`.
+Repeat `--component` to select more than one. Without it, the command builds
+the complete runtime and Android components as before.
+
+A component build reuses unchanged files from the newest completed older package
+pair with the same version and architecture in `dist/arch`. It produces a new
+matching pair and records its baseline and selections in `build-summary.json`.
+It does not use installed binaries or rebuild Android, Mesa or SurfaceFlinger;
+extracting and repackaging the image still takes some time.
+
+Use a full build for Android changes, changes spanning the host/Android protocol,
+or changes to dependencies and package integration. Component builds reject
+changed Cargo lockfiles, pinned Android inputs, runtime contracts and packaging
+recipes. They also reject `--clean` and `--source-cache`. A completed full build
+provides the baseline; builds made before component support need a full rebuild
+to record their inputs. Keep that baseline's archives, summary and
+`component-inputs.json` together. Unselected source edits are not included.
+
 Rerun the same build command to reuse caches. Downloads, sparse AOSP sources and
 outputs live under `.work/arch`; build attempts save `build-*.log` there.
 `build --clean` removes this workflow's compiler outputs while retaining downloads.

@@ -75,50 +75,30 @@ The density persists. Desktop tiling determines the window's available size.
 
 ## 5. Install an APK
 
-There is currently no dedicated APK installation command or drag-and-drop
-installer. The following is the manual procedure used for the preview. It installs
-a **single, standalone APK**. Use an x86_64 APK, or an app with no native libraries;
+The installation command accepts a **single, standalone APK**. Use an x86_64 APK,
+or an app with no native libraries;
 ARM-only APKs need translation that Droidloom does not currently provide.
 
 Download the APK from its publisher or another source you trust. Keep it on the
 Linux host; you do not need to copy it into Android first.
 
-Find the host PID of the running Android init process:
+Start Droidloom, then install the APK as your ordinary desktop user:
 
 ```console
-pgrep -af '^/init second_stage$'
+droidloomctl start
+droidloomctl install "$HOME/Downloads/application.apk"
 ```
 
-The first number is the PID. If multiple Android containers are running, identify
-the Droidloom entry before continuing: `cat /proc/<PID>/cgroup` should show
-`droidloomd.service`. Do not use an arbitrary container PID. Set these two values,
-replacing the example PID and APK path:
+No sudo is needed for installation. The client opens the APK with your permissions
+and passes its file descriptor to the authenticated runtime daemon, which feeds
+it to Android's package manager. The command waits for boot readiness, updates
+an existing app while retaining its data, and reports success only when Android
+confirms installation. The desktop catalog refreshes automatically.
 
-```console
-ANDROID_INIT_PID=12345
-APK="$HOME/Downloads/application.apk"
-```
-
-Confirm boot has completed:
-
-```console
-sudo nsenter --target "$ANDROID_INIT_PID" \
-  --mount --uts --ipc --net --pid --cgroup --root --wd --env \
-  -- /system/bin/getprop sys.boot_completed
-```
-
-Wait until it prints `1`. Then install:
-
-```console
-sudo nsenter --target "$ANDROID_INIT_PID" \
-  --mount --uts --ipc --net --pid --cgroup --root --wd --env \
-  -- /system/bin/cmd package install -r -S "$(stat -c %s -- "$APK")" < "$APK"
-```
-
-Sudo is needed to enter Droidloom's Android namespaces and invoke its package
-manager. The host reads the APK and streams it into Android. `-r` permits updating
-an existing installation while retaining its data. The expected result is
-`Success`. Re-identify the PID after every Android restart.
+Use `--user <id>` to select an Android user (default: `0`), or `--json` for a
+machine-readable response. Files must be regular APK archives no larger than
+2 GiB. Both `droidloomctl` and `droidloomd` must include the install command;
+older preview packages need an update.
 
 If installation reports `device is still booting`, wait and retry. An ABI error
 usually means the APK needs an unsupported CPU architecture. A `.apkm`, `.apks`
@@ -146,8 +126,9 @@ droidloomctl launch com.halfbrick.fruitninjafree \
 
 These examples assume you installed WhatsApp or the tested Fruit Ninja 2.8.9
 x86_64 APK. APKs are not bundled with Droidloom. Complete app registration and
-first-run prompts yourself. Fruit Ninja's age-screen transition may require
-repeating the launch command once; see [known issues](KNOWN_ISSUES.md).
+first-run prompts yourself. Revision 11 handles Fruit Ninja's launcher and
+age-screen handoffs without requiring an activity-specific retry; earlier
+revisions are affected by the [known launch issue](KNOWN_ISSUES.md).
 
 ## Stop, restart, upgrade and remove
 

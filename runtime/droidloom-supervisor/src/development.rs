@@ -97,6 +97,9 @@ pub enum DevelopmentError {
 /// image formats, non-device render paths, and non-socket Denial endpoints.
 pub fn validate_development_inputs(spec: &CellSpec) -> Result<(), DevelopmentError> {
     spec.validate()?;
+    for path in spec.graphics_backend.auxiliary_devices() {
+        auxiliary_graphics_device_numbers(Path::new(path))?;
+    }
     if effective_uid()? != 0 {
         return Err(DevelopmentError::InvalidInput(
             "development boot must be run as root".into(),
@@ -811,8 +814,17 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     // partitions a second time, which Android treats as fatal.
     arm_android_init_parent_death()?;
     pivot_into_cell_root(&root)?;
+    let mut init = Command::new("/init");
+    // Do not inherit a host renderer override accidentally. The explicit
+    // pairing applies to all Android children, including mapper clients.
+    init.env_remove("MESA_LOADER_DRIVER_OVERRIDE")
+        .env_remove("vendor.minigbm.allocator");
+    if spec.graphics_backend == crate::GraphicsBackend::KgslDmaHeap {
+        init.env("MESA_LOADER_DRIVER_OVERRIDE", "zink")
+            .env("vendor.minigbm.allocator", "dma_heap_images");
+    }
     let error = std::os::unix::process::CommandExt::exec(
-        Command::new("/init")
+        init
             .arg("second_stage")
             // Android's mount-namespace decision runs before ro.boot.*
             // properties are guaranteed to exist. Give the package-owned
@@ -1486,6 +1498,22 @@ fn mount_tmpfs(target: &Path, options: &str) -> Result<(), DevelopmentError> {
     )
 }
 
+// Linux reserves a power-of-two minor-number range for every loop device
+// when loop.max_part is enabled. For example loop6 is 7:48 with max_part=7;
+// 7:6 would address a partition of loop0 instead of the requested whole disk.
+fn loop_device_minor(index: u32, max_part: u32) -> Result<u32, DevelopmentError> {
+    max_part
+        .checked_add(1)
+        .and_then(u32::checked_next_power_of_two)
+        .and_then(|stride| index.checked_mul(stride))
+        .filter(|minor| *minor < (1 << 20))
+        .ok_or_else(|| {
+            DevelopmentError::InvalidInput(format!(
+                "loop device {index} with max_part={max_part} exceeds Linux minor-number range"
+            ))
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
     let dev = root.join("dev");
@@ -1526,12 +1554,19 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     // unused loop minors through loop-control; provide only loop devices, not
     // the host block-device tree that ueventd would otherwise recreate.
     make_device_node(&dev.join("loop-control"), "c", 10, 237, "600")?;
-    for minor in 0..DEVELOPMENT_LOOP_DEVICES {
+    let loop_max_part = fs::read_to_string("/sys/module/loop/parameters/max_part")
+        .map_err(|error| io_error("read host loop partition geometry", error))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| {
+            DevelopmentError::InvalidInput(format!("invalid host loop max_part: {error}"))
+        })?;
+    for index in 0..DEVELOPMENT_LOOP_DEVICES {
         make_device_node(
-            &dev.join("block").join(format!("loop{minor}")),
+            &dev.join("block").join(format!("loop{index}")),
             "b",
             7,
-            minor,
+            loop_device_minor(index, loop_max_part)?,
             "600",
         )?;
     }
@@ -1589,11 +1624,19 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
 
     // The host may enumerate the selected GPU as any render minor (for
     // example renderD129 when another GPU owns renderD128). Android sees one
-    // private GPU, so give it the canonical first-render-node name while the
-    // bind mount preserves the selected host device's real major/minor.
+    // private GPU, so give it the canonical first-render-node name with the
+    // selected device's real major/minor. Use a private inode: host render-group
+    // IDs do not match Android's users, and chmod on a bind mount would change
+    // the host node. A render node has no display-master/modesetting authority.
     let render_target = dev.join("dri").join(ANDROID_RENDER_NODE);
-    create_mount_target(&render_target)?;
-    bind_mount(&spec.render_node, &render_target, false)?;
+    let render = read_render_node_sysfs_metadata(&spec.render_node)?;
+    make_device_node(
+        &render_target,
+        "c",
+        u32::try_from(render.major).expect("validated Linux device major"),
+        u32::try_from(render.minor).expect("validated Linux device minor"),
+        "666",
+    )?;
     let host_node_name = spec.render_node.file_name().ok_or_else(|| {
         DevelopmentError::InvalidInput(format!(
             "{} has no render-node filename",
@@ -1607,6 +1650,15 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         // exact same selected character device.  No second GPU is exposed.
         symlink(ANDROID_RENDER_NODE, dev.join("dri").join(host_node_name))
             .map_err(|source| io_error("create render-node minor compatibility alias", source))?;
+    }
+
+    for path in spec.graphics_backend.auxiliary_devices() {
+        let path = Path::new(path);
+        let (major, minor) = auxiliary_graphics_device_numbers(path)?;
+        let target = root.join(path.strip_prefix("/").expect("fixed absolute device path"));
+        fs::create_dir_all(target.parent().expect("device parent"))
+            .map_err(|source| io_error("create private graphics device directory", source))?;
+        make_device_node(&target, "c", major, minor, "666")?;
     }
 
     let denial_target = root.join(ANDROID_DENIAL_SOCKET);
@@ -1643,6 +1695,27 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         }
     }
     Ok(())
+}
+
+fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| io_error("stat auxiliary graphics device", source))?;
+    if !metadata.file_type().is_char_device() {
+        return Err(DevelopmentError::InvalidInput(format!(
+            "{} must be a character device, not a symlink", path.display()
+        )));
+    }
+    let (major, minor) = linux_device_numbers(metadata.rdev());
+    let uevent = fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/uevent"))
+        .map_err(|source| io_error("read auxiliary graphics device identity", source))?;
+    let expected = format!("DEVNAME={}", path.strip_prefix("/dev").expect("fixed device path").display());
+    if !uevent.lines().any(|line| line == expected) {
+        return Err(DevelopmentError::InvalidInput(format!(
+            "{} does not match its kernel device identity", path.display()
+        )));
+    }
+    Ok((u32::try_from(major).expect("Linux device major"),
+        u32::try_from(minor).expect("Linux device minor")))
 }
 
 fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
@@ -1845,6 +1918,23 @@ fn io_error(context: &str, source: io::Error) -> DevelopmentError {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn loop_device_minors_follow_host_partition_geometry() {
+        assert_eq!(loop_device_minor(0, 7).unwrap(), 0);
+        assert_eq!(loop_device_minor(6, 0).unwrap(), 6);
+        assert_eq!(loop_device_minor(6, 7).unwrap(), 48);
+        assert_eq!(loop_device_minor(6, 15).unwrap(), 96);
+        assert_eq!(loop_device_minor(255, 7).unwrap(), 2040);
+        assert_eq!(loop_device_minor(6, 5).unwrap(), 48);
+    }
+
+    #[test]
+    fn loop_device_minors_reject_overflow_and_out_of_range_devices() {
+        assert!(loop_device_minor(1, u32::MAX).is_err());
+        assert!(loop_device_minor(u32::MAX, 7).is_err());
+        assert!(loop_device_minor(1 << 17, 7).is_err());
+    }
 
     #[test]
     fn storage_identity_uses_installed_media_provider_not_media_rw_or_other_apps() {

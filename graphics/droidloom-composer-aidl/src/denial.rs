@@ -20,6 +20,7 @@ use droidloom_composer::{
 use droidloom_denial_ipc::{AttachedDescriptor, IpcError, ProtocolSocket};
 use droidloom_denial_protocol::{AndroidMessage, DenialMessage, DescriptorKind, TaskObjectId};
 use droidloom_syncobj::{AndroidTaskTimelines, SyncobjDevice, SyncobjError};
+use droidloom_syncobj::frame_trace;
 use droidloom_transport::{AcceptedFrame, BufferId, BufferMetadata};
 use thiserror::Error;
 
@@ -173,6 +174,8 @@ impl DenialPresentationSink {
                 timelines,
                 render_targets: BTreeMap::new(),
                 frame_targets: BTreeMap::new(),
+                trace_fences: BTreeMap::new(),
+                content_opaque: None,
                 surfaceflinger_present_fence: None,
                 android_display_extent: None,
             },
@@ -259,6 +262,7 @@ impl DenialPresentationSink {
         session: &mut Session,
         message: &DenialMessage,
     ) -> Result<AppliedDenialEvent, DenialSinkError> {
+        let received = if frame_trace::enabled() { frame_trace::now_ns() } else { 0 };
         let object = task_object(message).ok_or(DenialSinkError::ConnectionMessage)?;
         let mut tasks = self.lock_tasks()?;
         let task = tasks
@@ -287,6 +291,18 @@ impl DenialPresentationSink {
             };
             if remove {
                 task.render_targets.remove(buffer);
+            }
+            if frame_trace::sampled(frame.0) {
+                frame_trace::event("android_reusable", object.0, frame.0, buffer.0,
+                    &[("receive_ns", received), ("reusable_ns", frame_trace::now_ns())]);
+                if let Some(fence) = task.trace_fences.remove(frame) {
+                    match frame_trace::fence_signal_ns(fence.as_fd()) {
+                        Ok(Some(signal)) => frame_trace::event("android_gpu_complete", object.0,
+                            frame.0, buffer.0, &[("signal_ns", signal)]),
+                        _ => frame_trace::event("android_gpu_timestamp_unavailable", object.0,
+                            frame.0, buffer.0, &[]),
+                    }
+                }
             }
         }
         Ok(event)
@@ -429,13 +445,22 @@ impl DenialPresentationSink {
         display: DisplayId,
         target: ImportedRenderTarget,
         acquire_fence: Option<std::os::fd::OwnedFd>,
+        opaque: bool,
+        damage: Option<droidloom_transport::Damage>,
     ) -> Result<droidloom_transport::FrameId, DenialSinkError> {
-        let damage = vec![droidloom_transport::Damage {
+        // Legacy or unknown damage remains full. The transport validates
+        // bounds before accepting the target; empty damage remains empty.
+        let damage = damage.unwrap_or(droidloom_transport::Damage {
             x: 0,
             y: 0,
             width: target.metadata.width,
             height: target.metadata.height,
-        }];
+        });
+        let damage = if damage.width == 0 && damage.height == 0 {
+            Vec::new()
+        } else {
+            vec![damage]
+        };
         let frame = match session
             .windows_mut()
             .composer_for_display_mut(display)
@@ -455,7 +480,7 @@ impl DenialPresentationSink {
             }
         };
 
-        if let Err(error) = self.send_surfaceflinger_frame(display, &frame, &target, acquire_fence)
+        if let Err(error) = self.send_surfaceflinger_frame(display, &frame, &target, acquire_fence, opaque)
         {
             if let Ok(composer) = session.windows_mut().composer_for_display_mut(display) {
                 let _ = composer.cancel_unsubmitted_target(frame.frame_id);
@@ -576,7 +601,10 @@ impl DenialPresentationSink {
         frame: &AcceptedFrame,
         target: &ImportedRenderTarget,
         acquire_fence: Option<std::os::fd::OwnedFd>,
+        opaque: bool,
     ) -> Result<(), DenialSinkError> {
+        let tracing = frame_trace::sampled(frame.frame_id.0);
+        let begin = if tracing { frame_trace::now_ns() } else { 0 };
         if target.metadata != frame.buffer || !frame.requires_acquire_fence {
             return Err(DenialSinkError::BufferMetadataMismatch(target.metadata.id));
         }
@@ -596,7 +624,17 @@ impl DenialPresentationSink {
             return Err(DenialSinkError::BufferMetadataMismatch(frame.buffer.id));
         }
 
+        // Send metadata before this exact frame on the ordered transport. A
+        // transparent successor must clear a preceding frame's opaque proof.
+        if task.content_opaque != Some(opaque) {
+            self.socket.send_android(&AndroidMessage::SetContentState {
+                object: task.binding.object(),
+                flags: if opaque { droidloom_denial_protocol::content_state::OPAQUE } else { 0 },
+            }, &[])?;
+            task.content_opaque = Some(opaque);
+        }
         let prepared = task.binding.prepare_present(display, frame)?;
+        let import_begin = if tracing { frame_trace::now_ns() } else { 0 };
         let import_result = if let Some(acquire_fence) = acquire_fence.as_ref() {
             task.timelines
                 .import_acquire_fence(prepared.acquire_point, acquire_fence.as_fd())
@@ -614,6 +652,7 @@ impl DenialPresentationSink {
                 return Err(error.into());
             }
         };
+        let send_begin = if tracing { frame_trace::now_ns() } else { 0 };
         if let Err(error) = self.socket.send_android(&prepared.message, &[]) {
             cancel_prepared(&mut task.binding, frame, &prepared);
             return Err(error.into());
@@ -627,6 +666,17 @@ impl DenialPresentationSink {
         host_target.busy = true;
         task.frame_targets.insert(frame.frame_id, frame.buffer.id);
         task.surfaceflinger_present_fence = Some(present_fence);
+        if tracing {
+            // Keep the original render fence: exporting an already completed DRM
+            // point may replace it with a timestamp-less/global placeholder.
+            if let Some(fence) = acquire_fence.as_ref().and_then(|fd| fd.try_clone().ok()) {
+                task.trace_fences.insert(frame.frame_id, fence);
+            }
+            frame_trace::event("android_submit", task.binding.object().0, frame.frame_id.0,
+                frame.buffer.id.0, &[("display", display.0), ("begin_ns", begin),
+                    ("import_begin_ns", import_begin), ("send_begin_ns", send_begin),
+                    ("send_done_ns", frame_trace::now_ns()), ("acquire_point", prepared.acquire_point)]);
+        }
         Ok(())
     }
 
@@ -755,6 +805,10 @@ struct TaskChannel {
     timelines: AndroidTaskTimelines,
     render_targets: BTreeMap<BufferId, HostRenderTarget>,
     frame_targets: BTreeMap<droidloom_transport::FrameId, BufferId>,
+    /// Sampled original render fences, bounded by the existing in-flight pool.
+    trace_fences: BTreeMap<droidloom_transport::FrameId, std::os::fd::OwnedFd>,
+    /// Last opaque-coverage proof sent to the host for this task.
+    content_opaque: Option<bool>,
     /// SurfaceFlinger's GPU completion fence awaiting Composer3 present reply.
     surfaceflinger_present_fence: Option<std::os::fd::OwnedFd>,
     /// SurfaceFlinger display space pinned by the first hotplug configure.

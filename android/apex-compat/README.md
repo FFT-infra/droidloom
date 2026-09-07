@@ -29,6 +29,15 @@ RCU primitive before production permits runtime BPF map rotation.
 The platform `libmeminfo` projection reports absent in-cell GPU BPF accounting
 as zero only for a marked Droidloom cell. If the map exists, Android's strict
 key/value/permission validation remains unchanged.
+The projection also supplies `libnetd_updatable.so` with the maintained
+`0009-netd-bpf-pid-namespace.patch`. Netd's identity map must contain the TGID
+used by `bpf_get_current_pid_tgid`, not a container-local `getpid()` value.
+Inside a marked Droidloom cell, a temporary, unattached BPF syscall program
+queries that identity using the existing CAP_BPF capability. It is run once
+and closed, and failures remain fatal. Android's root/TGID authorization
+checks and networking self-tests are unchanged. This path was verified on
+Motorola Linux 6.6.98, including the real `netd1shot` startup self-test.
+
 The wrapper then delegates all classpath generation to Android's own binary. It
 does not start virtualization services or emulate an APEX manager.
 

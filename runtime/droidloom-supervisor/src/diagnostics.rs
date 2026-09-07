@@ -159,12 +159,19 @@ fn read_tail(mut reader: impl Read, limit: usize) -> io::Result<String> {
 }
 
 fn capture(command: &mut Command) -> Result<String, ControlError> {
+    capture_with_stdin(command, Stdio::null())
+}
+
+pub(super) fn capture_with_stdin(
+    command: &mut Command,
+    stdin: Stdio,
+) -> Result<String, ControlError> {
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|source| io_error("start Android diagnostics", source))?;
+        .map_err(|source| io_error("start Android command", source))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let (status, stdout, stderr) = thread::scope(|scope| {
@@ -172,17 +179,17 @@ fn capture(command: &mut Command) -> Result<String, ControlError> {
         let err = scope.spawn(|| read_tail(stderr, 16 * 1024));
         (child.wait(), out.join(), err.join())
     });
-    let status = status.map_err(|source| io_error("wait for Android diagnostics", source))?;
+    let status = status.map_err(|source| io_error("wait for Android command", source))?;
     let read = |result: thread::Result<io::Result<String>>| {
         result
-            .map_err(|_| ControlError::Invalid("diagnostic output reader failed".into()))?
-            .map_err(|source| io_error("read Android diagnostics", source))
+            .map_err(|_| ControlError::Invalid("Android command output reader failed".into()))?
+            .map_err(|source| io_error("read Android command output", source))
     };
     let stdout = read(stdout)?;
     let stderr = read(stderr)?;
     if !status.success() {
         return Err(ControlError::Invalid(format!(
-            "Android diagnostic command failed ({status}): {stderr}{stdout}"
+            "Android command failed ({status}): {stderr}{stdout}"
         )));
     }
     Ok(if stderr.is_empty() {

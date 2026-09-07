@@ -8,6 +8,7 @@ use droidloom_denial_ipc::{SeqPacket, SeqPacketListener};
 use droidloom_surface_bridge::{Plane, Request, Response, decode_request, encode_response};
 use std::collections::BTreeMap;
 use std::os::fd::AsFd;
+use droidloom_syncobj::frame_trace;
 
 use crate::control::TaskCoordinator;
 
@@ -87,6 +88,10 @@ impl SurfaceBridge {
         let mut selected_display = None;
         let mut selected_task = None;
         let mut reservations: BTreeMap<u64, ImportedRenderTarget> = BTreeMap::new();
+        let tracing = frame_trace::enabled();
+        let mut acquire_begin = 0;
+        let mut acquire_retries = 0_u64;
+        let mut timings: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
         let result = (|| -> Result<(), String> {
             loop {
                 let record = match socket.receive_record() {
@@ -130,6 +135,7 @@ impl SurfaceBridge {
                     }
                     _ if !ready => break Err("SurfaceFlinger hello is required".to_owned()),
                     Request::Acquire { display } => {
+                        if tracing && acquire_begin == 0 { acquire_begin = frame_trace::now_ns(); }
                         let display = require_display(selected_display, display)?;
                         if reservations.len() >= MAX_RESERVATIONS {
                             send_response(socket, &Response::Error { code: -16 }, &[])?;
@@ -138,6 +144,7 @@ impl SurfaceBridge {
                         let target = match self.sink.acquire_surfaceflinger_target(display) {
                             Ok(target) => target,
                             Err(error) => {
+                                if tracing { acquire_retries += 1; }
                                 eprintln!("Droidloom SurfaceFlinger acquire failed: {error}");
                                 send_response(socket, &Response::Error { code: -11 }, &[])?;
                                 continue;
@@ -169,13 +176,20 @@ impl SurfaceBridge {
                             break Err(error);
                         }
                         let buffer = target.metadata.id.0;
+                        if tracing {
+                            timings.insert(buffer, (acquire_begin, frame_trace::now_ns(), acquire_retries));
+                            acquire_begin = 0;
+                            acquire_retries = 0;
+                        }
                         if reservations.insert(buffer, target).is_some() {
                             break Err(format!(
                                 "SurfaceFlinger acquired duplicate target {buffer}"
                             ));
                         }
                     }
-                    Request::Present { display, buffer } => {
+                    Request::Present { display, buffer, opaque, damage } => {
+                        let received = if tracing { frame_trace::now_ns() } else { 0 };
+                        let timing = timings.remove(&buffer);
                         let display = require_display(selected_display, display)?;
                         let Some(target) = reservations.remove(&buffer) else {
                             send_response(socket, &Response::Error { code: -22 }, &[])?;
@@ -194,12 +208,25 @@ impl SurfaceBridge {
                                         display,
                                         target,
                                         acquire_fence,
+                                        opaque,
+                                        damage.map(|rect| droidloom_transport::Damage {
+                                            x: rect.x, y: rect.y,
+                                            width: rect.width, height: rect.height,
+                                        }),
                                     )
                                     .map_err(|error| error.to_string())
                             });
                         match submit {
-                            Ok(_frame) => {
+                            Ok(frame) => {
                                 send_response(socket, &Response::Ack, &[])?;
+                                if let Some((begin, acquired, retries)) = timing {
+                                    frame_trace::event("sf_bridge", 0, frame.0, buffer, &[
+                                        ("display", display.0), ("android_task", selected_task.unwrap_or(0)),
+                                        ("acquire_begin_ns", begin), ("acquired_ns", acquired),
+                                        ("acquire_retries", retries), ("present_received_ns", received),
+                                        ("ack_sent_ns", frame_trace::now_ns()),
+                                    ]);
+                                }
                             }
                             Err(error) => {
                                 eprintln!("Droidloom SurfaceFlinger present failed: {error}");
@@ -208,6 +235,7 @@ impl SurfaceBridge {
                         }
                     }
                     Request::Cancel { display, buffer } => {
+                        timings.remove(&buffer);
                         let display = require_display(selected_display, display)?;
                         let Some(target) = reservations.remove(&buffer) else {
                             send_response(socket, &Response::Error { code: -22 }, &[])?;

@@ -1,0 +1,139 @@
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1713,6 +1713,55 @@
+ }
+ 
+ static int
++zink_get_kgsl_device(const struct zink_screen *screen, uint32_t pdev_count,
++                     const VkPhysicalDevice *pdevs)
++{
++   int selected = -1;
++
++   for (uint32_t i = 0; i < pdev_count; ++i) {
++      VkPhysicalDeviceDriverProperties driver = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++      };
++      VkPhysicalDeviceProperties2 props = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++         .pNext = &driver,
++      };
++      VKSCR(GetPhysicalDeviceProperties2)(pdevs[i], &props);
++      if (driver.driverID != VK_DRIVER_ID_MESA_TURNIP)
++         continue;
++
++      uint32_t count = 0;
++      if (VKSCR(EnumerateDeviceExtensionProperties)(pdevs[i], NULL, &count, NULL) != VK_SUCCESS)
++         return -1;
++      VkExtensionProperties *extensions = calloc(count, sizeof(*extensions));
++      if (!extensions)
++         return -1;
++      VkResult result = VKSCR(EnumerateDeviceExtensionProperties)(pdevs[i], NULL, &count, extensions);
++      bool drm = false, memory_fd = false, dmabuf = false, modifiers = false;
++      for (uint32_t j = 0; result == VK_SUCCESS && j < count; ++j) {
++         const char *name = extensions[j].extensionName;
++         drm |= !strcmp(name, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
++         memory_fd |= !strcmp(name, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
++         dmabuf |= !strcmp(name, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
++         modifiers |= !strcmp(name, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
++      }
++      free(extensions);
++      if (result != VK_SUCCESS)
++         return -1;
++
++      /* Turnip's KGSL backend has no DRM identity. Its buffers can still be
++       * imported by the separate downstream msm_drm display device.
++       */
++      if (drm || !memory_fd || !dmabuf || !modifiers)
++         continue;
++      if (selected != -1)
++         return -1; /* Do not guess between multiple rendering devices. */
++      selected = i;
++   }
++   return selected;
++}
++
++static int
+ zink_get_cpu_device_type(const struct zink_screen *screen, uint32_t pdev_count,
+                          const VkPhysicalDevice *pdevs)
+ {
+@@ -1755,7 +1804,8 @@
+ }
+ 
+ static void
+-choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
++choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor,
++            uint64_t adapter_luid, bool kgsl_display)
+ {
+    bool cpu = debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false) ||
+               debug_get_bool_option("D3D_ALWAYS_SOFTWARE", false);
+@@ -1788,9 +1838,12 @@
+          idx = zink_match_adapter_luid(screen, pdev_count, pdevs, adapter_luid);
+       else if (cpu)
+          idx = zink_get_cpu_device_type(screen, pdev_count, pdevs);
+-      else
++      else {
+          idx = zink_get_display_device(screen, pdev_count, pdevs, dev_major,
+                                        dev_minor);
++         if (idx == -1 && kgsl_display)
++            idx = zink_get_kgsl_device(screen, pdev_count, pdevs);
++      }
+ 
+       if (idx != -1)
+          /* valid cpu device */
+@@ -3371,7 +3424,8 @@
+ }
+ 
+ static struct zink_screen *
+-zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
++zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major,
++                            int64_t dev_minor, uint64_t adapter_luid, bool kgsl_display)
+ {
+    if (os_get_option("ZINK_USE_LAVAPIPE")) {
+       mesa_loge("ZINK_USE_LAVAPIPE is obsolete. Use LIBGL_ALWAYS_SOFTWARE\n");
+@@ -3469,7 +3523,7 @@
+          debug_printf("ZINK: failed to setup debug utils\n");
+    }
+ 
+-   choose_pdev(screen, dev_major, dev_minor, adapter_luid);
++   choose_pdev(screen, dev_major, dev_minor, adapter_luid, kgsl_display);
+    if (screen->pdev == VK_NULL_HANDLE) {
+       if (!screen->driver_name_is_inferred)
+          mesa_loge("ZINK: failed to choose pdev");
+@@ -3842,7 +3896,7 @@
+ struct pipe_screen *
+ zink_create_screen(struct sw_winsys *winsys, const struct pipe_screen_config *config)
+ {
+-   struct zink_screen *ret = zink_internal_create_screen(config, -1, -1, 0);
++   struct zink_screen *ret = zink_internal_create_screen(config, -1, -1, 0, false);
+    if (ret) {
+       ret->drm_fd = -1;
+    }
+@@ -3894,7 +3948,18 @@
+    if (zink_render_rdev(fd, &dev_major, &dev_minor))
+       return NULL;
+ 
+-   ret = zink_internal_create_screen(config, dev_major, dev_minor, 0);
++   bool kgsl_display = false;
++#ifdef HAVE_LIBDRM
++   /* Qualcomm's downstream display driver exposes a render node for GEM and
++    * PRIME, while GPU submission belongs to KGSL. Upstream msm is different.
++    */
++   drmVersionPtr version = drmGetVersion(fd);
++   if (version) {
++      kgsl_display = version->name && !strcmp(version->name, "msm_drm");
++      drmFreeVersion(version);
++   }
++#endif
++   ret = zink_internal_create_screen(config, dev_major, dev_minor, 0, kgsl_display);
+    if (!ret)
+       return NULL;
+ 
+@@ -3929,7 +3994,7 @@
+ struct pipe_screen *
+ zink_win32_create_screen(uint64_t adapter_luid)
+ {
+-   struct zink_screen *ret = zink_internal_create_screen(NULL, -1, -1, adapter_luid);
++   struct zink_screen *ret = zink_internal_create_screen(NULL, -1, -1, adapter_luid, false);
+    return ret ? &ret->base : NULL;
+ }
+ 

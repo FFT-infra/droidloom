@@ -32,7 +32,7 @@ first-time setup and **[installing APKs](docs/INSTALL.md#5-install-an-apk)**.
    configuration and the system-service permission. The guide includes an explicit
    setup command if the authentication prompt is unavailable.
 4. Try `droidloomctl launch com.android.settings`, then follow the guide to install
-   your APKs. Droidloom currently has no dedicated APK installation command.
+   your APKs with `droidloomctl install /path/to/application.apk`.
 
 Startup is manual; launching an app does not start a stopped runtime. Read
 **[known issues](docs/KNOWN_ISSUES.md)** for compatibility limits and workarounds.

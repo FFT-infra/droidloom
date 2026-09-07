@@ -1,31 +1,40 @@
 # Pinned Mesa Android build
 
-Droidloom builds Mesa 26.1.7 from the exact archive and SHA-256/SHA-512 identity
-in `android/manifest/source-lock.json`. It does not use the incomplete generated
-Soong driver modules in AOSP's `external/mesa3d` project.
+Droidloom builds Mesa 26.1.7 from the archive and checksums in the source lock.
+It uses Mesa's Android Meson wrapper with the pinned AOSP/Bionic compiler and
+Android API 37, rather than AOSP's incomplete generated Mesa Soong modules.
 
-`droidloom-mesa prepare` verifies the downloaded archive, rejects unsafe archive
-paths, applies the ordered patches in `patches/`, hashes the resulting tree, and
-atomically publishes it below `.work/mesa-prepared/`. An existing prepared tree
-is accepted only when its manifest, patch hashes, and complete tree hash still
-match.
+`droidloom-mesa prepare` verifies the archive, applies the ordered `patches/`,
+and records the resulting tree's identity. The maintained Rust Android builder
+in `tools/droidloom-update/src/android.rs` mirrors that tree into its temporary
+AOSP projection, applies the runtime patches below, and restores projected
+sources after building. The cached ARM64 build uses the same projection.
 
-`tools/droidloom-vendor-image-smoke` then projects that verified tree into the
-sparse AOSP materialization and invokes Mesa's Android Meson wrapper with:
+The ARM64 product builds Gallium Freedreno and Zink, Vulkan Freedreno (Turnip),
+and both MSM and KGSL kernel interfaces. Native DRM remains the cell default.
+Explicit `graphics_backend: "kgsl_dma_heap"` selects Zink over Turnip and the
+portable minigbm allocator; see `docs/architecture.md` for the device boundary.
+No software renderer is included.
 
-- Gallium `freedreno` for EGL/GLES;
-- Vulkan `freedreno` (Turnip);
-- only the MSM DRM render-node KMD;
-- Android API 37 and the pinned AOSP/Bionic compiler/linker inputs.
+Runtime patches under `android/aosp-patches/`:
 
-The two local patches make host code generation use AOSP's pinned Mako and add
-the standard `<type_traits>` include required by Android's libc++. Neither patch
-changes driver behavior.
+- `0010-minigbm-dma-heap-images.patch`: opt-in bounded linear image allocation,
+  import validation and matching allocation/capability-query checks.
+- `0011-mesa-zink-kgsl.patch`: when ordinary DRM matching fails on `msm_drm`,
+  select a unique Turnip device without DRM identity only if external DMA-BUF
+  memory and image modifier extensions are present. Other DRM drivers keep
+  their existing matching behavior.
+- `0012-mesa-adreno722.patch`: upstream device entry from Mesa commit
+  `803731f7ed4aa8e8265fe0aff08b85efb3f3c7e9`, also used by the validated host
+  Turnip build. It retains upstream's initial A730-derived register settings.
 
-Download the already-pinned archive when it is not present:
+- `0013-mesa-texture-upload-span.patch`: preserve the threaded staging layout
+  while copying only the valid source span, excluding trailing row/layer
+  padding. Prevents guard-page overreads during Skia glyph-atlas uploads on
+  the Zink render-pass path; keeps threading and GPU buffer-to-image copies.
 
-    curl --fail --location \
-      --output .work/mesa-26.1.7.tar.xz \
-      https://archive.mesa3d.org/mesa-26.1.7.tar.xz
-
-The build wrapper refuses a missing or hash-mismatched archive.
+Validate a new host using real Android allocations, raw DMA-BUF and native
+Android EGL imports, GPU rendering/readback, native fences and synchronized CPU
+visibility. EGL initialization alone does not prove the complete graphics path.
+Full Android boot and application presentation remain separate checks; linear
+buffer bandwidth and frame rate must be measured under the intended workload.

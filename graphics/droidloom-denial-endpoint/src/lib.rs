@@ -824,6 +824,8 @@ impl DenialEndpoint {
         release_point: u64,
         damage: Vec<droidloom_denial_protocol::Damage>,
     ) -> Result<EndpointAction, EndpointError> {
+        let trace_begin = droidloom_syncobj::frame_trace::sampled(frame.0)
+            .then(droidloom_syncobj::frame_trace::now_ns);
         let task = self.task_mut(object)?;
         let accepted = match task.state.present(
             object,
@@ -873,6 +875,10 @@ impl DenialEndpoint {
             }
         };
         task.pending.insert(frame, accepted.clone());
+        if let Some(begin) = trace_begin {
+            droidloom_syncobj::frame_trace::event("host_receive", object.0, frame.0, buffer.0,
+                &[("receive_ns", begin), ("fence_exported_ns", droidloom_syncobj::frame_trace::now_ns())]);
+        }
         Ok(EndpointAction::Present {
             frame: accepted,
             acquire_fence,

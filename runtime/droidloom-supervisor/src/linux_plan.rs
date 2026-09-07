@@ -188,6 +188,15 @@ pub enum LinuxOperation {
         /// Numeric Unix mode.
         mode: u32,
     },
+    /// Recreate a selected graphics character device with a private inode.
+    CreateGraphicsDevice {
+        /// Validated host device whose major/minor are preserved.
+        source: PathBuf,
+        /// Cell-private node path.
+        target: PathBuf,
+        /// Cell permissions; host inode permissions remain unchanged.
+        mode: u32,
+    },
     /// Add one private Binder context through binder-control.
     AddBinderDevice {
         /// Exact permitted Binder name.
@@ -296,6 +305,8 @@ pub enum LinuxOperation {
 pub struct PlanInvariants {
     /// Exactly one DRM render node is exposed.
     pub render_nodes: Vec<PathBuf>,
+    /// Explicit auxiliary rendering/allocator devices, absent for native DRM.
+    pub auxiliary_graphics_devices: Vec<PathBuf>,
     /// Always false by construction.
     pub drm_card_nodes: bool,
     /// Always false by construction.
@@ -379,6 +390,8 @@ pub fn build_linux_plan(spec: &CellSpec) -> Result<LinuxCellPlan, SpecError> {
         teardown: backend.teardown.clone(),
         invariants: PlanInvariants {
             render_nodes: vec![spec.render_node.clone()],
+            auxiliary_graphics_devices: spec.graphics_backend.auxiliary_devices()
+                .iter().map(PathBuf::from).collect(),
             drm_card_nodes: false,
             physical_input_nodes: false,
             private_binderfs: true,
@@ -523,15 +536,16 @@ fn mount_operations(spec: &CellSpec) -> Vec<LinuxOperation> {
         }
     }));
     operations.extend(basic_device_operations());
-    operations.push(mount(
-        MountKind::FileBind,
-        Some(spec.render_node.clone()),
-        &Path::new("/dev/dri").join(spec.render_node.file_name().unwrap_or_default()),
-        false,
-        false,
-        true,
-        true,
-    ));
+    operations.push(LinuxOperation::CreateGraphicsDevice {
+        source: spec.render_node.clone(),
+        target: "/dev/dri/renderD128".into(),
+        mode: 0o666,
+    });
+    operations.extend(spec.graphics_backend.auxiliary_devices().iter().map(|path| {
+        LinuxOperation::CreateGraphicsDevice {
+            source: path.into(), target: path.into(), mode: 0o666,
+        }
+    }));
     operations.push(mount(
         MountKind::FileBind,
         Some(spec.denial_socket.clone()),
@@ -773,7 +787,6 @@ fn teardown_operations(spec: &CellSpec, step: LifecycleStep) -> Vec<LinuxOperati
             }
             targets.extend([
                 PathBuf::from("/dev/socket/droidloom/denial"),
-                Path::new("/dev/dri").join(spec.render_node.file_name().unwrap_or_default()),
             ]);
             targets.extend(
                 spec.shared_storage_directories
@@ -861,6 +874,7 @@ mod tests {
             data_dir: "/var/lib/droidloom/users/1000/data".into(),
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),
+            graphics_backend: crate::GraphicsBackend::default(),
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
     }
@@ -905,7 +919,6 @@ mod tests {
             [
                 &PathBuf::from("/usr/lib/droidloom/android/init"),
                 &PathBuf::from("/usr/lib/droidloom/android/lib64/libbinder.so"),
-                &PathBuf::from("/dev/dri/renderD128"),
                 &PathBuf::from("/run/user/1000/denial/native-bridge.sock")
             ]
         );

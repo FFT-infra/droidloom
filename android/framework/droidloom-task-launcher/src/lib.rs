@@ -248,15 +248,15 @@ fn launch_direct(
             .args(["activity", "stack", "list"])
             .output()?;
         last_listing = checked_activity_output(&output, "stack list")?;
-        let all_tasks = matching_launch_tasks(
+        let tasks = discover_launch_candidates(
             &last_listing,
             BUILT_IN_DISPLAY,
             request,
             &launched_activity,
             alias.as_deref(),
             permission_dialog.as_deref(),
+            &preexisting,
         )?;
-        let tasks = launch_candidates(&all_tasks, &preexisting);
         match tasks.as_slice() {
             [task] => {
                 timing.record("discovery");
@@ -422,7 +422,13 @@ fn configure_cell_display_policy(
     // Legacy games may declare themselves non-resizable and otherwise stay
     // fullscreen on the private Android display without a host window.
     let output = command_as_android_shell(android_command)
-        .args(["settings", "put", "global", "force_resizable_activities", "1"])
+        .args([
+            "settings",
+            "put",
+            "global",
+            "force_resizable_activities",
+            "1",
+        ])
         .output()?;
     checked_activity_output(&output, "enable legacy app window compatibility")?;
 
@@ -765,11 +771,72 @@ fn matching_launch_tasks(
     )
 }
 
+fn discover_launch_candidates(
+    listing: &str,
+    display: u64,
+    request: &LaunchRequest,
+    completed: &str,
+    alias: Option<&str>,
+    permission_dialog: Option<&str>,
+    preexisting: &BTreeSet<u64>,
+) -> Result<Vec<u64>, LaunchError> {
+    let exact = matching_launch_tasks(
+        listing,
+        display,
+        request,
+        completed,
+        alias,
+        permission_dialog,
+    )?;
+    if !exact.is_empty() {
+        return Ok(launch_candidates(&exact, preexisting));
+    }
+    // -W can complete the launcher before an app replaces it with its game
+    // or onboarding activity. Follow a visible successor only inside the
+    // requested package's task, user and display. Never choose foreign UI or
+    // a hidden background task merely because its base package matches.
+    if completed.split_once('/').map(|(owner, _)| owner) != Some(request.package.as_str()) {
+        return Ok(Vec::new());
+    }
+    let successors = matching_task_records(
+        listing,
+        display,
+        &request.package,
+        Some(request.user),
+        true,
+        |top| {
+            top.and_then(|top| top.split_once('/').map(|(owner, _)| owner))
+                == Some(request.package.as_str())
+        },
+    )?;
+    // Prefer a task created by this launch. A unique restored task can also
+    // complete a handoff; multiple eligible tasks remain an error upstream.
+    Ok(launch_candidates(&successors, preexisting))
+}
+
 fn matching_tasks_with(
     listing: &str,
     target_display: u64,
     package: &str,
     user: Option<u32>,
+    accept_activity: impl FnMut(Option<&str>) -> bool,
+) -> Result<Vec<u64>, LaunchError> {
+    matching_task_records(
+        listing,
+        target_display,
+        package,
+        user,
+        false,
+        accept_activity,
+    )
+}
+
+fn matching_task_records(
+    listing: &str,
+    target_display: u64,
+    package: &str,
+    user: Option<u32>,
+    require_visible: bool,
     mut accept_activity: impl FnMut(Option<&str>) -> bool,
 ) -> Result<Vec<u64>, LaunchError> {
     let mut display = None;
@@ -786,6 +853,13 @@ fn matching_tasks_with(
         let Some((identity, remainder)) = trimmed["taskId=".len()..].split_once(':') else {
             continue;
         };
+        if require_visible
+            && !remainder
+                .split_whitespace()
+                .any(|field| field == "visible=true")
+        {
+            continue;
+        }
         let task_name = remainder.split_whitespace().next().unwrap_or("");
         let package_match = task_name == package
             || task_name
@@ -1000,6 +1074,75 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn handoff_task(id: u64, top: &str, visible: bool, user: u32, display: u64) -> String {
+        format!(
+            "RootTask id={id} displayId={display} userId={user}\n  taskId={id}: com.halfbrick.fruitninjafree/.Game userId={user} visible={visible} topActivity=ComponentInfo{{{top}}}\n"
+        )
+    }
+
+    fn discover_fruit(listing: &str, preexisting: &[u64]) -> Vec<u64> {
+        let request = LaunchRequest {
+            package: "com.halfbrick.fruitninjafree".into(),
+            component: Some("com.halfbrick.fruitninjafree/.Launcher".into()),
+            user: 0,
+        };
+        discover_launch_candidates(
+            listing,
+            0,
+            &request,
+            "com.halfbrick.fruitninjafree/com.halfbrick.fruitninjafree.Launcher",
+            None,
+            None,
+            &preexisting.iter().copied().collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn follows_game_handoff_after_launcher_completion_and_on_reopen() {
+        let game = handoff_task(7, "com.halfbrick.fruitninjafree/.Game", true, 0, 0);
+        assert_eq!(discover_fruit(&game, &[]), vec![7]);
+        assert_eq!(discover_fruit(&game, &[7]), vec![7]);
+        let age = handoff_task(7, "com.halfbrick.fruitninjafree/.AgeScreen", true, 0, 0);
+        assert_eq!(discover_fruit(&age, &[]), vec![7]);
+    }
+
+    #[test]
+    fn handoff_requires_visible_owned_task_user_and_display() {
+        let game = "com.halfbrick.fruitninjafree/.Game";
+        for listing in [
+            handoff_task(7, game, false, 0, 0),
+            handoff_task(7, game, true, 10, 0),
+            handoff_task(7, game, true, 0, 2),
+            handoff_task(7, "com.halfbrick.fruitninjafree.extra/.Game", true, 0, 0),
+            handoff_task(7, "org.example.foreign/.Main", true, 0, 0),
+            handoff_task(7, game, true, 0, 0).replace("userId=0", ""),
+            handoff_task(7, game, true, 0, 0).replace("visible=true", ""),
+            handoff_task(7, game, true, 0, 0).replace(
+                "taskId=7: com.halfbrick.fruitninjafree/",
+                "taskId=7: org.example.foreign/",
+            ),
+        ] {
+            assert!(discover_fruit(&listing, &[]).is_empty(), "{listing}");
+        }
+    }
+
+    #[test]
+    fn handoff_prefers_new_tasks_but_does_not_guess_between_ambiguous_tasks() {
+        let game = "com.halfbrick.fruitninjafree/.Game";
+        let listing = handoff_task(7, game, true, 0, 0) + &handoff_task(8, game, true, 0, 0);
+        assert_eq!(discover_fruit(&listing, &[7]), vec![8]);
+        assert_eq!(discover_fruit(&listing, &[]), vec![7, 8]);
+        assert_eq!(discover_fruit(&listing, &[7, 8]), vec![7, 8]);
+    }
+
+    #[test]
+    fn exact_completed_activity_takes_precedence_over_handoff_fallback() {
+        let listing = handoff_task(7, "com.halfbrick.fruitninjafree/.Launcher", true, 0, 0)
+            + &handoff_task(8, "com.halfbrick.fruitninjafree/.Game", true, 0, 0);
+        assert_eq!(discover_fruit(&listing, &[]), vec![7]);
     }
 
     #[test]

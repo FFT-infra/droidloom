@@ -2,7 +2,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::{env, fs, io::Write, os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt}, path::PathBuf};
+use std::{
+    env, fs,
+    io::Write,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::PathBuf,
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use droidloom_supervisor::control::{
@@ -30,6 +35,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Install a standalone APK, updating an existing app while retaining its data.
+    Install {
+        /// Host path to a standalone APK (split APK bundles are unsupported).
+        apk: PathBuf,
+        /// Android user identifier.
+        #[arg(long, default_value_t = 0)]
+        user: u32,
+    },
     /// Update a source installation, or show pacman package-update instructions.
     Update {
         /// Discard updater-owned build outputs before rebuilding.
@@ -143,7 +156,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     if !cli.cell && cli.socket == PathBuf::from(DEFAULT_CONTROL_SOCKET) {
         let operation = match &cli.command {
-            Command::Start { spec, mode } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => Some(("start", Some(*mode))),
+            Command::Start { spec, mode } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => {
+                Some(("start", Some(*mode)))
+            }
             Command::Stop => Some(("stop", None)),
             Command::Restart { spec, mode } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => {
                 Some(("restart", *mode))
@@ -165,95 +180,118 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-    let control_request = match cli.command {
-        Command::Update { clean, build_only } => {
-            if PathBuf::from("/usr/share/droidloom/package.json").is_file() {
-                return Err("Droidloom is managed by pacman. Install the new package pair with sudo pacman -U, or build it with cargo run --locked -j 1 -p droidloom-package -- build. Sudo is needed only to replace package-owned system files and update pacman's database.".into());
+    let response = if let Command::Install { apk, user } = &cli.command {
+        droidloom_supervisor::control::install_apk(&cli.socket, apk, *user)?
+    } else {
+        let control_request = match cli.command {
+            Command::Install { .. } => unreachable!("handled with its APK file descriptor"),
+            Command::Update { clean, build_only } => {
+                if PathBuf::from("/usr/share/droidloom/package.json").is_file() {
+                    return Err("Droidloom is managed by pacman. Install the new package pair with sudo pacman -U, or build it with cargo run --locked -j 1 -p droidloom-package -- build. Sudo is needed only to replace package-owned system files and update pacman's database.".into());
+                }
+                let mut command = std::process::Command::new("/usr/bin/droidloom-update");
+                if clean {
+                    command.arg("--clean");
+                }
+                if build_only {
+                    command.arg("--build-only");
+                }
+                let status = command.status()?;
+                if !status.success() {
+                    return Err(format!("update failed: {status}").into());
+                }
+                return Ok(());
             }
-            let mut command = std::process::Command::new("/usr/bin/droidloom-update");
-            if clean { command.arg("--clean"); }
-            if build_only { command.arg("--build-only"); }
-            let status = command.status()?;
-            if !status.success() { return Err(format!("update failed: {status}").into()); }
-            return Ok(());
-        }
-        Command::Start { spec, .. } => ControlRequest::Start { spec },
-        Command::Stop => ControlRequest::Stop,
-        Command::Restart { spec, .. } => ControlRequest::Restart { spec },
-        Command::Status => ControlRequest::Status,
-        Command::Logs { package, lines, user } => ControlRequest::Diagnostics {
-            package, lines, user, crashes: false,
-        },
-        Command::Crashes { package, lines } => ControlRequest::Diagnostics {
-            package, lines, user: 0, crashes: true,
-        },
-        Command::Launch {
-            package,
-            component,
-            user,
-            spec,
-        } => ControlRequest::Launch {
-            spec,
-            package,
-            component,
-            user,
-        },
-        Command::Applications { user } => ControlRequest::ListApplications { user },
-        Command::Dpi { dpi, spec } => ControlRequest::SetDpi { spec, dpi },
-        Command::WindowMode {
-            mode,
-            width,
-            height,
-            package,
-        } => {
-            let preference = match (mode, width, height) {
-                (WindowMode::FitOutput, None, None) => WindowPreference::fit_output(),
-                (WindowMode::Windowed, Some(width), Some(height)) => {
-                    WindowPreference::windowed(LogicalSize::new(width, height)?)
+            Command::Start { spec, .. } => ControlRequest::Start { spec },
+            Command::Stop => ControlRequest::Stop,
+            Command::Restart { spec, .. } => ControlRequest::Restart { spec },
+            Command::Status => ControlRequest::Status,
+            Command::Logs {
+                package,
+                lines,
+                user,
+            } => ControlRequest::Diagnostics {
+                package,
+                lines,
+                user,
+                crashes: false,
+            },
+            Command::Crashes { package, lines } => ControlRequest::Diagnostics {
+                package,
+                lines,
+                user: 0,
+                crashes: true,
+            },
+            Command::Launch {
+                package,
+                component,
+                user,
+                spec,
+            } => ControlRequest::Launch {
+                spec,
+                package,
+                component,
+                user,
+            },
+            Command::Applications { user } => ControlRequest::ListApplications { user },
+            Command::Dpi { dpi, spec } => ControlRequest::SetDpi { spec, dpi },
+            Command::WindowMode {
+                mode,
+                width,
+                height,
+                package,
+            } => {
+                let preference = match (mode, width, height) {
+                    (WindowMode::FitOutput, None, None) => WindowPreference::fit_output(),
+                    (WindowMode::Windowed, Some(width), Some(height)) => {
+                        WindowPreference::windowed(LogicalSize::new(width, height)?)
+                    }
+                    (WindowMode::FitOutput, _, _) => {
+                        return Err("fit-output mode does not accept --width or --height".into());
+                    }
+                    (WindowMode::Windowed, _, _) => {
+                        return Err("windowed mode requires both --width and --height".into());
+                    }
+                };
+                let paths = WindowPolicyPaths::from_environment(
+                    env::var_os("XDG_CONFIG_HOME"),
+                    env::var_os("XDG_STATE_HOME"),
+                    env::var_os("HOME"),
+                )?;
+                let mut store = WindowPolicyStore::load(paths)?;
+                store.set_preference(package.as_deref(), preference)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "mode": match mode {
+                                WindowMode::FitOutput => "fit_output",
+                                WindowMode::Windowed => "windowed",
+                            },
+                            "width": width,
+                            "height": height,
+                            "package": package,
+                        }))?
+                    );
+                } else if let Some(package) = package {
+                    println!("set persistent Droidloom window policy for {package}");
+                } else {
+                    println!("set persistent default Droidloom window policy");
                 }
-                (WindowMode::FitOutput, _, _) => {
-                    return Err("fit-output mode does not accept --width or --height".into());
-                }
-                (WindowMode::Windowed, _, _) => {
-                    return Err("windowed mode requires both --width and --height".into());
-                }
-            };
-            let paths = WindowPolicyPaths::from_environment(
-                env::var_os("XDG_CONFIG_HOME"),
-                env::var_os("XDG_STATE_HOME"),
-                env::var_os("HOME"),
-            )?;
-            let mut store = WindowPolicyStore::load(paths)?;
-            store.set_preference(package.as_deref(), preference)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "mode": match mode {
-                            WindowMode::FitOutput => "fit_output",
-                            WindowMode::Windowed => "windowed",
-                        },
-                        "width": width,
-                        "height": height,
-                        "package": package,
-                    }))?
-                );
-            } else if let Some(package) = package {
-                println!("set persistent Droidloom window policy for {package}");
-            } else {
-                println!("set persistent default Droidloom window policy");
+                return Ok(());
             }
-            return Ok(());
-        }
+        };
+        request(&cli.socket, &control_request)?
     };
-    let response = request(&cli.socket, &control_request)?;
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else if response.ok {
         if let Some(diagnostics) = &response.diagnostics {
             print!("{diagnostics}");
-            if !diagnostics.ends_with('\n') { println!(); }
+            if !diagnostics.ends_with('\n') {
+                println!();
+            }
         } else {
             println!("{}", response.message);
         }
@@ -275,21 +313,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn session_lifecycle(operation: &str, json: bool, requested_mode: Option<SessionMode>) -> Result<(), Box<dyn std::error::Error>> {
+fn session_lifecycle(
+    operation: &str,
+    json: bool,
+    requested_mode: Option<SessionMode>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if operation != "stop" && PathBuf::from("/usr/share/droidloom/package.json").is_file() {
-        let status = std::process::Command::new("/usr/lib/droidloom/droidloom-package-helper").arg("prepare").status()?;
-        if !status.success() { return Err("Droidloom setup did not complete; the runtime was not started".into()); }
-        let status = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()?;
-        if !status.success() { return Err("could not reload the installed Droidloom user service".into()); }
+        let status = std::process::Command::new("/usr/lib/droidloom/droidloom-package-helper")
+            .arg("prepare")
+            .status()?;
+        if !status.success() {
+            return Err("Droidloom setup did not complete; the runtime was not started".into());
+        }
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()?;
+        if !status.success() {
+            return Err("could not reload the installed Droidloom user service".into());
+        }
     }
     let mut operation = operation;
     if operation != "stop" {
-        let runtime = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is missing")?);
-        if !runtime.is_absolute() { return Err("XDG_RUNTIME_DIR must be absolute".into()); }
+        let runtime =
+            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is missing")?);
+        if !runtime.is_absolute() {
+            return Err("XDG_RUNTIME_DIR must be absolute".into());
+        }
         let directory = runtime.join("droidloom");
         match fs::DirBuilder::new().mode(0o700).create(&directory) {
-            Ok(()) => {},
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
         let metadata = fs::symlink_metadata(&directory)?;
@@ -301,18 +354,31 @@ fn session_lifecycle(operation: &str, json: bool, requested_mode: Option<Session
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         let path = directory.join("session.env");
         let previous = match fs::read_to_string(&path) {
-            Ok(value) => value.trim().strip_prefix("DROIDLOOM_MODE=").ok_or("invalid session mode file")?.parse::<SessionMode>()?,
+            Ok(value) => value
+                .trim()
+                .strip_prefix("DROIDLOOM_MODE=")
+                .ok_or("invalid session mode file")?
+                .parse::<SessionMode>()?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionMode::Desktop,
             Err(error) => return Err(error.into()),
         };
         let mode = requested_mode.unwrap_or(previous);
         // A start with a different mode must actually change the running service.
-        if operation == "start" && mode != previous
-            && std::process::Command::new("systemctl").args(["--user", "is-active", "--quiet", "droidloom.service"]).status()?.success() {
+        if operation == "start"
+            && mode != previous
+            && std::process::Command::new("systemctl")
+                .args(["--user", "is-active", "--quiet", "droidloom.service"])
+                .status()?
+                .success()
+        {
             operation = "restart";
         }
         let temporary = directory.join(format!(".session-{}.env", std::process::id()));
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
         writeln!(file, "DROIDLOOM_MODE={mode}")?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;

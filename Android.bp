@@ -104,6 +104,7 @@ rust_binary {
         "libdroidloom_syncobj",
         "libdroidloom_surface_bridge",
         "libdroidloom_task_control",
+        "libdroidloom_transport",
     ],
 }
 

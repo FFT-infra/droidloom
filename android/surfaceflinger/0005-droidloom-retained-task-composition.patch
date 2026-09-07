@@ -1,0 +1,404 @@
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+index 016ffd9..f845632 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -87,6 +87,7 @@ enum class Opcode : uint16_t {
+     Error = 8,
+     Retire = 9,
+     PresentWithContent = 10,
++    PresentWithDamage = 11,
+ };
+ 
+ struct ReceivedRecord {
+@@ -350,6 +351,11 @@ void DroidloomNativeWindow::setContentOpaque(bool opaque) {
+     mContentOpaque = opaque;
+ }
+ 
++void DroidloomNativeWindow::setContentDamage(const Rect& damage) {
++    std::lock_guard lock(mMutex);
++    mContentDamage = damage;
++}
++
+ int DroidloomNativeWindow::dequeueBuffer(ANativeWindowBuffer** output, int* fenceFd) {
+     if (output == nullptr || fenceFd == nullptr) return BAD_VALUE;
+     std::lock_guard lock(mMutex);
+@@ -491,7 +497,9 @@ int DroidloomNativeWindow::queueBuffer(ANativeWindowBuffer* buffer, int fenceFd)
+     const auto found = mBufferIds.find(buffer);
+     if (found == mBufferIds.end() || mDequeued.count(found->second) == 0) return BAD_VALUE;
+     const uint64_t id = found->second;
+-    status_t status = sendRequest(static_cast<uint16_t>(Opcode::PresentWithContent), id, fence.get());
++    const auto opcode = mContentDamage ? Opcode::PresentWithDamage : Opcode::PresentWithContent;
++    status_t status = sendRequest(static_cast<uint16_t>(opcode), id, fence.get());
++    mContentDamage.reset();
+     if (status == NO_ERROR) status = receiveAck();
+     mDequeued.erase(id);
+     ALOGV("Queued Denial target %" PRIu64 "; status=%d, %zu buffers remain dequeued", id,
+@@ -603,13 +611,22 @@ status_t DroidloomNativeWindow::sendRequest(uint16_t opcode, uint64_t buffer, in
+     appendU64(payload, mDisplay);
+     if (static_cast<Opcode>(opcode) == Opcode::Present ||
+         static_cast<Opcode>(opcode) == Opcode::PresentWithContent ||
++        static_cast<Opcode>(opcode) == Opcode::PresentWithDamage ||
+         static_cast<Opcode>(opcode) == Opcode::Cancel) {
+         appendU64(payload, buffer);
+     }
+-    if (static_cast<Opcode>(opcode) == Opcode::PresentWithContent) {
++    if (static_cast<Opcode>(opcode) == Opcode::PresentWithContent ||
++        static_cast<Opcode>(opcode) == Opcode::PresentWithDamage) {
+         appendU32(payload, mContentOpaque ? 1u : 0u);
+         appendU32(payload, 0); // reserved
+     }
++    if (static_cast<Opcode>(opcode) == Opcode::PresentWithDamage) {
++        const auto& damage = *mContentDamage;
++        appendU32(payload, static_cast<uint32_t>(damage.left));
++        appendU32(payload, static_cast<uint32_t>(damage.top));
++        appendU32(payload, static_cast<uint32_t>(damage.getWidth()));
++        appendU32(payload, static_cast<uint32_t>(damage.getHeight()));
++    }
+     const uint32_t descriptors = fenceFd >= 0 ? 1 : 0;
+     return sendRecord(mSocket.get(), makeRecord(static_cast<Opcode>(opcode), payload, descriptors),
+                       fenceFd);
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+index 27a85ad..e93ae37 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.h
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -10,6 +10,9 @@
+ 
+ #pragma once
+ 
++#include <optional>
++#include <ui/Rect.h>
++
+ #include <android-base/unique_fd.h>
+ #include <system/window.h>
+ #include <ui/ANativeObjectBase.h>
+@@ -36,6 +39,7 @@ public:
+     DroidloomNativeWindow(uint64_t task, uint32_t expectedWidth, uint32_t expectedHeight);
+     ~DroidloomNativeWindow() override;
+     void setContentOpaque(bool opaque);
++    void setContentDamage(const Rect& damage);
+ 
+ private:
+     struct Target {
+@@ -74,6 +78,7 @@ private:
+     ui::Dataspace mDataspace = ui::Dataspace::UNKNOWN;
+     bool mConnected = false;
+     bool mContentOpaque = false;
++    std::optional<Rect> mContentDamage;
+     android::base::unique_fd mSocket;
+     std::unordered_map<uint64_t, Target> mTargets;
+     std::unordered_map<const ANativeWindowBuffer*, uint64_t> mBufferIds;
+diff --git a/services/surfaceflinger/ScreenCaptureOutput.cpp b/services/surfaceflinger/ScreenCaptureOutput.cpp
+index ed2cbdd..53f755c 100644
+--- a/services/surfaceflinger/ScreenCaptureOutput.cpp
++++ b/services/surfaceflinger/ScreenCaptureOutput.cpp
+@@ -16,10 +16,15 @@
+ 
+ #include "ScreenCaptureOutput.h"
+ #include "ScreenCaptureRenderSurface.h"
++#include "FrontEnd/LayerSnapshot.h"
+ #include "common/include/common/FlagManager.h"
+ #include "ui/Rotation.h"
+ 
++#include <cmath>
+ #include <compositionengine/CompositionEngine.h>
++#include <compositionengine/OutputLayer.h>
++#include <compositionengine/LayerFECompositionState.h>
++#include <compositionengine/impl/OutputLayerCompositionState.h>
+ #include <compositionengine/DisplayColorProfileCreationArgs.h>
+ #include <compositionengine/impl/DisplayColorProfile.h>
+ #include <ui/HdrRenderTypeUtils.h>
+@@ -73,6 +78,61 @@ ScreenCaptureOutput::ScreenCaptureOutput(
+         mDimInGammaSpaceForEnhancedScreenshots(dimInGammaSpaceForEnhancedScreenshots),
+         mEnableLocalTonemapping(enableLocalTonemapping) {}
+ 
++void ScreenCaptureOutput::setDroidloomTarget(
++        std::shared_ptr<renderengine::ExternalTexture> buffer) {
++    mDroidloomTarget = true;
++    static_cast<ScreenCaptureRenderSurface*>(getRenderSurface())->setBuffer(std::move(buffer));
++}
++
++ftl::Future<std::monostate> ScreenCaptureOutput::present(
++        const compositionengine::CompositionRefreshArgs& args) {
++    if (mDroidloomTarget) {
++        // prepare() has updated coverage; present() clears dirtyRegion. Export
++        // damage in target coordinates, never in Android desktop coordinates.
++        const auto& state = getState();
++        Region damage = getDirtyRegion();
++        bool samplesBehind = false;
++        for (const auto* outputLayer : getOutputLayersOrderedByZ()) {
++            const auto* layer = outputLayer->getLayerFE().getCompositionState();
++            // Normal physical displays receive buffer invalidation through
++            // SurfaceFlinger::invalidateLayerStack. Task outputs must include
++            // those content changes themselves even when geometry is stable.
++            const auto& snapshot =
++                    static_cast<const surfaceflinger::frontend::LayerSnapshot&>(*layer);
++            if (layer->contentDirty || !layer->surfaceDamage.isEmpty()) {
++                // Producer damage is buffer-local. Preserve it exactly for
++                // unscaled, uncropped buffers; otherwise damage the layer's
++                // visible coverage rather than guess its sampling footprint.
++                constexpr auto bufferUpdate = layer_state_t::eBufferChanged |
++                        layer_state_t::eSurfaceDamageRegionChanged;
++                const Rect bufferBounds = layer->buffer
++                        ? Rect(layer->buffer->getWidth(), layer->buffer->getHeight()) : Rect();
++                const bool simpleBuffer = layer->buffer && !snapshot.autoRefresh &&
++                        !(snapshot.clientChanges & (layer_state_t::CONTENT_DIRTY & ~bufferUpdate)) &&
++                        layer->surfaceDamage.getBounds().isValid() &&
++                        layer->geomBufferTransform == 0 &&
++                        !layer->geomBufferUsesDisplayInverseTransform &&
++                        layer->geomLayerBounds == bufferBounds.toFloatRect() &&
++                        (layer->geomContentCrop.isEmpty() || layer->geomContentCrop == bufferBounds) &&
++                        !(layer->geomLayerTransform.getType() & ~ui::Transform::TRANSLATE) &&
++                        layer->geomLayerTransform.tx() == std::floor(layer->geomLayerTransform.tx()) &&
++                        layer->geomLayerTransform.ty() == std::floor(layer->geomLayerTransform.ty());
++                damage.orSelf(simpleBuffer
++                        ? layer->geomLayerTransform.transform(layer->surfaceDamage)
++                                  .intersect(outputLayer->getState().visibleRegion)
++                        : outputLayer->getState().visibleRegion);
++            }
++            samplesBehind |= snapshot.drawShadows() || snapshot.hasBlur() ||
++                    snapshot.hasBorderSettings() || snapshot.hasBoxShadowSettings() ||
++                    snapshot.postProcessShader != nullptr || layer->isTextureSamplingBehind;
++        }
++        mDroidloomDamage = samplesBehind && !damage.isEmpty()
++                ? Region(state.displaySpace.getBoundsAsRect())
++                : state.transform.transform(damage).intersect(state.displaySpace.getBoundsAsRect());
++    }
++    return compositionengine::impl::Output::present(args);
++}
++
+ void ScreenCaptureOutput::updateColorProfile(const compositionengine::CompositionRefreshArgs&) {
+     auto& outputState = editState();
+     outputState.dataspace = mColorProfile.dataspace;
+diff --git a/services/surfaceflinger/ScreenCaptureOutput.h b/services/surfaceflinger/ScreenCaptureOutput.h
+index 54923c5..67292f3 100644
+--- a/services/surfaceflinger/ScreenCaptureOutput.h
++++ b/services/surfaceflinger/ScreenCaptureOutput.h
+@@ -56,6 +56,11 @@ public:
+                         float layerAlpha, bool disableBlur,
+                         bool dimInGammaSpaceForEnhancedScreenshots, bool enableLocalTonemapping);
+ 
++    void setDroidloomTarget(std::shared_ptr<renderengine::ExternalTexture> buffer);
++    const Region& getDroidloomDamage() const { return mDroidloomDamage; }
++    ftl::Future<std::monostate> present(
++            const compositionengine::CompositionRefreshArgs&) override;
++
+     void updateColorProfile(const compositionengine::CompositionRefreshArgs&) override;
+ 
+     std::vector<compositionengine::LayerFE::LayerSettings> generateClientCompositionRequests(
+@@ -71,6 +76,8 @@ protected:
+ 
+ private:
+     std::unordered_map<int32_t, aidl::android::hardware::graphics::composer3::Luts> generateLuts();
++    bool mDroidloomTarget = false;
++    Region mDroidloomDamage;
+     const Rect mSourceCrop;
+     const ftl::Optional<DisplayIdVariant> mDisplayIdVariant;
+     const compositionengine::Output::ColorProfile& mColorProfile;
+diff --git a/services/surfaceflinger/ScreenCaptureRenderSurface.h b/services/surfaceflinger/ScreenCaptureRenderSurface.h
+index 50ba9bf..8c7db91 100644
+--- a/services/surfaceflinger/ScreenCaptureRenderSurface.h
++++ b/services/surfaceflinger/ScreenCaptureRenderSurface.h
+@@ -32,6 +32,12 @@ public:
+     ScreenCaptureRenderSurface(std::shared_ptr<renderengine::ExternalTexture> buffer)
+           : mBuffer(std::move(buffer)){};
+ 
++    // Droidloom rotates host targets without rebuilding the output/layer state.
++    void setBuffer(std::shared_ptr<renderengine::ExternalTexture> buffer) {
++        mBuffer = std::move(buffer);
++        mRenderFence = Fence::NO_FENCE;
++    }
++
+     std::shared_ptr<renderengine::ExternalTexture> dequeueBuffer(
+             base::unique_fd* /* bufferFence */) override {
+         return mBuffer;
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 56a1ff4..e53c912 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3468,6 +3468,19 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         struct DirectTaskOutput {
+             sp<DroidloomNativeWindow> window;
+             std::unordered_map<uint64_t, std::shared_ptr<renderengine::ExternalTexture>> textures;
++            std::unique_ptr<compositionengine::CompositionEngine> engine;
++            // ScreenCaptureOutput retains a reference to this profile.
++            compositionengine::Output::ColorProfile colorProfile{
++                    .dataspace = ui::Dataspace::V0_SRGB,
++                    .renderIntent = ui::RenderIntent::TONE_MAP_COLORIMETRIC,
++            };
++            std::shared_ptr<ScreenCaptureOutput> output;
++            std::unordered_map<uint32_t, sp<LayerFE>> layers;
++            std::vector<uint32_t> layerOrder;
++            Rect compositionCrop;
++            ftl::Optional<PhysicalDisplayId> pacesetter;
++            ui::Size targetSize;
++            bool invalidated = true;
+             nsecs_t retryAfter = 0;
+             uint32_t retryAttempts = 0;
+             bool retired = false;
+@@ -3518,9 +3531,16 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 }
+             }
+             frame.hasBuffer |= snapshot->externalTexture != nullptr;
+-            sp<LayerFE> copy = getFactory().createLayerFE(snapshot->name, owner);
+-            copy->mSnapshot = std::make_unique<frontend::LayerSnapshot>(*snapshot);
+-            frame.layers.emplace_back(owner, std::move(copy));
++            // Keep the task's LayerFE identity stable so OutputLayer coverage
++            // and composition state survive ordinary buffer-only updates.
++            auto& copy = taskOutputs[task].layers[snapshot->uniqueSequence];
++            if (!copy) {
++                copy = getFactory().createLayerFE(snapshot->name, owner);
++                copy->mSnapshot = std::make_unique<frontend::LayerSnapshot>(*snapshot);
++            } else {
++                *copy->mSnapshot = *snapshot;
++            }
++            frame.layers.emplace_back(owner, copy);
+         }
+ 
+         std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
+@@ -3541,6 +3561,9 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // ordinary Denial window through its normal lifecycle.
+         const nsecs_t taskNow = systemTime();
+         for (auto output = taskOutputs.begin(); output != taskOutputs.end();) {
++            if (taskFrames.find(output->first) == taskFrames.end()) {
++                output->second.invalidated = true;
++            }
+             if (liveTasks.find(output->first) != liveTasks.end()) {
+                 output->second.missingSince = 0;
+                 ++output;
+@@ -3560,8 +3583,24 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         }
+ 
+         for (auto& [task, frame] : taskFrames) {
+-            if (!frame.hasCrop || !frame.hasBuffer || frame.layers.empty()) continue;
+             auto& taskOutput = taskOutputs[task];
++            if (!frame.hasCrop || !frame.hasBuffer || frame.layers.empty()) {
++                taskOutput.invalidated = true;
++                continue;
++            }
++            std::vector<uint32_t> layerOrder;
++            layerOrder.reserve(frame.layers.size());
++            for (const auto& [_, layer] : frame.layers) {
++                layerOrder.push_back(layer->mSnapshot->uniqueSequence);
++            }
++            const bool layersChanged = layerOrder != taskOutput.layerOrder;
++            if (layersChanged) {
++                taskOutput.layerOrder = std::move(layerOrder);
++                std::erase_if(taskOutput.layers, [&](const auto& entry) {
++                    return std::find(taskOutput.layerOrder.begin(), taskOutput.layerOrder.end(),
++                                     entry.first) == taskOutput.layerOrder.end();
++                });
++            }
+             if (taskOutput.retired) continue;
+             if (!taskOutput.window) {
+                 if (systemTime() < taskOutput.retryAfter) continue;
+@@ -3602,29 +3641,15 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             base::unique_fd targetAcquireFence(acquireFence);
+             if (status != NO_ERROR || nativeBuffer == nullptr) {
+                 ALOGE("Failed to acquire target for Android task %d: %d", task, status);
++                taskOutput.invalidated = true;
+                 continue;
+             }
+ 
+-            sp<GraphicBuffer> graphicBuffer = GraphicBuffer::from(nativeBuffer);
+-            auto& texture = taskOutput.textures[graphicBuffer->getId()];
+-            if (!texture) {
+-                texture = std::make_shared<renderengine::impl::ExternalTexture>(
+-                        graphicBuffer, getRenderEngine(),
+-                        renderengine::impl::ExternalTexture::Usage::WRITEABLE);
++            if (!taskOutput.engine) {
++                taskOutput.engine = mFactory.createCompositionEngine();
++                taskOutput.engine->setRenderEngine(mRenderEngine.get());
++                taskOutput.engine->setHwComposer(mHWComposer.get());
+             }
+-
+-            std::unique_ptr<compositionengine::CompositionEngine> compositionEngine =
+-                    mFactory.createCompositionEngine();
+-            compositionEngine->setRenderEngine(mRenderEngine.get());
+-            compositionEngine->setHwComposer(mHWComposer.get());
+-            // Denial consumes the exported dma-buf as ordinary SDR sRGB.
+-            // Leaving this UNKNOWN lets RenderEngine choose a capture profile
+-            // that does not describe the pixels handed to Wayland, visibly
+-            // lifting dark colors and reducing saturation.
+-            compositionengine::Output::ColorProfile colorProfile{
+-                    .dataspace = ui::Dataspace::V0_SRGB,
+-                    .renderIntent = ui::RenderIntent::TONE_MAP_COLORIMETRIC,
+-            };
+             const ui::Size targetSize{nativeBuffer->width, nativeBuffer->height};
+             const Rect compositionCrop{
+                     frame.sourceCrop.left,
+@@ -3632,12 +3657,29 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                     frame.sourceCrop.left + targetSize.width,
+                     frame.sourceCrop.top + targetSize.height,
+             };
+-            auto output = createScreenCaptureOutput(
+-                    ScreenCaptureOutputArgs{.compositionEngine = *compositionEngine,
+-                                            .colorProfile = colorProfile,
+-                                            .layerStack = frame.layers.back()
+-                                                                  .second->getCompositionState()
+-                                                                  ->outputFilter.layerStack,
++            const auto layerStack = frame.layers.back().second->getCompositionState()
++                                            ->outputFilter.layerStack;
++            const bool resetOutput = !taskOutput.output ||
++                    taskOutput.compositionCrop != compositionCrop ||
++                    taskOutput.targetSize != targetSize ||
++                    taskOutput.output->getState().layerFilter.layerStack != layerStack ||
++                    taskOutput.pacesetter != pacesetterId;
++            if (taskOutput.targetSize != targetSize) taskOutput.textures.clear();
++            sp<GraphicBuffer> graphicBuffer = GraphicBuffer::from(nativeBuffer);
++            auto& texture = taskOutput.textures[graphicBuffer->getId()];
++            if (!texture) {
++                texture = std::make_shared<renderengine::impl::ExternalTexture>(
++                        graphicBuffer, getRenderEngine(),
++                        renderengine::impl::ExternalTexture::Usage::WRITEABLE);
++            }
++            if (resetOutput) {
++                taskOutput.pacesetter = pacesetterId;
++                taskOutput.compositionCrop = compositionCrop;
++                taskOutput.targetSize = targetSize;
++                taskOutput.output = createScreenCaptureOutput(
++                    ScreenCaptureOutputArgs{.compositionEngine = *taskOutput.engine,
++                                            .colorProfile = taskOutput.colorProfile,
++                                            .layerStack = layerStack,
+                                             // Preserve 1:1 pixels. The Android task and the
+                                             // Denial-owned target share physical-pixel bounds;
+                                             // never hide a producer-size mismatch by scaling the
+@@ -3661,16 +3703,28 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                                             .enableLocalTonemapping = false,
+                                             .debugName = base::StringPrintf(
+                                                     "Droidloom task %d", task)});
++            }
++            auto& output = taskOutput.output;
++            output->setDroidloomTarget(texture);
++            const bool forceGeometry = resetOutput || layersChanged || taskOutput.invalidated;
+             std::vector<sp<compositionengine::LayerFE>> taskLayers;
+             taskLayers.reserve(frame.layers.size());
+             for (auto& [_, layer] : frame.layers) taskLayers.push_back(std::move(layer));
+             compositionengine::CompositionRefreshArgs taskRefresh{
+                     .outputs = {output},
+                     .layers = std::move(taskLayers),
+-                    .updatingOutputGeometryThisFrame = true,
+-                    .updatingGeometryThisFrame = true,
++                    .updatingOutputGeometryThisFrame =
++                            forceGeometry || refreshArgs.updatingOutputGeometryThisFrame,
++                    .updatingGeometryThisFrame =
++                            forceGeometry || refreshArgs.updatingGeometryThisFrame,
+             };
+-            compositionEngine->present(taskRefresh);
++            taskOutput.engine->present(taskRefresh);
++            // Every rotated target is still fully rendered. Damage describes
++            // differences from the last submitted frame, not target buffer age.
++            const bool fullDamage = forceGeometry || refreshArgs.updatingGeometryThisFrame;
++            taskOutput.window->setContentDamage(fullDamage
++                            ? Rect(targetSize.width, targetSize.height)
++                            : output->getDroidloomDamage().getBounds());
+             // Reuse CompositionEngine's transformed/clipped opaque coverage.
+             // A gap keeps real task transparency; never infer opacity from the app ID.
+             taskOutput.window->setContentOpaque(output->getState().undefinedRegion.isEmpty());
+@@ -3690,6 +3744,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             }
+             const int readyFence = renderFence != Fence::NO_FENCE ? renderFence->dup() : -1;
+             status = nativeWindow->queueBuffer(nativeWindow, nativeBuffer, readyFence);
++            taskOutput.invalidated = status != NO_ERROR;
+             if (status != NO_ERROR) {
+                 ALOGE("Failed to present Android task %d: %d", task, status);
+             }

@@ -1,4 +1,5 @@
 //! Rust orchestration around makepkg's standard package interface.
+mod components;
 mod validation;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,9 @@ struct Cli {
 enum Action {
     /// Compile the complete runtime and produce packages in a rootless Arch builder.
     Build {
+        /// Rebuild only selected host components; omitted builds everything.
+        #[arg(long, value_enum, conflicts_with_all = ["clean", "source_cache"])]
+        component: Vec<components::Component>,
         #[arg(long)]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -52,6 +56,8 @@ enum Action {
     },
     #[command(hide = true)]
     InContainer {
+        #[arg(long, value_enum)]
+        component: Vec<components::Component>,
         #[arg(long)]
         jobs: usize,
         #[arg(long)]
@@ -221,6 +227,7 @@ fn build(
     requested: Option<usize>,
     clean: bool,
     source_cache: Option<PathBuf>,
+    components: Vec<components::Component>,
 ) -> Result<()> {
     let started = Instant::now();
     require_user()?;
@@ -261,6 +268,11 @@ fn build(
         return Err("another Droidloom package build is already using this checkout".into());
     }
     let snapshot = work.join("source");
+    let baseline = if components.is_empty() {
+        None
+    } else {
+        Some(components::baseline(&repo, &version)?)
+    };
     copy_inputs(&repo, &snapshot)?;
     let cache = work.join("build");
     fs::create_dir_all(&cache)?;
@@ -353,6 +365,12 @@ fn build(
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let mut container = podman(&work);
+    if let Some(baseline) = &baseline {
+        eprintln!(
+            "Reusing unchanged package files from {}",
+            baseline.display()
+        );
+    }
     container
         .args(["run", "--rm", "--userns=keep-id", "--user"])
         .arg(format!("{uid}:{gid}"))
@@ -374,7 +392,13 @@ fn build(
         .arg("--volume")
         .arg(format!("{}:/build:rw", cache.display()))
         .arg("--volume")
-        .arg(format!("{}:/output:rw", output.display()))
+        .arg(format!("{}:/output:rw", output.display()));
+    if let Some(baseline) = &baseline {
+        container
+            .arg("--volume")
+            .arg(format!("{}:/baseline:ro", baseline.display()));
+    }
+    container
         .arg("localhost/droidloom-arch-builder")
         .args([
             "cargo",
@@ -393,6 +417,9 @@ fn build(
     if clean {
         container.arg("--clean");
     }
+    for component in &components {
+        container.arg("--component").arg(component.name());
+    }
     run_logged(&mut container, &log)?;
     let mut packages = fs::read_dir(&output)?
         .map(|e| e.map(|e| e.path()))
@@ -406,9 +433,12 @@ fn build(
         output.join("build-summary.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "version":version,"elapsed_seconds":started.elapsed().as_secs(),"jobs":jobs,
+            "components": components.iter().map(|c| c.name()).collect::<Vec<_>>(),
+            "baseline": baseline,
             "packages":packages.iter().map(|p| Ok(serde_json::json!({"file":p.file_name().map(|n| n.to_string_lossy()),"bytes":fs::metadata(p)?.len()}))).collect::<Result<Vec<_>>>()?
         }))?,
     )?;
+    components::record_inputs(&snapshot, &output)?;
     println!("Packages ready in {}", output.display());
     println!(
         "Administrator access is needed only to install these files under /usr, install their runtime dependencies, and update /var/lib/pacman:"
@@ -459,7 +489,7 @@ fn seed_sources(source: &Path, destination: &Path, relative: &Path) -> Result<()
     Ok(())
 }
 
-fn in_container(jobs: usize, clean: bool) -> Result<()> {
+fn in_container(jobs: usize, clean: bool, components: Vec<components::Component>) -> Result<()> {
     require_user()?;
     let repo = Path::new("/source");
     let work = Path::new("/build");
@@ -488,6 +518,7 @@ fn in_container(jobs: usize, clean: bool) -> Result<()> {
             "DROIDLOOM_CLEAN_PACKAGE_BUILD",
             if clean { "1" } else { "0" },
         );
+    command.env("DROIDLOOM_COMPONENTS", serde_json::to_string(&components)?);
     if let Err(error) = run(&mut command) {
         cleanup_package_staging(&packaging);
         return Err(error);
@@ -542,6 +573,12 @@ fn remove_staging(path: &Path) -> Result<()> {
 }
 fn compile(source: &Path, work: &Path, destination: &Path, jobs: usize) -> Result<()> {
     require_user()?;
+    let selected: Vec<components::Component> = serde_json::from_str(
+        &std::env::var("DROIDLOOM_COMPONENTS").unwrap_or_else(|_| "[]".into()),
+    )?;
+    if !selected.is_empty() {
+        return components::compile(source, work, destination, jobs, &selected);
+    }
     run(Command::new("cargo")
         .current_dir(source)
         .env("CARGO_TARGET_DIR", work.join("cargo"))
@@ -602,13 +639,18 @@ fn install_tree(source: &Path, destination: &Path) -> Result<()> {
 fn execute() -> Result<()> {
     match Cli::parse().action {
         Action::Build {
+            component,
             source,
             jobs,
             clean,
             source_cache,
-        } => build(source, jobs, clean, source_cache),
+        } => build(source, jobs, clean, source_cache, component),
         Action::Check { packages, previous } => validation::check(&packages, previous.as_deref()),
-        Action::InContainer { jobs, clean } => in_container(jobs, clean),
+        Action::InContainer {
+            jobs,
+            clean,
+            component,
+        } => in_container(jobs, clean, component),
         Action::Compile {
             source,
             work,

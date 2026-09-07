@@ -355,6 +355,7 @@ pub fn assemble_artifacts(
     }
     for (name, destination) in [
         ("netbpfload", "compat/classpath-compat/bin/netbpfload"),
+        ("libnetd_updatable", "compat/classpath-compat/lib64/libnetd_updatable.so"),
         (
             "libservice-connectivity",
             "compat/classpath-compat/lib64/libservice-connectivity.so",

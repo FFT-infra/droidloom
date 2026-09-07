@@ -1,0 +1,79 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3655,6 +3655,9 @@
+                     .updatingGeometryThisFrame = true,
+             };
+             compositionEngine->present(taskRefresh);
++            // Reuse CompositionEngine's transformed/clipped opaque coverage.
++            // A gap keeps real task transparency; never infer opacity from the app ID.
++            taskOutput.window->setContentOpaque(output->getState().undefinedRegion.isEmpty());
+             const sp<Fence>& renderFence =
+                     output->getRenderSurface()->getClientTargetAcquireFence();
+             if (renderFence->isValid()) {
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -86,6 +86,7 @@
+     Ack = 7,
+     Error = 8,
+     Retire = 9,
++    PresentWithContent = 10,
+ };
+ 
+ struct ReceivedRecord {
+@@ -344,6 +345,11 @@
+     return NO_ERROR;
+ }
+ 
++void DroidloomNativeWindow::setContentOpaque(bool opaque) {
++    std::lock_guard lock(mMutex);
++    mContentOpaque = opaque;
++}
++
+ int DroidloomNativeWindow::dequeueBuffer(ANativeWindowBuffer** output, int* fenceFd) {
+     if (output == nullptr || fenceFd == nullptr) return BAD_VALUE;
+     std::lock_guard lock(mMutex);
+@@ -485,7 +491,7 @@
+     const auto found = mBufferIds.find(buffer);
+     if (found == mBufferIds.end() || mDequeued.count(found->second) == 0) return BAD_VALUE;
+     const uint64_t id = found->second;
+-    status_t status = sendRequest(static_cast<uint16_t>(Opcode::Present), id, fence.get());
++    status_t status = sendRequest(static_cast<uint16_t>(Opcode::PresentWithContent), id, fence.get());
+     if (status == NO_ERROR) status = receiveAck();
+     mDequeued.erase(id);
+     ALOGV("Queued Denial target %" PRIu64 "; status=%d, %zu buffers remain dequeued", id,
+@@ -596,9 +602,14 @@
+     std::vector<uint8_t> payload;
+     appendU64(payload, mDisplay);
+     if (static_cast<Opcode>(opcode) == Opcode::Present ||
++        static_cast<Opcode>(opcode) == Opcode::PresentWithContent ||
+         static_cast<Opcode>(opcode) == Opcode::Cancel) {
+         appendU64(payload, buffer);
+     }
++    if (static_cast<Opcode>(opcode) == Opcode::PresentWithContent) {
++        appendU32(payload, mContentOpaque ? 1u : 0u);
++        appendU32(payload, 0); // reserved
++    }
+     const uint32_t descriptors = fenceFd >= 0 ? 1 : 0;
+     return sendRecord(mSocket.get(), makeRecord(static_cast<Opcode>(opcode), payload, descriptors),
+                       fenceFd);
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+--- a/services/surfaceflinger/DroidloomNativeWindow.h
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -35,6 +35,7 @@
+ 
+     DroidloomNativeWindow(uint64_t task, uint32_t expectedWidth, uint32_t expectedHeight);
+     ~DroidloomNativeWindow() override;
++    void setContentOpaque(bool opaque);
+ 
+ private:
+     struct Target {
+@@ -72,6 +73,7 @@
+     int mFormat = HAL_PIXEL_FORMAT_RGBA_8888;
+     ui::Dataspace mDataspace = ui::Dataspace::UNKNOWN;
+     bool mConnected = false;
++    bool mContentOpaque = false;
+     android::base::unique_fd mSocket;
+     std::unordered_map<uint64_t, Target> mTargets;
+     std::unordered_map<const ANativeWindowBuffer*, uint64_t> mBufferIds;

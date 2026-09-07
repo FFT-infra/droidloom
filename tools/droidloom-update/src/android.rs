@@ -39,6 +39,7 @@ pub const TARGETS: &[&str] = &[
     "mapper.minigbm",
     "libandroid_net_connectivity_com_android_net_module_util_jni",
     "libservice-connectivity",
+    "libnetd_updatable",
     "services",
     "vendorimage",
 ];
@@ -52,10 +53,18 @@ pub fn apex_output(name: &str) -> Option<&'static str> {
         "libservice-connectivity" => Some(
             "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/android_x86_64_shared/libservice-connectivity.so",
         ),
+        "libnetd_updatable" => Some(
+            "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_x86_64_shared_cfi/libnetd_updatable.so",
+        ),
         _ => None,
     }
 }
 const PATCHES: &[(&str, &str)] = &[
+    ("external/minigbm", "android/aosp-patches/0010-minigbm-dma-heap-images.patch"),
+    (
+        "packages/modules/Connectivity",
+        "android/aosp-patches/0009-netd-bpf-pid-namespace.patch",
+    ),
     (
         "packages/modules/Connectivity",
         "android/aosp-patches/0001-netbpfload-tolerate-shared-kernel-bpf-ids.patch",
@@ -95,6 +104,22 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/native",
         "android/surfaceflinger/0002-droidloom-task-input-token.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0003-droidloom-headless-bootstrap.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0004-droidloom-opaque-content.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0005-droidloom-retained-task-composition.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0006-droidloom-late-task-registration.patch",
     ),
     (
         "frameworks/native",
@@ -514,6 +539,9 @@ pub fn build(
         .args(["-a", "--delete"])
         .arg(format!("{}/", work.join("mesa-source").display()))
         .arg(&mesa))?;
+    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0011-mesa-zink-kgsl.patch"))?;
+    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0012-mesa-adreno722.patch"))?;
+    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0013-mesa-texture-upload-span.patch"))?;
     let cross = mesa.join("android/mesa3d_cross.mk");
     let cross_text = fs::read_to_string(&cross)?;
     let python_assignment = "MESA3D_PYTHONPATH := $(AOSP_ABSOLUTE_PATH)/external/python/mako";
