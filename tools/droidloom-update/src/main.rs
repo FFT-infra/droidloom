@@ -54,7 +54,7 @@ enum Action {
         /// Use an existing package build workspace (containing aosp-source).
         #[arg(long)]
         work: Option<PathBuf>,
-        /// Also build Digitalis's ARM64 host regression suite.
+    /// Also build Teto's ARM64 host regression suite.
         #[arg(long)]
         tests: bool,
     },

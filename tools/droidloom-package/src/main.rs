@@ -44,7 +44,7 @@ enum Action {
         /// Seed the source cache from an existing sparse AOSP checkout (never binaries).
         #[arg(long)]
         source_cache: Option<PathBuf>,
-        /// Build Digitalis directly from a local Git checkout, including edits.
+        /// Build Teto directly from a local Git checkout, including edits.
         #[arg(long, conflicts_with = "component")]
         native_bridge_source: Option<PathBuf>,
     },
@@ -405,7 +405,7 @@ fn build(
     if let Some(checkout) = native_bridge_source {
         let checkout = checkout.canonicalize()?;
         if !checkout.join(".git").exists() {
-            return Err("--native-bridge-source requires a Digitalis Git checkout".into());
+            return Err("--native-bridge-source requires a Teto Git checkout".into());
         }
         container
             .args([

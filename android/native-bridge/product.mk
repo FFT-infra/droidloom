@@ -1,4 +1,4 @@
-# Digitalis uses Android's native API proxies; the selected Mesa drivers remain native.
+# Teto uses Android's native API proxies; the selected Mesa drivers remain native.
 include frameworks/libs/binary_translation/berberis_config.mk
 
 # RenderScript is outside the initial ARM64 APK milestone. Use the common NDK

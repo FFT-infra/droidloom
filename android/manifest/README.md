@@ -1,9 +1,9 @@
 # Android source and base-image locks
 
 `native-bridge-lock.json` independently pins the
-[denialwm Digitalis fork](https://github.com/denialwm/platform_frameworks_libs_binary_translation/tree/droidloom),
+[Teto](https://github.com/denialwm/teto/tree/droidloom) (Translation Engine with Target Optimization),
 based on [DigitalisX64's ARM64-to-x86_64 Berberis implementation](https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation).
-The updater verifies the fork's Git origin, exact commit and clean worktree
+The updater verifies Teto's Git origin, exact commit and clean worktree
 before building. The pin includes Droidloom's memory-reservation, FPCR rounding,
 breakpoint/ptrace and JNI-table isolation fixes; it never follows a moving branch.
 It is a separate source repository from AOSP and does not

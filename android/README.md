@@ -12,8 +12,8 @@ upstream base partitions, materializes required sources, applies Droidloom patch
 builds modified platform components and the vendor image, and assembles packages.
 Mesa is prepared from its pinned upstream release. It does not rebuild all of AOSP.
 
-The x86_64 product also builds the experimental Digitalis/Berberis ARM64
-NativeBridge. `manifest/native-bridge-lock.json` pins its separate open-source
+The x86_64 product also builds the experimental Teto ARM64 NativeBridge,
+derived from Digitalis/AOSP Berberis. `manifest/native-bridge-lock.json` pins its separate open-source
 checkout; the Android guest linker and API stubs come from the pinned AOSP
 `frameworks/libs/native_bridge_support` project. `native-bridge/product.mk`
 selects the translator and ARM64 guest library closure. The image assembler
@@ -22,10 +22,10 @@ libraries, and updates ABI/ART properties before zygote starts. It verifies the
 rebuilt image's contents and metadata after extraction and records translator
 provenance in `/system/etc/droidloom-native-bridge.json`.
 
-Translator fixes are developed directly in a separate Digitalis Git checkout.
-`droidloom-package build --native-bridge-source /absolute/path/to/digitalis`
+Translator fixes are developed directly in a separate Teto Git checkout.
+`droidloom-package build --native-bridge-source /absolute/path/to/teto`
 builds its current working files and records their hashes in that provenance.
-The local Android-overcommit change uses `MAP_NORESERVE` for private anonymous
+The pinned Android-overcommit change uses `MAP_NORESERVE` for private anonymous
 guest mappings when `ro.berberis.flags=android-mmap-noreserve` is enabled. This
 handles Unreal's large virtual arenas while leaving the host sysctl unchanged.
 

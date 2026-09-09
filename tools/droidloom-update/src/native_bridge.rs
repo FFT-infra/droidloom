@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn source_lock_accepts_only_reviewed_fork_and_valid_contract() {
+    fn source_lock_accepts_only_teto_and_valid_contract() {
         let original: serde_json::Value = serde_json::from_str(LOCK).unwrap();
         validate_source_lock(&serde_json::from_value(original.clone()).unwrap()).unwrap();
         for (key, value) in [
@@ -523,6 +523,12 @@ mod tests {
                 "url",
                 serde_json::json!(
                     "https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation.git"
+                ),
+            ),
+            (
+                "url",
+                serde_json::json!(
+                    "https://github.com/denialwm/platform_frameworks_libs_binary_translation.git"
                 ),
             ),
             (
@@ -660,7 +666,7 @@ mod tests {
 
 fn validate_source_lock(lock: &SourceLock) -> Result<()> {
     if lock.schema_version != 1
-        || lock.url != "https://github.com/denialwm/platform_frameworks_libs_binary_translation.git"
+        || lock.url != "https://github.com/denialwm/teto.git"
         || lock.path != "frameworks/libs/binary_translation"
         || lock.license != "Apache-2.0"
         || lock.commit.len() != 40
@@ -669,7 +675,7 @@ fn validate_source_lock(lock: &SourceLock) -> Result<()> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
-        return fail("invalid Digitalis source lock");
+        return fail("invalid Teto source lock");
     }
     Ok(())
 }
@@ -696,7 +702,7 @@ fn prepare_source_with_local(
         let local = local.canonicalize()?;
         if local.starts_with(source.canonicalize()?) {
             return fail(
-                "Digitalis development checkout must be outside the generated AOSP source tree",
+                "Teto development checkout must be outside the generated AOSP source tree",
             );
         }
         if output(
@@ -706,9 +712,9 @@ fn prepare_source_with_local(
                 .args(["remote", "get-url", "origin"]),
         )? != lock.url
         {
-            return fail("local Digitalis checkout must use the locked fork origin");
+            return fail("local Teto checkout must use the locked origin");
         }
-        // A development branch can commit fixes on top of the published fork pin.
+        // A development branch can commit fixes on top of the published Teto pin.
         // Keep the base check while recording the actual revision being built.
         run(Command::new("git").arg("-C").arg(&local).args([
             "merge-base",
@@ -733,7 +739,7 @@ fn prepare_source_with_local(
         if source_inventory(&checkout)? != files || source_inventory(&local)? != files {
             return fail("Digitalis working files changed while snapshotting; retry the build");
         }
-        eprintln!("Building Digitalis working files based on {}", lock.commit);
+        eprintln!("Building Teto working files based on {}", lock.commit);
         return Ok(
             serde_json::json!({"commit": head, "base_commit": lock.commit,
                 "working_tree": true, "files": files}),
@@ -743,7 +749,7 @@ fn prepare_source_with_local(
         let parent = checkout.parent().ok_or("source checkout has no parent")?;
         fs::create_dir_all(parent)?;
         let temporary = tempfile::Builder::new()
-            .prefix(".digitalis-")
+            .prefix(".teto-")
             .tempdir_in(parent)?;
         run(Command::new("git")
             .arg("init")
@@ -773,7 +779,7 @@ fn prepare_source_with_local(
         (vec!["status", "--porcelain", "--untracked-files=all"], ""),
     ] {
         if output(Command::new("git").arg("-C").arg(&checkout).args(args))? != expected {
-            return fail("Digitalis checkout differs from its source lock or has local changes");
+            return fail("Teto checkout differs from its source lock or has local changes");
         }
     }
     eprintln!("Verified {} at {}", lock.name, lock.commit);
@@ -794,13 +800,13 @@ fn source_inventory(root: &Path) -> Result<BTreeMap<String, String>> {
                 visit(root, &path, result)?;
             } else if kind.is_symlink() {
                 if !path.canonicalize()?.starts_with(root) {
-                    return fail("Digitalis source symlink escapes its checkout");
+                    return fail("Teto source symlink escapes its checkout");
                 }
                 result.insert(relative, format!("link:{}", fs::read_link(path)?.display()));
             } else if kind.is_file() {
                 result.insert(relative, hash(&path)?);
             } else {
-                return fail("unsupported object in Digitalis checkout");
+                return fail("unsupported object in Teto checkout");
             }
         }
         Ok(())

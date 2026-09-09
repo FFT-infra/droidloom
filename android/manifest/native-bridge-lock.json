@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "name": "Digitalis ARM64 to x86_64",
-  "url": "https://github.com/denialwm/platform_frameworks_libs_binary_translation.git",
-  "commit": "39e3aed979007ffe43f111573df2a3c090dc9b21",
+  "name": "Teto ARM64 to x86_64",
+  "url": "https://github.com/denialwm/teto.git",
+  "commit": "917021cf3ecd077eb1581146a79d2265011755b8",
   "license": "Apache-2.0",
   "path": "frameworks/libs/binary_translation"
 }

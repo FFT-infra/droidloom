@@ -8,12 +8,13 @@ licenses; applying a patch does not give Droidloom ownership of that code.
 
 ## Retained licenses
 
-- Digitalis/Berberis retains the Apache-2.0 notices of the Android Open Source
+- Teto (Translation Engine with Target Optimization), derived from
+  Digitalis/Berberis, retains the Apache-2.0 notices of the Android Open Source
   Project and Digitalis author utzcoz. `android/manifest/native-bridge-lock.json`
   pins the source-built ARM64 translator in the
-  [denialwm fork](https://github.com/denialwm/platform_frameworks_libs_binary_translation),
+  [Teto repository](https://github.com/denialwm/teto),
   retaining its [DigitalisX64 upstream](https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation)
-  history. Translator fixes in that separate fork retain their per-file
+  history. Translator fixes in that separate repository retain their per-file
   Apache-2.0 licensing; its Android support dependencies are
   pinned in the AOSP sparse-source lock. No proprietary translation binaries
   are used.

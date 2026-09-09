@@ -1,4 +1,5 @@
-Digitalis / Berberis
+Teto — Translation Engine with Target Optimization
+Based on Digitalis / Berberis
 
 Copyright (C) The Android Open Source Project
 Copyright (C) 2026 utzcoz
@@ -8,10 +9,10 @@ The translator and the Android NativeBridge support sources retain their
 Apache License, Version 2.0 notices. See LICENSES/Apache-2.0.txt in the
 Droidloom license directory and the individual files in the pinned sources:
 
-https://github.com/denialwm/platform_frameworks_libs_binary_translation
+https://github.com/denialwm/teto
 Upstream: https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation
 https://android.googlesource.com/platform/frameworks/libs/native_bridge_support
 
-android/manifest/native-bridge-lock.json records the Digitalis revision.
+android/manifest/native-bridge-lock.json records the Teto revision.
 android/manifest/m2-sparse-source-lock.json records the Android support revision.
 Droidloom's integration and local modifications are described in THIRD_PARTY.md.

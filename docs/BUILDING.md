@@ -71,14 +71,15 @@ dist/arch/0.1.0-7/droidloom-image-0.1.0-7-x86_64.pkg.tar.zst
 The command prints the exact installation command when finished. Install both
 packages by following [INSTALL.md](INSTALL.md).
 
-Normal builds fetch the published `denialwm` Digitalis fork at exact commit
-`39e3aed979007ffe43f111573df2a3c090dc9b21`, pinned in
+Normal builds fetch [Teto](https://github.com/denialwm/teto), the Translation
+Engine with Target Optimization, at exact commit
+`917021cf3ecd077eb1581146a79d2265011755b8`, pinned in
 `android/manifest/native-bridge-lock.json`. It includes the memory-reservation,
 FPCR rounding, breakpoint/ptrace and JNI-table isolation fixes. No local
 development checkout is needed for these fixes.
 
-For further Digitalis development, use a separate Git checkout whose `origin`
-matches the fork URL in that lock and whose history contains the pinned commit.
+For further Teto development, use a separate Git checkout whose `origin`
+matches the repository URL in that lock and whose history contains the pinned commit.
 Commits on top of that base and uncommitted edits are both supported:
 
 ```console
@@ -89,21 +90,25 @@ cargo run --locked -j 1 -p droidloom-package -- build --jobs 8 \
 The checkout is mounted read-only and copied into the generated AOSP workspace.
 The installed `/system/etc/droidloom-native-bridge.json` records its base, actual
 commit and hashes of all working source files. Keep any unpublished development
-edits needed to reproduce such a package. Omit the option for the locked fork
-source. Existing caches with the old upstream origin, an older revision, or
+edits needed to reproduce such a package. Omit the option for the locked Teto
+source. Existing caches with an old origin URL, an older revision, or
 development edits deliberately fail verification instead of silently discarding
 them. Use a fresh build workspace when switching to the new pin. For an existing
 development clone, preserve the DigitalisX64 remote as `upstream`, set `origin`
-to the lock's fork URL, and fetch the pinned commit before building.
+to the lock's Teto URL, and fetch the pinned commit before building.
 
-The published fork's `droidloom` branch includes `android-mmap-noreserve`,
+Teto's `droidloom` branch includes `android-mmap-noreserve`,
 enabled by Droidloom's `ro.berberis.flags`.
 It gives private anonymous guest mappings Android's expected
 overcommit behavior without modifying the desktop's global memory policy. Strict
-host overcommit policy still applies. The pinned translator source matches the
-locally validated build (3743 host tests passed, three skipped; Brawl Stars
+host overcommit policy still applies. The pin adds branding, licensing documents
+and change notices to the previously validated translator code (3743 host tests
+passed, three skipped; Brawl Stars
 startup confirmed by the user). Pinning source does not publish new packages or
-replace existing installed images and local library overrides.
+replace existing installed images and local library overrides. Teto derives from
+Digitalis/AOSP Berberis; upstream history and notices remain intact. Existing
+`berberis_*` ABI names, build targets, source paths, and the local
+`.work/translation/digitalis` directory remain unchanged for compatibility.
 
 ## 4. Exercise package installation
 
