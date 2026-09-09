@@ -92,6 +92,7 @@ public final class NotificationBridge extends NotificationListenerService implem
         active.put(sbn.getKey(),new Entry(sbn,session+"-"+(++generation),importance));
     }
     private void connect() {
+        com.android.droidloom.runtime.CpuPlacement.background();
         while (!stopped) {
             try (LocalSocket current = new LocalSocket()) {
                 socket=current;
@@ -131,6 +132,7 @@ public final class NotificationBridge extends NotificationListenerService implem
         }
     }
     private void writeSnapshots(LocalSocket current, DataOutputStream out) {
+        com.android.droidloom.runtime.CpuPlacement.background();
         try {
             while(!stopped && connected) {
                 ArrayList<Entry> entries;

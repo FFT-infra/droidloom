@@ -42,6 +42,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    droidloom_cpu_placement::initialize(droidloom_cpu_placement::Role::Background);
     let paths = CatalogPaths::from_environment(
         env::var_os("XDG_DATA_HOME"),
         env::var_os("XDG_STATE_HOME"),

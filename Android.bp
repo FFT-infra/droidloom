@@ -39,7 +39,8 @@ android_app {
 android_app {
     name: "DroidloomSystemUI",
     manifest: "android/framework/droidloom-systemui/AndroidManifest.xml",
-    srcs: ["android/framework/droidloom-systemui/src/**/*.java"],
+    srcs: ["android/framework/droidloom-systemui/src/**/*.java",
+        "android/framework/cpu-placement/src/com/android/droidloom/runtime/CpuPlacement.java"],
     resource_dirs: [],
     platform_apis: true,
     system_ext_specific: true,
@@ -128,10 +129,14 @@ rust_library {
 java_binary {
     name: "droidloom-input-bridge",
     vendor: true,
-    srcs: ["android/framework/droidloom-input-bridge/src/**/*.java"],
+    srcs: ["android/framework/droidloom-input-bridge/src/**/*.java",
+        "android/framework/cpu-placement/src/com/android/droidloom/runtime/CpuPlacement.java"],
     wrapper: "android/framework/droidloom-input-bridge/droidloom-input-bridge",
     init_rc: ["android/framework/droidloom-input-bridge/droidloom-input-bridge.rc"],
-    sdk_version: "37",
+    // TaskStackListener is a pinned platform API. The root bridge observes
+    // Android launches without intercepting or reconstructing their intents.
+    sdk_version: "core_platform",
+    libs: ["framework"],
     // This privileged platform adapter is built from plain Java and is covered
     // by the focused runtime tests. Avoid pulling Android's global app-lint
     // plugin graph into the intentionally sparse Droidloom source checkout.
@@ -237,11 +242,21 @@ rust_library {
 // endpoint. This wraps opaque task timelines and sync_file point transfers;
 // Android never receives a KMS/card node.
 rust_library {
+    name: "libdroidloom_cpu_placement",
+    crate_name: "droidloom_cpu_placement",
+    crate_root: "runtime/droidloom-cpu-placement/src/lib.rs",
+    edition: "2024",
+    vendor_available: true,
+    rustlibs: ["liblibc"],
+}
+
+rust_library {
     name: "libdroidloom_syncobj",
     crate_name: "droidloom_syncobj",
     crate_root: "graphics/droidloom-syncobj/src/lib.rs",
     edition: "2021",
     vendor: true,
+    rlibs: ["libdroidloom_cpu_placement"],
     rustlibs: [
         "libdrm_rust",
         "liblibc",

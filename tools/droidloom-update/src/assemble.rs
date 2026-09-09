@@ -449,9 +449,14 @@ pub fn assemble_artifacts(
         )?;
     }
     let images = payload.join("var/lib/droidloom/images/images");
-    for name in ["system.img", "system_ext.img", "product.img"] {
+    for name in ["system.img", "product.img"] {
         copy(&base.join(name), &images.join(name))?;
     }
+    crate::image_policy::stage(
+        &base.join("system_ext.img"),
+        &images.join("system_ext.img"),
+        &product.join("vendor/build.prop"),
+    )?;
     let vendor = product.join("vendor.img");
     let mut magic = [0; 4];
     use std::io::Read;

@@ -60,6 +60,7 @@ pub fn apex_output(name: &str) -> Option<&'static str> {
     }
 }
 const PATCHES: &[(&str, &str)] = &[
+    ("frameworks/native", "android/surfaceflinger/0009-droidloom-cpu-placement.patch"),
     ("external/minigbm", "android/aosp-patches/0010-minigbm-dma-heap-images.patch"),
     (
         "packages/modules/Connectivity",
@@ -123,6 +124,18 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "frameworks/native",
+        "android/surfaceflinger/0007-droidloom-wayland-layers.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0008-droidloom-release-fences.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0010-droidloom-task-backpressure-background.patch",
+    ),
+    (
+        "frameworks/native",
         "android/inputflinger/0001-application-token-targeted-injection.patch",
     ),
     (
@@ -144,6 +157,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/base",
         "android/framework/0001-droidloom-bottom-navigation-insets.patch",
+    ),
+    (
+        "frameworks/base",
+        "android/framework/0002-droidloom-routed-touch-configuration.patch",
     ),
 ];
 #[derive(Serialize, Deserialize)]
@@ -514,6 +531,7 @@ pub fn build(
         "LICENSE",
         "LICENSES",
         "graphics",
+        "runtime/droidloom-cpu-placement",
         "android/framework",
         "android/lmkd-compat",
         "android/runtime",
@@ -542,6 +560,7 @@ pub fn build(
     p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0011-mesa-zink-kgsl.patch"))?;
     p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0012-mesa-adreno722.patch"))?;
     p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0013-mesa-texture-upload-span.patch"))?;
+    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0014-mesa-background-cpu-placement.patch"))?;
     let cross = mesa.join("android/mesa3d_cross.mk");
     let cross_text = fs::read_to_string(&cross)?;
     let python_assignment = "MESA3D_PYTHONPATH := $(AOSP_ABSOLUTE_PATH)/external/python/mako";

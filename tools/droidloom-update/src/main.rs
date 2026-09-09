@@ -3,6 +3,7 @@ mod android;
 mod assemble;
 mod bundle;
 mod dependencies;
+mod image_policy;
 mod install;
 mod licenses;
 mod package;
@@ -36,6 +37,15 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    #[command(hide = true)]
+    PruneDesktopImage {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        vendor_properties: PathBuf,
+    },
     /// Compile and stage a portable pacman payload; does not install or start services.
     PackageStage {
         #[arg(long)]
@@ -94,6 +104,9 @@ fn repository(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 fn execute(args: Args) -> Result<()> {
     match &args.command {
+        Some(Action::PruneDesktopImage { image, destination, vendor_properties }) => {
+            return image_policy::prune(image, destination, vendor_properties);
+        }
         Some(Action::PackageStage { work, destination, clean, jobs }) => {
             return package::stage(&repository(args.source.clone())?, work, destination, *clean, *jobs);
         }

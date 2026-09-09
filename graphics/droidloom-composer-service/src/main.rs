@@ -64,9 +64,10 @@ fn run() -> Result<(), String> {
         SeqPacket::connect(&socket_path)
             .map_err(|error| format!("connect {}: {error}", socket_path.display()))?,
     );
-    handshake(&socket)?;
+    let activation_requests = handshake(&socket)?;
 
-    let sink = DenialPresentationSink::new(socket, SyncobjDevice::from_file(render_file));
+    let sink = DenialPresentationSink::new(socket, SyncobjDevice::from_file(render_file))
+        .with_activation_requests(activation_requests);
     let session: SharedSession = Arc::new(Mutex::new(Session::default()));
     let factory_sink = sink.clone();
     let service = ComposerService::new(Arc::clone(&session), move || {
@@ -167,13 +168,13 @@ fn arguments() -> Result<(PathBuf, PathBuf), String> {
     Ok((socket, render_node))
 }
 
-fn handshake(socket: &ProtocolSocket) -> Result<(), String> {
+fn handshake(socket: &ProtocolSocket) -> Result<bool, String> {
     socket
         .send_android(
             &AndroidMessage::ClientHello {
                 min_major: PROTOCOL_MAJOR,
                 max_major: PROTOCOL_MAJOR,
-                capabilities: capability::REQUIRED_V1,
+                capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION,
             },
             &[],
         )
@@ -190,7 +191,7 @@ fn handshake(socket: &ProtocolSocket) -> Result<(), String> {
         } if major == PROTOCOL_MAJOR
             && capabilities & capability::REQUIRED_V1 == capability::REQUIRED_V1 =>
         {
-            Ok(())
+            Ok(capabilities & capability::TASK_ACTIVATION != 0)
         }
         DenialMessage::Error { message, .. } => {
             Err(format!("Denial rejected handshake: {message}"))
@@ -206,10 +207,11 @@ fn event_loop(
     coordinator: &TaskCoordinator,
     input: &InputBridge,
 ) -> Result<(), String> {
+    let mut receive_buffer = vec![0; droidloom_denial_protocol::MAX_PACKET_BYTES];
     loop {
         let received = sink
             .socket()
-            .receive_denial()
+            .receive_denial_into(&mut receive_buffer)
             .map_err(|error| error.to_string())?;
         let message = received.message;
         match message {
@@ -373,16 +375,22 @@ fn dispatch_event(
             event,
         } => match coordinator.input_route_for_object(object) {
             Ok((task, android_display, scale_numerator, scale_denominator)) => {
-                if let InputEvent::Key {
-                    action,
-                    keycode,
-                    repeat,
-                } = &event
-                {
-                    eprintln!(
-                        "Droidloom key trace: stage=composer serial={serial} object={} task={} display={} action={action:?} scan_code={keycode} repeat={repeat}",
-                        object.0, task.0, android_display
-                    );
+                static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *KEY_TRACE.get_or_init(|| {
+                    std::env::var_os("DROIDLOOM_INPUT_TRACE").as_deref()
+                        == Some(std::ffi::OsStr::new("1"))
+                }) {
+                    if let InputEvent::Key {
+                        action,
+                        keycode,
+                        repeat,
+                    } = &event
+                    {
+                        eprintln!(
+                            "Droidloom key trace: stage=composer serial={serial} object={} task={} display={} action={action:?} scan_code={keycode} repeat={repeat}",
+                            object.0, task.0, android_display
+                        );
+                    }
                 }
                 if let Err(error) = input.send(
                     serial,

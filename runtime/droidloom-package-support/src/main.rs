@@ -197,6 +197,7 @@ fn configuration(
         }
         for key in [
             "data_dir",
+            "gapps_dir",
             "shared_storage_directories",
             "subordinate_uids",
             "subordinate_gids",
@@ -505,10 +506,12 @@ mod tests {
         assert_eq!(previous["runtime_dir"], "/run/droidloom/cells/u1234");
         assert_eq!(previous["data_dir"], "/var/lib/droidloom/users/1234/data");
         previous["data_dir"] = json!("/var/lib/droidloom/preserved-data");
+        previous["gapps_dir"] = json!("/usr/lib/droidloom/addons/gapps");
         previous["android_file_overrides"] = json!([]);
         let updated =
             configuration(recipe(), Some(&previous), 1234, "/dev/dri/renderD128").unwrap();
         assert_eq!(updated["data_dir"], previous["data_dir"]);
+        assert_eq!(updated["gapps_dir"], previous["gapps_dir"]);
         assert!(
             !updated["android_file_overrides"]
                 .as_array()

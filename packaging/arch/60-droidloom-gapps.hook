@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = droidloom-gapps
+
+[Action]
+Description = Stopping Droidloom before changing its optional Google-app images...
+When = PreTransaction
+Exec = /usr/lib/droidloom/droidloom-package-helper before-upgrade
+AbortOnFail

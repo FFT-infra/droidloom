@@ -42,6 +42,14 @@ offer alternative licenses for Droidloom's GPL-covered implementation.
 
 ## Binary distribution
 
+The optional `droidloom-gapps` workflow imports a user-supplied LiteGapps archive.
+Google APKs retain their separate proprietary terms. LiteGapps' installer license
+does not license Google's APKs. The workflow records source and APK hashes,
+preserves signer identity and includes the supplied notices; it does not grant
+redistribution rights or establish Google device certification. Keep these local
+payloads out of source control and resolve distribution rights independently
+before publishing a package containing them.
+
 Both pacman packages include Droidloom's LICENSE, the full GPLv3 text and this
 scope document under `/usr/share/licenses/<package>/`. The runtime package also
 includes the Cargo dependency notices under `rust/`. The image package retains

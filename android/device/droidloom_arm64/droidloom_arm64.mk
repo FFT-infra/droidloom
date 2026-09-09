@@ -66,6 +66,7 @@ PRODUCT_PACKAGES += \
 # while BUS endpoints select its timing-correct stub streams and never open a
 # host ALSA device.
 PRODUCT_COPY_FILES += \
+    vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_input.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_input.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.activities_on_secondary_displays.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.activities_on_secondary_displays.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.app_widgets.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.app_widgets.xml \
     vendor/droidloom/android/device/droidloom_arm64/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
@@ -76,12 +77,14 @@ PRODUCT_COPY_FILES += \
 
 # Android's loaders derive these exact filenames from the properties:
 # lib{EGL,GLESv1_CM,GLESv2}_mesa.so and vulkan.freedreno.so.
+# The ARM64 Mesa rendering path supports GLES 3.2 (0x00030002 = 196610).
 PRODUCT_VENDOR_PROPERTIES += \
     ro.zygote=zygote64 \
     ro.vendor.droidloom.surfaceflinger_direct=true \
     ro.vendor.droidloom.surfaceflinger_tasks=true \
     ro.hardware.egl=mesa \
     ro.hardware.vulkan=freedreno \
+    ro.opengles.version=196610 \
     dalvik.vm.heapstartsize=16m \
     dalvik.vm.heapgrowthlimit=256m \
     dalvik.vm.heapsize=512m \

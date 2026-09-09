@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+droidloom-cpu-placement = { path = "../droidloom-cpu-placement" }
 clap.workspace = true
 droidloom-supervisor = { path = "../droidloom-supervisor" }
 hex.workspace = true

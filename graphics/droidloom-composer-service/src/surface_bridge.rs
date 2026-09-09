@@ -1,7 +1,7 @@
 //! Cell-private broker between SurfaceFlinger and the Denial presentation sink.
 
 use droidloom_composer::{DisplayId, TaskId};
-use droidloom_composer_aidl::denial::DenialPresentationSink;
+use droidloom_composer_aidl::denial::{DenialPresentationSink, DenialSinkError};
 use droidloom_composer_aidl::minigbm::ImportedRenderTarget;
 use droidloom_composer_aidl::service::SharedSession;
 use droidloom_denial_ipc::{SeqPacket, SeqPacketListener};
@@ -84,7 +84,9 @@ impl SurfaceBridge {
     }
 
     fn serve_connection(&self, socket: &SeqPacket) -> Result<(), String> {
+        let mut receive_buffer = vec![0; droidloom_denial_protocol::MAX_PACKET_BYTES];
         let mut ready = false;
+        let mut layers_opened = false;
         let mut selected_display = None;
         let mut selected_task = None;
         let mut reservations: BTreeMap<u64, ImportedRenderTarget> = BTreeMap::new();
@@ -94,11 +96,11 @@ impl SurfaceBridge {
         let mut timings: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
         let result = (|| -> Result<(), String> {
             loop {
-                let record = match socket.receive_record() {
+                let record = match socket.receive_record_into(&mut receive_buffer) {
                     Ok(record) => record,
                     Err(error) => break Err(format!("receive SurfaceFlinger request: {error}")),
                 };
-                let request = match decode_request(&record.bytes, record.descriptors.len()) {
+                let request = match decode_request(record.bytes, record.descriptors.len()) {
                     Ok(request) => request,
                     Err(error) => break Err(format!("decode SurfaceFlinger request: {error}")),
                 };
@@ -143,10 +145,16 @@ impl SurfaceBridge {
                         }
                         let target = match self.sink.acquire_surfaceflinger_target(display) {
                             Ok(target) => target,
-                            Err(error) => {
+                            Err(DenialSinkError::NoRenderTarget(_)) => {
                                 if tracing { acquire_retries += 1; }
+                                // Normal backpressure, not a logging event. The
+                                // task retries on a later composition cycle.
+                                send_response(socket, &Response::Error { code: ERROR_TRY_AGAIN }, &[])?;
+                                continue;
+                            }
+                            Err(error) => {
                                 eprintln!("Droidloom SurfaceFlinger acquire failed: {error}");
-                                send_response(socket, &Response::Error { code: -11 }, &[])?;
+                                send_response(socket, &Response::Error { code: ERROR_IO }, &[])?;
                                 continue;
                             }
                         };
@@ -233,6 +241,18 @@ impl SurfaceBridge {
                                 send_response(socket, &Response::Error { code: -5 }, &[])?;
                             }
                         }
+                    }
+                    Request::OpenLayers { display } => {
+                        let display = require_display(selected_display, display)?;
+                        if layers_opened || selected_task == Some(0) {
+                            send_response(socket, &Response::Error { code: -22 }, &[])?;
+                            continue;
+                        }
+                        let (requests, host_requests) = SeqPacket::pair().map_err(|e| e.to_string())?;
+                        let (events, host_events) = SeqPacket::pair().map_err(|e| e.to_string())?;
+                        self.sink.bind_layer_stream(display, &[host_requests.as_fd(), host_events.as_fd()]).map_err(|e| e.to_string())?;
+                        send_response(socket, &Response::LayerStream, &[requests.as_fd(), events.as_fd()])?;
+                        layers_opened = true;
                     }
                     Request::Cancel { display, buffer } => {
                         timings.remove(&buffer);

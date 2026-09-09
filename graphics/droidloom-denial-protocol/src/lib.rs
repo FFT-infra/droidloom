@@ -20,7 +20,9 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 4;
+/// Wire version retained by existing records, including initial negotiation.
+pub const BASE_PROTOCOL_MINOR: u16 = 3;
 /// Fixed wire-header size.
 pub const HEADER_BYTES: usize = 32;
 /// Maximum complete sequenced packet, including its header.
@@ -58,6 +60,8 @@ pub mod capability {
     pub const HOST_RENDER_TARGETS: u64 = 1 << 6;
     /// Droidloom composes Android task layers into the host render targets.
     pub const DROIDLOOM_COMPOSITION: u64 = 1 << 7;
+    /// The host accepts task activation requests under its own focus policy.
+    pub const TASK_ACTIVATION: u64 = 1 << 8;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -86,6 +90,8 @@ pub struct AndroidDisplayId(pub u64);
 pub enum DescriptorKind {
     /// One DMA-BUF plane, ordered by its dense plane index.
     DmabufPlane,
+    /// Authenticated task-scoped layer request/release socket.
+    LayerStream,
     /// Opaque descriptor exporting the task's acquire syncobj timeline.
     AcquireTimeline,
     /// Opaque descriptor exporting the task's release syncobj timeline.
@@ -187,6 +193,11 @@ pub enum AndroidMessage {
         /// Buffer-coordinate damage.
         damage: Vec<Damage>,
     },
+    /// Delegate two private sockets for layer requests and completion events.
+    BindLayerStream {
+        /// Existing, authorized task object.
+        object: TaskObjectId,
+    },
     /// Update opaque/secure/HDR state for following presents.
     SetContentState {
         /// Owning task.
@@ -200,6 +211,12 @@ pub enum AndroidMessage {
         object: TaskObjectId,
         /// Requested rate in millihertz.
         millihz: u32,
+    },
+    /// Ask the host to present an existing task after an Android intent launch.
+    /// Requires negotiated `TASK_ACTIVATION`; focus remains host-authoritative.
+    RequestActivation {
+        /// Existing task to activate.
+        object: TaskObjectId,
     },
     /// Answer a host liveness probe.
     Pong {
@@ -1118,6 +1135,8 @@ const OP_SET_CONTENT_STATE: u16 = 0x0009;
 const OP_SET_FRAME_RATE: u16 = 0x000a;
 const OP_PONG: u16 = 0x000b;
 const OP_BIND_TASK: u16 = 0x000c;
+const OP_BIND_LAYER_STREAM: u16 = 0x000d;
+const OP_REQUEST_ACTIVATION: u16 = 0x000e;
 
 const OP_SERVER_HELLO: u16 = 0x8001;
 const OP_FORMAT_FEEDBACK: u16 = 0x8002;
@@ -1256,6 +1275,7 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             }
             (OP_PRESENT, valid_object(*object)?, Vec::new())
         }
+        AndroidMessage::BindLayerStream { object } => (OP_BIND_LAYER_STREAM, valid_object(*object)?, vec![DescriptorKind::LayerStream; 2]),
         AndroidMessage::SetContentState { object, flags } => {
             known_bits(
                 "content state",
@@ -1274,6 +1294,8 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             payload.u32(*millihz);
             (OP_SET_FRAME_RATE, valid_object(*object)?, Vec::new())
         }
+        AndroidMessage::RequestActivation { object } =>
+            (OP_REQUEST_ACTIVATION, valid_object(*object)?, Vec::new()),
         AndroidMessage::Pong { cookie } => {
             payload.u64(*cookie);
             (OP_PONG, 0, Vec::new())
@@ -1424,6 +1446,10 @@ pub fn decode_android(
                 Vec::new(),
             )
         }
+        OP_BIND_LAYER_STREAM => {
+            valid_object(object)?;
+            (AndroidMessage::BindLayerStream { object }, vec![DescriptorKind::LayerStream; 2])
+        }
         OP_SET_CONTENT_STATE => {
             valid_object(object)?;
             let flags = payload.u32()?;
@@ -1446,6 +1472,10 @@ pub fn decode_android(
                 });
             }
             (AndroidMessage::SetFrameRate { object, millihz }, Vec::new())
+        }
+        OP_REQUEST_ACTIVATION => {
+            valid_object(object)?;
+            (AndroidMessage::RequestActivation { object }, Vec::new())
         }
         OP_PONG => {
             require_connection(header.object)?;
@@ -2022,7 +2052,10 @@ fn finish_packet(
     let mut bytes = Vec::with_capacity(complete_length);
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
-    bytes.extend_from_slice(&PROTOCOL_MINOR.to_le_bytes());
+    // Existing peers reject a header newer than their implementation before
+    // reading capabilities. Only the negotiated new opcode needs minor 4.
+    let minor = if opcode == OP_REQUEST_ACTIVATION { PROTOCOL_MINOR } else { BASE_PROTOCOL_MINOR };
+    bytes.extend_from_slice(&minor.to_le_bytes());
     bytes.extend_from_slice(&opcode.to_le_bytes());
     bytes.extend_from_slice(&fd_count.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
@@ -2424,6 +2457,24 @@ mod tests {
     }
 
     #[test]
+    fn activation_does_not_raise_the_wire_version_of_legacy_handshakes() {
+        let hello = encode_android(&AndroidMessage::ClientHello {
+            min_major: 1, max_major: 1,
+            capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION,
+        }).unwrap();
+        let create = encode_android(&AndroidMessage::CreateTask {
+            object: OBJECT, display: AndroidDisplayId(9), package: "org.example.app".into(),
+        }).unwrap();
+        for legacy in [hello, create] {
+            assert_eq!(&legacy.bytes[6..8], &3_u16.to_le_bytes());
+        }
+        let activation = encode_android(&AndroidMessage::RequestActivation { object: OBJECT }).unwrap();
+        assert_eq!(&activation.bytes[6..8], &4_u16.to_le_bytes());
+        assert!(activation.descriptors.is_empty());
+        assert_eq!(activation.bytes.len(), HEADER_BYTES);
+    }
+
+    #[test]
     fn android_control_messages_round_trip() {
         for message in [
             AndroidMessage::ClientHello {
@@ -2457,6 +2508,7 @@ mod tests {
                 buffer: BufferId(11),
             },
             AndroidMessage::DestroyTask { object: OBJECT },
+            AndroidMessage::RequestActivation { object: OBJECT },
             AndroidMessage::Pong { cookie: 99 },
         ] {
             round_trip_android(&message);

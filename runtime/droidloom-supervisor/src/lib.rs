@@ -9,6 +9,8 @@
 pub mod control;
 pub mod development;
 mod development_network;
+mod cpu_placement;
+pub mod gapps;
 pub mod linux_plan;
 mod package_cache;
 
@@ -139,6 +141,11 @@ pub struct CellSpec {
     pub subordinate_gids: IdRange,
     /// Activated, verified image directory.
     pub image_dir: PathBuf,
+    /// Explicit optional Google-app image pair. Omission uses the base images.
+    /// First activation requires fresh Android data; package installation alone
+    /// never enables Google services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gapps_dir: Option<PathBuf>,
     /// Raw ext4 Droidloom vendor image compatible with the activated base.
     pub vendor_image: PathBuf,
     /// Optional package-owned Android init binary mounted over the immutable
@@ -218,6 +225,13 @@ impl CellSpec {
             if !is_normal_absolute(path) {
                 problems.push(format!("{name} must be a normalized absolute path"));
             }
+        }
+        if self
+            .gapps_dir
+            .as_ref()
+            .is_some_and(|path| !is_normal_absolute(path))
+        {
+            problems.push("gapps_dir must be a normalized absolute path".into());
         }
 
         if self
@@ -666,6 +680,7 @@ mod tests {
                 count: 100_000,
             },
             image_dir: "/var/lib/droidloom/images/current".into(),
+            gapps_dir: None,
             vendor_image: "/var/lib/droidloom/images/current/images/vendor.raw.img".into(),
             android_init: None,
             android_file_overrides: Vec::new(),

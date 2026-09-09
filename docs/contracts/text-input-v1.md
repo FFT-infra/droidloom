@@ -53,6 +53,14 @@ the completed `start-activity -W` result. This matters for both Settings and
 Firefox; treating a real activity and its launcher alias as different tasks
 strands the running app. No-display trampoline successors remain distinct.
 
+App-to-app launches also reach the host through the input bridge's platform
+task observer. It registers Android's resolved foreground task without replaying
+the intent or substituting a MAIN/LAUNCHER launch, preserving deep-link data and
+activity results. Reused tasks request host activation through the optional
+`TASK_ACTIVATION` capability; the host retains authority over window focus.
+See the [framework boundary](../../android/framework/README.md) for eligibility
+and regression checks.
+
 Presenter activation logs include `touch_age_ms`; IME logs distinguish
 start/restart, finish, and show callbacks without logging editor text.
 

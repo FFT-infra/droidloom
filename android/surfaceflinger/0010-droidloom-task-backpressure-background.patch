@@ -1,0 +1,50 @@
+Subject: [PATCH] Droidloom: yield busy task targets and retain an opaque backing
+
+Task composition shares SurfaceFlinger's main thread. A task whose targets
+are busy must yield to the next scheduled composition, not sleep/retry while
+blocking every other task. The bootstrap native window keeps its existing
+blocking contract. Normal task windows compose over black, matching the
+presenter's direct-layer backing when producer layers leave gaps.
+
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -357,6 +357,9 @@
+         if (opcode == Opcode::Error && record.length == kHeaderBytes + 4) {
+             const int32_t error = static_cast<int32_t>(readU32(record.bytes.data() + kHeaderBytes));
+             if (error == -EAGAIN) {
++                // Each task shares SF's composition thread. Keep its preceding
++                // frame visible and let other tasks progress on this cycle.
++                if (mTask != 0) return WOULD_BLOCK;
+                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                 continue;
+             }
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3641,6 +3641,12 @@
+             base::unique_fd targetAcquireFence(acquireFence);
+             if (status != NO_ERROR || nativeBuffer == nullptr) {
+-                ALOGE("Failed to acquire target for Android task %d: %d", task, status);
++                if (status == WOULD_BLOCK) {
++                    // Retry on the scheduler's next frame, outside this task's
++                    // dequeue. Never spin or sleep on the shared SF thread.
++                    scheduleComposite(FrameHint::kNone);
++                } else {
++                    ALOGE("Failed to acquire target for Android task %d: %d", task, status);
++                }
+                 taskOutput.invalidated = true;
+                 continue;
+             }
+@@ -3684,3 +3690,3 @@
+                                             .targetBrightness = 1.0f,
+-                                            .layerAlpha = 0.0f,
++                                            .layerAlpha = 1.0f,
+                                             .disableBlur = false,
+@@ -3743,5 +3749,5 @@
+-            // Reuse CompositionEngine's transformed/clipped opaque coverage.
+-            // A gap keeps real task transparency; never infer opacity from the app ID.
+-            taskOutput.window->setContentOpaque(output->getState().undefinedRegion.isEmpty());
++            // The task output includes an opaque black fill beneath app layers.
++            // Intra-app transparency still blends with those layers and the fill.
++            taskOutput.window->setContentOpaque(true);
+             const sp<Fence>& renderFence =
+                     output->getRenderSurface()->getClientTargetAcquireFence();

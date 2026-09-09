@@ -37,6 +37,7 @@ pub struct TaskCoordinator {
     lifecycle: ComposerLifecycle,
     state: Arc<(Mutex<State>, Condvar)>,
     operation_gate: Arc<Mutex<()>>,
+    direct_registration_gate: Arc<Mutex<()>>,
 }
 
 impl TaskCoordinator {
@@ -63,6 +64,7 @@ impl TaskCoordinator {
                 Condvar::new(),
             )),
             operation_gate: Arc::new(Mutex::new(())),
+            direct_registration_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -153,7 +155,7 @@ impl TaskCoordinator {
             .unwrap_or(false)
     }
 
-    /// Register one launcher-verified WindowManager task for direct export.
+    /// Register one launcher- or observer-verified WindowManager task for direct export.
     /// The channel reuses safe Composer window state but intentionally skips
     /// Composer hotplug: it is not an Android display. This explicit registry
     /// is also the allowlist that excludes HOME and system organizer tasks.
@@ -163,6 +165,10 @@ impl TaskCoordinator {
         package: String,
         android_display: u32,
     ) -> Result<(TaskObjectId, DisplayId), String> {
+        // Explicit host launches and the Android task observer can discover
+        // the same task together. Wait for its complete binding before reuse.
+        let _registration = self.direct_registration_gate.lock()
+            .map_err(|_| "direct registration lock is poisoned".to_owned())?;
         if task.0 == 0 || task.0 > i32::MAX as u64 {
             return Err(format!("invalid Android task identity {}", task.0));
         }
@@ -399,6 +405,7 @@ impl TaskCoordinator {
         let (object, display) = self
             .register_direct_task(task, package, android_display)
             .map_err(backend)?;
+        self.sink.request_activation(display).map_err(|error| backend(error.to_string()))?;
         Ok(ControlResponse::Bound {
             request_id,
             object: object.0,
@@ -427,17 +434,14 @@ impl TaskCoordinator {
                     .map_err(|_| backend("task-control state lock is poisoned"))?;
                 let registration = state.registry.reserve(package).map_err(control_error)?;
                 if let Some((task, android_display)) = direct_task {
-                    if state
-                        .direct_tasks
-                        .insert(task, registration.object)
-                        .is_some()
-                    {
+                    if state.direct_tasks.contains_key(&task) {
                         let _ = state.registry.cancel_reservation(registration.object);
                         return Err((
                             ControlErrorCode::Conflict,
                             format!("Android task {} already has a direct channel", task.0),
                         ));
                     }
+                    state.direct_tasks.insert(task, registration.object);
                     state
                         .direct_android_displays
                         .insert(registration.object, android_display);

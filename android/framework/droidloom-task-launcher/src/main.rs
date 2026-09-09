@@ -4,12 +4,17 @@
 
 use std::env;
 
-use droidloom_task_launcher::{LaunchRequest, launch, set_display_density};
+use droidloom_task_launcher::{LaunchRequest, bind_existing_task, launch, set_display_density};
 
 #[derive(Debug, Eq, PartialEq)]
 enum Operation {
     Launch(LaunchRequest),
     SetDensity(u32),
+    BindTask {
+        package: String,
+        user: u32,
+        task: u64,
+    },
 }
 
 fn main() {
@@ -24,6 +29,13 @@ fn main() {
             .map_err(|error| error.to_string()),
         Operation::SetDensity(dpi) => set_display_density(dpi)
             .map(|()| format!("dpi={dpi}"))
+            .map_err(|error| error.to_string()),
+        Operation::BindTask {
+            package,
+            user,
+            task,
+        } => bind_existing_task(&package, user, task)
+            .map(|binding| format!("object={} task={}", binding.object, binding.task))
             .map_err(|error| error.to_string()),
     });
     match result {
@@ -43,10 +55,13 @@ fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operati
     let mut package = None;
     let mut component = None;
     let mut user = 0;
+    let mut task = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--set-density" if package.is_none() && component.is_none() && user == 0 => {
+            "--set-density"
+                if package.is_none() && component.is_none() && user == 0 && task.is_none() =>
+            {
                 let dpi = arguments
                     .next()
                     .ok_or_else(|| "--set-density requires a DPI value".to_owned())?
@@ -64,6 +79,15 @@ fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operati
                         .ok_or_else(|| "--component requires PACKAGE/ACTIVITY".to_owned())?,
                 );
             }
+            "--bind-task" if task.is_none() => {
+                task = Some(
+                    arguments
+                        .next()
+                        .ok_or("--bind-task requires a task ID")?
+                        .parse::<u64>()
+                        .map_err(|_| "--bind-task must be an unsigned integer")?,
+                );
+            }
             "--user" => {
                 user = arguments
                     .next()
@@ -78,11 +102,22 @@ fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operati
             _ => return Err("only one Android package may be launched".to_owned()),
         }
     }
-    Ok(Operation::Launch(LaunchRequest {
-        package: package.ok_or_else(|| {
-            "usage: droidloom-task-launcher [--user ID] [--component PACKAGE/ACTIVITY] PACKAGE | --set-density DPI"
+    let package = package.ok_or_else(|| {
+            "usage: droidloom-task-launcher [--user ID] [--component PACKAGE/ACTIVITY | --bind-task ID] PACKAGE | --set-density DPI"
                 .to_owned()
-        })?,
+        })?;
+    if let Some(task) = task {
+        if component.is_some() {
+            return Err("--bind-task cannot start a component".into());
+        }
+        return Ok(Operation::BindTask {
+            package,
+            user,
+            task,
+        });
+    }
+    Ok(Operation::Launch(LaunchRequest {
+        package,
         component,
         user,
     }))
@@ -94,6 +129,38 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Result<Operation, String> {
         arguments_from(values.iter().map(|value| (*value).to_owned()))
+    }
+
+    #[test]
+    fn binding_an_existing_task_never_becomes_a_launch() {
+        assert_eq!(
+            arguments(&[
+                "--bind-task",
+                "26",
+                "--user",
+                "0",
+                "com.zhiliaoapp.musically"
+            ]),
+            Ok(Operation::BindTask {
+                package: "com.zhiliaoapp.musically".into(),
+                user: 0,
+                task: 26
+            })
+        );
+        for args in [
+            vec!["--bind-task"],
+            vec!["--bind-task", "x", "org.example.app"],
+            vec![
+                "--bind-task",
+                "26",
+                "--component",
+                "org.example.app/.Main",
+                "org.example.app",
+            ],
+            vec!["--bind-task", "26", "--set-density", "175"],
+        ] {
+            assert!(arguments(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]

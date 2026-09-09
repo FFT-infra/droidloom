@@ -40,7 +40,7 @@ pub(super) fn install(pid: u32, user: u32, mut file: File) -> Result<(), Control
 }
 
 fn install_command(pid: u32, user: u32, bytes: u64) -> Command {
-    let mut command = Command::new("/usr/bin/timeout");
+    let mut command = droidloom_cpu_placement::command("/usr/bin/timeout");
     command
         .args(["--kill-after=5s", "110s", "/usr/bin/nsenter", "--target"])
         .arg(pid.to_string())
@@ -296,7 +296,7 @@ mod tests {
         file.write_all(b"PK\x03\x04test payload").unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         let output =
-            diagnostics::capture_with_stdin(&mut Command::new("/usr/bin/cat"), Stdio::from(file))
+            diagnostics::capture_with_stdin(&mut droidloom_cpu_placement::command("/usr/bin/cat"), Stdio::from(file))
                 .unwrap();
         assert_eq!(output.as_bytes(), b"PK\x03\x04test payload");
     }

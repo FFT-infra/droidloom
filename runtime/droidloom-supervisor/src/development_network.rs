@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::CellSpec;
 use crate::development::DevelopmentError;
@@ -471,7 +471,7 @@ fn ufw_rule_arguments<'a>(operation: &'a str, names: &'a NetworkNames) -> [&'a s
 }
 
 fn ufw_chain_exists() -> Result<bool, DevelopmentError> {
-    match Command::new("iptables")
+    match droidloom_cpu_placement::command("iptables")
         .args(["-w", "-S", "ufw-user-forward"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -494,7 +494,7 @@ fn command_succeeds<const N: usize>(
     program: &str,
     args: [&str; N],
 ) -> Result<bool, DevelopmentError> {
-    Command::new(program)
+    droidloom_cpu_placement::command(program)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -504,7 +504,7 @@ fn command_succeeds<const N: usize>(
 }
 
 fn namespace_exists(namespace: &str) -> Result<bool, DevelopmentError> {
-    let output = Command::new("ip")
+    let output = droidloom_cpu_placement::command("ip")
         .args(["netns", "list"])
         .output()
         .map_err(|source| io_error("execute ip", source))?;
@@ -558,7 +558,7 @@ fn run_os<I>(program: &str, args: I) -> Result<(), DevelopmentError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let status = Command::new(program)
+    let status = droidloom_cpu_placement::command(program)
         .args(args)
         .status()
         .map_err(|source| io_error(&format!("execute {program}"), source))?;
@@ -605,6 +605,7 @@ mod tests {
                 count: 100_000,
             },
             image_dir: PathBuf::from("/images"),
+            gapps_dir: None,
             vendor_image: PathBuf::from("/images/vendor.img"),
             android_init: None,
             android_file_overrides: Vec::new(),

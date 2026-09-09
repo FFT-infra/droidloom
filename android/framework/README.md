@@ -73,6 +73,33 @@ ordinary freeform tasks on the shared built-in display through Android's pinned
 `cmd activity` interface, discovers the exact leaf task, and binds its real task
 ID to the host window. This does not require a full AOSP checkout.
 
+The root input bridge also registers a platform `TaskStackListener`. When Android
+brings a visible standard application task to the foreground on user 0/display 0,
+the observer binds that existing task through `droidloom-task-launcher --bind-task`.
+This covers Play Store's Open button, deep links, shares, choosers and activity
+PendingIntents without starting another launcher activity. Android retains the
+original intent, extras, URI grants, task flags and activity-result relationship.
+HOME, recents, organizer containers, background tasks and other users/displays
+are excluded. Activities from another package within the same task retain that
+task's base owner, including authentication and permission screens.
+
+Task callbacks are coalesced on a worker thread, with bounded retries for failed
+registration and no idle task polling. Concurrent explicit launches and observer
+registration serialize through the same idempotent task registry. Reopening an
+existing task requests host activation through the negotiated task-activation
+capability. The Wayland presenter uses `xdg_activation_v1` and a recent input
+serial when available; the host compositor decides whether to grant focus.
+Update the input bridge, task launcher, Composer and presenter together for
+this path. Older hosts can still create task windows but cannot honor the new
+activation request.
+
+The observer policy has a local JVM check:
+
+```console
+javac -d .work/task-observer-tests android/framework/droidloom-input-bridge/src/com/android/droidloom/input/TaskRegistration.java android/framework/droidloom-input-bridge/tests/com/android/droidloom/input/TaskRegistrationTest.java
+java -cp .work/task-observer-tests com.android.droidloom.input.TaskRegistrationTest
+```
+
 First-launch permission dialogs remain part of the requesting app's task. The
 launcher resolves Android's system permission handler and accepts that exact
 activity during task discovery, while still requiring the requested app's base

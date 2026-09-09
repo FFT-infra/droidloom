@@ -111,6 +111,7 @@ pub struct DenialPresentationSink {
     device: SyncobjDevice,
     tasks: Arc<Mutex<BTreeMap<DisplayId, TaskChannel>>>,
     compositor: Arc<Mutex<Option<LayerCompositor>>>,
+    activation_requests: bool,
 }
 
 impl DenialPresentationSink {
@@ -121,7 +122,30 @@ impl DenialPresentationSink {
             device,
             tasks: Arc::new(Mutex::new(BTreeMap::new())),
             compositor: Arc::new(Mutex::new(None)),
+            activation_requests: false,
         }
+    }
+
+    /// Record the activation capability negotiated with this host.
+    #[must_use]
+    pub fn with_activation_requests(mut self, enabled: bool) -> Self {
+        self.activation_requests = enabled;
+        self
+    }
+
+    /// Request host activation of an already bound task when supported.
+    ///
+    /// # Errors
+    /// Returns unknown-display or transport errors; older hosts remain usable.
+    pub fn request_activation(&self, display: DisplayId) -> Result<(), DenialSinkError> {
+        if self.activation_requests {
+            let tasks = self.lock_tasks()?;
+            let channel = tasks.get(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
+            self.socket.send_android(&AndroidMessage::RequestActivation {
+                object: channel.binding.object(),
+            }, &[])?;
+        }
+        Ok(())
     }
 
     /// Borrow the connected socket for a single-owner protocol event pump.
@@ -489,6 +513,14 @@ impl DenialPresentationSink {
             return Err(error);
         }
         Ok(frame.frame_id)
+    }
+
+    /// Delegate an authenticated pair of sockets to the task's presenter.
+    pub fn bind_layer_stream(&self, display: DisplayId, sockets: &[std::os::fd::BorrowedFd<'_>]) -> Result<(), DenialSinkError> {
+        let tasks = self.lock_tasks()?;
+        let task = tasks.get(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
+        self.socket.send_android(&AndroidMessage::BindLayerStream { object: task.binding.object() }, sockets)?;
+        Ok(())
     }
 
     /// Resolve a protocol task object to its dedicated Composer display.

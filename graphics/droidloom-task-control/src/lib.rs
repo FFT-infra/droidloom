@@ -2,7 +2,7 @@
 //!
 //! This is a privileged lifecycle channel, separate from the high-frequency
 //! DMA-BUF presentation protocol. Direct tasks are registered only after the
-//! launcher has resolved their real `ActivityTaskManager` identity, making the
+//! launcher or privileged task observer resolves their `ActivityTaskManager` identity, making the
 //! registry the allowlist for windows `SurfaceFlinger` may export to the host.
 
 #![forbid(unsafe_code)]

@@ -1,0 +1,26 @@
+From: Droidloom <droidloom@localhost>
+Subject: [PATCH] wm: include routed touch in Droidloom display configuration
+
+Denial owns physical input devices. Droidloom's bridge delivers touchscreen
+MotionEvents directly to each task, so enumerating Android input nodes alone
+incorrectly selects notouch resources and advertises no touch to app stores.
+Require both the Droidloom task marker and the product's touchscreen feature;
+ordinary Android products retain their input-device-derived configuration.
+
+--- a/services/core/java/com/android/server/wm/DisplayContent.java
++++ b/services/core/java/com/android/server/wm/DisplayContent.java
+@@ -2918,6 +2918,13 @@
+ 
+         // Update the configuration based on available input devices, lid switch,
+         // and platform configuration.
+-        config.touchscreen = Configuration.TOUCHSCREEN_NOTOUCH;
++        // Droidloom receives touch through its task-token bridge, without
++        // exposing Denial's physical input nodes as Android input devices.
++        // Include that routed source only when the product declares it.
++        final boolean hasDroidloomTouch = mWmService.mIsTouchDevice
++                && android.os.SystemProperties.getBoolean(
++                        "ro.vendor.droidloom.surfaceflinger_tasks", false);
++        config.touchscreen = hasDroidloomTouch
++                ? Configuration.TOUCHSCREEN_FINGER : Configuration.TOUCHSCREEN_NOTOUCH;
+         config.keyboard = Configuration.KEYBOARD_NOKEYS;
+         config.navigation = Configuration.NAVIGATION_NONAV;

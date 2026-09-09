@@ -2,6 +2,7 @@ service droidloom-input-bridge /vendor/bin/droidloom-input-bridge
     class main
     user root
     group root system graphics
+    task_profiles MaxPerformance
     socket droidloom_input seqpacket+listen 0660 system system
     stdio_to_kmsg
 

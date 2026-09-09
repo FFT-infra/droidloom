@@ -163,3 +163,18 @@ index 7f658bec..5991aaf8 100644
  }
  
  // static
+diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+--- a/audio/aidl/default/primary/StreamPrimary.cpp
++++ b/audio/aidl/default/primary/StreamPrimary.cpp
+@@ -203,9 +203,11 @@ bool StreamPrimary::useStubStream(
+     if (isInput) {
+         return kSimulateInput || device.type.type == AudioDeviceType::IN_TELEPHONY_RX ||
+                device.type.type == AudioDeviceType::IN_FM_TUNER ||
++               device.type.type == AudioDeviceType::IN_BUS ||
+                device.type.connection == AudioDeviceDescription::CONNECTION_BUS /*deprecated */;
+     }
+     return kSimulateOutput || device.type.type == AudioDeviceType::OUT_TELEPHONY_TX ||
++           device.type.type == AudioDeviceType::OUT_BUS ||
+            device.type.connection == AudioDeviceDescription::CONNECTION_BUS /*deprecated*/;
+ }
+ 

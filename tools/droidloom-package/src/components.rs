@@ -80,6 +80,7 @@ fn inputs(source: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
         "android/manifest",
         "protocol",
         "runtime/droidloom-contracts/src",
+        "tools/droidloom-update/src",
     ] {
         visit(source, Path::new(directory), &mut result)?;
     }
@@ -238,6 +239,7 @@ mod tests {
             "android/manifest",
             "protocol",
             "runtime/droidloom-contracts/src",
+            "tools/droidloom-update/src",
         ] {
             fs::create_dir_all(root.join(directory)).unwrap();
         }

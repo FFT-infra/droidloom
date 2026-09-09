@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+droidloom-cpu-placement = { path = "../../runtime/droidloom-cpu-placement" }
+droidloom-surface-bridge = { path = "../droidloom-surface-bridge" }
 drm-fourcc.workspace = true
 droidloom-denial-endpoint = { path = "../droidloom-denial-endpoint" }
 droidloom-denial-ipc = { path = "../droidloom-denial-ipc" }

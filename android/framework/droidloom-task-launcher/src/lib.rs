@@ -131,6 +131,26 @@ pub fn launch(request: &LaunchRequest) -> Result<TaskBinding, LaunchError> {
     )
 }
 
+/// Bind a task already resolved by the privileged Android task observer.
+/// This performs no activity start, so intent extras, URI grants, results and
+/// Android's original task selection remain intact.
+///
+/// # Errors
+/// Rejects invalid identities or a failed task-control transaction.
+pub fn bind_existing_task(package: &str, user: u32, task: u64) -> Result<TaskBinding, LaunchError> {
+    validate_request(&LaunchRequest {
+        package: package.into(),
+        component: None,
+        user,
+    })?;
+    if user != 0 || task == 0 || task > i32::MAX as u64 {
+        return Err(LaunchError::InvalidRequest(
+            "observed task must belong to user 0 and have a positive Android task ID".into(),
+        ));
+    }
+    TaskControlClient::connect(Path::new(DEFAULT_CONTROL_SOCKET))?.register_direct(package, task, 0)
+}
+
 /// Persist a density override for Android's single built-in display.
 ///
 /// Android stores this through `WindowManager` in its writable data image, so
@@ -235,7 +255,9 @@ fn launch_direct(
         permission_dialog.as_deref(),
     )?;
     timing.record("activity");
-    let alias = if permission_dialog.as_deref() == Some(&launched_activity) {
+    let alias = if permission_dialog.as_deref() == Some(&launched_activity)
+        || is_play_store_sign_in(&request.package, &launched_activity)
+    {
         None
     } else {
         resolve_launch_alias(request, android_command, &launched_activity)?
@@ -594,6 +616,7 @@ fn completed_launch_activity(
         })?;
     if component.split_once('/').map(|(owner, _)| owner) != Some(package)
         && permission_dialog != Some(component.as_str())
+        && !is_play_store_sign_in(package, &component)
     {
         return Err(LaunchError::Activity(format!(
             "launch completed in {component}, outside requested package {package}"
@@ -612,6 +635,14 @@ fn normalized_component(component: &str) -> Option<String> {
     } else {
         component.to_owned()
     })
+}
+
+// The optional Google package opens this authentication activity inside the
+// Play Store's existing task. Keep this exception scoped to that exact pair;
+// task ownership, user, display, visibility and ambiguity checks still apply.
+fn is_play_store_sign_in(package: &str, component: &str) -> bool {
+    package == "com.android.vending"
+        && component == "com.google.android.gms/com.google.android.gms.auth.uiflows.minutemaid.MinuteMaidActivity"
 }
 
 fn is_pending_display_error(error: &LaunchError, android_display: u64) -> bool {
@@ -752,6 +783,19 @@ fn matching_launch_tasks(
     alias: Option<&str>,
     permission_dialog: Option<&str>,
 ) -> Result<Vec<u64>, LaunchError> {
+    if is_play_store_sign_in(&request.package, completed) {
+        return matching_task_records(
+            listing,
+            display,
+            &request.package,
+            Some(request.user),
+            true,
+            |top| top.is_some_and(|top| {
+                is_play_store_sign_in(&request.package, top)
+                    || top.split_once('/').map(|(owner, _)| owner) == Some(request.package.as_str())
+            }),
+        );
+    }
     matching_tasks_with(
         listing,
         display,
@@ -793,8 +837,9 @@ fn discover_launch_candidates(
     }
     // -W can complete the launcher before an app replaces it with its game
     // or onboarding activity. Follow a visible successor only inside the
-    // requested package's task, user and display. Never choose foreign UI or
-    // a hidden background task merely because its base package matches.
+    // requested package's task, user and display. Play Store may instead hand
+    // off to its specific Google sign-in activity. Other foreign activities
+    // and hidden background tasks remain ineligible.
     if completed.split_once('/').map(|(owner, _)| owner) != Some(request.package.as_str()) {
         return Ok(Vec::new());
     }
@@ -805,8 +850,10 @@ fn discover_launch_candidates(
         Some(request.user),
         true,
         |top| {
-            top.and_then(|top| top.split_once('/').map(|(owner, _)| owner))
-                == Some(request.package.as_str())
+            top.is_some_and(|top| {
+                top.split_once('/').map(|(owner, _)| owner) == Some(request.package.as_str())
+                    || is_play_store_sign_in(&request.package, top)
+            })
         },
     )?;
     // Prefer a task created by this launch. A unique restored task can also
@@ -1204,6 +1251,41 @@ RootTask id=5 bounds=[0,0][900,1600] displayId=42 userId=0
     }
 
     const PERMISSION_DIALOG: &str = "com.android.permissioncontroller/com.android.permissioncontroller.permission.ui.GrantPermissionsActivity";
+
+    #[test]
+    fn play_store_sign_in_stays_in_its_visible_owned_task() {
+        let store = "com.android.vending/com.android.vending.AssetBrowserActivity";
+        let auth = "com.google.android.gms/com.google.android.gms.auth.uiflows.minutemaid.MinuteMaidActivity";
+        let request = LaunchRequest { package: "com.android.vending".into(), component: None, user: 0 };
+        let task = |id, owner, top, visible, display, user| format!(
+            "RootTask id={id} displayId={display} userId={user}\n  taskId={id}: {owner}/.Main userId={user} visible={visible} topActivity=ComponentInfo{{{top}}}\n"
+        );
+        let discover = |listing: &str, completed: &str| discover_launch_candidates(
+            listing, 0, &request, completed, None, None, &BTreeSet::from([9])
+        ).unwrap();
+        let own = task(9, "com.android.vending", auth, true, 0, 0);
+        assert_eq!(discover(&own, store), vec![9]);
+        assert_eq!(discover(&own, auth), vec![9]);
+        assert_eq!(discover(&task(9, "com.android.vending", store, true, 0, 0), auth), vec![9]);
+        for listing in [
+            task(9, "com.google.android.gms", auth, true, 0, 0),
+            task(9, "com.android.vending.extra", auth, true, 0, 0),
+            task(9, "com.android.vending", auth, false, 0, 0),
+            task(9, "com.android.vending", auth, true, 1, 0),
+            task(9, "com.android.vending", auth, true, 0, 10),
+            task(9, "com.android.vending", "com.google.android.gms/.OtherActivity", true, 0, 0),
+            own.replace("userId=0", ""),
+        ] {
+            assert!(discover(&listing, store).is_empty(), "{listing}");
+            assert!(discover(&listing, auth).is_empty(), "{listing}");
+        }
+        let ambiguous = task(10, "com.android.vending", auth, true, 0, 0)
+            + &task(11, "com.android.vending", auth, true, 0, 0);
+        assert_eq!(discover(&ambiguous, store), vec![10, 11]);
+        let output = format!("Status: ok\nActivity: {auth}\nComplete\n");
+        assert_eq!(completed_launch_activity(&output, "com.android.vending", None).unwrap(), auth);
+        assert!(completed_launch_activity(&output, "org.example.other", None).is_err());
+    }
 
     fn contacts_request() -> LaunchRequest {
         LaunchRequest {

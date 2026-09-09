@@ -1,0 +1,50 @@
+Subject: [PATCH] SurfaceFlinger: declare frame dependencies as top-app work
+
+Use the native task-profile API; Droidloom supplies the cell CPU topology.
+Keep the low-priority executor background. Mesa background queues opt out
+of the process graphics group before their first job.
+
+--- a/services/surfaceflinger/main_surfaceflinger.cpp
++++ b/services/surfaceflinger/main_surfaceflinger.cpp
+@@ -118,7 +118,7 @@
+ 
+     setpriority(PRIO_PROCESS, 0, PRIORITY_URGENT_DISPLAY);
+ 
+-    set_sched_policy(0, SP_FOREGROUND);
++    set_sched_policy(0, SP_TOP_APP);
+ 
+     // initialize before clients can connect
+     flinger->init();
+--- a/services/surfaceflinger/BackgroundExecutor.cpp
++++ b/services/surfaceflinger/BackgroundExecutor.cpp
+@@ -31,7 +31,7 @@
+ namespace {
+ 
+ void set_thread_priority(bool highPriority) {
+-    set_sched_policy(0, highPriority ? SP_FOREGROUND : SP_BACKGROUND);
++    set_sched_policy(0, highPriority ? SP_TOP_APP : SP_BACKGROUND);
+     struct sched_param param = {0};
+     param.sched_priority = highPriority ? 2 : 0 /* must be 0 for non-RT */;
+     sched_setscheduler(gettid(), highPriority ? SCHED_FIFO : SCHED_NORMAL, &param);
+--- a/services/surfaceflinger/CompositionEngine/src/HwcAsyncWorker.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/HwcAsyncWorker.cpp
+@@ -52,7 +52,7 @@
+ }
+ 
+ void HwcAsyncWorker::run() {
+-    set_sched_policy(0, SP_FOREGROUND);
++    set_sched_policy(0, SP_TOP_APP);
+     struct sched_param param = {0};
+     param.sched_priority = 2;
+     sched_setscheduler(gettid(), SCHED_FIFO, &param);
+--- a/services/surfaceflinger/Scheduler/EventThread.cpp
++++ b/services/surfaceflinger/Scheduler/EventThread.cpp
+@@ -338,7 +338,7 @@
+         ALOGE("Couldn't set SCHED_FIFO for EventThread");
+     }
+ 
+-    set_sched_policy(tid, SP_FOREGROUND);
++    set_sched_policy(tid, SP_TOP_APP);
+ }
+ 
+ EventThread::~EventThread() {

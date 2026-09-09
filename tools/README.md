@@ -8,6 +8,7 @@
 | `droidloom-update` | Rust source builder and transactional developer installer. Supplies the package builder's Android build and assembly implementation. See its [guide](droidloom-update/README.md). |
 | `droidloom-source` | Materialize pinned sparse AOSP sources; a library dependency of the updater. |
 | `droidloom-image` | Prepare the pinned Android base; a library dependency of the updater. |
+| `droidloom-gapps` | Import a local LiteGapps archive, derive optional raw ext4 images and build a pacman data package. See [optional Google apps](../docs/BUILDING.md#optional-google-apps). |
 | `droidloom-mesa` | Prepare pinned Mesa sources and patches; a library dependency of the updater. |
 
 The package builder is the distribution entry point. The source updater is an

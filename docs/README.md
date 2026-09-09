@@ -6,6 +6,7 @@
 
 - [Architecture](architecture.md): Android cell, graphics path and source boundaries.
 - [Desktop integration](desktop-integration.md): windows, clipboard, notifications and diagnostics.
+- Integration proposals: [audio](audio-integration-proposal.md) and [SMS](sms-integration-proposal.md).
 - [Security requirements](threat-model-v1.md): trust boundaries and isolation limitations.
 
 ## Integration contracts

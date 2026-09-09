@@ -7,7 +7,8 @@
 <!--
   Android requires a primary module while bootstrapping AudioFlinger. Both
   endpoints use BUS devices so AOSP's example AIDL implementation selects its
-  timing-correct stub stream rather than opening ALSA or another host device.
+  timed stub stream. The audio-service patch recognizes AIDL IN_BUS/OUT_BUS
+  device types as well as the older BUS connection string.
 -->
 <module name="default" halVersion="3.0">
     <attachedDevices>

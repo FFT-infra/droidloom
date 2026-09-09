@@ -17,7 +17,7 @@ pub(super) fn collect(
     crashes: bool,
 ) -> Result<String, ControlError> {
     collect_with(package, user, lines, crashes, |args| {
-        let mut command = Command::new("/usr/bin/timeout");
+        let mut command = droidloom_cpu_placement::command("/usr/bin/timeout");
         command
             .args(["--kill-after=1s", "10s", "/usr/bin/nsenter", "--target"])
             .arg(pid.to_string())
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn timed_out_commands_report_failure() {
-        let mut command = Command::new("/usr/bin/timeout");
+        let mut command = droidloom_cpu_placement::command("/usr/bin/timeout");
         command.args(["--kill-after=0.1s", "0.1s", "/usr/bin/sleep", "5"]);
         let started = std::time::Instant::now();
         assert!(

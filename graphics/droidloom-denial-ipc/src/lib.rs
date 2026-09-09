@@ -539,6 +539,27 @@ impl SeqPacket {
     /// peer shutdown; otherwise propagates `recvmsg(2)` failures.
     pub fn receive_record(&self) -> Result<RawRecord, IpcError> {
         let mut bytes = vec![0_u8; MAX_PACKET_BYTES];
+        let record = self.receive_record_into(&mut bytes)?;
+        let length = record.bytes.len();
+        let descriptors = record.descriptors;
+        bytes.truncate(length);
+        Ok(RawRecord { bytes, descriptors })
+    }
+
+    /// Receive into caller-owned storage, borrowing only the initialized record.
+    /// Reusing this storage avoids allocating or clearing a maximum-sized packet
+    /// on each frame/input event or unsuccessful nonblocking receive.
+    ///
+    /// # Errors
+    /// Rejects empty or oversized storage and truncated packets. Ancillary
+    /// descriptors are closed on failure, including payload truncation.
+    pub fn receive_record_into<'a>(
+        &self,
+        bytes: &'a mut [u8],
+    ) -> Result<BorrowedRecord<'a>, IpcError> {
+        if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
+            return Err(IpcError::Truncated);
+        }
         let mut iovec = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
@@ -582,8 +603,10 @@ impl SeqPacket {
             });
         }
         let received = usize::try_from(received).map_err(|_| IpcError::Truncated)?;
-        bytes.truncate(received);
-        Ok(RawRecord { bytes, descriptors })
+        Ok(BorrowedRecord {
+            bytes: &bytes[..received],
+            descriptors,
+        })
     }
 }
 
@@ -599,6 +622,15 @@ pub struct RawRecord {
     /// Complete record bytes.
     pub bytes: Vec<u8>,
     /// Unclassified owned ancillary descriptors.
+    pub descriptors: Vec<OwnedFd>,
+}
+
+/// A received record borrowing caller-owned payload storage.
+#[derive(Debug)]
+pub struct BorrowedRecord<'a> {
+    /// Exactly the received bytes; unused receive capacity is never exposed.
+    pub bytes: &'a [u8],
+    /// Owned ancillary descriptors, closed when dropped.
     pub descriptors: Vec<OwnedFd>,
 }
 
@@ -648,6 +680,21 @@ impl ProtocolSocket {
         )
     }
 
+    /// Receive an Android message using reusable payload storage.
+    ///
+    /// # Errors
+    /// Propagates transport/codec failures and closes all FDs on failure.
+    pub fn receive_android_into(
+        &self,
+        bytes: &mut [u8],
+    ) -> Result<ReceivedMessage<AndroidMessage>, IpcError> {
+        let record = self.socket.receive_record_into(bytes)?;
+        attach_decoded(
+            decode_android(record.bytes, record.descriptors.len())?,
+            record.descriptors,
+        )
+    }
+
     /// Send one Denial-to-Android message.
     ///
     /// # Errors
@@ -683,6 +730,21 @@ impl ProtocolSocket {
         let record = self.socket.receive_record()?;
         attach_decoded(
             decode_denial(&record.bytes, record.descriptors.len())?,
+            record.descriptors,
+        )
+    }
+
+    /// Receive a host message using reusable payload storage.
+    ///
+    /// # Errors
+    /// Propagates transport/codec failures and closes all FDs on failure.
+    pub fn receive_denial_into(
+        &self,
+        bytes: &mut [u8],
+    ) -> Result<ReceivedMessage<DenialMessage>, IpcError> {
+        let record = self.socket.receive_record_into(bytes)?;
+        attach_decoded(
+            decode_denial(record.bytes, record.descriptors.len())?,
             record.descriptors,
         )
     }
@@ -827,6 +889,98 @@ mod tests {
         left.send_record(b"second", &[]).unwrap();
         assert_eq!(right.receive_record().unwrap().bytes, b"first");
         assert_eq!(right.receive_record().unwrap().bytes, b"second");
+    }
+
+    #[test]
+    fn reusable_storage_exposes_only_each_record_and_survives_would_block() {
+        let (left, right) = SeqPacket::pair().unwrap();
+        right.set_nonblocking(true).unwrap();
+        let mut bytes = [0xaa; 128];
+        let storage = bytes.as_ptr();
+        for payload in [b"longer first record".as_slice(), b"next", b"x"] {
+            left.send_record(payload, &[]).unwrap();
+            let record = right.receive_record_into(&mut bytes).unwrap();
+            assert_eq!(record.bytes.as_ptr(), storage);
+            assert_eq!(record.bytes, payload);
+            assert!(record.descriptors.is_empty());
+            assert!(matches!(right.receive_record_into(&mut bytes),
+                Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[test]
+    fn truncated_reusable_record_closes_received_descriptors() {
+        let (left, right) = SeqPacket::pair().unwrap();
+        let (mut observer, transferred) = std::os::unix::net::UnixStream::pair().unwrap();
+        observer.set_nonblocking(true).unwrap();
+        left.send_record(&[42; 129], &[transferred.as_fd()])
+            .unwrap();
+        drop(transferred);
+        assert!(matches!(
+            right.receive_record_into(&mut [0; 128]),
+            Err(IpcError::Truncated)
+        ));
+        // EOF, rather than WouldBlock, proves that the received peer FD closed.
+        assert_eq!(observer.read(&mut [0; 1]).unwrap(), 0);
+        left.send_record(b"next", &[]).unwrap();
+        assert_eq!(
+            right.receive_record_into(&mut [0; 128]).unwrap().bytes,
+            b"next"
+        );
+    }
+
+    #[test]
+    fn reusable_typed_receiver_preserves_both_message_directions() {
+        let (left, right) = SeqPacket::pair().unwrap();
+        let android = ProtocolSocket::new(left);
+        let host = ProtocolSocket::new(right);
+        let mut bytes = [0; 128];
+        let message = AndroidMessage::Pong { cookie: 42 };
+        android.send_android(&message, &[]).unwrap();
+        assert_eq!(
+            host.receive_android_into(&mut bytes).unwrap().message,
+            message
+        );
+        let message = DenialMessage::Ping { cookie: 43 };
+        host.send_denial(&message).unwrap();
+        assert_eq!(
+            android.receive_denial_into(&mut bytes).unwrap().message,
+            message
+        );
+    }
+
+    #[test]
+    #[ignore = "local socket microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_reused_record_storage() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (left, right) = SeqPacket::pair().unwrap();
+        let payload = [42; 112];
+        let mut bytes = [0; 128];
+        const RECORDS: u32 = 50_000;
+        // Alternate order to reduce warmup/order bias. This measures only local
+        // send/receive and buffer management, not graphics or input latency.
+        for trial in 0..6 {
+            for reused in if trial % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                for _ in 0..RECORDS {
+                    left.send_record(black_box(&payload), &[]).unwrap();
+                    if reused {
+                        black_box(right.receive_record_into(&mut bytes).unwrap());
+                    } else {
+                        black_box(right.receive_record().unwrap());
+                    }
+                }
+                eprintln!(
+                    "trial={trial} reused={reused} ns_per_record={}",
+                    start.elapsed().as_nanos() / u128::from(RECORDS)
+                );
+            }
+        }
     }
 
     #[test]

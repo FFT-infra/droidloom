@@ -38,6 +38,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    droidloom_cpu_placement::initialize(droidloom_cpu_placement::Role::Background);
     install_signal_handlers()?;
     let cli = Cli::parse();
     let config = DaemonConfig {

@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gapps;
+
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;

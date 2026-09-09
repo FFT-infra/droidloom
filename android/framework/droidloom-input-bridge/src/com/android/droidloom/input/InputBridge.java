@@ -44,6 +44,7 @@ import java.util.concurrent.TimeUnit;
  */
 public final class InputBridge {
     private static final String TAG = "DroidloomInput";
+    private static final boolean INPUT_TRACE = "1".equals(System.getenv("DROIDLOOM_INPUT_TRACE"));
     private static final String SOCKET_ENV = "ANDROID_SOCKET_droidloom_input";
     private static final int RECORD_BYTES = 40;
     private static final int PROTOCOL_MAJOR = 5;
@@ -95,8 +96,8 @@ public final class InputBridge {
 
     private InputBridge() throws ReflectiveOperationException {
         // ServiceManager and ActivityTaskManager are hidden framework APIs.
-        // Keep their use at this tiny runtime boundary so the bridge can be
-        // built against the released SDK. The two private transactions are
+        // Keep their use at this tiny runtime boundary. The observer also
+        // uses the pinned platform TaskStackListener. The two private transactions are
         // implemented natively by Droidloom's SurfaceFlinger and InputFlinger,
         // leaving the boot framework and its Binder ABI untouched.
         final Class<?> serviceManagerClass = Class.forName("android.os.ServiceManager");
@@ -129,6 +130,7 @@ public final class InputBridge {
         try {
             TextInputBridge.start();
             ClipboardRelay.start();
+            TaskObserver.start();
             new InputBridge().run();
         } catch (Throwable error) {
             Log.e(TAG, "Input bridge terminated", error);
@@ -583,7 +585,7 @@ public final class InputBridge {
             mSetDisplayId.invoke(event, record.displayId);
             if (!injectInputEventToApplication(event, applicationToken)) {
                 Log.w(TAG, "InputManager rejected key for display " + record.displayId);
-            } else {
+            } else if (INPUT_TRACE) {
                 Log.i(TAG, "Key trace stage=android serial=" + record.routeSerial
                         + " task=" + record.taskId + " display=" + record.displayId
                         + " action=" + record.action + " scanCode=" + record.scanCode

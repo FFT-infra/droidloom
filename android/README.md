@@ -19,10 +19,11 @@ The SurfaceFlinger task path retains one headless bootstrap display for Android
 scheduling and layer-release accounting. Patch
 `surfaceflinger/0003-droidloom-headless-bootstrap.patch` can suppress that
 display's duplicate GPU composition with
-`persist.vendor.droidloom.elide_bootstrap=true` (default false). It forwards the
+`persist.vendor.droidloom.elide_bootstrap=true` (enabled by default by patch 0007). It forwards the
 merged completion fences from actual task rendering through the existing HWC
 path, including across idle transitions. Only the explicit bootstrap display
-is selected; task and capture outputs keep rendering. Fence merge/export errors
+is selected; capture outputs keep rendering and task outputs retain their
+independent composition policy. Fence merge/export errors
 fall back to ordinary composition. The property is read each frame, allowing
 same-process performance comparisons and rollback without restarting Android.
 
@@ -36,6 +37,23 @@ The ARGB buffer format and pixel contents are unchanged. Package IDs do not
 determine opacity. Deploy the patched SurfaceFlinger with the matching Composer
 service, Rust dependency closure and presenter; older private requests remain
 conservatively non-opaque.
+
+`surfaceflinger/0007-droidloom-wayland-layers.patch` exports supported task
+layer lists through synchronized Wayland subsurfaces. SurfaceFlinger still
+resolves transactions, visibility, output geometry and input; it skips the task
+GPU draw when the host accepts the complete scene. Original buffer/frame identities
+remain protected until the host confirms actual read completion. Droidloom uses
+asynchronous Android release callbacks even on source branches where their
+upstream feature flag defaults off. Unsupported scenes retain the task renderer.
+`surfaceflinger/0008-droidloom-release-fences.patch` forwards and merges real
+compositor release fences, defers only callbacks whose fences are unavailable,
+and preserves first-frame commit metadata. It avoids blocking SurfaceFlinger's
+shared callback worker on desktop buffer reads. The host release-queue regression
+runs with `cargo test --locked -j 1 -p droidloom-update --test release_queue`.
+The application-neutral policy defaults on and can be disabled with
+`persist.vendor.droidloom.direct_layers=false`. It requires the matching Composer
+broker, presenter and Denial surface-tree alpha/orientation support. Live visual
+and performance acceptance belongs to the user after activation.
 
 - [Manifest](manifest/README.md): source locks and sparse materialization.
 - [Device products](device/README.md): architecture configuration and image boundary.

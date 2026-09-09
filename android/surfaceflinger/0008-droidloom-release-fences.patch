@@ -1,0 +1,544 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+index e63ddac..4f19f3c 100644
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ #include "DroidloomLayers.h"
++#include "BackgroundExecutor.h"
+ 
+ #include <android-base/properties.h>
+ #include <common/FlagManager.h>
+@@ -14,10 +15,8 @@
+ 
+ #include <algorithm>
+ #include <array>
+-#include <atomic>
+ #include <bit>
+ #include <cmath>
+-#include <condition_variable>
+ #include <cstring>
+ #include <map>
+ #include <mutex>
+@@ -30,29 +29,8 @@
+ namespace android {
+ namespace {
+ constexpr size_t kMaxLayers = 64, kMaxBuffers = 128;
+-struct Read {
+-    std::mutex mutex;
+-    std::condition_variable ready;
+-    std::atomic<bool> complete{false};
+-    void finish() {
+-        std::lock_guard lock(mutex);
+-        complete = true;
+-        ready.notify_all();
+-    }
+-    void wait() {
+-        std::unique_lock lock(mutex);
+-        ready.wait(lock, [&] { return complete.load(); });
+-    }
+-};
+-using Key = std::pair<uint64_t, uint64_t>;
+-std::mutex readsMutex;
+-std::map<Key, std::vector<std::shared_ptr<Read>>> reads;
+-void retainRead(const Key& key, const std::shared_ptr<Read>& read) {
+-    std::lock_guard lock(readsMutex);
+-    auto& list = reads[key];
+-    std::erase_if(list, [](const auto& r) { return r->complete.load(); });
+-    list.push_back(read);
+-}
++using Read = DroidloomReleaseQueue<sp<Fence>>::Read;
++DroidloomReleaseQueue<sp<Fence>> reads;
+ uint32_t u32(const uint8_t* p) {
+     uint32_t v;
+     std::memcpy(&v, p, 4);
+@@ -90,13 +68,34 @@ bool send(int socket, uint32_t op, const std::vector<uint8_t>& payload,
+     return TEMP_FAILURE_RETRY(sendmsg(socket, &msg, MSG_NOSIGNAL)) ==
+            static_cast<ssize_t>(header.size() + payload.size());
+ }
+-bool receive(int socket, uint32_t op, std::vector<uint32_t>* words) {
++bool receive(int socket, uint32_t op, std::vector<uint32_t>* words,
++             base::unique_fd* fence = nullptr, uint32_t* receivedOp = nullptr) {
+     std::array<uint8_t, 128> bytes{};
+-    const ssize_t n = TEMP_FAILURE_RETRY(recv(socket, bytes.data(), bytes.size(), MSG_TRUNC));
++    iovec iov{bytes.data(), bytes.size()};
++    alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int) * 4)> control{};
++    msghdr msg{};
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = control.data();
++    msg.msg_controllen = control.size();
++    const ssize_t n = TEMP_FAILURE_RETRY(recvmsg(socket, &msg, MSG_TRUNC | MSG_CMSG_CLOEXEC));
++    if (n < 0) return false;
++    std::vector<base::unique_fd> descriptors;
++    bool valid = !(msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC));
++    for (auto* h = CMSG_FIRSTHDR(&msg); h; h = CMSG_NXTHDR(&msg, h)) {
++        if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS ||
++            h->cmsg_len < CMSG_LEN(0)) { valid = false; continue; }
++        const size_t count = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++        const auto* fds = reinterpret_cast<const int*>(CMSG_DATA(h));
++        for (size_t i = 0; i < count; ++i) descriptors.emplace_back(fds[i]);
++    }
+     if (n < 16 || n > 128 || std::memcmp(bytes.data(), "DLL1", 4) != 0 ||
+-        u32(bytes.data() + 4) != op || u32(bytes.data() + 8) != n - 16 ||
+-        u32(bytes.data() + 12) != 0 || n % 4 != 0)
++        !valid || (op && u32(bytes.data() + 4) != op) || u32(bytes.data() + 8) != n - 16 ||
++        u32(bytes.data() + 12) != descriptors.size() || n % 4 != 0 ||
++        descriptors.size() != (fence && u32(bytes.data() + 4) == 0x8004 ? 1u : 0u))
+         return false;
++    if (receivedOp) *receivedOp = u32(bytes.data() + 4);
++    if (fence) *fence = descriptors.empty() ? base::unique_fd{} : std::move(descriptors.front());
+     words->clear();
+     for (ssize_t i = 16; i < n; i += 4) words->push_back(u32(bytes.data() + i));
+     return true;
+@@ -221,30 +220,41 @@ bool droidloomAsyncReleasesEnabled() {
+         base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false);
+     return enabled;
+ }
+-void waitDroidloomBufferReads(const ReleaseCallbackId& id) {
+-    std::vector<std::shared_ptr<Read>> list;
+-    {
+-        std::lock_guard lock(readsMutex);
+-        auto it = reads.find({id.bufferId, id.framenumber});
+-        if (it == reads.end()) return;
+-        list = it->second;
+-    }
+-    for (const auto& r : list) r->wait();
+-    std::lock_guard lock(readsMutex);
+-    auto it = reads.find({id.bufferId, id.framenumber});
+-    if (it != reads.end() && std::all_of(it->second.begin(), it->second.end(),
+-                                         [](const auto& r) { return r->complete.load(); }))
+-        reads.erase(it);
++void enqueueDroidloomCallback(const std::vector<ReleaseCallbackId>& ids, const void* lane,
++                             std::function<void(DroidloomReadFences)> callback) {
++    std::vector<DroidloomReleaseQueue<sp<Fence>>::Key> keys;
++    for (const auto& id : ids) keys.emplace_back(id.bufferId, id.framenumber);
++    reads.defer(keys, lane, [callback = std::move(callback)](DroidloomReadFences fences) {
++        BackgroundExecutor::getInstanceForTransaction().sendCallbacks({
++            [callback, fences = std::move(fences)]() mutable { callback(std::move(fences)); }});
++    });
+ }
+-bool hasDroidloomBufferReads(const ReleaseCallbackId& id) {
+-    std::lock_guard lock(readsMutex);
+-    return reads.contains({id.bufferId, id.framenumber});
++sp<Fence> mergeDroidloomReleaseFence(const ReleaseCallbackId& id, sp<Fence> fence,
++                                    const DroidloomReadFences& readFences) {
++    if (!fence) fence = Fence::NO_FENCE;
++    const auto it = readFences.find({id.bufferId, id.framenumber});
++    if (it == readFences.end()) return fence;
++    for (const auto& host : it->second) {
++        if (!host->isValid()) continue; // Explicitly completed or rejected read.
++        if (!fence->isValid()) { fence = host; continue; }
++        fence = Fence::merge("Droidloom release", fence, host);
++        LOG_ALWAYS_FATAL_IF(!fence || !fence->isValid(),
++                            "Failed to preserve Droidloom buffer release dependencies");
++    }
++    return fence;
+ }
+ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint)
+     : mState(std::make_shared<State>()), mRequests(std::move(requests)) {
+     std::thread([state = mState, events = std::move(events), repaint = std::move(repaint)] {
+         std::vector<uint32_t> words;
+-        while (receive(events.get(), 0x8003, &words) && words.size() == 2) {
++        base::unique_fd fd;
++        uint32_t op = 0;
++        while (receive(events.get(), 0, &words, &fd, &op)) {
++            if (op == 0x8005) {
++                if (!configurationEvent(state->config, words, repaint)) break;
++                continue;
++            }
++            if (words.size() != 2 || (op != 0x8003 && op != 0x8004)) break;
+             const uint64_t ticket = words[0] | static_cast<uint64_t>(words[1]) << 32;
+             std::lock_guard lock(state->mutex);
+             auto it = state->pending.find(ticket);
+@@ -252,13 +258,19 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+                 ALOGE("Droidloom unknown source release ticket");
+                 break;
+             }
+-            it->second->finish();
+-            state->pending.erase(it);
++            const bool complete = op == 0x8003;
++            sp<Fence> fence = complete ? Fence::NO_FENCE : sp<Fence>::make(std::move(fd));
++            if ((!complete && fence->getStatus() == Fence::Status::Invalid) ||
++                !reads.publish(it->second, fence, complete)) {
++                ALOGE("Droidloom invalid or duplicate release fence");
++                break;
++            }
++            if (complete) state->pending.erase(it);
+         }
+         std::lock_guard lock(state->mutex);
+         state->live = false;
+-        // A disconnected socket does not prove completion. Keep outstanding
+-        // gates closed; never turn uncertainty into producer buffer reuse.
++        // Missing fences stay unresolved on disconnect. Already delivered
++        // sync-files continue protecting buffers independently of this socket.
+         if (!state->pending.empty())
+             ALOGE("Droidloom layer stream lost with outstanding reads; retaining release gates");
+     }).detach();
+@@ -374,7 +386,7 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+         transact(6, {});
+         std::lock_guard lock(mState->mutex);
+         for (auto& [ticket, r] : added) {
+-            r->finish();
++            reads.publish(r, Fence::NO_FENCE, true);
+             mState->pending.erase(ticket);
+         }
+         return false;
+@@ -392,9 +404,8 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+                 reuse = true;
+             } else {
+                 ticket = ++mNextTicket;
+-                auto r = std::make_shared<Read>();
++                auto r = reads.track({buffer, e.frame});
+                 mState->pending.emplace(ticket, r);
+-                retainRead({buffer, e.frame}, r);
+                 added.emplace_back(ticket, r);
+             }
+             next.emplace(e.id, Last{buffer, e.frame, ticket});
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+index e63e823..76cda3c 100644
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -3,6 +3,7 @@
+ #include <android-base/unique_fd.h>
+ #include <gui/ITransactionCompletedListener.h>
+ #include <ui/GraphicBuffer.h>
++#include "DroidloomReleaseQueue.h"
+ 
+ #include <memory>
+ #include <unordered_map>
+@@ -13,12 +14,15 @@ namespace compositionengine {
+ class Output;
+ }
+ 
+-// Release gates are keyed by the producer's actual buffer AND frame identity.
+-// Only the host's completed Wayland read opens a gate. These waits are used
+-// exclusively on Android's background transaction callback executor.
++// Fence availability is asynchronous; callbacks never wait for a host read.
+ bool droidloomAsyncReleasesEnabled();
+-void waitDroidloomBufferReads(const ReleaseCallbackId& id);
+-bool hasDroidloomBufferReads(const ReleaseCallbackId& id);
++using DroidloomReadFences = DroidloomReleaseQueue<sp<Fence>>::Fences;
++void enqueueDroidloomCallback(const std::vector<ReleaseCallbackId>& ids, const void* lane,
++                             std::function<void(DroidloomReadFences)> callback);
++// Failure to preserve a dependency is fatal: later completion callbacks can
++// otherwise make BLAST recycle a buffer whose earlier release was withheld.
++sp<Fence> mergeDroidloomReleaseFence(const ReleaseCallbackId& id, sp<Fence> fence,
++                                    const DroidloomReadFences& reads);
+ 
+ class DroidloomLayers {
+    public:
+diff --git a/services/surfaceflinger/DroidloomReleaseQueue.h b/services/surfaceflinger/DroidloomReleaseQueue.h
+new file mode 100644
+index 0000000..f41cb80
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomReleaseQueue.h
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <utility>
++#include <vector>
++
++namespace android {
++
++// Fence availability is a dependency, never a wait on a callback executor.
++// Value holds a real fence; readiness says nothing about whether it signalled.
++template <class Value>
++class DroidloomReleaseQueue {
++public:
++    using Key = std::pair<uint64_t, uint64_t>;
++    using Fences = std::map<Key, std::vector<Value>>;
++    using Callback = std::function<void(Fences)>;
++    struct Read {
++        Key key;
++        std::optional<Value> fence;
++        bool complete = false;
++    };
++
++    std::shared_ptr<Read> track(Key key) {
++        std::lock_guard lock(mMutex);
++        auto read = std::make_shared<Read>(Read{key, {}, false});
++        mReads[key].push_back(read);
++        return read;
++    }
++
++    // Completion may use NO_FENCE only when the host has proved all use ended
++    // (or a scene was explicitly rejected before any attachment).
++    bool publish(const std::shared_ptr<Read>& read, Value fence, bool complete = false) {
++        std::lock_guard dispatch(mDispatchMutex);
++        std::vector<std::function<void()>> ready;
++        {
++            std::lock_guard lock(mMutex);
++            if (read->complete || (read->fence && !complete)) return false;
++            if (!read->fence) read->fence = std::move(fence);
++            read->complete = complete;
++            auto it = mReads.find(read->key);
++            if (it != mReads.end() && std::all_of(it->second.begin(), it->second.end(),
++                                                [](const auto& r) { return r->complete; })) {
++                mReads.erase(it);
++            }
++            ready = takeReadyLocked();
++        }
++        for (auto& callback : ready) callback();
++        return true;
++    }
++
++    // Non-null lanes preserve completion order for a listener. Commit
++    // notifications and independent buffer releases use no lane.
++    void defer(const std::vector<Key>& keys, const void* lane, Callback callback) {
++        std::lock_guard dispatch(mDispatchMutex);
++        std::vector<std::function<void()>> ready;
++        {
++            std::lock_guard lock(mMutex);
++            Job job{{}, lane, std::move(callback)};
++            for (const auto& key : keys) {
++                auto it = mReads.find(key);
++                if (it != mReads.end()) job.reads.emplace(key, it->second);
++            }
++            mJobs.push_back(std::move(job));
++            ready = takeReadyLocked();
++        }
++        for (auto& action : ready) action();
++    }
++
++private:
++    struct Job {
++        std::map<Key, std::vector<std::shared_ptr<Read>>> reads;
++        const void* lane;
++        Callback callback;
++    };
++    std::vector<std::function<void()>> takeReadyLocked() {
++        std::vector<std::function<void()>> ready;
++        std::set<const void*> blocked;
++        for (auto it = mJobs.begin(); it != mJobs.end();) {
++            bool available = !it->lane || !blocked.contains(it->lane);
++            Fences fences;
++            for (const auto& [key, reads] : it->reads) {
++                for (const auto& read : reads) {
++                    if (!read->fence) { available = false; break; }
++                    fences[key].push_back(*read->fence);
++                }
++            }
++            if (!available) {
++                if (it->lane) blocked.insert(it->lane);
++                ++it;
++                continue;
++            }
++            ready.push_back([callback = std::move(it->callback), fences = std::move(fences)]() mutable {
++                callback(std::move(fences));
++            });
++            it = mJobs.erase(it);
++        }
++        return ready;
++    }
++    std::mutex mMutex;
++    // Preserve enqueue order across concurrent event/transaction threads.
++    // Callbacks only enqueue work; recursive entry remains safe for callers.
++    std::recursive_mutex mDispatchMutex;
++    std::map<Key, std::vector<std::shared_ptr<Read>>> mReads;
++    std::vector<Job> mJobs;
++};
++} // namespace android
+diff --git a/services/surfaceflinger/Layer.cpp b/services/surfaceflinger/Layer.cpp
+index c02bea7..dd11d53 100644
+--- a/services/surfaceflinger/Layer.cpp
++++ b/services/surfaceflinger/Layer.cpp
+@@ -724,20 +724,21 @@ void Layer::callReleaseBufferCallback(const sp<ITransactionCompletedListener>& l
+     uint32_t currentMaxAcquiredBufferCount =
+             mFlinger->getMaxAcquiredBufferCountForCurrentRefreshRate(mOwnerUid);
+ 
+-    if (hasDroidloomBufferReads(callbackId)) {
++    if (droidloomAsyncReleasesEnabled()) {
+         // Destruction and replacement of an unlatched buffer also reach this
+         // path. Keep the exact source identity, channel and buffer alive on
+-        // the callback executor; never wait for desktop GPU work on SF's main thread.
+-        BackgroundExecutor::getInstanceForTransaction().sendCallbacks({
++        // callback until its host fence exists, without occupying a worker.
++        enqueueDroidloomCallback({callbackId}, nullptr,
+             [listener, channel = mBufferReleaseChannel, buffer, callbackId, fence,
+-             currentMaxAcquiredBufferCount] {
+-                waitDroidloomBufferReads(callbackId);
++             currentMaxAcquiredBufferCount](DroidloomReadFences reads) {
++                const auto merged = mergeDroidloomReleaseFence(callbackId, fence, reads);
++                if (!merged) return;
+                 if (FlagManager::getInstance().monitor_buffer_fences()) {
+-                    buffer->getDependencyMonitor().addEgress(FenceTime::makeValid(fence), "Droidloom release");
++                    buffer->getDependencyMonitor().addEgress(FenceTime::makeValid(merged), "Droidloom release");
+                 }
+-                if (listener) listener->onReleaseBuffer(callbackId, fence, currentMaxAcquiredBufferCount, false);
+-                if (channel) channel->writeReleaseFence(callbackId, fence, currentMaxAcquiredBufferCount);
+-            }});
++                if (listener) listener->onReleaseBuffer(callbackId, merged, currentMaxAcquiredBufferCount, false);
++                if (channel) channel->writeReleaseFence(callbackId, merged, currentMaxAcquiredBufferCount);
++            });
+         return;
+     }
+ 
+diff --git a/services/surfaceflinger/TransactionCallbackInvoker.cpp b/services/surfaceflinger/TransactionCallbackInvoker.cpp
+index 0491d53..66690c5 100644
+--- a/services/surfaceflinger/TransactionCallbackInvoker.cpp
++++ b/services/surfaceflinger/TransactionCallbackInvoker.cpp
+@@ -107,12 +107,18 @@ void TransactionCallbackInvoker::addCallbackHandle(CallbackHandle&& handle) {
+                                       handle.compositorTiming, handle.refreshStartTime,
+                                       handle.dequeueReadyTime);
+     if ((FlagManager::getInstance().fence_handling() || droidloomAsyncReleasesEnabled())) {
+-        if (handle.previousReleaseCallbackId != ReleaseCallbackId::INVALID_ID) {
+-            transactionStats.surfaceStats.emplace_back(surfaceControl, handle.acquireTimeOrFence,
++        // Initial/synchronized frames still need their surface identity and
++        // frame number in ON_COMMIT, even with no preceding buffer to release.
++        transactionStats.surfaceStats.emplace_back(surfaceControl, handle.acquireTimeOrFence,
+                                                        Fence::NO_FENCE, handle.transformHint,
+                                                        handle.currentMaxAcquiredBufferCount,
+                                                        handle.cornerRadii, eventStats,
+                                                        handle.previousReleaseCallbackId);
++        if (droidloomAsyncReleasesEnabled() && containsOnCommitCallbacks(handle.callbackIds)) {
++            transactionStats.surfaceStats.back().previousReleaseCallbackId = ReleaseCallbackId::INVALID_ID;
++            return;
++        }
++        if (handle.previousReleaseCallbackId != ReleaseCallbackId::INVALID_ID) {
+             mReleaseIdToFenceMerger.try_emplace(handle.previousReleaseCallbackId,
+                                                  std::move(handle.fenceMerger));
+             if (handle.bufferReleaseChannel) {
+@@ -219,6 +225,77 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+         mPresentFence.clear();
+     }
+ 
++    if (droidloomAsyncReleasesEnabled()) {
++        auto mergers = std::make_shared<ftl::SmallMap<ReleaseCallbackId, FenceMerger, 20>>(
++                std::move(mReleaseIdToFenceMerger));
++        // A release channel only depends on this buffer, never another app.
++        for (auto& release : mBufferReleases) {
++            const auto id = release.callbackId;
++            enqueueDroidloomCallback({id}, nullptr,
++                    [release = std::move(release), mergers](DroidloomReadFences reads) {
++                        auto it = mergers->find(release.callbackId);
++                        auto fence = mergeDroidloomReleaseFence(release.callbackId,
++                                it == mergers->end() ? Fence::NO_FENCE
++                                                    : it->second.waitAndGetFence("merged_fence"), reads);
++                        if (!fence) return;
++                        if (FlagManager::getInstance().monitor_buffer_fences()) {
++                            if (auto buffer = release.previousBuffer.lock()) {
++                                buffer->getBuffer()->getDependencyMonitor().addEgress(
++                                        FenceTime::makeValid(fence), "Txn release");
++                            }
++                        }
++                        const auto status = release.channel->writeReleaseFence(
++                                release.callbackId, fence, release.currentMaxAcquiredBufferCount);
++                        if (status != OK) ALOGE("Droidloom writeReleaseFence failed: %d", status);
++                    });
++        }
++        for (auto& stats : listenerStatsToSend) {
++            // Commit acknowledgements unblock BLAST's synchronized frame
++            // queue. They must not depend on a previous frame being released.
++            ListenerStats commits, completions;
++            commits.listener = stats.listener;
++            completions.listener = stats.listener;
++            for (auto& transaction : stats.transactionStats) {
++                auto& target = containsOnCommitCallbacks(transaction.callbackIds) ? commits : completions;
++                target.transactionStats.push_back(std::move(transaction));
++            }
++            if (!commits.transactionStats.empty()) {
++                enqueueDroidloomCallback({}, nullptr,
++                        [commits = std::move(commits)](DroidloomReadFences) {
++                            interface_cast<ITransactionCompletedListener>(commits.listener)
++                                    ->onTransactionCompleted(commits);
++                        });
++            }
++            if (!completions.transactionStats.empty()) {
++                std::vector<ReleaseCallbackId> ids;
++                for (const auto& transaction : completions.transactionStats) {
++                    for (const auto& surface : transaction.surfaceStats) {
++                        ids.push_back(surface.previousReleaseCallbackId);
++                    }
++                }
++                const auto* lane = completions.listener.get();
++                enqueueDroidloomCallback(ids, lane,
++                        [stats = std::move(completions), mergers](DroidloomReadFences reads) mutable {
++                            for (auto& transaction : stats.transactionStats) {
++                                for (auto& surface : transaction.surfaceStats) {
++                                    auto it = mergers->find(surface.previousReleaseCallbackId);
++                                    surface.previousReleaseFence = mergeDroidloomReleaseFence(
++                                            surface.previousReleaseCallbackId,
++                                            it == mergers->end() ? Fence::NO_FENCE
++                                                                : it->second.waitAndGetFence("merged_fence"), reads);
++                                    if (!surface.previousReleaseFence) return;
++                                }
++                            }
++                            interface_cast<ITransactionCompletedListener>(stats.listener)
++                                    ->onTransactionCompleted(stats);
++                        });
++            }
++        }
++        mReleaseIdToFenceMerger.clear();
++        mBufferReleases.clear();
++        return;
++    }
++
+     if ((FlagManager::getInstance().fence_handling() || droidloomAsyncReleasesEnabled())) {
+         // Use a shared_ptr as FenceMerger is not copyable, but std::function requires the lambda
+         // to be copyable.
+@@ -234,7 +311,6 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+                     for (auto& listenerStats : listenerStatsToSend) {
+                         for (auto& transactionStats : listenerStats.transactionStats) {
+                             for (auto& surfaceStats : transactionStats.surfaceStats) {
+-                                waitDroidloomBufferReads(surfaceStats.previousReleaseCallbackId);
+                                 auto it = fenceMergers->find(
+                                         surfaceStats.previousReleaseCallbackId);
+                                 if (it != fenceMergers->end()) {
+@@ -246,7 +322,6 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+                     }
+ 
+                     for (auto& bufferRelease : bufferReleases) {
+-                        waitDroidloomBufferReads(bufferRelease.callbackId);
+                         sp<Fence> fence =
+                                 fenceMergers->find(bufferRelease.callbackId)
+                                         ->second.waitAndGetFence("merged_fence");
+diff --git a/services/surfaceflinger/tests/unittests/TransactionCallbackInvoker_test.cpp b/services/surfaceflinger/tests/unittests/TransactionCallbackInvoker_test.cpp
+index ecbf672..1a0032c 100644
+--- a/services/surfaceflinger/tests/unittests/TransactionCallbackInvoker_test.cpp
++++ b/services/surfaceflinger/tests/unittests/TransactionCallbackInvoker_test.cpp
+@@ -20,6 +20,9 @@
+ #include <binder/Binder.h>
+ #include <gui/ITransactionCompletedListener.h>
+ #include <ui/Fence.h>
++#include <common/FlagManager.h>
++#include <common/test/FlagUtils.h>
++#include <com_android_graphics_surfaceflinger_flags.h>
+ 
+ #include "BackgroundExecutor.h"
+ #include "TransactionCallbackInvoker.h"
+@@ -163,4 +166,25 @@ TEST_F(TransactionCallbackInvokerTest, clearCompletedTransactions) {
+     flushCallbacks();
+ }
+ 
++TEST_F(TransactionCallbackInvokerTest, firstFrameCommitPreservesSurfaceAndFrameWithoutRelease) {
++    FlagManager::getMutableInstance().setUnitTestMode();
++    SET_FLAG_FOR_TEST(com::android::graphics::surfaceflinger::flags::fence_handling, true);
++    sp<MockTransactionCompletedListener> listener = sp<MockTransactionCompletedListener>::make();
++    CallbackHandle handle{listener, {{7, CallbackId::Type::ON_COMMIT}}, mSurfaceControl};
++    handle.frameNumber = 42;
++    handle.latchTime = 12345;
++    ASSERT_EQ(handle.previousReleaseCallbackId, ReleaseCallbackId::INVALID_ID);
++    mInvoker.addCallbackHandle(std::move(handle));
++    EXPECT_CALL(*listener, onTransactionCompleted(_)).WillOnce([&](const ListenerStats& stats) {
++        ASSERT_EQ(stats.transactionStats.size(), 1u);
++        const auto& transaction = stats.transactionStats[0];
++        ASSERT_EQ(transaction.surfaceStats.size(), 1u);
++        EXPECT_EQ(transaction.surfaceStats[0].surfaceControl, mSurfaceControl);
++        EXPECT_EQ(transaction.surfaceStats[0].eventStats.frameNumber, 42u);
++        EXPECT_EQ(transaction.surfaceStats[0].previousReleaseCallbackId, ReleaseCallbackId::INVALID_ID);
++    });
++    mInvoker.sendCallbacks(true);
++    flushCallbacks();
++}
++
+ } // namespace android

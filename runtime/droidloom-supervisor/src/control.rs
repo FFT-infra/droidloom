@@ -12,7 +12,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1044,7 +1043,7 @@ fn wait_for_android_init(spec: &CellSpec) -> Result<u32, ControlError> {
 
 fn android_runtime_ready(init_pid: u32) -> Result<bool, ControlError> {
     let pid = init_pid.to_string();
-    let output = Command::new("nsenter")
+    let output = droidloom_cpu_placement::command("nsenter")
         .args([
             "--target",
             &pid,
@@ -1111,7 +1110,7 @@ fn android_system_server_pid(spec: &CellSpec) -> Result<u32, ControlError> {
 
 fn android_namespace_pids(spec: &CellSpec) -> Result<Vec<u32>, ControlError> {
     let namespace = format!("droidloom-u{}", spec.host_uid);
-    let output = Command::new("ip")
+    let output = droidloom_cpu_placement::command("ip")
         .args(["netns", "pids", &namespace])
         .output()
         .map_err(|source| io_error("list exact cell namespace processes", source))?;
@@ -1158,7 +1157,7 @@ fn run_task_launcher_in_cell(
     operation: &str,
 ) -> Result<String, ControlError> {
     let pid = init_pid.to_string();
-    let mut command = Command::new("nsenter");
+    let mut command = droidloom_cpu_placement::command("nsenter");
     command
         .args([
             "--target",
@@ -1211,7 +1210,7 @@ fn run_application_catalog_in_cell(
     let pid = framework_pid.to_string();
     // A failed Android boot must not leave catalog requests holding the
     // lifecycle lock indefinitely and prevent the updater from rolling back.
-    let output = Command::new("timeout")
+    let output = droidloom_cpu_placement::command("timeout")
         .args(["--kill-after=5s", "110s", "nsenter"])
         .args([
             "--target",

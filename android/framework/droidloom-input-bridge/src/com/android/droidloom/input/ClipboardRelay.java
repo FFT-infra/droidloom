@@ -20,6 +20,7 @@ final class ClipboardRelay {
         thread.setDaemon(true); thread.start();
     }
     private static void serve(String endpoint) {
+        com.android.droidloom.runtime.CpuPlacement.background();
         try (LocalServerSocket listener = new LocalServerSocket("droidloom-" + endpoint)) {
             while (true) {
                 try (LocalSocket cell = listener.accept(); LocalSocket host = new LocalSocket()) {
@@ -44,6 +45,7 @@ final class ClipboardRelay {
         } catch (Exception e) { android.util.Log.e("DroidloomClipboard", "Relay unavailable"); }
     }
     private static void copy(LocalSocket from, LocalSocket to) {
+        com.android.droidloom.runtime.CpuPlacement.background();
         try {
             byte[] buffer = new byte[65536]; int n;
             while ((n = from.getInputStream().read(buffer)) >= 0) to.getOutputStream().write(buffer, 0, n);

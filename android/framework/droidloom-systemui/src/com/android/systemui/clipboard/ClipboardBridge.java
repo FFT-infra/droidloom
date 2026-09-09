@@ -76,6 +76,7 @@ public final class ClipboardBridge implements AutoCloseable {
         try{s.close();}catch(Exception ignored){}
     }
     private void connect(){
+        com.android.droidloom.runtime.CpuPlacement.background();
         while(!stopped){
             try(LocalSocket client=new LocalSocket()){
                 client.connect(new LocalSocketAddress("droidloom-clipboard"));
@@ -94,6 +95,7 @@ public final class ClipboardBridge implements AutoCloseable {
         }
     }
     private void writeLoop(LocalSocket client,DataOutputStream out){
+        com.android.droidloom.runtime.CpuPlacement.background();
         try{
             while(!stopped){
                 JSONObject control=null;boolean snapshot=false;

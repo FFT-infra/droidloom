@@ -10,4 +10,4 @@ service vendor.droidloom-composer /vendor/bin/hw/android.hardware.graphics.compo
     interface aidl android.hardware.graphics.composer3.IComposer/default
     stdio_to_kmsg
     onrestart restart surfaceflinger
-    task_profiles ServiceCapacityLow
+    task_profiles MaxPerformance

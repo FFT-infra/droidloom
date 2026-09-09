@@ -1,0 +1,776 @@
+diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
+index ad2b6ce..927ad66 100644
+--- a/services/surfaceflinger/Android.bp
++++ b/services/surfaceflinger/Android.bp
+@@ -272,6 +272,7 @@ filegroup {
+         "Display/DisplaySnapshot.cpp",
+         "DisplayDevice.cpp",
+         "DroidloomNativeWindow.cpp",
++        "DroidloomLayers.cpp",
+         "Effects/Daltonizer.cpp",
+         "FpsReporter.cpp",
+         "FrameTracer/FrameTracer.cpp",
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+new file mode 100644
+index 0000000..e63ddac
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -0,0 +1,495 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "DroidloomLayers.h"
++
++#include <android-base/properties.h>
++#include <common/FlagManager.h>
++#include <compositionengine/Output.h>
++#include <compositionengine/OutputLayer.h>
++#include <compositionengine/impl/OutputLayerCompositionState.h>
++#include <cutils/native_handle.h>
++#include <log/log.h>
++#include <sys/socket.h>
++#include <ui/Fence.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <bit>
++#include <cmath>
++#include <condition_variable>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <vector>
++
++#include "FrontEnd/LayerSnapshot.h"
++
++namespace android {
++namespace {
++constexpr size_t kMaxLayers = 64, kMaxBuffers = 128;
++struct Read {
++    std::mutex mutex;
++    std::condition_variable ready;
++    std::atomic<bool> complete{false};
++    void finish() {
++        std::lock_guard lock(mutex);
++        complete = true;
++        ready.notify_all();
++    }
++    void wait() {
++        std::unique_lock lock(mutex);
++        ready.wait(lock, [&] { return complete.load(); });
++    }
++};
++using Key = std::pair<uint64_t, uint64_t>;
++std::mutex readsMutex;
++std::map<Key, std::vector<std::shared_ptr<Read>>> reads;
++void retainRead(const Key& key, const std::shared_ptr<Read>& read) {
++    std::lock_guard lock(readsMutex);
++    auto& list = reads[key];
++    std::erase_if(list, [](const auto& r) { return r->complete.load(); });
++    list.push_back(read);
++}
++uint32_t u32(const uint8_t* p) {
++    uint32_t v;
++    std::memcpy(&v, p, 4);
++    return v;
++}
++void put32(std::vector<uint8_t>& p, uint32_t v) {
++    for (unsigned i = 0; i < 32; i += 8) p.push_back(static_cast<uint8_t>(v >> i));
++}
++void put64(std::vector<uint8_t>& p, uint64_t v) {
++    put32(p, static_cast<uint32_t>(v));
++    put32(p, static_cast<uint32_t>(v >> 32));
++}
++bool send(int socket, uint32_t op, const std::vector<uint8_t>& payload,
++          const std::vector<int>& fds = {}) {
++    if (fds.size() > 4 || payload.size() > 112) return false;
++    std::array<uint8_t, 16> header{'D', 'L', 'L', '1'};
++    const uint32_t words[] = {op, static_cast<uint32_t>(payload.size()), static_cast<uint32_t>(fds.size())};
++    for (size_t i = 0; i < 3; ++i)
++        for (unsigned shift = 0; shift < 32; shift += 8)
++            header[4 + i * 4 + shift / 8] = static_cast<uint8_t>(words[i] >> shift);
++    iovec iov[2] = {{header.data(), header.size()},
++                    {const_cast<uint8_t*>(payload.data()), payload.size()}};
++    msghdr msg{};
++    msg.msg_iov = iov;
++    msg.msg_iovlen = payload.empty() ? 1 : 2;
++    alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int) * 4)> control{};
++    if (!fds.empty()) {
++        msg.msg_control = control.data();
++        msg.msg_controllen = CMSG_SPACE(sizeof(int) * fds.size());
++        auto* h = CMSG_FIRSTHDR(&msg);
++        h->cmsg_level = SOL_SOCKET;
++        h->cmsg_type = SCM_RIGHTS;
++        h->cmsg_len = CMSG_LEN(sizeof(int) * fds.size());
++        std::memcpy(CMSG_DATA(h), fds.data(), sizeof(int) * fds.size());
++    }
++    return TEMP_FAILURE_RETRY(sendmsg(socket, &msg, MSG_NOSIGNAL)) ==
++           static_cast<ssize_t>(header.size() + payload.size());
++}
++bool receive(int socket, uint32_t op, std::vector<uint32_t>* words) {
++    std::array<uint8_t, 128> bytes{};
++    const ssize_t n = TEMP_FAILURE_RETRY(recv(socket, bytes.data(), bytes.size(), MSG_TRUNC));
++    if (n < 16 || n > 128 || std::memcmp(bytes.data(), "DLL1", 4) != 0 ||
++        u32(bytes.data() + 4) != op || u32(bytes.data() + 8) != n - 16 ||
++        u32(bytes.data() + 12) != 0 || n % 4 != 0)
++        return false;
++    words->clear();
++    for (ssize_t i = 16; i < n; i += 4) words->push_back(u32(bytes.data() + i));
++    return true;
++}
++// A negotiated pipeline reports all staging failures at the Commit barrier.
++bool stage(int socket, bool pipelined, const std::vector<uint8_t>& payload,
++           const std::vector<int>& fds) {
++    if (pipelined) return send(socket, 7, payload, fds);
++    std::vector<uint32_t> reply;
++    return send(socket, 4, payload, fds) && receive(socket, 0x8001, &reply) &&
++            reply.size() == 1 && reply[0] == 0;
++}
++
++// Revisioned snapshots order the initial reply against asynchronous updates.
++struct ConfigCache {
++    std::mutex mutex;
++    uint64_t revision = 0;
++    std::array<uint32_t, 4> value{};
++    bool update(const std::vector<uint32_t>& words, bool* changed = nullptr) {
++        if (changed) *changed = false;
++        if (words.size() != 6) return false;
++        const uint64_t next = words[0] | static_cast<uint64_t>(words[1]) << 32;
++        if (!next) return false;
++        const std::array<uint32_t, 4> incoming{words[2], words[3], words[4], words[5]};
++        std::lock_guard lock(mutex);
++        if (next < revision) return true;
++        if (next == revision) return incoming == value;
++        revision = next;
++        value = incoming;
++        if (changed) *changed = true;
++        return true;
++    }
++    std::array<uint32_t, 4> snapshot() {
++        std::lock_guard lock(mutex);
++        return value;
++    }
++};
++bool configurationEvent(ConfigCache& cache, const std::vector<uint32_t>& words,
++                        const std::function<void()>& repaint) {
++    bool changed = false;
++    if (!cache.update(words, &changed)) return false;
++    if (changed && repaint) repaint();
++    return true;
++}
++bool configuration(int socket, ConfigCache& cache, bool& subscribed, uint32_t width,
++                   uint32_t height, std::array<uint32_t, 4>* config) {
++    if (!subscribed) {
++        std::vector<uint32_t> words;
++        if (!send(socket, 1, {}) || !receive(socket, 0x8002, &words) || words.size() != 4 ||
++            (words[0] & 3) != 3) return false;
++        if (words[0] & 8) {
++            if (!send(socket, 8, {}) || !receive(socket, 0x8005, &words) ||
++                !cache.update(words)) return false;
++            subscribed = true;
++        } else {
++            *config = {words[0], words[1], words[2], words[3]};
++        }
++    }
++    if (subscribed) *config = cache.snapshot();
++    return ((*config)[0] & 3) == 3 && (*config)[2] == width && (*config)[3] == height;
++}
++// Exact ABI of the pinned minigbm mapper; never pass its metadata FD as an image plane.
++struct CrosHandle : native_handle_t {
++    int32_t fds[5];
++    uint32_t strides[4], offsets[4], sizes[4], id, width, height, format, tiling;
++    uint64_t modifier, useFlags;
++    uint32_t magic, pixelStride;
++    int32_t androidFormat;
++    int64_t usage;
++    uint32_t planes;
++    uint64_t reservedSize, totalSize;
++} __attribute__((packed));
++const CrosHandle* handle(const sp<GraphicBuffer>& buffer) {
++    auto* h = buffer->handle;
++    if (!h || h->numInts < 0 || h->numInts > 128 || h->version != sizeof(native_handle_t) ||
++        h->numFds < 1 || h->numFds > 5 ||
++        sizeof(native_handle_t) + static_cast<size_t>(h->numFds + h->numInts) * sizeof(int) !=
++            sizeof(CrosHandle))
++        return nullptr;
++    const auto* c = reinterpret_cast<const CrosHandle*>(h);
++    if (c->magic != 0xABCDDCBA || c->planes < 1 || c->planes > 4 ||
++        c->planes > static_cast<uint32_t>(h->numFds) || c->width != buffer->getWidth() ||
++        c->height != buffer->getHeight() || c->modifier == UINT64_MAX ||
++        (c->usage & GRALLOC_USAGE_PROTECTED))
++        return nullptr;
++    // These SDR RGB formats have the same sampling interpretation on both sides.
++    constexpr uint32_t ar = 0x34325241, xr = 0x34325258, ab = 0x34324241, xb = 0x34324258;
++    if (c->format != ar && c->format != xr && c->format != ab && c->format != xb) return nullptr;
++    return c;
++}
++struct Export {
++    uint32_t id;
++    sp<GraphicBuffer> buffer;
++    uint64_t frame;
++    sp<Fence> acquire;
++    Rect destination;
++    FloatRect source;
++    uint32_t transform, alpha, color;
++    bool opaque;
++    uint32_t format = 0;
++};
++std::optional<Export> prepare(const compositionengine::OutputLayer& layer, uint32_t width,
++                              uint32_t height) {
++    const auto& o = layer.getState();
++    const auto& s = static_cast<const surfaceflinger::frontend::LayerSnapshot&>(
++        *layer.getLayerFE().getCompositionState());
++    if (s.forceClientComposition || o.forceClientComposition || s.hasProtectedContent ||
++        s.isSecure || s.hasBlur() || s.drawShadows() || s.hasBorderSettings() ||
++        s.hasBoxShadowSettings() || s.roundedCorner.hasSfDrawnRadius() ||
++        s.parentRoundedCorner.hasSfDrawnRadius() || s.stretchEffect.hasEffect() ||
++        s.edgeExtensionEffect.hasEffect() || s.postProcessShader || s.renderCommandBuffer ||
++        s.isTextureSamplingBehind || !s.colorTransformIsIdentity || s.sidebandStream ||
++        s.hdrMetadata.validTypes || s.luts || o.appLuts || o.generatedLuts ||
++        o.overrideInfo.buffer || o.dimmingRatio != 1.0f || !std::isfinite(s.alpha) || s.alpha < 0 ||
++        s.alpha > 1 ||
++        (o.dataspace != ui::Dataspace::V0_SRGB && o.dataspace != ui::Dataspace::SRGB &&
++         o.dataspace != ui::Dataspace::UNKNOWN))
++        return {};
++    const auto r = o.displayFrame;
++    if (r.isEmpty() || r.left < 0 || r.top < 0 || r.right > static_cast<int32_t>(width) ||
++        r.bottom > static_cast<int32_t>(height))
++        return {};
++    Export e{.id = s.uniqueSequence,
++             .buffer = s.externalTexture ? s.externalTexture->getBuffer() : nullptr,
++             .frame = s.frameNumber,
++             .acquire = s.acquireFence,
++             .destination = r,
++             .source = o.sourceCrop,
++             .transform = 0,
++             .alpha = static_cast<uint32_t>(std::round(static_cast<double>(s.alpha) * UINT32_MAX)),
++             .color = 0,
++             .opaque = s.isOpaque};
++    if (!e.buffer) {
++        if (!s.fillsColor()) return {};
++        auto channel = [](float v) {
++            return static_cast<uint32_t>(std::round(std::clamp(v, 0.0f, 1.0f) * 255));
++        };
++        e.color =
++            0xff000000 | channel(s.color.r) << 16 | channel(s.color.g) << 8 | channel(s.color.b);
++        e.source = FloatRect(0, 0, 1, 1);
++        return e;
++    }
++    const auto* c = handle(e.buffer);
++    if (!c || s.isFrontBuffered()) return {};
++    if (s.blendMode != hal::BlendMode::NONE && !s.premultipliedAlpha && !s.contentOpaque) return {};
++    e.format = c->format;
++    // An opaque Android layer may contain arbitrary bits in its alpha channel.
++    // Import the same planes and modifier as XRGB/XBGR so sampling ignores
++    // those bits. Import rejection remains an ordinary composition fallback.
++    if (s.blendMode == hal::BlendMode::NONE) {
++        if (e.format == 0x34325241) e.format = 0x34325258;
++        if (e.format == 0x34324241) e.format = 0x34324258;
++    }
++    const uint32_t flags = static_cast<uint32_t>(o.bufferTransform);
++    if (flags > 7) return {};
++    // Android flips before its clockwise rotation. Wayland describes the
++    // inverse buffer transform, so its reflected quarter turns swap places.
++    constexpr uint32_t transforms[8] = {0, 4, 6, 2, 1, 7, 5, 3};
++    e.transform = transforms[flags];
++    ui::Transform orientation;
++    // ui::Transform::set takes the dimensions AFTER the transformation.
++    const bool rotated = flags & ui::Transform::ROT_90;
++    orientation.set(flags, rotated ? e.buffer->getHeight() : e.buffer->getWidth(),
++                    rotated ? e.buffer->getWidth() : e.buffer->getHeight());
++    e.source = orientation.transform(e.source);
++    for (float v : {e.source.left, e.source.top, e.source.right, e.source.bottom})
++        if (!std::isfinite(v) || v < 0 || v > 16384) return {};
++    if (e.source.isEmpty()) return {};
++    return e;
++}
++}  // namespace
++struct DroidloomLayers::State {
++    std::mutex mutex;
++    ConfigCache config;
++    std::map<uint64_t, std::shared_ptr<Read>> pending;
++    bool live = true;
++};
++bool droidloomAsyncReleasesEnabled() {
++    static const bool enabled =
++        base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false);
++    return enabled;
++}
++void waitDroidloomBufferReads(const ReleaseCallbackId& id) {
++    std::vector<std::shared_ptr<Read>> list;
++    {
++        std::lock_guard lock(readsMutex);
++        auto it = reads.find({id.bufferId, id.framenumber});
++        if (it == reads.end()) return;
++        list = it->second;
++    }
++    for (const auto& r : list) r->wait();
++    std::lock_guard lock(readsMutex);
++    auto it = reads.find({id.bufferId, id.framenumber});
++    if (it != reads.end() && std::all_of(it->second.begin(), it->second.end(),
++                                         [](const auto& r) { return r->complete.load(); }))
++        reads.erase(it);
++}
++bool hasDroidloomBufferReads(const ReleaseCallbackId& id) {
++    std::lock_guard lock(readsMutex);
++    return reads.contains({id.bufferId, id.framenumber});
++}
++DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint)
++    : mState(std::make_shared<State>()), mRequests(std::move(requests)) {
++    std::thread([state = mState, events = std::move(events), repaint = std::move(repaint)] {
++        std::vector<uint32_t> words;
++        while (receive(events.get(), 0x8003, &words) && words.size() == 2) {
++            const uint64_t ticket = words[0] | static_cast<uint64_t>(words[1]) << 32;
++            std::lock_guard lock(state->mutex);
++            auto it = state->pending.find(ticket);
++            if (it == state->pending.end()) {
++                ALOGE("Droidloom unknown source release ticket");
++                break;
++            }
++            it->second->finish();
++            state->pending.erase(it);
++        }
++        std::lock_guard lock(state->mutex);
++        state->live = false;
++        // A disconnected socket does not prove completion. Keep outstanding
++        // gates closed; never turn uncertainty into producer buffer reuse.
++        if (!state->pending.empty())
++            ALOGE("Droidloom layer stream lost with outstanding reads; retaining release gates");
++    }).detach();
++}
++DroidloomLayers::~DroidloomLayers() = default;
++bool DroidloomLayers::transact(uint32_t opcode, const std::vector<uint8_t>& payload,
++                               const std::vector<int>& fds) {
++    std::vector<uint32_t> reply;
++    if (!send(mRequests.get(), opcode, payload, fds) || !receive(mRequests.get(), 0x8001, &reply) ||
++        reply.size() != 1)
++        return false;
++    return reply[0] == 0;
++}
++bool DroidloomLayers::present(compositionengine::Output& output, uint32_t width, uint32_t height) {
++    const bool accepted = presentFrame(output, width, height);
++    if (!accepted) invalidate();
++    return accepted;
++}
++
++bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t width,
++                                   uint32_t height) {
++    if (!droidloomAsyncReleasesEnabled()) return false;
++    {
++        std::lock_guard lock(mState->mutex);
++        if (!mState->live) return false;
++    }
++    std::vector<Export> exports;
++    std::set<uint64_t> buffers;
++    for (auto* layer : output.getOutputLayersOrderedByZ()) {
++        if (layer->getState().visibleRegion.isEmpty()) continue;
++        auto e = prepare(*layer, width, height);
++        if (!e || exports.size() == kMaxLayers) return false;
++        if (e->buffer && !buffers.insert(e->buffer->getId()).second) return false;
++        exports.push_back(std::move(*e));
++    }
++    if (exports.empty() || mNextTicket > UINT64_MAX - exports.size()) return false;
++    std::array<uint32_t, 4> config;
++    if (!configuration(mRequests.get(), mState->config, mSubscribed, width, height, &config)) return false;
++    // A desktop frame does not imply new content in every Android task.
++    // Preserve unchanged attachments and reads; do not invalidate Flutter's
++    // scene or resend buffers merely because another application is animating.
++    std::vector<uint64_t> scene{config[1], width, height};
++    for (const auto& e : exports) {
++        scene.insert(
++            scene.end(),
++            {e.id, e.buffer ? e.buffer->getId() : 0, e.frame,
++             static_cast<uint64_t>(e.destination.left), static_cast<uint64_t>(e.destination.top),
++             static_cast<uint64_t>(e.destination.right),
++             static_cast<uint64_t>(e.destination.bottom), std::bit_cast<uint32_t>(e.source.left),
++             std::bit_cast<uint32_t>(e.source.top), std::bit_cast<uint32_t>(e.source.right),
++             std::bit_cast<uint32_t>(e.source.bottom), e.transform, e.alpha, e.color,
++             static_cast<uint64_t>(e.opaque), e.format});
++    }
++    if (scene == mScene) return true;
++
++    // Retire imports only after their reads have completed, never while an
++    // Android producer or the desktop compositor still owns a submission.
++    if (mBuffers.size() + buffers.size() > kMaxBuffers) {
++        for (auto it = mBuffers.begin(); it != mBuffers.end();) {
++            if (buffers.contains(it->first)) {
++                ++it;
++                continue;
++            }
++            std::vector<uint8_t> p;
++            put64(p, it->first);
++            if (transact(3, p))
++                it = mBuffers.erase(it);
++            else
++                ++it;
++        }
++    }
++    for (const auto& e : exports) {
++        if (!e.buffer) continue;
++        auto cached = mBuffers.find(e.buffer->getId());
++        if (cached != mBuffers.end()) {
++            if (cached->second.format == e.format) continue;
++            // A producer can change the blend mode without reallocating.
++            // Retire the old interpretation only after its host read ends;
++            // a busy import selects fallback, which detaches that old view.
++            std::vector<uint8_t> p;
++            put64(p, e.buffer->getId());
++            if (!transact(3, p)) return false;
++            mBuffers.erase(cached);
++        }
++        if (mBuffers.size() == kMaxBuffers) return false;
++        const auto* h = handle(e.buffer);
++        if (!h) return false;
++        std::vector<uint8_t> p;
++        put64(p, e.buffer->getId());
++        put32(p, h->width);
++        put32(p, h->height);
++        put32(p, e.format);
++        put32(p, 0);
++        put64(p, h->modifier);
++        put32(p, 0);
++        put32(p, h->planes);
++        std::vector<int> fds;
++        for (uint32_t i = 0; i < h->planes; i++) {
++            put32(p, h->offsets[i]);
++            put32(p, h->strides[i]);
++            fds.push_back(h->fds[i]);
++        }
++        if (!transact(2, p, fds)) return false;
++        mBuffers.emplace(e.buffer->getId(), Cached{e.buffer, e.format});
++    }
++    std::unordered_map<uint32_t, Last> next;
++    std::vector<std::pair<uint64_t, std::shared_ptr<Read>>> added;
++    auto reject = [&] {
++        // Explicit pre-commit rejection proves these staged sources were never
++        // attached. Aborting pending metadata does not affect preceding reads.
++        transact(6, {});
++        std::lock_guard lock(mState->mutex);
++        for (auto& [ticket, r] : added) {
++            r->finish();
++            mState->pending.erase(ticket);
++        }
++        return false;
++    };
++    for (const auto& e : exports) {
++        const uint64_t buffer = e.buffer ? e.buffer->getId() : 0;
++        uint64_t ticket = 0;
++        bool reuse = false;
++        if (buffer) {
++            std::lock_guard lock(mState->mutex);
++            auto old = mLayers.find(e.id);
++            if (old != mLayers.end() && old->second.buffer == buffer &&
++                old->second.frame == e.frame && mState->pending.contains(old->second.ticket)) {
++                ticket = old->second.ticket;
++                reuse = true;
++            } else {
++                ticket = ++mNextTicket;
++                auto r = std::make_shared<Read>();
++                mState->pending.emplace(ticket, r);
++                retainRead({buffer, e.frame}, r);
++                added.emplace_back(ticket, r);
++            }
++            next.emplace(e.id, Last{buffer, e.frame, ticket});
++        }
++        std::vector<uint8_t> p;
++        put64(p, e.id);
++        put64(p, buffer);
++        put64(p, ticket);
++        for (int32_t v : {e.destination.left, e.destination.top, e.destination.getWidth(),
++                          e.destination.getHeight()})
++            put32(p, static_cast<uint32_t>(v));
++        for (float v : {e.source.left, e.source.top, e.source.getWidth(), e.source.getHeight()})
++            put32(p, static_cast<uint32_t>(std::round(v * 256)));
++        put32(p, e.transform);
++        put32(p, e.alpha);
++        put32(p, e.opaque ? 1 : 0);
++        put32(p, e.color);
++        std::vector<int> fds;
++        if (buffer && !reuse && e.acquire && e.acquire->isValid()) fds.push_back(e.acquire->get());
++        if (!stage(mRequests.get(), (config[0] & 4) != 0, p, fds)) return reject();
++    }
++    std::vector<uint8_t> p;
++    put32(p, config[1]);
++    put32(p, width);
++    put32(p, height);
++    put32(p, static_cast<uint32_t>(exports.size()));
++    // Distinguish an explicit rejection from a lost commit acknowledgement:
++    // only the former proves the host did not start reading source buffers.
++    std::vector<uint32_t> reply;
++    if (!send(mRequests.get(), 5, p) || !receive(mRequests.get(), 0x8001, &reply) ||
++        reply.size() != 1) {
++        std::lock_guard lock(mState->mutex);
++        mState->live = false;
++        return false;
++    }
++    if (reply[0] != 0) return reject();
++    mLayers = std::move(next);
++    mScene = std::move(scene);
++    return true;
++}
++}  // namespace android
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+new file mode 100644
+index 0000000..e63e823
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <android-base/unique_fd.h>
++#include <gui/ITransactionCompletedListener.h>
++#include <ui/GraphicBuffer.h>
++
++#include <memory>
++#include <unordered_map>
++#include <functional>
++#include <vector>
++
++namespace android {
++namespace compositionengine {
++class Output;
++}
++
++// Release gates are keyed by the producer's actual buffer AND frame identity.
++// Only the host's completed Wayland read opens a gate. These waits are used
++// exclusively on Android's background transaction callback executor.
++bool droidloomAsyncReleasesEnabled();
++void waitDroidloomBufferReads(const ReleaseCallbackId& id);
++bool hasDroidloomBufferReads(const ReleaseCallbackId& id);
++
++class DroidloomLayers {
++   public:
++    DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint);
++    ~DroidloomLayers();
++    void invalidate() { mScene.clear(); }
++    bool present(compositionengine::Output& output, uint32_t width, uint32_t height);
++
++   private:
++    bool presentFrame(compositionengine::Output& output, uint32_t width, uint32_t height);
++    std::vector<uint64_t> mScene;
++    struct State;
++    std::shared_ptr<State> mState;
++    base::unique_fd mRequests;
++    struct Cached {
++        sp<GraphicBuffer> buffer;
++        uint32_t format;
++    };
++    struct Last {
++        uint64_t buffer;
++        uint64_t frame;
++        uint64_t ticket;
++    };
++    std::unordered_map<uint64_t, Cached> mBuffers;
++    std::unordered_map<uint32_t, Last> mLayers;
++    uint64_t mNextTicket = 0;
++    bool mSubscribed = false;
++    bool transact(uint32_t opcode, const std::vector<uint8_t>& payload,
++                  const std::vector<int>& fds = {});
++};
++}  // namespace android
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+index f845632..66fbfd9 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "DroidloomNativeWindow.h"
++#include "SurfaceFlinger.h"
+ 
+ #include <cutils/native_handle.h>
+ #include <log/log.h>
+ #include <sync/sync.h>
+@@ -346,6 +346,26 @@ status_t DroidloomNativeWindow::initialize() {
+     return NO_ERROR;
+ }
+ 
++bool DroidloomNativeWindow::presentLayers(compositionengine::Output& output,
++                                                uint32_t width, uint32_t height, SurfaceFlinger& flinger) {
++    std::lock_guard lock(mMutex);
++    if (!mLayersAttempted) {
++        mLayersAttempted = true;
++        std::vector<uint8_t> payload;
++        appendU64(payload, mDisplay);
++        if (sendRecord(mSocket.get(), makeRecord(static_cast<Opcode>(12), payload, 0), -1) != NO_ERROR) return false;
++        ReceivedRecord response;
++        if (receiveRecord(mSocket.get(), &response) != NO_ERROR || response.length != 16 ||
++            readU16(response.bytes.data() + 6) != 13 || response.descriptors.size() != 2) return false;
++        mLayers = std::make_unique<DroidloomLayers>(std::move(response.descriptors[0]),
++                                                  std::move(response.descriptors[1]),
++                [weak = wp<SurfaceFlinger>::fromExisting(&flinger)] {
++                    if (auto owner = weak.promote()) owner->scheduleComposite(SurfaceFlinger::FrameHint::kNone);
++                });
++    }
++    return mLayers && mLayers->present(output, width, height);
++}
++
+ void DroidloomNativeWindow::setContentOpaque(bool opaque) {
+     std::lock_guard lock(mMutex);
+     mContentOpaque = opaque;
+@@ -493,6 +510,7 @@ int DroidloomNativeWindow::dequeueBuffer(ANativeWindowBuffer** output, int* fenc
+ 
+ int DroidloomNativeWindow::queueBuffer(ANativeWindowBuffer* buffer, int fenceFd) {
+     std::lock_guard lock(mMutex);
++    if (mLayers) mLayers->invalidate();
+     base::unique_fd fence(fenceFd);
+     const auto found = mBufferIds.find(buffer);
+     if (found == mBufferIds.end() || mDequeued.count(found->second) == 0) return BAD_VALUE;
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+index e93ae37..2d01363 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.h
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -11,6 +11,8 @@
+ #pragma once
+ 
+ #include <optional>
++#include "DroidloomLayers.h"
++namespace android { class SurfaceFlinger; }
+ #include <ui/Rect.h>
+ 
+ #include <android-base/unique_fd.h>
+@@ -40,6 +41,7 @@ public:
+     ~DroidloomNativeWindow() override;
+     void setContentOpaque(bool opaque);
+     void setContentDamage(const Rect& damage);
++    bool presentLayers(compositionengine::Output& output, uint32_t width, uint32_t height, SurfaceFlinger& flinger);
+ 
+ private:
+     struct Target {
+@@ -67,6 +69,8 @@ private:
+     status_t sendRequest(uint16_t opcode, uint64_t buffer, int fenceFd = -1);
+     status_t receiveAck();
+ 
++    std::unique_ptr<DroidloomLayers> mLayers;
++    bool mLayersAttempted = false;
+     const uint64_t mTask;
+     const uint32_t mExpectedWidth;
+     const uint32_t mExpectedHeight;
+diff --git a/services/surfaceflinger/Layer.cpp b/services/surfaceflinger/Layer.cpp
+index 38b7c43..c02bea7 100644
+--- a/services/surfaceflinger/Layer.cpp
++++ b/services/surfaceflinger/Layer.cpp
+@@ -67,6 +67,8 @@
+ #include "FrontEnd/LayerCreationArgs.h"
+ #include "FrontEnd/LayerHandle.h"
+ #include "Layer.h"
++#include "DroidloomLayers.h"
++#include "BackgroundExecutor.h"
+ #include "LayerProtoHelper.h"
+ #include "Scheduler/FrameTimeline.h"
+ #include "SurfaceFlinger.h"
+@@ -722,6 +724,23 @@ void Layer::callReleaseBufferCallback(const sp<ITransactionCompletedListener>& l
+     uint32_t currentMaxAcquiredBufferCount =
+             mFlinger->getMaxAcquiredBufferCountForCurrentRefreshRate(mOwnerUid);
+ 
++    if (hasDroidloomBufferReads(callbackId)) {
++        // Destruction and replacement of an unlatched buffer also reach this
++        // path. Keep the exact source identity, channel and buffer alive on
++        // the callback executor; never wait for desktop GPU work on SF's main thread.
++        BackgroundExecutor::getInstanceForTransaction().sendCallbacks({
++            [listener, channel = mBufferReleaseChannel, buffer, callbackId, fence,
++             currentMaxAcquiredBufferCount] {
++                waitDroidloomBufferReads(callbackId);
++                if (FlagManager::getInstance().monitor_buffer_fences()) {
++                    buffer->getDependencyMonitor().addEgress(FenceTime::makeValid(fence), "Droidloom release");
++                }
++                if (listener) listener->onReleaseBuffer(callbackId, fence, currentMaxAcquiredBufferCount, false);
++                if (channel) channel->writeReleaseFence(callbackId, fence, currentMaxAcquiredBufferCount);
++            }});
++        return;
++    }
++
+     if (FlagManager::getInstance().monitor_buffer_fences()) {
+         buffer->getDependencyMonitor().addEgress(FenceTime::makeValid(fence), "Layer release");
+     }
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 8c92dee..0160642 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3722,6 +3722,21 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                     .updatingGeometryThisFrame =
+                             forceGeometry || refreshArgs.updatingGeometryThisFrame,
+             };
++            // Resolve the same occlusion, clipping and HWC geometry used by
++            // normal composition, but export the original producer buffers
++            // before invoking RenderEngine. This policy is application-neutral.
++            if (base::GetBoolProperty("persist.vendor.droidloom.direct_layers", true) &&
++                droidloomAsyncReleasesEnabled()) {
++                compositionengine::LayerFESet snapshots;
++                output->prepare(taskRefresh, snapshots);
++                output->updateColorProfile(taskRefresh);
++                output->updateCompositionState(taskRefresh);
++                if (taskOutput.window->presentLayers(*output, targetSize.width, targetSize.height, *this)) {
++                    nativeWindow->cancelBuffer(nativeWindow, nativeBuffer, targetAcquireFence.release());
++                    taskOutput.invalidated = false;
++                    continue;
++                }
++            }
+             taskOutput.engine->present(taskRefresh);
+             // Every rotated target is still fully rendered. Damage describes
+             // differences from the last submitted frame, not target buffer age.
+@@ -3759,7 +3774,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // This switch is live so the same process supports controlled A/B tests.
+         if (taskFencesValid &&
+             base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_direct", false) &&
+-            base::GetBoolProperty("persist.vendor.droidloom.elide_bootstrap", false)) {
++            base::GetBoolProperty("persist.vendor.droidloom.elide_bootstrap", true)) {
+             refreshArgs.droidloomHeadlessDisplay = pacesetterId;
+             refreshArgs.droidloomHeadlessFence = taskCompletion;
+         }
+diff --git a/services/surfaceflinger/TransactionCallbackInvoker.cpp b/services/surfaceflinger/TransactionCallbackInvoker.cpp
+index a2aa641..0491d53 100644
+--- a/services/surfaceflinger/TransactionCallbackInvoker.cpp
++++ b/services/surfaceflinger/TransactionCallbackInvoker.cpp
+@@ -23,6 +23,7 @@
+ #define ATRACE_TAG ATRACE_TAG_GRAPHICS
+ 
+ #include "TransactionCallbackInvoker.h"
++#include "DroidloomLayers.h"
+ #include "BackgroundExecutor.h"
+ #include "Utils/FenceUtils.h"
+ 
+@@ -105,7 +106,7 @@ void TransactionCallbackInvoker::addCallbackHandle(CallbackHandle&& handle) {
+                                       handle.gpuCompositionDoneFence->getSnapshot().fence,
+                                       handle.compositorTiming, handle.refreshStartTime,
+                                       handle.dequeueReadyTime);
+-    if (FlagManager::getInstance().fence_handling()) {
++    if ((FlagManager::getInstance().fence_handling() || droidloomAsyncReleasesEnabled())) {
+         if (handle.previousReleaseCallbackId != ReleaseCallbackId::INVALID_ID) {
+             transactionStats.surfaceStats.emplace_back(surfaceControl, handle.acquireTimeOrFence,
+                                                        Fence::NO_FENCE, handle.transformHint,
+@@ -156,7 +157,7 @@ void TransactionCallbackInvoker::addPresentFence(sp<Fence> presentFence) {
+ }
+ 
+ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+-    if (!FlagManager::getInstance().fence_handling()) {
++    if (!(FlagManager::getInstance().fence_handling() || droidloomAsyncReleasesEnabled())) {
+         for (const auto& bufferRelease : mBufferReleases) {
+             status_t status = bufferRelease.channel->writeReleaseFence(
+                 bufferRelease.callbackId, bufferRelease.fence,
+@@ -218,7 +219,7 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+         mPresentFence.clear();
+     }
+ 
+-    if (FlagManager::getInstance().fence_handling()) {
++    if ((FlagManager::getInstance().fence_handling() || droidloomAsyncReleasesEnabled())) {
+         // Use a shared_ptr as FenceMerger is not copyable, but std::function requires the lambda
+         // to be copyable.
+         auto fenceMergers =
+@@ -233,6 +234,7 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+                     for (auto& listenerStats : listenerStatsToSend) {
+                         for (auto& transactionStats : listenerStats.transactionStats) {
+                             for (auto& surfaceStats : transactionStats.surfaceStats) {
++                                waitDroidloomBufferReads(surfaceStats.previousReleaseCallbackId);
+                                 auto it = fenceMergers->find(
+                                         surfaceStats.previousReleaseCallbackId);
+                                 if (it != fenceMergers->end()) {
+@@ -244,6 +246,7 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+                     }
+ 
+                     for (auto& bufferRelease : bufferReleases) {
++                        waitDroidloomBufferReads(bufferRelease.callbackId);
+                         sp<Fence> fence =
+                                 fenceMergers->find(bufferRelease.callbackId)
+                                         ->second.waitAndGetFence("merged_fence");

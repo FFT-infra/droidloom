@@ -1,5 +1,20 @@
 # Working on Droidloom
 
+## Moto Edge 70 test device (.154)
+
+- Device workspace: `/mnt/development/moto70edge`.
+- Wi-Fi SSH: `root@192.168.1.154` (Moto Edge 70, `roadstr`, serial `ZY22MMG59D`).
+- Use `/mnt/development/droidloom/.work/moto-ssh` from this checkout; the helper
+  selects the workspace key and verifies the known host key.
+- Host command: `.work/moto-ssh uname -a`.
+- Android command: `.work/moto-ssh --android /system/bin/getprop sys.boot_completed`.
+  Arguments are passed literally; Android commands need absolute paths.
+- Before device work, read `/mnt/development/AGENTS.md`,
+  `/mnt/development/denial-ace3/procedures.md`, and the device workspace's
+  `WORKFLOW.md`. Follow their device identity and activation rules. Android
+  image-only updates require a Droidloom restart, not a phone reboot.
+- This is an ARM64 device; the x86_64 desktop pacman packages do not apply.
+
 ## Commands
 
 - Build pacman packages: `cargo run --locked -j 1 -p droidloom-package -- build`

@@ -43,6 +43,21 @@ scans are never lifecycle authority.
 | `/dev/pts` | private devpts | nosuid, noexec, newinstance |
 | `/dev/binderfs` | private binderfs | three named devices only |
 
+An optional `gapps_dir` in the root-owned cell specification selects a derived
+`product`/`system_ext` image pair before Android init starts. `system` and `vendor`
+retain their normal sources. The add-on manifest binds all three base partitions
+and both derived outputs to exact hashes, Android SDK and native architecture.
+Its files and ancestors must be root-owned, without symlinks or group/other write
+access. Missing or mismatched selected images fail startup. Omission uses the
+base images; installing the optional package does not edit the specification.
+
+The first GApps activation refuses already initialized Android data. A marker
+inside the cell-owned data image records selected packages, signers and manifest
+identity. Changing signers/selection or disabling the add-on requires fresh data
+or a suitable backup; images alone cannot roll back Google updates in `/data`.
+Manifest changes invalidate only the selected Google applications' parser cache.
+The runtime never deletes accounts or installed app updates as a side effect.
+
 The supervisor builds the complete tree before exec. Android receives neither
 `CAP_SYS_ADMIN` nor a general view of host mounts to finish construction.
 Android-controlled system state remains confined to loop-backed filesystems.

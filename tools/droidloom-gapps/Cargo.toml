@@ -1,0 +1,13 @@
+[package]
+name = "droidloom-gapps"
+description = "Import optional Google apps and derive immutable Droidloom add-on images"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+droidloom-contracts = { path = "../../runtime/droidloom-contracts" }
+serde_json.workspace = true
+tempfile.workspace = true
+quick-xml = "0.39.4"

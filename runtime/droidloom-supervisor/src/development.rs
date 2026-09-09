@@ -16,7 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -107,9 +107,10 @@ pub fn validate_development_inputs(spec: &CellSpec) -> Result<(), DevelopmentErr
     }
 
     for name in ["system", "system_ext", "product"] {
-        let image = spec.image_dir.join("images").join(format!("{name}.img"));
+        let image = crate::gapps::partition_image(spec, name);
         detect_read_only_filesystem(&image)?;
     }
+    crate::gapps::validate(spec).map_err(|error| DevelopmentError::InvalidInput(error.to_string()))?;
     if starts_with_magic(&spec.vendor_image, 0, &ANDROID_SPARSE_MAGIC)? {
         return Err(DevelopmentError::InvalidInput(format!(
             "{} is Android-sparse; convert it with simg2img before boot",
@@ -409,7 +410,7 @@ pub fn start_development_cell(
         }
     };
     let parent_pid = unsafe { libc::getpid() };
-    let mut command = Command::new("ip");
+    let mut command = droidloom_cpu_placement::command("ip");
     command
         .args(["netns", "exec", network.namespace(), "unshare"])
         .args([
@@ -420,7 +421,6 @@ pub fn start_development_cell(
             OsStr::new("--mount-proc"),
             OsStr::new("--ipc"),
             OsStr::new("--uts"),
-            OsStr::new("--cgroup"),
             OsStr::new("--fork"),
             OsStr::new("--kill-child=TERM"),
             OsStr::new("--forward-signals"),
@@ -514,7 +514,7 @@ fn start_idmap_namespace(
     // the collection's setgid bit still gives files the normal host group.
     let primary_gid_mapping = format!("{}:{android_uid}:1", spec.subordinate_gids.start);
     let parent_pid = unsafe { libc::getpid() };
-    let mut command = Command::new("unshare");
+    let mut command = droidloom_cpu_placement::command("unshare");
     command
         .args(["--user", "--map-users"])
         .arg(&uid_mapping)
@@ -640,6 +640,14 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
             Err(source) => return Err(io_error(context, source)),
         }
     }
+    let cpu_policy = spec.runtime_dir.join("cpu-policy");
+    if cpu_policy.exists() {
+        for entry in fs::read_dir(&cpu_policy).map_err(|e| io_error("read CPU policy directory", e))? {
+            let entry = entry.map_err(|e| io_error("read CPU policy entry", e))?;
+            fs::remove_file(entry.path()).map_err(|e| io_error("remove generated CPU policy", e))?;
+        }
+        fs::remove_dir(cpu_policy).map_err(|e| io_error("remove CPU policy directory", e))?;
+    }
     let private_sysctls = spec.runtime_dir.join(PRIVATE_SYSCTL_DIRECTORY);
     let private_net_core = private_sysctls.join(PRIVATE_NET_CORE_DIRECTORY);
     match fs::read_dir(&private_net_core) {
@@ -717,11 +725,11 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     mount_read_only_image(&spec.image_dir.join("images/system.img"), &system_lower)?;
     mount_synthetic_system_root(&system_lower, &root)?;
     mount_read_only_image(
-        &spec.image_dir.join("images/system_ext.img"),
+        &crate::gapps::partition_image(spec, "system_ext"),
         &root.join("system_ext"),
     )?;
     mount_read_only_image(
-        &spec.image_dir.join("images/product.img"),
+        &crate::gapps::partition_image(spec, "product"),
         &root.join("product"),
     )?;
     mount_image("ext4", &spec.vendor_image, &root.join("vendor"), true)?;
@@ -795,6 +803,8 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     // Android init may issue filesystem-wide shutdown ioctls during a failed
     // boot. Dedicated loop-backed filesystems contain that effect to the cell.
     mount_writable_ext4_image(&spec.data_dir.join(ANDROID_DATA_IMAGE), &root.join("data"))?;
+    crate::gapps::prepare_data(spec, &root)
+        .map_err(|error| DevelopmentError::InvalidInput(error.to_string()))?;
     crate::package_cache::invalidate_systemui_cache(&root)
         .map_err(|source| io_error("invalidate overlaid SystemUI package cache", source))?;
     mount_writable_ext4_image(
@@ -806,7 +816,10 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     create_private_dev(spec, &root)?;
     mount_first_stage_runtime_filesystems(&root)?;
     bind_boot_parameters(spec, &root)?;
-    bind_development_cgroups(spec, &root)?;
+    let cpu_policy = crate::cpu_placement::prepare(&root, spec.id().as_str())
+        .map_err(|source| io_error("prepare private Android CPU placement hierarchy", source))?;
+    bind_development_cgroups(spec, &root, cpu_policy.is_some())?;
+    if let Some(policy) = cpu_policy { bind_cpu_policy(spec, &root, &policy)?; }
 
     // The reusable base is a system-as-root image, but Droidloom has already
     // supplied the mounts that Android first-stage init normally constructs.
@@ -814,7 +827,7 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     // partitions a second time, which Android treats as fatal.
     arm_android_init_parent_death()?;
     pivot_into_cell_root(&root)?;
-    let mut init = Command::new("/init");
+    let mut init = droidloom_cpu_placement::command("/init");
     // Do not inherit a host renderer override accidentally. The explicit
     // pairing applies to all Android children, including mapper clients.
     init.env_remove("MESA_LOADER_DRIVER_OVERRIDE")
@@ -1734,14 +1747,70 @@ fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentE
     bind_mount(&cmdline, &root.join("proc/cmdline"), true)
 }
 
-fn bind_development_cgroups(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
+fn bind_development_cgroups(spec: &CellSpec, root: &Path, cpuset: bool) -> Result<(), DevelopmentError> {
     // The target host is unified cgroup v2. Keep Android's legacy controller
     // descriptors optional so their unavailable v1 mounts cannot prevent the
     // private v2 hierarchy (and its /system subtree) from being created.
     let source = spec.runtime_dir.join("android-cgroups.json");
-    fs::write(&source, DEVELOPMENT_CGROUPS)
+    let mut config: serde_json::Value = serde_json::from_str(DEVELOPMENT_CGROUPS)
+        .expect("embedded cgroup configuration is valid");
+    if cpuset {
+        // CPU placement uses cpuset. Do not advertise an unusable legacy CPU
+        // controller: get_sched_policy() must read the real cpuset hierarchy.
+        config["Cgroups"].as_array_mut().expect("controller list")
+            .retain(|controller| controller["Controller"] != "cpu");
+    }
+    fs::write(&source, serde_json::to_vec_pretty(&config).expect("JSON value serializes"))
         .map_err(|source| io_error("write Android development cgroup configuration", source))?;
     bind_mount(&source, &root.join(ANDROID_CGROUPS_TARGET), true)
+}
+
+fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), DevelopmentError> {
+    let directory = spec.runtime_dir.join("cpu-policy");
+    fs::create_dir(&directory).map_err(|e| io_error("create CPU policy directory", e))?;
+    // Preserve the already projected init file, including the classpath and
+    // shared-kernel adaptations. The appended on-init action follows AOSP's
+    // cpuset defaults and completes before services are started.
+    let target = root.join("system/etc/init/hw/init.rc");
+    let mut init = fs::read_to_string(&target).map_err(|e| io_error("read Android init policy", e))?;
+    init.push_str(policy);
+    let source = directory.join("init.rc");
+    fs::write(&source, init).map_err(|e| io_error("write Android CPU init policy", e))?;
+    bind_mount(&source, &target, true)?;
+
+    let target = root.join("system/etc/init/surfaceflinger.rc");
+    let original = fs::read_to_string(&target).map_err(|e| io_error("read SurfaceFlinger service", e))?;
+    let service = crate::cpu_placement::graphics_service(&original)
+        .map_err(|e| io_error("set SurfaceFlinger graphics role", e))?;
+    let source = directory.join("surfaceflinger.rc");
+    fs::write(&source, service).map_err(|e| io_error("write SurfaceFlinger CPU policy", e))?;
+    bind_mount(&source, &target, true)?;
+
+    let mut targets = vec![root.join("system/etc/task_profiles.json")];
+    for relative in ["vendor/etc/task_profiles.json", "system_ext/etc/task_profiles.json"] {
+        let target = root.join(relative);
+        if target.exists() { targets.push(target); }
+    }
+    // API-specific profiles load between system and vendor; translate them
+    // too, so an older image cannot silently replace a working CPU backend.
+    let api_directory = root.join("system/etc/task_profiles");
+    if api_directory.is_dir() {
+        for entry in fs::read_dir(api_directory).map_err(|e| io_error("read API task profiles", e))? {
+            let entry = entry.map_err(|e| io_error("read API task profile entry", e))?;
+            if entry.file_name().to_str().is_some_and(|s| s.starts_with("task_profiles_") && s.ends_with(".json")) {
+                targets.push(entry.path());
+            }
+        }
+    }
+    for (index, target) in targets.iter().enumerate() {
+        let original = fs::read_to_string(target).map_err(|e| io_error("read Android task profiles", e))?;
+        let translated = crate::cpu_placement::task_profiles(&original)
+            .map_err(|e| io_error("translate Android CPU task profiles", e))?;
+        let source = directory.join(format!("profiles-{index}.json"));
+        fs::write(&source, translated).map_err(|e| io_error("write Android task profiles", e))?;
+        bind_mount(&source, target, true)?;
+    }
+    Ok(())
 }
 
 fn create_mount_target(path: &Path) -> Result<(), DevelopmentError> {
@@ -1893,7 +1962,7 @@ fn run_os<I>(program: &str, args: I) -> Result<(), DevelopmentError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let status = Command::new(program)
+    let status = droidloom_cpu_placement::command(program)
         .args(args)
         .status()
         .map_err(|source| io_error(&format!("execute {program}"), source))?;

@@ -129,3 +129,116 @@ packages, caches and local test artifacts must stay out of Git.
 
 The fully empty-cache source-download path has not yet been rehearsed; see
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Build logs should accompany reports of failures.
+
+## Desktop image policy
+
+The Android 17 x86_64 package omits legacy VNDK 31–34 APEXes from its derived
+`system_ext.img`. The pinned upstream inputs remain unchanged. The policy rejects
+other vendor products, SDK versions, or an explicit legacy VNDK selection. `adbd`
+is retained. Image derivation runs in one fakeroot session to preserve Android
+ownership and security xattrs. Before staging, it re-extracts the rebuilt image
+and compares every retained file’s contents, permissions, ownership, timestamps,
+symlink target and extended attributes. Missing expected VNDK files or any other
+content/metadata change fails the build. A full package build is required.
+
+## Optional Google apps
+
+`droidloom-gapps` builds an optional add-on from a **locally supplied LiteGapps
+regular lite archive for Android 17/API 37**. The guest architecture comes from
+the APK payload and base build properties, independently of the build host.
+The first implementation accepts raw ext4 base partitions, matching the ARM64
+developer runtime. The standard desktop package uses EROFS and is not yet an
+input to this builder. An ARM64 archive cannot be used with an x86_64 image.
+
+Host tools are `bsdtar`, `xz`, `e2fsprogs`, Android SDK `aapt2` and `apksigner`,
+and a Java runtime. Pacman archives use the existing rootless Podman Arch builder
+and its `makepkg`/`fakeroot` tools. Build as an ordinary user; assembly uses `debugfs` on private image
+copies and does not mount images, install software or start services.
+
+Inspect the selected archive, then pass its reviewed SHA-256 to the builder:
+
+```console
+cargo run --locked -j 1 -p droidloom-gapps -- inspect /path/to/LiteGapps-arm64-17.0.zip
+cargo run --locked -j 1 -p droidloom-gapps -- build \
+  --archive /path/to/LiteGapps-arm64-17.0.zip --sha256 <archive-sha256> \
+  --base /path/to/active-image-set --output .work/gapps-arm64 \
+  --aapt2 /path/to/aapt2 --apksigner /path/to/apksigner
+```
+
+`--base` contains `images/system.img`, `images/system_ext.img` and
+`images/product.img`. Use the actual activated images, including previous
+Droidloom derivations. `--system-ext /path/to/system_ext.img` selects a separately
+derived input without modifying the base directory. APK signatures, package IDs,
+SDK and native ABI are checked. The importer does not execute upstream installer
+scripts or resign APKs. A supplied archive checksum establishes input identity;
+it is not an independent endorsement of its publisher.
+
+The default selects Google Services Framework, Play Services and Play Store.
+`--sync-adapters` also selects Google Contacts and Calendar sync. Configuration
+is filtered to selected applications and their requested permissions, with
+privileged allowlists on the apps' own partitions. Pixel feature declarations,
+phone setup wizard configuration and unrelated applications are excluded.
+`import-report.json` lists selected files and excluded upstream files. Original
+license comments and the archive's license notice are retained.
+
+Only `product` and `system_ext` are derived. Assembly checks every retained
+file's contents, symlink target, UID/GID, mode, mtime and xattrs and checks ext4
+integrity. The manifest binds the outputs to all three exact base image hashes,
+the source archive, SDK, architecture and verified APK signers. A failed build
+does not publish the destination. Keep images, APKs and packages outside Git.
+
+For a separately maintained ARM developer runtime:
+
+```console
+cargo run --locked -j 1 -p droidloom-gapps -- package \
+  --addon .work/gapps-arm64 --version 4.9.20260513 --standalone \
+  --output dist/droidloom-gapps-4.9.20260513-1-aarch64.pkg.tar.zst
+```
+
+For pacman-managed raw-ext4 deployments, replace `--standalone` with
+`--base-package-version <version-release>` to require the exact matching
+`droidloom-runtime` and `droidloom-image` packages and include the lifecycle hook.
+Standalone packages require manually stopping Droidloom before every install,
+upgrade or removal. They contain images and notices, not an updated supervisor.
+
+The runtime must include `gapps_dir` support before activation. Install the
+package with pacman only when ready; administrator access is needed to write
+the package-owned directory and update the package database. While Droidloom is
+stopped, add `"gapps_dir": "/usr/lib/droidloom/addons/gapps"` to its root-owned
+cell specification. Package installation alone does not activate Google apps.
+The supervisor verifies root ownership and every base/output hash before boot.
+An incompatible or missing selected add-on fails startup without falling back.
+
+**First activation requires fresh Android data.** Configure a separately
+provisioned fresh `data_dir` (with its `data.img` and `metadata.img`), or enable
+GApps before the installation's first Android boot. Existing data is never wiped.
+The runtime records Google-app selection and signers in the cell's data image;
+updates with the same selection/signers refresh only Google parser caches.
+Changing selection or signers requires fresh data or a separately validated
+migration. To disable GApps, stop Droidloom, remove `gapps_dir` and select fresh
+data or restore a pre-GApps backup. Merely removing the package cannot undo
+Google updates and account state in `/data`; startup rejects that mixed state.
+
+Offline checks do not prove account sign-in, Play Store installation, push
+delivery or Play Integrity behavior. Validate those on the intended device,
+including repeat boots and package changes, before considering the integration
+ready for use. Google certification and redistribution rights are separate from
+successful image assembly; see [third-party scope](../THIRD_PARTY.md).
+
+Play Store also filters its catalog using Android's reported capabilities.
+The vendor product declares the basic touch interface provided by Droidloom's
+input bridge. The framework includes that routed input when computing display
+configuration, since physical input devices remain private to Denial. The ARM64
+Mesa product advertises OpenGL ES 3.2 (`ro.opengles.version=196610`), matching the
+verified Moto rendering path. When validating another graphics backend, compare
+the advertised version with SurfaceFlinger's actual GLES implementation.
+
+From inside the Android cell, `cmd package list features` should include the
+touch features and a nonzero `reqGlEsVersion`; `cmd activity get-config` should
+report `finger` for a touch-enabled Droidloom product. A feature XML alone does
+not correct the display's input configuration. After updating these boot-time
+capabilities, restart the cell and refresh Play Store's cache. Successful account
+sign-in does not guarantee that Google has refreshed its device profile or that
+every app is compatible. Only declare capabilities the runtime implements;
+Google certification and missing camera, microphone or sensor integration are
+not repaired by adding feature names.

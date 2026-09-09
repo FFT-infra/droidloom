@@ -45,6 +45,7 @@ impl Bridge {
         std::thread::Builder::new()
             .name("droidloom-notifications".into())
             .spawn(move || {
+                droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Background);
                 future::block_on(async move {
                     loop {
                         let result = future::race(run(&listener, &state_path), async {

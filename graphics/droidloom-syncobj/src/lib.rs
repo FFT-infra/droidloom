@@ -115,6 +115,7 @@ impl SyncobjDevice {
         Ok(Timeline {
             device: self.clone(),
             handle: Some(handle),
+            transfer: None,
             last_attached_point: 0,
             last_signalled_point: 0,
             last_exported_point: 0,
@@ -128,6 +129,7 @@ impl SyncobjDevice {
         Ok(Timeline {
             device: self.clone(),
             handle: Some(handle),
+            transfer: None,
             last_attached_point: 0,
             last_signalled_point: 0,
             last_exported_point: 0,
@@ -191,6 +193,11 @@ impl WaylandTimeline {
         self.timeline.attach_sync_file(point, sync_file)
     }
 
+    /// Publish an already completed producer write (a missing Android fence).
+    pub fn signal_acquire(&mut self, point: u64) -> Result<(), SyncobjError> {
+        self.timeline.signal(point)
+    }
+
     /// Return the greatest signalled point without waiting.
     ///
     /// # Errors
@@ -203,6 +210,35 @@ impl WaylandTimeline {
             .syncobj_timeline_query(&[self.timeline.handle()], &mut point, false)
             .map_err(|source| drm_error("query Wayland release timeline", source))?;
         Ok(point[0])
+    }
+
+    /// Export the compositor's actual release fence as soon as it exists,
+    /// without waiting for GPU/KMS completion. An unsubmitted point returns
+    /// `None`; it must never be replaced by an already-signalled fence.
+    ///
+    /// # Errors
+    /// Rejects reused/zero points and propagates DRM errors other than a
+    /// nonblocking availability timeout. Call only until the first export.
+    pub fn try_export_release_fence(&mut self, point: u64) -> Result<Option<OwnedFd>, SyncobjError> {
+        match self.timeline.wait_available_and_export(point, NO_WAIT) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(SyncobjError::Drm { source, .. }) if source.raw_os_error() == Some(libc::ETIME) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Wake when the compositor attaches a fence, before that fence signals.
+    ///
+    /// # Errors
+    /// Rejects zero and propagates unsupported-kernel or registration errors.
+    pub fn notify_when_available(&self, point: u64, event: BorrowedFd<'_>) -> Result<(), SyncobjError> {
+        require_newer(0, point)?;
+        self.timeline
+            .device
+            .syncobj_eventfd(self.timeline.handle(), point, event, true)
+            .map_err(|source| drm_error("register Wayland fence availability wakeup", source))
     }
 
     /// Wake an eventfd when this point completes, including points whose
@@ -389,6 +425,9 @@ impl DenialTaskTimelines {
 struct Timeline {
     device: SyncobjDevice,
     handle: Option<syncobj::Handle>,
+    // A binary scratch handle is private to this timeline and serialized by
+    // &mut self. Exported sync_files own their fence references independently.
+    transfer: Option<BinarySyncobj>,
     last_attached_point: u64,
     last_signalled_point: u64,
     last_exported_point: u64,
@@ -397,6 +436,13 @@ struct Timeline {
 impl Timeline {
     fn handle(&self) -> syncobj::Handle {
         self.handle.expect("live timeline always owns its handle")
+    }
+
+    fn transfer_handle(&mut self) -> Result<syncobj::Handle, SyncobjError> {
+        if self.transfer.is_none() {
+            self.transfer = Some(BinarySyncobj::create(&self.device)?);
+        }
+        Ok(self.transfer.as_ref().expect("scratch handle initialized").handle())
     }
 
     fn export_opaque(&self) -> Result<OwnedFd, SyncobjError> {
@@ -412,10 +458,10 @@ impl Timeline {
     ) -> Result<(), SyncobjError> {
         let previous = self.last_attached_point.max(self.last_signalled_point);
         require_newer(previous, point)?;
-        let temporary = BinarySyncobj::create(&self.device)?;
-        import_sync_file_into(&self.device, temporary.handle(), sync_file)?;
+        let temporary = self.transfer_handle()?;
+        import_sync_file_into(&self.device, temporary, sync_file)?;
         self.device
-            .syncobj_timeline_transfer(temporary.handle(), self.handle(), 0, point)
+            .syncobj_timeline_transfer(temporary, self.handle(), 0, point)
             .map_err(|source| drm_error("transfer sync_file into timeline point", source))?;
         self.last_attached_point = point;
         Ok(())
@@ -433,11 +479,12 @@ impl Timeline {
 
     fn export_materialized(&mut self, point: u64) -> Result<OwnedFd, SyncobjError> {
         require_newer(self.last_exported_point, point)?;
-        let temporary = BinarySyncobj::create(&self.device)?;
+        let temporary = self.transfer_handle()?;
         self.device
-            .syncobj_timeline_transfer(self.handle(), temporary.handle(), point, 0)
+            .syncobj_timeline_transfer(self.handle(), temporary, point, 0)
             .map_err(|source| drm_error("transfer timeline point into sync_file", source))?;
-        let fd = temporary.export_sync_file()?;
+        let fd = self.device.syncobj_to_fd(temporary, true)
+            .map_err(|source| drm_error("export timeline point as sync_file", source))?;
         self.last_exported_point = point;
         Ok(fd)
     }
@@ -492,11 +539,6 @@ impl BinarySyncobj {
             .expect("live binary syncobj always owns its handle")
     }
 
-    fn export_sync_file(&self) -> Result<OwnedFd, SyncobjError> {
-        self.device
-            .syncobj_to_fd(self.handle(), true)
-            .map_err(|source| drm_error("export timeline point as sync_file", source))
-    }
 }
 
 impl Drop for BinarySyncobj {
@@ -622,19 +664,34 @@ mod tests {
         let second_fd = second.export_descriptor().unwrap();
         let first_handle = consumer.fd_to_syncobj(first_fd.as_fd(), false).unwrap();
         let second_handle = consumer.fd_to_syncobj(second_fd.as_fd(), false).unwrap();
+        assert!(first.timeline.transfer.is_none());
+        assert!(second.timeline.transfer.is_none());
+        let mut scratch_handles = None;
         for cycle in 0..128 {
             let acquire = cycle * 2 + 1;
             let release = acquire + 1;
             first.import_acquire_fence(acquire, ready.as_fd()).unwrap();
             second.import_acquire_fence(acquire, ready.as_fd()).unwrap();
+            let handles = (first.timeline.transfer.as_ref().unwrap().handle(),
+                second.timeline.transfer.as_ref().unwrap().handle());
+            if let Some(previous) = scratch_handles {
+                assert_eq!(handles, previous, "scratch handles must survive buffer reuse");
+            }
+            scratch_handles = Some(handles);
             assert!(first.signalled_point().unwrap() < release);
+            assert!(first.try_export_release_fence(release).unwrap().is_none());
             // The later buffer is discarded/released first. The earlier
             // buffer must remain unavailable until its own release arrives.
             consumer.syncobj_timeline_signal(&[second_handle], &[release]).unwrap();
             assert!(second.signalled_point().unwrap() >= release);
+            assert!(second.try_export_release_fence(release).unwrap().is_some());
+            assert!(first.try_export_release_fence(release).unwrap().is_none());
             assert!(first.signalled_point().unwrap() < release);
             consumer.syncobj_timeline_signal(&[first_handle], &[release]).unwrap();
             assert!(first.signalled_point().unwrap() >= release);
+            assert!(first.try_export_release_fence(release).unwrap().is_some());
+            assert_eq!(first.timeline.transfer.as_ref().unwrap().handle(), handles.0);
+            assert_eq!(second.timeline.transfer.as_ref().unwrap().handle(), handles.1);
         }
         consumer.destroy_syncobj(first_handle).unwrap();
         consumer.destroy_syncobj(second_handle).unwrap();

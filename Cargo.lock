@@ -447,6 +447,7 @@ name = "droidloom-applications"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "droidloom-cpu-placement",
  "droidloom-supervisor",
  "hex",
  "serde",
@@ -473,9 +474,19 @@ dependencies = [
 name = "droidloom-contracts"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "droidloom-cpu-placement"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -535,6 +546,17 @@ dependencies = [
  "droidloom-contracts",
  "flate2",
  "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "droidloom-gapps"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "droidloom-contracts",
+ "quick-xml",
  "serde_json",
  "tempfile",
 ]
@@ -619,6 +641,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "droidloom-contracts",
+ "droidloom-cpu-placement",
  "droidloom-window-policy",
  "libc",
  "serde",
@@ -639,6 +662,7 @@ name = "droidloom-syncobj"
 version = "0.1.0"
 dependencies = [
  "drm",
+ "droidloom-cpu-placement",
  "libc",
  "thiserror",
 ]
@@ -690,9 +714,11 @@ dependencies = [
  "async-channel",
  "async-io",
  "drm-fourcc",
+ "droidloom-cpu-placement",
  "droidloom-denial-endpoint",
  "droidloom-denial-ipc",
  "droidloom-denial-protocol",
+ "droidloom-surface-bridge",
  "droidloom-syncobj",
  "droidloom-window-policy",
  "futures-lite",

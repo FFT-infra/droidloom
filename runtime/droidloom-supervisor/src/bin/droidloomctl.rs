@@ -189,7 +189,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if PathBuf::from("/usr/share/droidloom/package.json").is_file() {
                     return Err("Droidloom is managed by pacman. Install the new package pair with sudo pacman -U, or build it with cargo run --locked -j 1 -p droidloom-package -- build. Sudo is needed only to replace package-owned system files and update pacman's database.".into());
                 }
-                let mut command = std::process::Command::new("/usr/bin/droidloom-update");
+                let mut command = droidloom_cpu_placement::command("/usr/bin/droidloom-update");
                 if clean {
                     command.arg("--clean");
                 }
@@ -319,13 +319,13 @@ fn session_lifecycle(
     requested_mode: Option<SessionMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if operation != "stop" && PathBuf::from("/usr/share/droidloom/package.json").is_file() {
-        let status = std::process::Command::new("/usr/lib/droidloom/droidloom-package-helper")
+        let status = droidloom_cpu_placement::command("/usr/lib/droidloom/droidloom-package-helper")
             .arg("prepare")
             .status()?;
         if !status.success() {
             return Err("Droidloom setup did not complete; the runtime was not started".into());
         }
-        let status = std::process::Command::new("systemctl")
+        let status = droidloom_cpu_placement::command("systemctl")
             .args(["--user", "daemon-reload"])
             .status()?;
         if !status.success() {
@@ -366,7 +366,7 @@ fn session_lifecycle(
         // A start with a different mode must actually change the running service.
         if operation == "start"
             && mode != previous
-            && std::process::Command::new("systemctl")
+            && droidloom_cpu_placement::command("systemctl")
                 .args(["--user", "is-active", "--quiet", "droidloom.service"])
                 .status()?
                 .success()
@@ -390,7 +390,7 @@ fn session_lifecycle(
             .filter(|name| env::var_os(name).is_some())
             .collect();
         if !variables.is_empty() {
-            let status = std::process::Command::new("systemctl")
+            let status = droidloom_cpu_placement::command("systemctl")
                 .args(["--user", "import-environment"])
                 .args(variables)
                 .status()?;
@@ -399,7 +399,7 @@ fn session_lifecycle(
             }
         }
     }
-    let status = std::process::Command::new("systemctl")
+    let status = droidloom_cpu_placement::command("systemctl")
         .args(["--user", operation, "droidloom.service"])
         .status()?;
     if !status.success() {

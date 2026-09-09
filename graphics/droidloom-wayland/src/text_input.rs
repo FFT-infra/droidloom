@@ -147,10 +147,9 @@ impl TextInput {
         );
     }
 
-    pub fn fds(&self) -> Vec<(RawFd, i16)> {
-        let mut fds = vec![(self.listener.as_fd().as_raw_fd(), libc::POLLIN)];
-        if let Some(client) = &self.client {
-            fds.push((
+    pub fn fds(&self) -> impl Iterator<Item = (RawFd, i16)> + '_ {
+        std::iter::once((self.listener.as_fd().as_raw_fd(), libc::POLLIN))
+            .chain(self.client.iter().map(|client| (
                 client.as_fd().as_raw_fd(),
                 libc::POLLIN
                     | if self.outgoing.is_empty() {
@@ -158,9 +157,7 @@ impl TextInput {
                     } else {
                         libc::POLLOUT
                     },
-            ));
-        }
-        fds
+            )))
     }
 
     pub fn note_touch(&mut self) {

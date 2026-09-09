@@ -1,0 +1,124 @@
+Subject: [PATCH] util/queue: honor explicit platform background CPU placement
+
+Apply after a queue's full-affinity reset and before its first job; ordinary
+render/submission queues retain their creator's graphics placement. Zink's
+cache writer is minimum-priority work; cache lookup and submission are not.
+Without either environment variable, the placement hook does nothing. Zink's
+cache writer now requests minimum priority independently of that optional hook.
+
+--- a/src/util/u_queue_cpu.h
++++ b/src/util/u_queue_cpu.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: MIT */
++/* Optional placement for queues already declared to be background work. */
++#ifndef U_QUEUE_CPU_H
++#define U_QUEUE_CPU_H
++
++#if defined(__linux__)
++#include <errno.h>
++#include <fcntl.h>
++#include <sched.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static inline bool
++util_queue_parse_cpus(const char *list, cpu_set_t *mask)
++{
++   CPU_ZERO(mask);
++   if (!list || !*list)
++      return false;
++   do {
++      if (*list < '0' || *list > '9')
++         return false;
++      char *end;
++      errno = 0;
++      unsigned long first = strtoul(list, &end, 10);
++      if (errno || first >= CPU_SETSIZE)
++         return false;
++      unsigned long last = first;
++      if (*end == '-') {
++         list = end + 1;
++         if (*list < '0' || *list > '9')
++            return false;
++         last = strtoul(list, &end, 10);
++         if (errno || last >= CPU_SETSIZE || last < first)
++            return false;
++      }
++      if (*end && *end != ',')
++         return false;
++      for (unsigned long cpu = first; cpu <= last; cpu++)
++         CPU_SET(cpu, mask);
++      if (!*end)
++         return true;
++      list = end + 1;
++   } while (*list);
++   return false;
++}
++
++static inline void
++util_queue_apply_background_policy(void)
++{
++   const char *tasks = getenv("MESA_BACKGROUND_CPUSET");
++   const char *cpus = getenv("MESA_BACKGROUND_CPUS");
++   if (!tasks && !cpus)
++      return;
++
++   /* Minimum nice alone does not demote an inherited FIFO/RR policy. These
++    * queues explicitly request minimum priority; preserve that intent. */
++   const struct sched_param param = { .sched_priority = 0 };
++   if (sched_setscheduler(0, SCHED_BATCH, &param))
++      fprintf(stderr, "Mesa background scheduling: %s\n", strerror(errno));
++
++   if (tasks) {
++      /* A platform-owned, real cgroup v1 tasks file. Zero means this thread.
++       * Moving it does not disturb a separate memory/freezer hierarchy. */
++      int fd = open(tasks, O_WRONLY | O_CLOEXEC);
++      if (fd < 0 || write(fd, "0", 1) != 1)
++         fprintf(stderr, "Mesa background cpuset %s: %s\n", tasks, strerror(errno));
++      if (fd >= 0)
++         close(fd);
++   }
++   if (cpus) {
++      cpu_set_t mask;
++      if (!util_queue_parse_cpus(cpus, &mask))
++         fprintf(stderr, "Mesa background CPUs: invalid CPU list '%s'\n", cpus);
++      else if (sched_setaffinity(0, sizeof(mask), &mask))
++         fprintf(stderr, "Mesa background affinity: %s\n", strerror(errno));
++   }
++}
++#else
++static inline void util_queue_apply_background_policy(void) {}
++#endif
++#endif
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include "u_queue.h"
++#include "u_queue_cpu.h"
+ 
+ #include "c11/threads.h"
+ #include "util/u_cpu_detect.h"
+@@ -255,6 +256,7 @@
+    if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
+       /* The nice() function can only set a maximum of 19. */
+       setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
++      util_queue_apply_background_policy();
+    }
+ #endif
+ 
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -362,7 +362,8 @@
+    if (!screen->disk_cache)
+       return true;
+ 
+-   if (!util_queue_init(&screen->cache_put_thread, "zcq", 8, 1, UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen)) {
++   if (!util_queue_init(&screen->cache_put_thread, "zcq", 8, 1,
++                        UTIL_QUEUE_INIT_RESIZE_IF_FULL | UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY, screen)) {
+       mesa_loge("zink: Failed to create disk cache queue\n");
+ 
+       disk_cache_destroy(screen->disk_cache);

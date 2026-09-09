@@ -559,6 +559,11 @@ fn mount_operations(spec: &CellSpec) -> Vec<LinuxOperation> {
 }
 
 fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
+    let addon_kind = if spec.gapps_dir.is_some() {
+        MountKind::Ext4Image
+    } else {
+        MountKind::ErofsImage
+    };
     vec![
         mount(
             MountKind::ErofsImage,
@@ -570,8 +575,8 @@ fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             false,
         ),
         mount(
-            MountKind::ErofsImage,
-            Some(spec.image_dir.join("images/system_ext.img")),
+            addon_kind,
+            Some(crate::gapps::partition_image(spec, "system_ext")),
             Path::new("/system_ext"),
             true,
             true,
@@ -579,8 +584,8 @@ fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             false,
         ),
         mount(
-            MountKind::ErofsImage,
-            Some(spec.image_dir.join("images/product.img")),
+            addon_kind,
+            Some(crate::gapps::partition_image(spec, "product")),
             Path::new("/product"),
             true,
             true,
@@ -860,6 +865,7 @@ mod tests {
                 count: 100_000,
             },
             image_dir: "/var/lib/droidloom/images/current".into(),
+            gapps_dir: None,
             vendor_image: "/var/lib/droidloom/images/current/images/vendor.raw.img".into(),
             android_init: Some("/usr/lib/droidloom/android/init".into()),
             android_file_overrides: vec![crate::AndroidFileOverride {
@@ -877,6 +883,29 @@ mod tests {
             graphics_backend: crate::GraphicsBackend::default(),
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
+    }
+
+    #[test]
+    fn gapps_selects_only_product_and_system_ext_before_boot() {
+        let mut cell = spec();
+        let base = partition_mounts(&cell);
+        cell.gapps_dir = Some("/usr/lib/droidloom/addons/gapps".into());
+        let addon = partition_mounts(&cell);
+        assert_eq!(base[0], addon[0]);
+        assert_eq!(base[3], addon[3]);
+        assert_ne!(base[1], addon[1]);
+        assert_ne!(base[2], addon[2]);
+        for operation in &addon[1..3] {
+            assert!(matches!(
+                operation,
+                LinuxOperation::Mount { kind: MountKind::Ext4Image, .. }
+            ));
+        }
+        let encoded = serde_json::to_string(&addon).unwrap();
+        assert!(encoded.contains("/usr/lib/droidloom/addons/gapps/images/system_ext.img"));
+        assert!(encoded.contains("/usr/lib/droidloom/addons/gapps/images/product.img"));
+        cell.gapps_dir = Some("/usr/lib/droidloom/../escape".into());
+        assert!(cell.validate().is_err());
     }
 
     #[test]

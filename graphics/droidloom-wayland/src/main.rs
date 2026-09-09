@@ -3,6 +3,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod clipboard;
+mod activation;
+mod layers;
+mod fence_wakeup;
 mod notifications;
 mod insets;
 mod presentation_audit;
@@ -58,7 +61,7 @@ use wayland_client::globals::{BindError, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum, backend::WaylandError};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, backend::WaylandError};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -179,7 +182,16 @@ struct PendingFrame {
     trace: Option<presentation_audit::FrameTrace>,
 }
 
+// Timing metadata outlives buffer ownership; no buffer or fence is retained here.
+struct FrameFeedback {
+    proxy: WpPresentationFeedback,
+    frame: FrameId,
+    buffer: BufferId,
+    submitted_nanos: u64,
+}
+
 struct TaskWindow {
+    layers: Option<layers::Stream>,
     package: String,
     android_task: Option<u64>,
     window: Option<Window>,
@@ -195,7 +207,7 @@ struct TaskWindow {
     presentation_output: Option<wl_output::WlOutput>,
     targets: BTreeMap<BufferId, RenderTarget>,
     pending: VecDeque<PendingFrame>,
-    presentation_feedback: Vec<(WpPresentationFeedback, FrameId)>,
+    presentation_feedback: Vec<FrameFeedback>,
     presentation_audit: Option<presentation_audit::Audit>,
     content_opaque: bool,
     applied_opaque: Option<bool>,
@@ -241,6 +253,8 @@ impl Contact {
 }
 
 struct App {
+    activation: activation::Activation,
+    layer_globals: layers::Globals,
     clipboard: clipboard::Clipboard,
     clipboard_inputs: VecDeque<(TaskObjectId, InputEvent)>,
     text_input: text_input::TextInput,
@@ -477,6 +491,7 @@ impl App {
         self.tasks.insert(
             object,
             TaskWindow {
+                layers: None,
                 package: package.to_owned(),
                 android_task: None,
                 window,
@@ -887,6 +902,10 @@ impl App {
                     object.0, frame.frame.0, task.content_opaque, droidloom_syncobj::frame_trace::now_ns());
             }
         }
+        let layers_hidden = task.layers.as_mut().is_some_and(|layers| layers.hide());
+        if layers_hidden {
+            if let Some(viewport) = task.viewport.as_ref() { viewport.set_source(-1.0,-1.0,-1.0,-1.0); }
+        }
         let target = task
             .targets
             .get_mut(&frame.buffer)
@@ -916,6 +935,7 @@ impl App {
         sync.timeline
             .import_acquire_fence(acquire_point, acquire_fence.as_fd())?;
         sync.arm_release_wakeup(release_point)?;
+        if task.sync_surface.is_none() { task.sync_surface=Some(self.sync_manager.get_surface(&surface,qh,())); }
         let sync_surface = task
             .sync_surface
             .as_ref()
@@ -926,8 +946,22 @@ impl App {
         let (release_hi, release_lo) = split_point(release_point);
         sync_surface.set_acquire_point(&sync.proxy, acquire_hi, acquire_lo);
         sync_surface.set_release_point(&sync.proxy, release_hi, release_lo);
-        let feedback = self.presentation_time.feedback(&surface, qh)?;
+        // Timing feedback is optional and can arrive long after the compositor
+        // releases a buffer (especially for obscured windows). Bound outstanding
+        // callbacks independently of render-target ownership.
+        let feedback = if self.endpoint.as_mut()
+            .ok_or(PresenterError::Configuration("endpoint disappeared"))?
+            .track_presentation(object, frame.frame)? {
+            Some(self.presentation_time.feedback(&surface, qh)?)
+        } else {
+            None
+        };
         surface.attach(target.wayland.as_ref(), 0, 0);
+        if layers_hidden {
+            // Android damage compares app frames, not our constant root backing.
+            // Replacing that root with a composed target changes the whole image.
+            surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        }
         for damage in &frame.damage {
             surface.damage_buffer(
                 i32::try_from(damage.x).unwrap_or(i32::MAX),
@@ -939,6 +973,7 @@ impl App {
         let submitted_nanos = if task.presentation_audit.is_some() { monotonic_timestamp_nanos()? } else { 0 };
         if let Some(trace) = frame_trace.as_mut() { trace.commit(); }
         surface.commit();
+        self.activation.mapped(object, &surface);
         target.busy = true;
         task.pending.push_back(PendingFrame {
             frame: frame.frame,
@@ -947,7 +982,14 @@ impl App {
             submitted_nanos,
             trace: frame_trace,
         });
-        task.presentation_feedback.push((feedback, frame.frame));
+        if let Some(feedback) = feedback {
+            task.presentation_feedback.push(FrameFeedback {
+                proxy: feedback,
+                frame: frame.frame,
+                buffer: frame.buffer,
+                submitted_nanos,
+            });
+        }
         Ok(())
     }
 
@@ -963,7 +1005,7 @@ impl App {
                             if let Ok(point) = sync.timeline.signalled_point() {
                                 if point >= pending.release_point {
                                     trace.release_ready(task.presentation_feedback.iter()
-                                        .any(|(_, frame)| *frame == pending.frame));
+                                        .any(|feedback| feedback.frame == pending.frame));
                                 }
                             }
                         }
@@ -974,12 +1016,9 @@ impl App {
                 let sync = task.targets.get(&pending.buffer)
                     .and_then(|target| target.sync.as_ref())
                     .ok_or(PresenterError::Configuration("pending buffer timeline is absent"))?;
-                if pending.release_point > sync.timeline.signalled_point()?
-                    || task
-                        .presentation_feedback
-                        .iter()
-                        .any(|(_, frame)| *frame == pending.frame)
-                {
+                // Only the compositor's real release fence controls reuse.
+                // Presentation feedback retains its own bounded frame identity.
+                if pending.release_point > sync.timeline.signalled_point()? {
                     break;
                 }
                 let pending = task.pending.pop_front().expect("front was present");
@@ -1030,7 +1069,7 @@ impl App {
             .tasks
             .iter()
             .filter_map(|(object, task)| {
-                (task.closing && task.pending.is_empty()).then_some(*object)
+                (task.closing && task.pending.is_empty() && task.layers.as_ref().is_none_or(|s|!s.busy())).then_some(*object)
             })
             .collect::<Vec<_>>();
         for object in finished {
@@ -1040,6 +1079,7 @@ impl App {
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             if let Some(fractional_scale) = task.fractional_scale.take() {
                 fractional_scale.destroy();
@@ -1070,6 +1110,7 @@ impl App {
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.activation.remove(object);
         let task = self
             .tasks
             .get_mut(&object)
@@ -1084,7 +1125,12 @@ impl App {
         // already submitted before its task removal completed.
         surface.attach(None, 0, 0);
         surface.commit();
-        task.presentation_feedback.clear();
+        for feedback in task.presentation_feedback.drain(..) {
+            if let Some(endpoint) = self.endpoint.as_mut() {
+                endpoint.forget_presentation(object, feedback.frame);
+            }
+        }
+        if let Some(stream)=task.layers.as_mut() { stream.hide(); }
         if let Some(fractional_scale) = task.fractional_scale.take() {
             fractional_scale.destroy();
         }
@@ -1132,7 +1178,7 @@ impl App {
             let finished = self
                 .tasks
                 .get(&object)
-                .is_some_and(|task| task.closing && task.pending.is_empty());
+                .is_some_and(|task| task.closing && task.pending.is_empty() && task.layers.as_ref().is_none_or(|s|!s.busy()));
             if finished {
                 self.remove_task(object);
             }
@@ -1156,6 +1202,13 @@ impl App {
         action: EndpointAction,
     ) -> Result<(), PresenterError> {
         match action {
+            EndpointAction::RequestActivation { object } => {
+                if self.focused != Some(object)
+                    && let Some(task) = self.tasks.get(&object).filter(|task| task.accepts_present()) {
+                    self.activation.request(qh, object, &task.package);
+                }
+            }
+            EndpointAction::BindLayerStream { object, sockets } => self.bind_layers(object, sockets)?,
             EndpointAction::ClientReady
             | EndpointAction::TimelinesBound { .. }
             | EndpointAction::ConfigureAcknowledged { .. }
@@ -1208,6 +1261,9 @@ impl App {
         }
         match self.listener.accept() {
             Ok(endpoint) => {
+                let endpoint = if self.activation.supported() {
+                    endpoint.with_activation_requests()
+                } else { endpoint };
                 endpoint.socket().socket().set_nonblocking(true)?;
                 self.endpoint = Some(endpoint);
             }
@@ -1237,6 +1293,7 @@ impl App {
     }
 
     fn disconnect_endpoint(&mut self) {
+        self.activation.clear();
         self.text_input.disconnect();
         self.endpoint = None;
         for object in self.tasks.keys().copied().collect::<Vec<_>>() {
@@ -1252,6 +1309,7 @@ impl App {
         object: TaskObjectId,
         event: InputEvent,
     ) -> Result<(), PresenterError> {
+        static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if self.clipboard.blocked() && self.clipboard_inputs.len() < 512 {
             self.clipboard_inputs.push_back((object, event));
             return Ok(());
@@ -1261,11 +1319,14 @@ impl App {
             .checked_add(1)
             .ok_or(PresenterError::Configuration("input serial exhausted"))?;
         let timestamp = monotonic_timestamp_nanos()?;
-        if let InputEvent::Key {
-            action,
-            keycode,
-            repeat,
-        } = &event
+        if *KEY_TRACE.get_or_init(|| {
+            env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        })
+            && let InputEvent::Key {
+                action,
+                keycode,
+                repeat,
+            } = &event
         {
             eprintln!(
                 "Droidloom key trace: stage=wayland serial={} object={} action={action:?} scan_code={keycode} repeat={repeat}",
@@ -1526,17 +1587,19 @@ impl DmabufHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
-        _buffer: wl_buffer::WlBuffer,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        buffer: wl_buffer::WlBuffer,
     ) {
+        self.layer_imported(params, Some(buffer));
     }
 
     fn failed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
     ) {
+        if self.layer_imported(params, None) { return; }
         self.fail(&"compositor rejected a DMA-BUF import");
     }
 
@@ -1630,7 +1693,7 @@ impl PresentationTimeHandler for App {
                     "presentation clock is not CLOCK_MONOTONIC",
                 ));
             }
-            let (frame, advertised_refresh) = {
+            let (completed, advertised_refresh) = {
                 let task = self
                     .tasks
                     .get_mut(&object)
@@ -1638,24 +1701,24 @@ impl PresentationTimeHandler for App {
                 let index = task
                     .presentation_feedback
                     .iter()
-                    .position(|(candidate, _)| candidate == feedback)
+                    .position(|candidate| candidate.proxy == *feedback)
                     .ok_or(PresenterError::Configuration(
                         "presentation feedback has no submitted frame",
                     ))?;
-                let (_, frame) = task.presentation_feedback.swap_remove(index);
-                (frame, task.refresh_millihz)
+                let completed = task.presentation_feedback.swap_remove(index);
+                (completed, task.refresh_millihz)
             };
+            let frame = completed.frame;
             let timestamp_nanos = presentation_timestamp_nanos(time.tv_sec, time.tv_nsec)?;
             let task = self.tasks.get_mut(&object).expect("task was just checked");
-            if let Some(trace) = task.pending.iter_mut().find(|pending| pending.frame == frame)
-                .and_then(|pending| pending.trace.as_mut()) {
-                trace.presented(timestamp_nanos, refresh, sequence);
+            if droidloom_syncobj::frame_trace::sampled(frame.0) {
+                droidloom_syncobj::frame_trace::event("presented", object.0, frame.0,
+                    completed.buffer.0, &[("display_ns", timestamp_nanos),
+                        ("refresh_ns", u64::from(refresh)), ("display_sequence", sequence)]);
             }
             if let Some(audit) = task.presentation_audit.as_mut() {
-                if let Some(pending) = task.pending.iter().find(|pending| pending.frame == frame) {
-                    audit.presented(object.0, pending.submitted_nanos, timestamp_nanos,
-                        monotonic_timestamp_nanos()?, task.pending.len());
-                }
+                audit.presented(object.0, completed.submitted_nanos, timestamp_nanos,
+                    monotonic_timestamp_nanos()?, task.pending.len());
             }
             let refresh_period_nanos = presentation_refresh_period(refresh, advertised_refresh)?;
             let protocol_flags = if matches!(
@@ -1667,7 +1730,7 @@ impl PresentationTimeHandler for App {
                 presentation_flag::DISPLAYED | presentation_flag::COMPOSITED
             };
             self.endpoint
-                .as_ref()
+                .as_mut()
                 .ok_or(PresenterError::Configuration("endpoint is absent"))?
                 .send_presented(
                     object,
@@ -1700,12 +1763,17 @@ impl PresentationTimeHandler for App {
         if let Some(index) = task
             .presentation_feedback
             .iter()
-            .position(|(candidate, _)| candidate == feedback)
+            .position(|candidate| candidate.proxy == *feedback)
         {
-            let frame = task.presentation_feedback[index].1;
-            if let Some(trace) = task.pending.iter_mut().find(|pending| pending.frame == frame)
-                .and_then(|pending| pending.trace.as_mut()) { trace.discarded(); }
-            task.presentation_feedback.swap_remove(index);
+            let completed = task.presentation_feedback.swap_remove(index);
+            let frame = completed.frame;
+            if droidloom_syncobj::frame_trace::sampled(frame.0) {
+                droidloom_syncobj::frame_trace::event("discarded", object.0, frame.0,
+                    completed.buffer.0, &[]);
+            }
+            if let Some(endpoint) = self.endpoint.as_mut() {
+                endpoint.forget_presentation(object, frame);
+            }
         }
     }
 }
@@ -1832,6 +1900,10 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
+        if let Some(data) = _keyboard.data::<smithay_client_toolkit::seat::keyboard::KeyboardData<App>>()
+            && let Some(surface) = self.focused.and_then(|id| self.tasks.get(&id)).and_then(TaskWindow::surface) {
+            self.activation.input(serial, data.seat(), surface);
+        }
         if let Some(object) = self.focused
             && let Err(error) = self.send_input(
                 object,
@@ -1923,6 +1995,10 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if let PointerEventKind::Press { serial, .. } = event.kind
+                && let Some(data) = _pointer.data::<smithay_client_toolkit::seat::pointer::PointerData>() {
+                self.activation.input(serial, data.seat(), &event.surface);
+            }
             if let PointerEventKind::Press { serial, .. } | PointerEventKind::Release { serial, .. } = event.kind { self.clipboard.serial(serial); }
             let object = self.task_for_surface(&event.surface);
             match event.kind {
@@ -2012,6 +2088,9 @@ impl TouchHandler for App {
             return;
         };
         self.text_input.note_touch();
+        if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
+            self.activation.input(_serial, data.seat(), &surface);
+        }
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
         let contact = Contact {
             object,
@@ -2133,6 +2212,11 @@ wayland_client::delegate_noop!(App: ignore WpViewporter);
 wayland_client::delegate_noop!(App: ignore WpViewport);
 
 fn main() {
+    // SAFETY: the process is still single-threaded. Mesa consumes this optional
+    // worker policy after its own full-affinity reset, before executing jobs.
+    if let Some(groups) = droidloom_cpu_placement::initialize(droidloom_cpu_placement::Role::Graphics) {
+        unsafe { env::set_var("MESA_BACKGROUND_CPUS", groups.background.list()); }
+    }
     if let Err(error) = run() {
         eprintln!("droidloom-wayland: {error}");
         std::process::exit(1);
@@ -2153,7 +2237,11 @@ fn run() -> Result<(), PresenterError> {
     validate_render_node(&render_node)?;
     let identity = fs::metadata("/proc/self")?;
     prepare_socket_path(&socket_path, &runtime_root, identity.uid())?;
-    let _notifications = notifications::Bridge::start(socket_path.with_file_name("notifications.sock"))?;
+    // The async reactor may be created synchronously by Bridge::start.
+    droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Background);
+    let notifications = notifications::Bridge::start(socket_path.with_file_name("notifications.sock"));
+    droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Graphics);
+    let _notifications = notifications?;
 
     let render_file = OpenOptions::new()
         .read(true)
@@ -2200,6 +2288,8 @@ fn run() -> Result<(), PresenterError> {
     }
     let sync_manager: WpLinuxDrmSyncobjManagerV1 = globals.bind(&qh, 1..=1, ())?;
     let mut app = App {
+        activation: activation::Activation::new(&globals, &qh),
+        layer_globals: layers::Globals { subcompositor: globals.bind(&qh, 1..=1, ())?, shm: globals.bind(&qh, 1..=1, ())?, alpha: globals.bind(&qh, 1..=1, ()).ok() },
         clipboard: clipboard::Clipboard::new(socket_path.with_file_name("clipboard.sock"), &globals, &qh)?,
         clipboard_inputs: VecDeque::new(),
         text_input: text_input::TextInput::new(
@@ -2251,6 +2341,8 @@ fn run_presenter_loop(
     mut app: App,
 ) -> Result<(), PresenterError> {
     let qh = event_queue.handle();
+    let mut poll_descriptors = Vec::new();
+    let mut layer_tasks = Vec::new();
     loop {
         event_queue.dispatch_pending(&mut app)?;
         app.unmap_requested_tasks()?;
@@ -2259,6 +2351,7 @@ fn run_presenter_loop(
         }
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
+        app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();
         app.clipboard.pump(&qh);
         if !app.clipboard.blocked() {
@@ -2268,7 +2361,7 @@ fn run_presenter_loop(
         }
         app.unmap_requested_tasks()?;
         app.release_ready_frames()?;
-        poll_sources(conn, &mut event_queue, &mut app)?;
+        poll_sources(conn, &mut event_queue, &mut app, &mut poll_descriptors)?;
     }
 }
 
@@ -2291,6 +2384,7 @@ fn poll_sources(
     conn: &Connection,
     event_queue: &mut EventQueue<App>,
     app: &mut App,
+    descriptors: &mut Vec<libc::pollfd>,
 ) -> Result<(), PresenterError> {
     let write_blocked = match event_queue.flush() {
         Ok(()) => {
@@ -2306,7 +2400,8 @@ fn poll_sources(
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
     let Some(read_guard) = event_queue.prepare_read() else { return Ok(()); };
-    let mut descriptors = vec![
+    descriptors.clear();
+    descriptors.extend([
         libc::pollfd {
             fd: conn.as_fd().as_raw_fd(),
             events: libc::POLLIN | if write_blocked { libc::POLLOUT } else { 0 },
@@ -2317,7 +2412,7 @@ fn poll_sources(
             events: libc::POLLIN,
             revents: 0,
         },
-    ];
+    ]);
     if let Some(endpoint) = app.endpoint.as_ref() {
         descriptors.push(libc::pollfd {
             fd: endpoint.socket().socket().as_fd().as_raw_fd(),
@@ -2325,15 +2420,18 @@ fn poll_sources(
             revents: 0,
         });
     }
-    for (fd, events) in app.text_input.fds().into_iter().chain(app.clipboard.fds()) {
+    for (fd, events) in app.text_input.fds().chain(app.clipboard.fds()) {
         descriptors.push(libc::pollfd {
             fd,
             events,
             revents: 0,
         });
     }
+    for stream in app.tasks.values().filter_map(|t|t.layers.as_ref()) {
+        for (fd,events) in stream.fds() { descriptors.push(libc::pollfd { fd, events, revents:0 }); }
+    }
     let wakeups_start = descriptors.len();
-    let mut release_fallback = false;
+    let mut release_fallback = app.tasks.values().filter_map(|t|t.layers.as_ref()).any(|s|s.poll_fallback());
     for target in app.tasks.values().flat_map(|task| task.targets.values()) {
         if target.busy {
             if let Some(event) = target.sync.as_ref().and_then(|sync| sync.release_wakeup.as_ref()) {
@@ -2367,7 +2465,7 @@ fn poll_sources(
             return Err(error.into());
         }
     }
-    app.clipboard.notify_ready(&descriptors);
+    app.clipboard.notify_ready(descriptors);
     for event in &descriptors[wakeups_start..] {
         if event.revents & libc::POLLIN != 0 {
             let mut count = 0_u64;

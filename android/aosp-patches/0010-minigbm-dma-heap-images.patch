@@ -8,7 +8,7 @@
  #include <unistd.h>
  
  #include "drv_helpers.h"
-@@ -163,6 +164,122 @@
+@@ -163,6 +164,126 @@
  	.bo_export = dma_heap_bo_export,
  	.bo_map = dma_heap_bo_map,
  	.bo_unmap = drv_bo_munmap,
@@ -61,9 +61,13 @@
 +	    (count && !drv_has_modifier(modifiers, count, DRM_FORMAT_MOD_LINEAR)))
 +		return -EINVAL;
 +	/* The dimension bounds make all layout-helper arithmetic fit uint32_t.
-+	 * Android YV12 needs chroma strides aligned to 16, unlike the RGB pitch.
++	 * Every plane must meet the GPU's 64-byte linear pitch alignment.
++	 * Planar 4:2:0 halves the luma stride, so align luma to 128. This also
++	 * preserves Android YV12's exact ALIGN(luma_stride / 2, 16) rule.
 +	 */
-+	uint32_t stride = ALIGN(drv_stride_from_format(format, width, 0), 64);
++	uint32_t alignment = format == DRM_FORMAT_YVU420 ||
++			     format == DRM_FORMAT_YVU420_ANDROID ? 128 : 64;
++	uint32_t stride = ALIGN(drv_stride_from_format(format, width, 0), alignment);
 +	if ((uint64_t)stride * height > DMA_HEAP_MAX_ALLOCATION)
 +		return -EINVAL;
 +	int ret = drv_bo_from_format(bo, stride,

@@ -32,6 +32,8 @@ mod opcode {
     pub const RETIRE: u16 = 9;
     pub const PRESENT_WITH_CONTENT: u16 = 10;
     pub const PRESENT_WITH_DAMAGE: u16 = 11;
+    pub const OPEN_LAYERS: u16 = 12;
+    pub const LAYER_STREAM: u16 = 13;
 }
 
 /// One DMA-BUF plane layout. Plane descriptors are attached in dense order.
@@ -84,6 +86,11 @@ pub enum Request {
         /// None means unknown/full damage, including legacy senders.
         damage: Option<DamageRect>,
     },
+    /// Open task-scoped layer requests and completion sockets.
+    OpenLayers {
+        /// Selected Composer display.
+        display: u64,
+    },
     /// Return an unsubmitted reservation.
     Cancel {
         /// Composer display identity.
@@ -129,6 +136,8 @@ pub enum Response {
         /// Plane layouts matching the attached DMA-BUF descriptors.
         planes: Vec<Plane>,
     },
+    /// Two delegated task sockets, requests then completion events.
+    LayerStream,
     /// The preceding mutation completed.
     Ack,
     /// Bounded failure code. Text is intentionally kept in Android logs.
@@ -214,6 +223,7 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
                 damage: Some(damage),
             })
         }
+        opcode::OPEN_LAYERS if payload.len() == 8 && descriptor_count == 0 => Ok(Request::OpenLayers { display: read_u64(payload, 0)? }),
         opcode::CANCEL if payload.len() == 16 && descriptor_count == 0 => Ok(Request::Cancel {
             display: read_u64(payload, 0)?,
             buffer: nonzero(read_u64(payload, 8)?)?,
@@ -297,6 +307,7 @@ pub fn encode_response(response: &Response, descriptor_count: usize) -> Result<V
             }
             (opcode::TARGET, payload)
         }
+        Response::LayerStream if descriptor_count == 2 => (opcode::LAYER_STREAM, Vec::new()),
         Response::Ack if descriptor_count == 0 => (opcode::ACK, Vec::new()),
         Response::Error { code } if descriptor_count == 0 => {
             let mut payload = Vec::with_capacity(4);
@@ -530,3 +541,6 @@ mod tests {
         );
     }
 }
+
+/// Atomic task layer stream, separate from host render-target reservations.
+pub mod layers;

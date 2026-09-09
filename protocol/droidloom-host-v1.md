@@ -56,7 +56,7 @@ are impossible at the protocol layer; truncation (`MSG_TRUNC` or
 | ---: | --- | --- | --- |
 | 0 | `[u8; 4]` | magic | ASCII `DLOM` |
 | 4 | `u16` | major | `1` |
-| 6 | `u16` | minor | `0` |
+| 6 | `u16` | minor | `3` for existing records; `4` for negotiated activation |
 | 8 | `u16` | opcode | direction-specific value |
 | 10 | `u16` | descriptor count | must equal ancillary descriptors |
 | 12 | `u32` | flags | zero in version 1 |
@@ -88,15 +88,87 @@ is malformed. Descriptors are never inferred from payload integers.
 | `0x0009` | `SetContentState` | task | none |
 | `0x000a` | `SetFrameRate` | task | none |
 | `0x000b` | `Pong` | connection | none |
+| `0x000c` | `BindTask` | task | none |
+| `0x000d` | `BindLayerStream` | task | request socket, completion socket |
+| `0x000e` | `RequestActivation` | bound task | none |
 
-`CreateTask` carries a non-zero Android task ID, a non-zero dedicated logical
-display ID, and a package identity of at most 255 bytes. Object, task, and
+`CreateTask` carries a non-zero dedicated logical display ID and a package
+identity of at most 255 bytes. `BindTask` subsequently supplies the real Android
+task ID. Object, task, and
 display identities cannot be reused while live.
+
+Protocol minor 4 adds optional capability bit 8 (`TASK_ACTIVATION`) and
+`RequestActivation`. Both peers must advertise support. The message carries
+no payload or descriptors and names an already bound live task. It requests
+native activation after Android has accepted an activity launch; it never
+asserts focus or synthesizes input. Native endpoint users opt in only when
+they handle the corresponding action. The Wayland presenter maps it to
+`xdg_activation_v1`, attaches the recent source input serial when available,
+and waits for a new window's first buffer commit before applying its token.
+Stale tokens and tokens for closed windows are discarded. Old peers remain
+compatible and receive no new opcode. Initial negotiation and all existing
+records retain minor-3 headers, so a minor-3 decoder can reach the handshake.
+ServerHello selects minor 4 only when both peers support task activation;
+otherwise it selects minor 3.
 
 `BindTimelines` transfers exactly two DRM syncobj opaque descriptors. The first
 exports the acquire timeline; the second exports the release timeline. Both
 sides retain imported handles for the lifetime of the task. Rebinding is a
 protocol error.
+
+Protocol minor 3 adds `BindLayerStream`. Composer delegates exactly two connected
+Unix sequenced-packet sockets after its task allowlist selects the presentation
+channel. A stream is bound once, cannot address other tasks, and has no authority
+to create windows. The `DLL1` stream codec in
+`graphics/droidloom-surface-bridge/src/layers.rs` is authoritative: each record has
+a 16-byte little-endian header (magic, opcode, payload size, descriptor count),
+with a 128-byte record bound and at most four image-plane descriptors.
+
+The stream requests are Config (1), Register (2), Unregister (3), Stage (4),
+Commit (5), Abort (6), optional StageAsync (7), and SubscribeConfig (8). Config returns capabilities,
+configure serial and physical dimensions. Register has one FD per image plane;
+Stage and StageAsync have at most
+one original producer sync-file. Remaining requests have no descriptors.
+Commit validates the entire layer list and current configure before publishing
+it. Ack (`0x8001`) reports acceptance or a negative error; Config (`0x8002`)
+returns four words; Released (`0x8003`) names one 64-bit completed read ticket.
+ReleaseFence (`0x8004`) names one 64-bit read ticket and carries exactly one
+`sync_file` FD exported from that source's actual compositor release point.
+It is sent when the fence becomes available, without waiting for it to signal;
+Released follows only after completion. A read that completes before fence
+export may send Released alone. Both events travel on the second socket
+and different tickets may complete out of order. Config capability bits 0
+(layers/alpha) and 1 (release fences) are both required for direct layers;
+older peers select composition fallback. Fence delivery permits asynchronous
+Android callbacks, but only Released permits reuse of the host import and its
+timeline. Source allocations and read tickets are separate from legacy host
+render-target IDs. Missing fences on disconnect never imply completion.
+
+Config capability bit 2 (`ASYNC_STAGE`) permits StageAsync. Its payload and
+descriptor rules match Stage, but it produces no acknowledgement. The sender
+can queue the bounded scene and then wait for Commit's single result. Stage
+overflow invalidates the whole staged scene until Commit rejection or Abort;
+the host must never accept an overflowing prefix even if the Commit count
+matches that prefix. Rejection, Abort and disconnect drop staged descriptors
+without completing any earlier submitted read. Malformed records still close
+the transport. A missing Commit acknowledgement remains an ambiguous submission,
+not proof of rejection. Without bit 2 the sender uses Stage and consumes each
+acknowledgement. Config and Commit retain their cross-socket ordering barriers.
+
+Config capability bit 3 (`CONFIG_EVENTS`) permits SubscribeConfig, an empty,
+descriptor-free request. Its initial reply (`0x8005`) contains six words:
+revision low, revision high, capabilities, configure serial, physical width,
+physical height. Later changes use the same record on the event socket. The
+host emits events only after subscription and when the configuration changes;
+the nonzero 64-bit revision also increments for visibility/capability changes
+that leave the configure serial unchanged. Revision exhaustion closes the
+transport rather than wrapping. The sender ignores older revisions, rejects
+conflicting snapshots at the same revision, and schedules composition on change.
+This orders events against the initial reply even across the two sockets.
+SubscribeConfig retains the same cross-socket barrier as Config. Cached values
+replace frame-by-frame Config queries; Commit still validates current host
+geometry and serial, rejecting stale submissions. Peers without bit 3 continue
+querying Config. No configuration events are sent to unsubscribed peers.
 
 `RegisterBuffer` carries an allocation ID, dimensions, explicit DRM FourCC and
 modifier, and one through four dense plane records containing index, offset,
@@ -151,6 +223,9 @@ event to retire its internal in-flight frame.
 `Presented` is independent from release because scanout timing and safe buffer
 reuse are different events. It carries a monotonic timestamp, refresh period,
 sequence, and whether the frame was composed or directly scanned out.
+It may arrive after `BufferReleased`; its timing metadata must not delay safe
+buffer reuse. The Wayland presenter bounds outstanding timing requests to 64
+per task and omits optional requests when full, without blocking presentation.
 
 `Input` carries a monotonic host sequence and timestamp plus a typed touch, key,
 or navigation event. Android never receives the host's physical input

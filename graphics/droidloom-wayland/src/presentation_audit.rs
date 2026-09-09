@@ -52,12 +52,6 @@ impl FrameTrace {
         self.event("release_observed", &[("feedback_pending", u64::from(feedback_pending))]);
         self.release_observed = true;
     }
-    pub(super) fn presented(&mut self, display_ns: u64, refresh_ns: u32, sequence: u64) {
-        self.gpu();
-        self.event("presented", &[("display_ns", display_ns),
-            ("refresh_ns", u64::from(refresh_ns)), ("display_sequence", sequence)]);
-    }
-    pub(super) fn discarded(&mut self) { self.event("discarded", &[]); }
     pub(super) fn returned(&mut self) {
         self.gpu();
         self.event("buffer_return_sent", &[("gpu_timestamp_known", u64::from(self.gpu_known))]);

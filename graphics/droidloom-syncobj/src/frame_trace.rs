@@ -36,6 +36,7 @@ fn trace() -> Option<&'static Trace> {
         }
         let (sender, receiver) = mpsc::sync_channel::<Record>(256);
         std::thread::Builder::new().name("dl-frame-log".into()).spawn(move || {
+            droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Background);
             for record in receiver {
                 let mut line = format!("Droidloom frame trace: pid={} seq={} stage={} object={} frame={} buffer={} observed_ns={}",
                     std::process::id(), record.sequence, record.stage, record.object,

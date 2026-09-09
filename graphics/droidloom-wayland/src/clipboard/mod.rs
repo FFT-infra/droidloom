@@ -311,7 +311,7 @@ impl Clipboard {
         let generation = self.generation.clone();
         let workers = self.workers.clone();
         let rev = self.revision;
-        std::thread::spawn(move || {
+        spawn_background("dl-clip-native", move || {
             let result = read_native(desc, pipes, &directory, &generation, rev);
             workers.fetch_sub(1, Ordering::AcqRel);
             events.send(Event::Native(rev, result));
@@ -348,7 +348,7 @@ impl Clipboard {
             let events = self.events.clone();
             let dir = self.directory.clone();
             let close = socket.try_clone().unwrap();
-            std::thread::spawn(move || {
+            spawn_background("dl-clip-read", move || {
                 let mut reader = Receiver::new(dir.path().into());
                 let mut hello = false;
                 loop {
@@ -368,7 +368,7 @@ impl Clipboard {
             });
             let pending = mailbox.clone();
             let close = socket.try_clone().unwrap();
-            std::thread::spawn(move || {
+            spawn_background("dl-clip-write", move || {
                 let mut result =
                     wire::send_message(&mut output, &Message::Hello { abi: wire::ABI });
                 while result.is_ok() {
@@ -461,7 +461,7 @@ impl Clipboard {
             return;
         }
         let workers = self.workers.clone();
-        std::thread::spawn(move || {
+        spawn_background("dl-clip-offer", move || {
             let _ = write_offer(&clip, &mime, fd);
             workers.fetch_sub(1, Ordering::AcqRel);
         });
@@ -805,4 +805,11 @@ mod tests {
         let state = mailbox.value.lock().unwrap();
         assert!(matches!(state.0, Some(Outbound::Sync(999))));
     }
+}
+
+
+fn spawn_background<F>(name: &str, work: F) -> std::thread::JoinHandle<()>
+where F: FnOnce() + Send + 'static {
+    droidloom_cpu_placement::spawn(name, droidloom_cpu_placement::Role::Background, work)
+        .expect("spawn clipboard worker")
 }
