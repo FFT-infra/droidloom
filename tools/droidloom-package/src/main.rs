@@ -44,6 +44,9 @@ enum Action {
         /// Seed the source cache from an existing sparse AOSP checkout (never binaries).
         #[arg(long)]
         source_cache: Option<PathBuf>,
+        /// Build Digitalis directly from a local Git checkout, including edits.
+        #[arg(long, conflicts_with = "component")]
+        native_bridge_source: Option<PathBuf>,
     },
     /// Exercise package install, setup, reinstall and removal in disposable Arch.
     Check {
@@ -228,6 +231,7 @@ fn build(
     clean: bool,
     source_cache: Option<PathBuf>,
     components: Vec<components::Component>,
+    native_bridge_source: Option<PathBuf>,
 ) -> Result<()> {
     let started = Instant::now();
     require_user()?;
@@ -397,6 +401,19 @@ fn build(
         container
             .arg("--volume")
             .arg(format!("{}:/baseline:ro", baseline.display()));
+    }
+    if let Some(checkout) = native_bridge_source {
+        let checkout = checkout.canonicalize()?;
+        if !checkout.join(".git").exists() {
+            return Err("--native-bridge-source requires a Digitalis Git checkout".into());
+        }
+        container
+            .args([
+                "--env",
+                "DROIDLOOM_NATIVE_BRIDGE_SOURCE=/native-bridge-source",
+            ])
+            .arg("--volume")
+            .arg(format!("{}:/native-bridge-source:ro", checkout.display()));
     }
     container
         .arg("localhost/droidloom-arch-builder")
@@ -644,7 +661,15 @@ fn execute() -> Result<()> {
             jobs,
             clean,
             source_cache,
-        } => build(source, jobs, clean, source_cache, component),
+            native_bridge_source,
+        } => build(
+            source,
+            jobs,
+            clean,
+            source_cache,
+            component,
+            native_bridge_source,
+        ),
         Action::Check { packages, previous } => validation::check(&packages, previous.as_deref()),
         Action::InContainer {
             jobs,

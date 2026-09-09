@@ -12,6 +12,43 @@ upstream base partitions, materializes required sources, applies Droidloom patch
 builds modified platform components and the vendor image, and assembles packages.
 Mesa is prepared from its pinned upstream release. It does not rebuild all of AOSP.
 
+The x86_64 product also builds the experimental Digitalis/Berberis ARM64
+NativeBridge. `manifest/native-bridge-lock.json` pins its separate open-source
+checkout; the Android guest linker and API stubs come from the pinned AOSP
+`frameworks/libs/native_bridge_support` project. `native-bridge/product.mk`
+selects the translator and ARM64 guest library closure. The image assembler
+derives `system.img` from the verified base, adds the compiled bridge and guest
+libraries, and updates ABI/ART properties before zygote starts. It verifies the
+rebuilt image's contents and metadata after extraction and records translator
+provenance in `/system/etc/droidloom-native-bridge.json`.
+
+Translator fixes are developed directly in a separate Digitalis Git checkout.
+`droidloom-package build --native-bridge-source /absolute/path/to/digitalis`
+builds its current working files and records their hashes in that provenance.
+The local Android-overcommit change uses `MAP_NORESERVE` for private anonymous
+guest mappings when `ro.berberis.flags=android-mmap-noreserve` is enabled. This
+handles Unreal's large virtual arenas while leaving the host sysctl unchanged.
+
+The bridge's host API dependencies link against libraries extracted from the
+checksum-pinned base image (including the ART and NNAPI APEXes). These are build references,
+not additional installed providers. This keeps the sparse build from rebuilding
+unmodified platform services. The guest libraries and translator are compiled
+from their pinned sources; build projections adapt Android 17 header locations.
+
+Native x86_64 libraries remain preferred. ARM64 JNI libraries use translation;
+Java/Kotlin code, Android services and Mesa stay native. The proxies call the
+native Android EGL/GLES/Vulkan libraries, with no emulator graphics driver.
+This first integration does not enable ARM32, RenderScript or transparent
+execution of standalone ARM ELF programs. It leaves host binfmt registrations
+untouched. Broad application compatibility and performance remain experimental.
+
+The initial workstation smoke test used TikTok 46.8.2 (ARM64, version code
+2024608020). Its APKM splits installed through a PackageManager session and its
+explicit catalog launcher activity opened a native Droidloom window. Android
+logs confirmed Digitalis JIT and optimizing-tier execution. This establishes
+installation and startup; sustained playback and broader compatibility are
+separate validation work.
+
 Cuttlefish vendor, ODM, boot and kernel images are excluded: their virtual-device
 graphics and KMS assumptions do not match Droidloom. The host retains its kernel.
 

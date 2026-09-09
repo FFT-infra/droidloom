@@ -8,6 +8,11 @@ licenses; applying a patch does not give Droidloom ownership of that code.
 
 ## Retained licenses
 
+- Digitalis/Berberis retains the Apache-2.0 notices of the Android Open Source
+  Project and Digitalis author utzcoz. `android/manifest/native-bridge-lock.json`
+  pins the source-built ARM64 translator; its Android support dependencies are
+  pinned in the AOSP sparse-source lock. No proprietary translation binaries
+  are used.
 - Android/AOSP code, interfaces, base images and upstream build recipes retain
   their individual licenses, predominantly Apache-2.0 and BSD/MIT variants.
   The copied

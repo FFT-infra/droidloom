@@ -40,9 +40,26 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
   their original process start times. Earlier logs separately showed Google
   Play Services repeatedly crashing with `wifiManager cannot be null`; its
   relationship to the reported notification replay is unproven.
-- **No ARM translation.** The packaged Android userspace supports x86_64 native
-  code and apps that need no native libraries. ARM64-only and 32-bit native APKs
-  are unsupported. ARM64 translation has not been demonstrated in Droidloom.
+- **Experimental ARM64 translation.** Revision 15 includes source-built
+  Digitalis/Berberis. TikTok 46.8.2's ARM64 split bundle installed and opened on
+  the x86_64 development workstation, with JIT and optimizing-tier execution
+  recorded in Android logs. Broader compatibility, sustained playback and
+  performance remain under test. ARM32, RenderScript and standalone ARM
+  executables are unsupported. `droidloomctl install` still accepts only a
+  standalone APK; the TikTok bundle was installed through an Android package
+  manager split session. TikTok needed its explicit catalog launcher component
+  (`com.zhiliaoapp.musically/com.ss.android.ugc.aweme.splash.SplashActivity`)
+  because launching by package name alone did not resolve the activity.
+  Installation also recorded ART `dex2oat32` execution failures (`ENOENT`) for
+  its dex splits, although installation completed and TikTok opened. Compiler
+  selection and ahead-of-time optimization need separate investigation.
+  NTE 1.3.1.84649's ARM64 XAPK installs, but revision 15 fails when Unreal
+  reserves a 76 GiB arena without `MAP_NORESERVE` on a desktop using heuristic
+  overcommit. Revision 16, built from the Digitalis development checkout, fixes
+  this container mismatch with an opt-in mapping policy. A debugger-free run
+  opened a visible window showing PairIP's Google Play error dialog and then
+  exited with status 0. The Play Store licensing service was absent. NTE testing
+  is paused pending Google Play support on x86_64; gameplay remains unverified.
 - **Fruit Ninja first launch on revisions through 10.** A launcher-to-game or
   age-screen handoff could defeat task discovery; a later successful launch
   could still have no window because SurfaceFlinger permanently abandoned the

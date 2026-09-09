@@ -14,6 +14,9 @@ directories supply conventional board-discovery entry points when this repositor
 is projected at `vendor/droidloom` in the AOSP tree.
 
 The x86_64 product supplies AMD/Intel graphics for the current pacman preview.
+Its ARM64 NativeBridge target compiles guest libraries alongside the native
+x86_64 platform. The updater installs that closure in a derived system image;
+building only `vendorimage` does not activate translation.
 ARM64 retains a specialist build/deployment workflow. See
 [current limitations](../../docs/desktop-integration.md#current-limitations); product definitions
 alone do not establish hardware compatibility.

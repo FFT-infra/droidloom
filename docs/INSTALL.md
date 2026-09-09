@@ -75,9 +75,10 @@ The density persists. Desktop tiling determines the window's available size.
 
 ## 5. Install an APK
 
-The installation command accepts a **single, standalone APK**. Use an x86_64 APK,
-or an app with no native libraries;
-ARM-only APKs need translation that Droidloom does not currently provide.
+The installation command accepts a **single, standalone APK**. Native x86_64
+APKs and apps without native libraries remain preferred. Revision 15 adds
+experimental ARM64 support through the source-built Digitalis/Berberis translator.
+ARM32 apps are unsupported; ARM64 compatibility and performance vary by app.
 
 Download the APK from its publisher or another source you trust. Keep it on the
 Linux host; you do not need to copy it into Android first.

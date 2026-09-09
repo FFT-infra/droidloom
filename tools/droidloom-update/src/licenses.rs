@@ -11,6 +11,8 @@ pub fn project(repo: &Path, destination: &Path) -> Result<()> {
         copy(&path, &destination.join(path.strip_prefix(repo)?))?;
     }
     for name in [
+        "android/native-bridge/NOTICE.txt",
+        "android/manifest/native-bridge-lock.json",
         "protocol/denial-frame-timeline-v1.xml",
         "graphics/droidloom-wayland/protocol/denial-text-input-panel-v1.xml",
         "graphics/droidloom-wayland/protocol/denial-insets-v1.xml",

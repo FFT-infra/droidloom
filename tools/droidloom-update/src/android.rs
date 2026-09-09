@@ -7,6 +7,7 @@ use std::{
 };
 // Full runtime closure. Every update asks the build system for every target.
 pub const TARGETS: &[&str] = &[
+    "droidloom-native-bridge",
     "android.hardware.graphics.composer3-service.droidloom",
     "droidloom-task-launcher",
     "droidloom-input-bridge",
@@ -60,8 +61,14 @@ pub fn apex_output(name: &str) -> Option<&'static str> {
     }
 }
 const PATCHES: &[(&str, &str)] = &[
-    ("frameworks/native", "android/surfaceflinger/0009-droidloom-cpu-placement.patch"),
-    ("external/minigbm", "android/aosp-patches/0010-minigbm-dma-heap-images.patch"),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0009-droidloom-cpu-placement.patch",
+    ),
+    (
+        "external/minigbm",
+        "android/aosp-patches/0010-minigbm-dma-heap-images.patch",
+    ),
     (
         "packages/modules/Connectivity",
         "android/aosp-patches/0009-netd-bpf-pid-namespace.patch",
@@ -170,7 +177,7 @@ struct Original {
     #[serde(default)]
     modified: Option<std::time::SystemTime>,
 }
-struct Projection {
+pub(crate) struct Projection {
     journal: PathBuf,
     originals: Vec<Original>,
 }
@@ -204,7 +211,7 @@ impl Projection {
         durable_write(&self.journal, serde_json::to_vec(&self.originals)?)?;
         Ok(())
     }
-    fn put(&mut self, path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+    pub(crate) fn put(&mut self, path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
         self.save(path)?;
         write(path, bytes)
     }
@@ -483,6 +490,17 @@ pub fn build(
     product: &str,
     jobs: usize,
 ) -> Result<()> {
+    build_targets(repo, source, out, work, product, jobs, TARGETS)
+}
+pub fn build_targets(
+    repo: &Path,
+    source: &Path,
+    out: &Path,
+    work: &Path,
+    product: &str,
+    jobs: usize,
+    targets: &[&str],
+) -> Result<()> {
     let lock = repo.join("android/manifest/m2-sparse-source-lock.json");
     let source_lock = droidloom_source::load_lock(&lock)?;
     if !source.exists() {
@@ -491,16 +509,26 @@ pub fn build(
         droidloom_source::reconcile(&lock, &source_lock, source)?;
     }
     droidloom_source::verify_materialized(&lock, &source_lock, source)?;
+    let native_bridge_source = crate::native_bridge::prepare_source(repo, source)?;
     for (aidl, adapter) in [
         ("statusbar/IStatusBar.aidl", "EmptyStatusBar"),
         ("policy/IKeyguardService.aidl", "EmptyKeyguard"),
     ] {
-        let digest = hash(&source.join("frameworks/base/core/java/com/android/internal").join(aidl))?;
+        let digest = hash(
+            &source
+                .join("frameworks/base/core/java/com/android/internal")
+                .join(aidl),
+        )?;
         let generated = fs::read_to_string(repo.join(format!(
             "android/framework/droidloom-systemui/src/com/android/systemui/compat/{adapter}.java"
         )))?;
-        if !generated.lines().any(|line| line == format!("// AIDL SHA-256: {digest}")) {
-            return fail("SystemUI Binder adapters are stale; run tools/droidloom-systemui-stubs for the pinned source");
+        if !generated
+            .lines()
+            .any(|line| line == format!("// AIDL SHA-256: {digest}"))
+        {
+            return fail(
+                "SystemUI Binder adapters are stale; run tools/droidloom-systemui-stubs for the pinned source",
+            );
         }
     }
     let mut p = Projection::new(work.join("source-projection.json"))?;
@@ -535,6 +563,7 @@ pub fn build(
         "android/framework",
         "android/lmkd-compat",
         "android/runtime",
+        "android/native-bridge",
         "android/selinux-compat",
         "android/device",
         "device",
@@ -551,16 +580,33 @@ pub fn build(
             copy(&repo.join(relative), &destination)?;
         }
     }
+    crate::native_bridge::prepare_build(source, &vendor, work, &mut p)?;
     let mesa = vendor.join("mesa3d");
     fs::create_dir_all(&mesa)?;
     run(Command::new("rsync")
         .args(["-a", "--delete"])
         .arg(format!("{}/", work.join("mesa-source").display()))
         .arg(&mesa))?;
-    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0011-mesa-zink-kgsl.patch"))?;
-    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0012-mesa-adreno722.patch"))?;
-    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0013-mesa-texture-upload-span.patch"))?;
-    p.patch(source, "vendor/droidloom/mesa3d", &repo.join("android/aosp-patches/0014-mesa-background-cpu-placement.patch"))?;
+    p.patch(
+        source,
+        "vendor/droidloom/mesa3d",
+        &repo.join("android/aosp-patches/0011-mesa-zink-kgsl.patch"),
+    )?;
+    p.patch(
+        source,
+        "vendor/droidloom/mesa3d",
+        &repo.join("android/aosp-patches/0012-mesa-adreno722.patch"),
+    )?;
+    p.patch(
+        source,
+        "vendor/droidloom/mesa3d",
+        &repo.join("android/aosp-patches/0013-mesa-texture-upload-span.patch"),
+    )?;
+    p.patch(
+        source,
+        "vendor/droidloom/mesa3d",
+        &repo.join("android/aosp-patches/0014-mesa-background-cpu-placement.patch"),
+    )?;
     let cross = mesa.join("android/mesa3d_cross.mk");
     let cross_text = fs::read_to_string(&cross)?;
     let python_assignment = "MESA3D_PYTHONPATH := $(AOSP_ABSOLUTE_PATH)/external/python/mako";
@@ -639,12 +685,18 @@ pub fn build(
         .env("SOONG_INCREMENTAL_ANALYSIS", "false")
         .arg("--make-mode")
         .arg(format!("-j{jobs}"))
-        .args(TARGETS.iter().map(|name| {
+        .args(targets.iter().map(|name| {
             apex_output(name).map_or_else(|| PathBuf::from(name), |path| out.join(path))
         }));
     let result = run_build(&mut cmd);
     p.restore()?;
-    result
+    result?;
+    write(
+        &out.join("target/product")
+            .join(product)
+            .join("droidloom-native-bridge-source.json"),
+        serde_json::to_vec_pretty(&native_bridge_source)?,
+    )
 }
 #[cfg(test)]
 mod tests {

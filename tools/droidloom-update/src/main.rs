@@ -6,6 +6,7 @@ mod dependencies;
 mod image_policy;
 mod install;
 mod licenses;
+mod native_bridge;
 mod package;
 mod python;
 mod util;
@@ -37,6 +38,26 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    #[command(hide = true)]
+    NativeBridgeImage {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        product: PathBuf,
+        #[arg(long)]
+        source_lock: PathBuf,
+    },
+    /// Rebuild the ARM64 translator in an already prepared Android workspace.
+    NativeBridgeBuild {
+        /// Use an existing package build workspace (containing aosp-source).
+        #[arg(long)]
+        work: Option<PathBuf>,
+        /// Also build Digitalis's ARM64 host regression suite.
+        #[arg(long)]
+        tests: bool,
+    },
     #[command(hide = true)]
     PruneDesktopImage {
         #[arg(long)]
@@ -104,11 +125,34 @@ fn repository(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 fn execute(args: Args) -> Result<()> {
     match &args.command {
-        Some(Action::PruneDesktopImage { image, destination, vendor_properties }) => {
+        Some(Action::NativeBridgeImage {
+            image,
+            destination,
+            product,
+            source_lock,
+        }) => {
+            return native_bridge::derive_image(image, destination, product, source_lock);
+        }
+        Some(Action::PruneDesktopImage {
+            image,
+            destination,
+            vendor_properties,
+        }) => {
             return image_policy::prune(image, destination, vendor_properties);
         }
-        Some(Action::PackageStage { work, destination, clean, jobs }) => {
-            return package::stage(&repository(args.source.clone())?, work, destination, *clean, *jobs);
+        Some(Action::PackageStage {
+            work,
+            destination,
+            clean,
+            jobs,
+        }) => {
+            return package::stage(
+                &repository(args.source.clone())?,
+                work,
+                destination,
+                *clean,
+                *jobs,
+            );
         }
         Some(Action::Recover { uid }) => return install::recover(*uid),
         Some(Action::Apply { payload, uid }) => {
@@ -124,8 +168,13 @@ fn execute(args: Args) -> Result<()> {
         }
         _ => {}
     }
-    if args.command.is_none() && !args.build_only && std::path::Path::new("/usr/share/droidloom/package.json").exists() {
-        return fail("Droidloom is managed by pacman. Build packages with cargo run --locked -j 1 -p droidloom-package -- build, then install the printed package pair with sudo pacman -U. Sudo is needed to replace package-owned system files and update pacman's database.");
+    if args.command.is_none()
+        && !args.build_only
+        && std::path::Path::new("/usr/share/droidloom/package.json").exists()
+    {
+        return fail(
+            "Droidloom is managed by pacman. Build packages with cargo run --locked -j 1 -p droidloom-package -- build, then install the printed package pair with sudo pacman -U. Sudo is needed to replace package-owned system files and update pacman's database.",
+        );
     }
     let repo = repository(args.source)?;
     let arch = std::env::consts::ARCH;
@@ -133,8 +182,20 @@ fn execute(args: Args) -> Result<()> {
         return fail("the source builder currently requires an x86_64 Linux build host");
     }
     let product = "droidloom_x86_64";
-    let work = repo.join(".work/update");
-    let source = repo.join(".work/aosp-m2-source");
+    let package_work = match &args.command {
+        Some(Action::NativeBridgeBuild {
+            work: Some(work), ..
+        }) => Some(work.canonicalize()?),
+        _ => None,
+    };
+    let work = package_work
+        .clone()
+        .unwrap_or_else(|| repo.join(".work/update"));
+    let source = if package_work.is_some() {
+        work.join("aosp-source")
+    } else {
+        repo.join(".work/aosp-m2-source")
+    };
     let out = work.join("android-out");
     let cargo = work.join("cargo");
     if matches!(args.command, Some(Action::Plan)) {
@@ -159,11 +220,38 @@ fn execute(args: Args) -> Result<()> {
     if jobs == 0 {
         return fail("jobs must be positive");
     }
-    let _lock = Lock::acquire(&work.join("update.lock"))?;
-    let _source_lock = Lock::acquire(&repo.join(".work/aosp-source-update.lock"))?;
-    dependencies::ensure()?;
+    let _lock = Lock::acquire(&work.join(if package_work.is_some() {
+        "package-build.lock"
+    } else {
+        "update.lock"
+    }))?;
+    let _source_lock = Lock::acquire(&if package_work.is_some() {
+        work.join("aosp-source-update.lock")
+    } else {
+        repo.join(".work/aosp-source-update.lock")
+    })?;
+    // A prepared package workspace runs inside the rootless builder, which
+    // supplies build tools and does not run host systemd or install services.
+    if package_work.is_none() {
+        dependencies::ensure()?;
+    }
     if work.join("source-projection.json").exists() {
         android::recover(&work.join("source-projection.json"), &source)?;
+    }
+    if let Some(Action::NativeBridgeBuild { tests, .. }) = args.command {
+        return android::build_targets(
+            &repo,
+            &source,
+            &out,
+            &work,
+            product,
+            jobs,
+            if tests {
+                &["droidloom-native-bridge", "berberis_arm64_host_tests"]
+            } else {
+                &["droidloom-native-bridge"]
+            },
+        );
     }
     if args.clean {
         for path in [&out, &cargo, &work.join("mesa-tools"), &work.join("ccache")] {

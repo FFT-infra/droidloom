@@ -61,7 +61,12 @@ pub fn prepare_inputs(repo: &Path, work: &Path, arch: &str) -> Result<PathBuf> {
 pub fn prepare_package_inputs(repo: &Path, work: &Path, arch: &str) -> Result<PathBuf> {
     prepare_inputs_from(repo, work, arch, false)
 }
-fn prepare_inputs_from(repo: &Path, work: &Path, arch: &str, reuse_installed: bool) -> Result<PathBuf> {
+fn prepare_inputs_from(
+    repo: &Path,
+    work: &Path,
+    arch: &str,
+    reuse_installed: bool,
+) -> Result<PathBuf> {
     let lock_path = repo.join(format!("android/manifest/source-lock-{arch}.json"));
     let lock = json(&lock_path)?;
     let typed = droidloom_image::load_source_lock(&lock_path)?;
@@ -208,9 +213,13 @@ fn extract_package_base(archive: &Path, base: &Path) -> Result<()> {
     run(Command::new("simg2img").arg(&sparse).arg(&raw))?;
     run(Command::new("lpunpack")
         .args(["-p", "system_a", "-p", "system_ext_a", "-p", "product_a"])
-        .arg(&raw).arg(&images))?;
+        .arg(&raw)
+        .arg(&images))?;
     for name in ["system", "system_ext", "product"] {
-        fs::rename(images.join(format!("{name}_a.img")), images.join(format!("{name}.img")))?;
+        fs::rename(
+            images.join(format!("{name}_a.img")),
+            images.join(format!("{name}.img")),
+        )?;
     }
     fs::remove_file(sparse)?;
     fs::remove_file(raw)?;
@@ -355,7 +364,10 @@ pub fn assemble_artifacts(
     }
     for (name, destination) in [
         ("netbpfload", "compat/classpath-compat/bin/netbpfload"),
-        ("libnetd_updatable", "compat/classpath-compat/lib64/libnetd_updatable.so"),
+        (
+            "libnetd_updatable",
+            "compat/classpath-compat/lib64/libnetd_updatable.so",
+        ),
         (
             "libservice-connectivity",
             "compat/classpath-compat/lib64/libservice-connectivity.so",
@@ -422,7 +434,10 @@ pub fn assemble_artifacts(
         ),
         ("packaging/ime/setup", "ime/setup"),
         ("packaging/home/setup", "ime/home-setup"),
-        ("android/framework/droidloom-home/droidloom-home.rc", "ime/droidloom-home.rc"),
+        (
+            "android/framework/droidloom-home/droidloom-home.rc",
+            "ime/droidloom-home.rc",
+        ),
         (
             "android/framework/droidloom-input-bridge/droidloom-input-bridge.rc",
             "ime/droidloom-input-bridge.rc",
@@ -449,9 +464,15 @@ pub fn assemble_artifacts(
         )?;
     }
     let images = payload.join("var/lib/droidloom/images/images");
-    for name in ["system.img", "product.img"] {
+    for name in ["product.img"] {
         copy(&base.join(name), &images.join(name))?;
     }
+    crate::native_bridge::stage_image(
+        repo,
+        &base.join("system.img"),
+        &images.join("system.img"),
+        product,
+    )?;
     crate::image_policy::stage(
         &base.join("system_ext.img"),
         &images.join("system_ext.img"),

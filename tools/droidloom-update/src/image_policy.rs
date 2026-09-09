@@ -29,7 +29,10 @@ fn desktop_vendor(properties: &str) -> Result<()> {
         .collect();
     if properties.get("ro.product.vendor.device") != Some(&"droidloom_x86_64")
         || properties.get("ro.vendor.build.version.sdk") != Some(&"37")
-        || properties.get("ro.vendor.product.cpu.abilist") != Some(&"x86_64")
+        || !matches!(
+            properties.get("ro.vendor.product.cpu.abilist"),
+            Some(&"x86_64" | &"x86_64,arm64-v8a")
+        )
         || ["ro.vndk.version", "ro.product.vndk.version"]
             .iter()
             .any(|key| properties.get(key).is_some_and(|value| !value.is_empty()))
@@ -67,7 +70,7 @@ pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Res
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Entry {
+pub(crate) struct Entry {
     uid: u32,
     gid: u32,
     mode: u32,
@@ -76,7 +79,7 @@ struct Entry {
     attributes: String,
 }
 
-fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
+pub(crate) fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
     fn visit(root: &Path, relative: &Path, entries: &mut BTreeMap<PathBuf, Entry>) -> Result<()> {
         let path = root.join(relative);
         let meta = fs::symlink_metadata(&path)?;
@@ -130,7 +133,7 @@ fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
     Ok(entries)
 }
 
-fn extract(image: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn extract(image: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination)?;
     run(Command::new("fsck.erofs")
         .arg("--preserve")

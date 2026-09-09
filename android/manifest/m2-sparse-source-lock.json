@@ -50,6 +50,19 @@
   ],
   "projects": [
     {
+      "path": "frameworks/wilhelm",
+      "name": "platform/frameworks/wilhelm",
+      "commit": "cbc8f246cd0c18d3c286ab39620846badd0676fb",
+      "purpose": "OpenSL ES and OpenMAX AL public headers for the NativeBridge audio proxies",
+      "sparse_paths": ["include"]
+    },
+    {
+      "path": "frameworks/libs/native_bridge_support",
+      "name": "platform/frameworks/libs/native_bridge_support",
+      "commit": "3d6ed1bcc2f0be54f92cf40458253647e8891176",
+      "purpose": "Android guest linker, ARM64 runtime stubs and native API forwarding for Digitalis"
+    },
+    {
       "path": "art",
       "name": "platform/art",
       "commit": "b753cf97923c3695338d21466fa14c57b480a59a",
@@ -151,6 +164,7 @@
       "commit": "a36a1bcac7ec7ac9be29d8b0b5e669d53f7886f7",
       "purpose": "Pinned CFI blocklist required by the Connectivity native library",
       "sparse_paths": [
+        "lib/builtins",
         "lib/cfi"
       ]
     },
@@ -735,6 +749,8 @@
         "graphics/mapper/3.0",
         "graphics/mapper/4.0",
         "graphics/mapper/stable-c",
+        "media/omx/1.0",
+        "media",
         "health",
         "input/common",
         "input/processor",

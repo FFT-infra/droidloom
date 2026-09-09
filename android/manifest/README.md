@@ -1,5 +1,15 @@
 # Android source and base-image locks
 
+`native-bridge-lock.json` independently pins Digitalis's open ARM64-to-x86_64
+Berberis implementation. The updater verifies its Git origin, exact commit and
+clean worktree before building. It is a separate upstream from AOSP and does not
+relax the sparse lock's requirement that Android dependencies match the pinned
+superproject. The accompanying AOSP `frameworks/libs/native_bridge_support`
+project supplies the guest runtime and API stubs at that Android revision.
+An explicit `--native-bridge-source` development checkout can contain commits
+and edits on top of the locked base; its actual commit and source-file hashes
+are recorded in the image provenance. See [the build guide](../../docs/BUILDING.md).
+
 `source-lock.json` pins two deliberately different inputs:
 
 - `aosp` is the immutable source baseline for Droidloom-owned product and HAL

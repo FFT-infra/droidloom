@@ -8,6 +8,8 @@ PRODUCT_MANUFACTURER := Droidloom
 
 PRODUCT_SOONG_NAMESPACES += vendor/droidloom
 
+$(call inherit-product, vendor/droidloom/android/native-bridge/product.mk)
+
 PRODUCT_BUILD_SYSTEM_IMAGE := false
 PRODUCT_BUILD_SYSTEM_OTHER_IMAGE := false
 PRODUCT_BUILD_SYSTEM_EXT_IMAGE := false
