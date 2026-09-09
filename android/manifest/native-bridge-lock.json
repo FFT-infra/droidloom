@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "name": "Digitalis ARM64 to x86_64",
-  "url": "https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation.git",
-  "commit": "9f3fe0b3c12187bec59ef0970ab0da816502e231",
+  "url": "https://github.com/denialwm/platform_frameworks_libs_binary_translation.git",
+  "commit": "39e3aed979007ffe43f111573df2a3c090dc9b21",
   "license": "Apache-2.0",
   "path": "frameworks/libs/binary_translation"
 }

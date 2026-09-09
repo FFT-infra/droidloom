@@ -2,12 +2,14 @@ Digitalis / Berberis
 
 Copyright (C) The Android Open Source Project
 Copyright (C) 2026 utzcoz
+Copyright (C) 2026 The Droidloom Authors (fork additions)
 
 The translator and the Android NativeBridge support sources retain their
 Apache License, Version 2.0 notices. See LICENSES/Apache-2.0.txt in the
 Droidloom license directory and the individual files in the pinned sources:
 
-https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation
+https://github.com/denialwm/platform_frameworks_libs_binary_translation
+Upstream: https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation
 https://android.googlesource.com/platform/frameworks/libs/native_bridge_support
 
 android/manifest/native-bridge-lock.json records the Digitalis revision.

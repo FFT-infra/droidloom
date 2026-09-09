@@ -469,6 +469,176 @@ pub fn derive_image(
 mod tests {
     use super::*;
 
+    const LOCK: &str = include_str!("../../../android/manifest/native-bridge-lock.json");
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        output(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=Droidloom Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+        )
+        .unwrap()
+    }
+
+    fn source_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let source = root.path().join("source");
+        let checkout = source.join("frameworks/libs/binary_translation");
+        fs::create_dir_all(repo.join("android/manifest")).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        git(&checkout, &["init", "--quiet"]);
+        let mut lock: serde_json::Value = serde_json::from_str(LOCK).unwrap();
+        git(
+            &checkout,
+            &["remote", "add", "origin", lock["url"].as_str().unwrap()],
+        );
+        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+        git(&checkout, &["add", "README.md"]);
+        git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+        lock["commit"] = git(&checkout, &["rev-parse", "HEAD"]).into();
+        fs::write(
+            repo.join("android/manifest/native-bridge-lock.json"),
+            serde_json::to_vec(&lock).unwrap(),
+        )
+        .unwrap();
+        (root, repo, source, checkout)
+    }
+
+    #[test]
+    fn source_lock_accepts_only_reviewed_fork_and_valid_contract() {
+        let original: serde_json::Value = serde_json::from_str(LOCK).unwrap();
+        validate_source_lock(&serde_json::from_value(original.clone()).unwrap()).unwrap();
+        for (key, value) in [
+            (
+                "url",
+                serde_json::json!(
+                    "https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation.git"
+                ),
+            ),
+            (
+                "url",
+                serde_json::json!("https://example.invalid/translator.git"),
+            ),
+            ("commit", serde_json::json!("main")),
+            ("commit", serde_json::json!("Z".repeat(40))),
+            ("path", serde_json::json!("../outside")),
+            ("license", serde_json::json!("unknown")),
+            ("schema_version", serde_json::json!(2)),
+        ] {
+            let mut lock = original.clone();
+            lock[key] = value;
+            assert!(
+                validate_source_lock(&serde_json::from_value(lock).unwrap()).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn locked_source_rejects_dirty_wrong_origin_and_wrong_revision() {
+        let (_root, repo, source, checkout) = source_fixture();
+        let result = prepare_source_with_local(&repo, &source, None).unwrap();
+        assert_eq!(result["working_tree"], false);
+        fs::write(checkout.join("README.md"), "modified\n").unwrap();
+        assert!(prepare_source_with_local(&repo, &source, None).is_err());
+        fs::write(checkout.join("README.md"), "fixture\n").unwrap();
+        fs::write(checkout.join("untracked"), "local\n").unwrap();
+        assert!(prepare_source_with_local(&repo, &source, None).is_err());
+        fs::remove_file(checkout.join("untracked")).unwrap();
+        let origin = git(&checkout, &["remote", "get-url", "origin"]);
+        git(
+            &checkout,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/other.git",
+            ],
+        );
+        assert!(prepare_source_with_local(&repo, &source, None).is_err());
+        git(&checkout, &["remote", "set-url", "origin", &origin]);
+        git(
+            &checkout,
+            &[
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "different revision",
+            ],
+        );
+        assert!(prepare_source_with_local(&repo, &source, None).is_err());
+    }
+
+    #[test]
+    fn development_source_requires_fork_ancestry_and_records_working_files() {
+        let (root, repo, source, checkout) = source_fixture();
+        assert!(prepare_source_with_local(&repo, &source, Some(checkout.clone())).is_err());
+        let local = root.path().join("development");
+        fs::rename(checkout, &local).unwrap();
+        git(
+            &local,
+            &["commit", "--allow-empty", "--quiet", "-m", "development"],
+        );
+        fs::write(local.join("README.md"), "uncommitted development\n").unwrap();
+        let result = prepare_source_with_local(&repo, &source, Some(local.clone())).unwrap();
+        assert_eq!(result["working_tree"], true);
+        assert_eq!(result["commit"], git(&local, &["rev-parse", "HEAD"]));
+        assert_ne!(result["commit"], result["base_commit"]);
+        assert_eq!(
+            result["files"]["README.md"],
+            hash(&local.join("README.md")).unwrap()
+        );
+        let lock_path = repo.join("android/manifest/native-bridge-lock.json");
+        let original = fs::read(&lock_path).unwrap();
+        let mut lock: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        lock["commit"] = "0".repeat(40).into();
+        fs::write(&lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
+        assert!(prepare_source_with_local(&repo, &source, Some(local.clone())).is_err());
+        fs::write(&lock_path, original).unwrap();
+        git(
+            &local,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/other.git",
+            ],
+        );
+        assert!(prepare_source_with_local(&repo, &source, Some(local)).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires network access to fetch the published source pin"]
+    fn published_source_pin_fetches_and_verifies() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("android/manifest")).unwrap();
+        fs::write(
+            root.path().join("android/manifest/native-bridge-lock.json"),
+            LOCK,
+        )
+        .unwrap();
+        let source = root.path().join("source");
+        let result = prepare_source_with_local(root.path(), &source, None).unwrap();
+        let lock: SourceLock = serde_json::from_str(LOCK).unwrap();
+        assert_eq!(result["commit"], lock.commit);
+        assert_eq!(result["working_tree"], false);
+        assert_eq!(
+            prepare_source_with_local(root.path(), &source, None).unwrap(),
+            result
+        );
+    }
+
     #[test]
     fn bridge_properties_replace_conflicts_and_preserve_system_identity() {
         let original = "ro.build.version.sdk=37\nro.product.cpu.abi=x86_64\nro.dalvik.vm.native.bridge=0\nro.product.cpu.abilist=x86_64\n";
@@ -488,13 +658,9 @@ mod tests {
     }
 }
 
-pub fn prepare_source(repo: &Path, source: &Path) -> Result<serde_json::Value> {
-    let lock: SourceLock = serde_json::from_slice(&fs::read(
-        repo.join("android/manifest/native-bridge-lock.json"),
-    )?)?;
+fn validate_source_lock(lock: &SourceLock) -> Result<()> {
     if lock.schema_version != 1
-        || lock.url
-            != "https://github.com/DigitalisX64/platform_frameworks_libs_binary_translation.git"
+        || lock.url != "https://github.com/denialwm/platform_frameworks_libs_binary_translation.git"
         || lock.path != "frameworks/libs/binary_translation"
         || lock.license != "Apache-2.0"
         || lock.commit.len() != 40
@@ -505,9 +671,29 @@ pub fn prepare_source(repo: &Path, source: &Path) -> Result<serde_json::Value> {
     {
         return fail("invalid Digitalis source lock");
     }
+    Ok(())
+}
+
+pub fn prepare_source(repo: &Path, source: &Path) -> Result<serde_json::Value> {
+    prepare_source_with_local(
+        repo,
+        source,
+        std::env::var_os("DROIDLOOM_NATIVE_BRIDGE_SOURCE").map(PathBuf::from),
+    )
+}
+
+fn prepare_source_with_local(
+    repo: &Path,
+    source: &Path,
+    local: Option<PathBuf>,
+) -> Result<serde_json::Value> {
+    let lock: SourceLock = serde_json::from_slice(&fs::read(
+        repo.join("android/manifest/native-bridge-lock.json"),
+    )?)?;
+    validate_source_lock(&lock)?;
     let checkout = source.join(&lock.path);
-    if let Some(local) = std::env::var_os("DROIDLOOM_NATIVE_BRIDGE_SOURCE") {
-        let local = PathBuf::from(local).canonicalize()?;
+    if let Some(local) = local {
+        let local = local.canonicalize()?;
         if local.starts_with(source.canonicalize()?) {
             return fail(
                 "Digitalis development checkout must be outside the generated AOSP source tree",
@@ -520,9 +706,9 @@ pub fn prepare_source(repo: &Path, source: &Path) -> Result<serde_json::Value> {
                 .args(["remote", "get-url", "origin"]),
         )? != lock.url
         {
-            return fail("local Digitalis checkout must use the locked upstream origin");
+            return fail("local Digitalis checkout must use the locked fork origin");
         }
-        // A development branch can commit fixes on top of the upstream pin.
+        // A development branch can commit fixes on top of the published fork pin.
         // Keep the base check while recording the actual revision being built.
         run(Command::new("git").arg("-C").arg(&local).args([
             "merge-base",
