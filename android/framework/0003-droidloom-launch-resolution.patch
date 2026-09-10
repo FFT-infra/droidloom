@@ -1,0 +1,65 @@
+--- a/services/core/java/com/android/server/am/ActivityManagerShellCommand.java
++++ b/services/core/java/com/android/server/am/ActivityManagerShellCommand.java
+@@ -228,6 +228,7 @@
+     private int mDisplayId;
+     private int mTaskDisplayAreaFeatureId;
+     private int mWindowingMode;
++    private Rect mDroidloomLaunchBounds;
+     private int mActivityType;
+     private int mTaskId;
+     private boolean mIsTaskOverlay;
+@@ -619,6 +620,7 @@
+         mDisplayId = INVALID_DISPLAY;
+         mTaskDisplayAreaFeatureId = FEATURE_UNDEFINED;
+         mWindowingMode = WINDOWING_MODE_UNDEFINED;
++        mDroidloomLaunchBounds = null;
+         mActivityType = ACTIVITY_TYPE_UNDEFINED;
+         mTaskId = INVALID_TASK_ID;
+         mIsTaskOverlay = false;
+@@ -688,6 +690,22 @@
+                     mTaskDisplayAreaFeatureId = Integer.parseInt(getNextArgRequired());
+                 } else if (opt.equals("--windowingMode")) {
+                     mWindowingMode = Integer.parseInt(getNextArgRequired());
++                } else if (opt.equals("--droidloom-resolution")) {
++                    if (!android.os.SystemProperties.getBoolean(
++                            "ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++                        throw new IllegalArgumentException("Droidloom task launch is unavailable");
++                    }
++                    final String value = getNextArgRequired();
++                    if (!value.matches("[0-9]{1,5}x[0-9]{1,5}")) {
++                        throw new IllegalArgumentException("resolution must be WIDTHxHEIGHT");
++                    }
++                    final String[] dimensions = value.split("x");
++                    final int width = Integer.parseInt(dimensions[0]);
++                    final int height = Integer.parseInt(dimensions[1]);
++                    if (width < 1 || height < 1 || width > 16384 || height > 16384) {
++                        throw new IllegalArgumentException("resolution dimensions outside 1..16384");
++                    }
++                    mDroidloomLaunchBounds = new Rect(0, 0, width, height);
+                 } else if (opt.equals("--activityType")) {
+                     mActivityType = Integer.parseInt(getNextArgRequired());
+                 } else if (opt.equals("--task")) {
+@@ -840,8 +858,14 @@
+             int res;
+             final long startTime = SystemClock.uptimeMillis();
+             ActivityOptions options = null;
+-            if (mDisplayId != INVALID_DISPLAY) {
++            if (mDroidloomLaunchBounds != null) {
+                 options = ActivityOptions.makeBasic();
++                options.setLaunchBounds(mDroidloomLaunchBounds);
++            }
++            if (mDisplayId != INVALID_DISPLAY) {
++                if (options == null) {
++                    options = ActivityOptions.makeBasic();
++                }
+                 options.setLaunchDisplayId(mDisplayId);
+             }
+             if (mTaskDisplayAreaFeatureId != FEATURE_UNDEFINED) {
+@@ -5010,6 +5034,7 @@
+             pw.println("      --user <USER_ID> | current: Specify which user to run as; if not");
+             pw.println("          specified then run as the current user.");
+             pw.println("      --windowingMode <WINDOWING_MODE>: The windowing mode to launch the activity into.");
++            pw.println("      --droidloom-resolution WIDTHxHEIGHT: Initial task bounds on Droidloom.");
+             pw.println("      --activityType <ACTIVITY_TYPE>: The activity type to launch the activity as.");
+             pw.println("      --display <DISPLAY_ID>: The display to launch the activity into.");
+             pw.println("      --splashscreen-show-icon: Show the splash screen icon on launch.");

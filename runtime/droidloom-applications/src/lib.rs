@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use droidloom_supervisor::control::{
     AndroidApplication, ControlRequest, DEFAULT_CONTROL_SOCKET, request,
+    parse_launch_resolution,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -307,12 +308,17 @@ pub fn reconcile(
             }
         }
 
-        let desktop = desktop_entry(
+        let desktop_path = paths.applications.join(&desktop_name);
+        let resolution = preserved_resolution(&desktop_path)?;
+        let mut desktop = desktop_entry(
             application,
             source.user(),
             has_icon.then_some(icon_name.as_str()),
         );
-        if write_if_changed(&paths.applications.join(&desktop_name), desktop.as_bytes())? {
+        if let Some(resolution) = resolution {
+            desktop = with_launch_resolution(desktop, &resolution);
+        }
+        if write_if_changed(&desktop_path, desktop.as_bytes())? {
             summary.launchers_updated += 1;
         }
         live_desktops.insert(desktop_name);
@@ -510,6 +516,47 @@ fn validate_icon(icon: &[u8]) -> Result<(), CatalogError> {
         ));
     }
     Ok(())
+}
+
+fn preserved_resolution(path: &Path) -> Result<Option<String>, CatalogError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("inspect desktop resolution", error)),
+        Ok(metadata) if !metadata.is_file() || metadata.len() > 1024 * 1024 => {
+            return Err(CatalogError::InvalidApplication("unsafe desktop entry for launch resolution".into()));
+        }
+        Ok(_) => {}
+    }
+    let content = fs::read_to_string(path).map_err(|error| io_error("read desktop resolution", error))?;
+    let mut in_entry = false;
+    let mut resolution = None;
+    for line in content.lines() {
+        if line.starts_with('[') { in_entry = line == "[Desktop Entry]"; }
+        if in_entry {
+            if let Some(value) = line.strip_prefix("X-Droidloom-Resolution=") {
+                if resolution.is_some() {
+                    return Err(CatalogError::InvalidApplication("duplicate desktop launch resolution".into()));
+                }
+                resolution = Some(parse_launch_resolution(value)
+                    .map_err(|error| CatalogError::InvalidApplication(error.to_string()))?);
+            }
+        }
+    }
+    Ok(resolution)
+}
+
+fn with_launch_resolution(desktop: String, resolution: &str) -> String {
+    let mut result = String::new();
+    for line in desktop.lines() {
+        result.push_str(line);
+        if line.starts_with("Exec=") {
+            result.push_str(" --resolution ");
+            result.push_str(resolution);
+        }
+        result.push('\n');
+    }
+    result.push_str(&format!("X-Droidloom-Resolution={resolution}\n"));
+    result
 }
 
 fn desktop_entry(application: &AndroidApplication, user: u32, icon: Option<&str>) -> String {
@@ -809,6 +856,31 @@ mod tests {
         let third = reconcile(&paths, &mut source).unwrap();
         assert_eq!(third.entries_removed, 2);
         assert_eq!(fs::read_dir(&paths.applications).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn reconciliation_preserves_validated_launch_resolution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = fixture_paths(temporary.path());
+        let mut source = FixtureSource {
+            user: 0,
+            applications: vec![application("Game", "org.example.game", "org.example.game/.Main", "one")],
+            icon_requests: 0,
+        };
+        reconcile(&paths, &mut source).unwrap();
+        let path = paths.applications.join(format!("droidloom-{}.desktop", application_id(0, "org.example.game/.Main")));
+        let mut desktop = fs::read_to_string(&path).unwrap();
+        desktop.push_str("X-Droidloom-Resolution=2560x1440\n");
+        fs::write(&path, desktop).unwrap();
+        source.applications[0].name = "Renamed Game".into();
+        reconcile(&paths, &mut source).unwrap();
+        let desktop = fs::read_to_string(&path).unwrap();
+        assert!(desktop.contains("Name=Renamed Game\n"));
+        assert!(desktop.contains("--user 0 --resolution 2560x1440\n"));
+        assert_eq!(desktop.matches("X-Droidloom-Resolution=").count(), 1);
+        assert_eq!(reconcile(&paths, &mut source).unwrap().launchers_updated, 0);
+        fs::write(&path, "[Desktop Entry]\nX-Droidloom-Resolution=2560x1440 --other\n").unwrap();
+        assert!(preserved_resolution(&path).is_err());
     }
 
     #[test]

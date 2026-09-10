@@ -1,5 +1,6 @@
 //! Offline optional-package preparation. Never installs or starts Droidloom.
 mod archive;
+mod erofs;
 mod ext4;
 mod import;
 mod package;
@@ -32,7 +33,7 @@ struct Cli {
 enum Action {
     /// Display archive identity and metadata without executing installer scripts.
     Inspect { archive: PathBuf },
-    /// Import APKs and derive a verified add-on from raw ext4 base images.
+    /// Import APKs and derive a verified add-on from ext4 or EROFS base images.
     Build {
         #[arg(long)]
         archive: PathBuf,
@@ -52,9 +53,23 @@ enum Action {
         aapt2: PathBuf,
         #[arg(long, default_value = "apksigner")]
         apksigner: PathBuf,
+        /// Native Play Services APK, verified against the archive's signing certificate.
+        #[arg(long)]
+        play_services_apk: Option<PathBuf>,
+        /// Native Play Store APK, verified against the archive's signing certificate.
+        #[arg(long)]
+        play_store_apk: Option<PathBuf>,
         /// Include Google Contacts and Calendar sync adapters.
         #[arg(long)]
         sync_adapters: bool,
+    },
+    /// Internal rootless EROFS assembly worker.
+    #[command(hide = true)]
+    DeriveErofs {
+        source: PathBuf,
+        destination: PathBuf,
+        additions: PathBuf,
+        tree: PathBuf,
     },
     /// Verify an add-on against the exact installed base without starting Android.
     Verify {
@@ -126,6 +141,8 @@ fn execute() -> Result<()> {
             output,
             aapt2,
             apksigner,
+            play_services_apk,
+            play_store_apk,
             sync_adapters,
         } => {
             build(
@@ -136,7 +153,22 @@ fn execute() -> Result<()> {
                 &output,
                 &aapt2,
                 &apksigner,
+                play_services_apk.as_deref(),
+                play_store_apk.as_deref(),
                 sync_adapters,
+            )?;
+        }
+        Action::DeriveErofs {
+            source,
+            destination,
+            additions,
+            tree,
+        } => {
+            erofs::derive_worker(
+                &source,
+                &destination,
+                &serde_json::from_slice(&fs::read(additions)?)?,
+                &tree,
             )?;
         }
         Action::Verify { addon, base } => {
@@ -177,6 +209,8 @@ fn build(
     output: &Path,
     aapt2: &Path,
     apksigner: &Path,
+    play_services_apk: Option<&Path>,
+    play_store_apk: Option<&Path>,
     sync_adapters: bool,
 ) -> Result<()> {
     new_output(output)?;
@@ -198,15 +232,15 @@ fn build(
         })
         .collect();
     for image in inputs.values() {
-        if !ext4::is_ext4(image)? {
+        if !ext4::is_ext4(image)? && !erofs::is_erofs(image)? {
             return Err(format!(
-                "{} is not raw ext4; this ARM-first builder currently requires raw ext4 inputs",
+                "{} is not a supported raw ext4 or EROFS image",
                 image.display()
             )
             .into());
         }
     }
-    let props = archive::properties(&String::from_utf8(ext4::read_file(
+    let props = archive::properties(&String::from_utf8(read_image_file(
         &inputs["system"],
         "/system/build.prop",
         65_536,
@@ -226,7 +260,7 @@ fn build(
         .get("ro.build.version.incremental")
         .ok_or("base system has no build revision")?;
     for role in ADDON_ROLES {
-        let partition = archive::properties(&String::from_utf8(ext4::read_file(
+        let partition = archive::properties(&String::from_utf8(read_image_file(
             &inputs[role],
             "/etc/build.prop",
             65_536,
@@ -251,6 +285,9 @@ fn build(
         aapt2,
         apksigner,
         sync_adapters,
+        architecture,
+        play_services_apk,
+        play_store_apk,
     )?;
     if imported.architecture != architecture {
         return Err("LiteGapps and base image architectures differ".into());
@@ -273,7 +310,12 @@ fn build(
             })
             .collect();
         let destination = stage.join("images").join(format!("{role}.img"));
-        ext4::derive(
+        let derive = if erofs::is_erofs(&inputs[role])? {
+            erofs::derive
+        } else {
+            ext4::derive
+        };
+        derive(
             &inputs[role],
             &destination,
             &files,
@@ -305,7 +347,7 @@ fn build(
     write(
         &stage.join("import-report.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"files": imported.files, "excluded": imported.excluded}),
+            &serde_json::json!({"files": imported.files, "excluded": imported.excluded, "native_apk_sources": imported.native_apk_sources}),
         )?,
     )?;
     write(&stage.join("LICENSE.LiteGapps"), imported.license)?;
@@ -319,4 +361,18 @@ fn build(
         "Activation requires the updated supervisor and fresh Android data. Nothing was installed or started."
     );
     Ok(())
+}
+
+fn read_image_file(image: &Path, path: &str, maximum: u64) -> Result<Vec<u8>> {
+    if erofs::is_erofs(image)? {
+        capture(
+            std::process::Command::new("dump.erofs")
+                .arg("--cat")
+                .arg(format!("--path={path}"))
+                .arg(image),
+            maximum,
+        )
+    } else {
+        ext4::read_file(image, path, maximum)
+    }
 }

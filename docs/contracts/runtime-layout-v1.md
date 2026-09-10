@@ -50,6 +50,8 @@ and both derived outputs to exact hashes, Android SDK and native architecture.
 Its files and ancestors must be root-owned, without symlinks or group/other write
 access. Missing or mismatched selected images fail startup. Omission uses the
 base images; installing the optional package does not edit the specification.
+Read-only Android image mounts detect raw ext4 or EROFS from the filesystem
+magic, including the selected add-on images.
 
 The first GApps activation refuses already initialized Android data. A marker
 inside the cell-owned data image records selected packages, signers and manifest
@@ -150,3 +152,28 @@ Teardown first refuses new launches, terminates the pidfd-owned namespace,
 waits with a bound, kills the remaining cgroup if necessary, removes network
 policy/veth, unmounts the private tree, removes runtime paths, and finally
 releases the cgroup. Repeating teardown must be safe.
+
+## Lifecycle readiness and progress
+
+`running` means the namespace owner is alive. Android readiness additionally
+requires `sys.boot_completed=1`, a running `droidloom-input-bridge`, the task
+launcher executable, and the task-control socket. Public `droidloomctl start`
+and `restart` wait for readiness; `--no-wait` and internal `--cell` orchestration
+retain service/cell-only startup. `droidloomctl wait` observes readiness without
+starting or restarting the cell. `status` reports the current observed stage.
+
+Legacy lifecycle requests remain bare JSON objects with a single JSON response.
+Interactive clients opt into progress with `{"request": <control request>}`.
+The daemon sends newline-delimited `{"progress": "..."}` frames followed by the
+normal response object. APK file descriptors still accompany the first request
+byte and are accepted only for installation. UID authorization is unchanged;
+boot observations are emitted only after authorizing the cell owner.
+
+Boot waiting is bounded at 120 seconds, with short timeouts on readiness probes.
+Task-launcher retries share a 120-second execution deadline; application catalog
+and package-manager commands use 110 seconds. Timed-out subprocess groups receive
+a forced kill after a short grace period. Clients enforce a 250-second wall-clock
+request deadline, including queue time, even if progress or partial bytes keep
+arriving. Socket writes are bounded, and a full accept queue fails promptly.
+Client disconnection does not tear down Android. A timed-out client's operation
+may still complete, so its error advises checking the result before retrying.

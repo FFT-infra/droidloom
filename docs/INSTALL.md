@@ -54,8 +54,33 @@ droidloomctl start
 ```
 
 This sudo command performs the same privileged setup described above. First boot
-can take longer while Android initializes its data. A running service does not
-necessarily mean Android's package manager has finished booting.
+can take longer while Android initializes its data. `start` and `restart` wait
+for Android readiness before printing `Droidloom is running; Android is ready`.
+They show the observed boot stage: Android init, boot completion (including
+runtime and boot-animation service states when available), and Droidloom's input
+and task services. These are readiness observations, not a percentage estimate.
+
+Boot readiness has a 120-second deadline. While a command waits, progress is
+repeated every 10 seconds with elapsed time and the remaining request budget.
+Application listing, launch and installation identify their operation after
+boot, with a separate bounded execution time. A lifecycle request, including
+time queued behind another request, stops waiting after 250 seconds. Service
+startup is a separate step bounded at 160 seconds; authentication prompts wait
+for your response.
+
+If Android does not become ready, the command exits with `Android looks stuck`,
+the last observed boot stage, and journal commands. A readiness timeout does not
+stop Android. After inspecting the logs you can follow its progress again:
+
+```console
+droidloomctl wait
+```
+
+Use `droidloomctl start --no-wait` when you only want to start the services;
+its success message explicitly says Android readiness has not been checked.
+`--json` keeps a single JSON result on stdout and suppresses progress messages.
+If a request times out while an app operation is in progress, it may still finish
+in the background; check its result before retrying.
 
 ## 4. Try a built-in app
 
@@ -106,6 +131,18 @@ usually means the APK needs an unsupported CPU architecture. A `.apkm`, `.apks`
 or `.xapk` bundle is not a standalone APK: renaming it will not work. Split-package
 and additional game-data installation are not covered by this preview guide.
 
+Android storage is limited by the cell's `data.img`, independently of the free
+space on the Linux host. First-time setup creates a 12 GiB data disk, which can
+be too small for games that download additional assets. If Android reports
+insufficient storage, check `/data` and `/storage/emulated/0` inside the cell.
+To enlarge an existing disk, stop Droidloom, verify its loop devices are detached,
+back up the selected `data_dir` and cell configuration, run an offline writable
+ext4 check, enlarge the image file, and grow its filesystem with `resize2fs`.
+Check the filesystem again before restarting. Growth preserves installed apps
+and accounts; package setup retains existing image sizes. A sparse image still
+needs enough host space for future writes. The development desktop's disk was
+expanded to 64 GiB for NTE's additional assets.
+
 ## 6. Launch the installed app
 
 The desktop catalog updates automatically. Find the app in your desktop launcher
@@ -130,6 +167,37 @@ x86_64 APK. APKs are not bundled with Droidloom. Complete app registration and
 first-run prompts yourself. Revision 11 handles Fruit Ninja's launcher and
 age-screen handoffs without requiring an activity-specific retry; earlier
 revisions are affected by the [known launch issue](KNOWN_ISSUES.md).
+
+For games that choose their rendering size only at startup, set the initial
+Android task resolution in pixels:
+
+```console
+droidloomctl launch com.hottagames.nte \
+  --component com.hottagames.nte/com.epicgames.unreal.SplashActivity \
+  --resolution 2560x1440
+```
+
+`--resolution WIDTHxHEIGHT` restarts that application and supplies its task
+bounds before Android starts the activity. Each dimension must be between 1 and
+16384. Ordinary launches keep their existing behavior. This sets the Android
+launch size; game-specific rendering-scale settings remain under the app's control.
+
+To keep a resolution in a generated `.desktop` launcher, append the option to
+its `Exec=` line and add `X-Droidloom-Resolution=2560x1440` in the `[Desktop Entry]`
+section. The catalog validates and preserves that key during refreshes, including
+app updates, and regenerates the matching command-line option.
+
+NTE 1.3.1 also needs its Unreal mobile render scale overridden: a 2560x1440
+Android window alone still produced approximately 1440x792 game buffers. On the
+tested installation, its existing Unreal launch-file reader accepts
+`-mcsf=0 -mobileresx=2560 -mobileresy=1440` in
+`/data/user/0/com.hottagames.nte/files/UnrealGame/HT/UECommandLine.txt`, appended
+to the original project/map command line. Preserve an existing launch file before
+changing it and restart only NTE afterward. Do not replace its encrypted
+`GameUserSettings.ini` or `Engine.ini` with plain-text Unreal settings.
+The native-resolution launch produced 2536x1392 game buffers inside the desktop's
+2542x1397 decorated work area; fullscreen removes that work-area constraint.
+This is an NTE-specific setup, separate from the general `--resolution` option.
 
 ## Stop, restart, upgrade and remove
 
@@ -163,6 +231,7 @@ droidloomctl status
 droidloomctl logs -n 500
 droidloomctl crashes com.whatsapp
 journalctl --user -u droidloom.service -n 100 --no-pager
+journalctl -b -u droidloomd.service -n 200 --no-pager
 ```
 
 These commands do not require sudo. Replace the example package in crash reports

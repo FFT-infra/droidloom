@@ -74,6 +74,8 @@ pub enum IdMapKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MountKind {
+    /// Android image whose EROFS or raw ext4 format is detected before mounting.
+    ReadOnlyAndroidImage,
     /// Read-only EROFS Android partition image.
     ErofsImage,
     /// Read-only raw ext4 Android partition image.
@@ -559,14 +561,9 @@ fn mount_operations(spec: &CellSpec) -> Vec<LinuxOperation> {
 }
 
 fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
-    let addon_kind = if spec.gapps_dir.is_some() {
-        MountKind::Ext4Image
-    } else {
-        MountKind::ErofsImage
-    };
     vec![
         mount(
-            MountKind::ErofsImage,
+            MountKind::ReadOnlyAndroidImage,
             Some(spec.image_dir.join("images/system.img")),
             Path::new("/"),
             true,
@@ -575,7 +572,7 @@ fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             false,
         ),
         mount(
-            addon_kind,
+            MountKind::ReadOnlyAndroidImage,
             Some(crate::gapps::partition_image(spec, "system_ext")),
             Path::new("/system_ext"),
             true,
@@ -584,7 +581,7 @@ fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             false,
         ),
         mount(
-            addon_kind,
+            MountKind::ReadOnlyAndroidImage,
             Some(crate::gapps::partition_image(spec, "product")),
             Path::new("/product"),
             true,
@@ -898,7 +895,7 @@ mod tests {
         for operation in &addon[1..3] {
             assert!(matches!(
                 operation,
-                LinuxOperation::Mount { kind: MountKind::Ext4Image, .. }
+                LinuxOperation::Mount { kind: MountKind::ReadOnlyAndroidImage, .. }
             ));
         }
         let encoded = serde_json::to_string(&addon).unwrap();
@@ -1164,7 +1161,7 @@ mod tests {
             .iter()
             .filter_map(|operation| match operation {
                 LinuxOperation::Mount {
-                    kind: MountKind::ErofsImage | MountKind::Ext4Image,
+                    kind: MountKind::ErofsImage | MountKind::Ext4Image | MountKind::ReadOnlyAndroidImage,
                     target,
                     read_only,
                     ..

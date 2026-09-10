@@ -15,6 +15,14 @@
   image-only updates require a Droidloom restart, not a phone reboot.
 - This is an ARM64 device; the x86_64 desktop pacman packages do not apply.
 
+## Play Store catalog reset
+
+After changing Android capabilities, restarting Droidloom alone may leave stale
+Play Store compatibility results. Inside Android, run
+`/system/bin/cmd package clear --user 0 --cache-only com.android.vending`, then
+`/system/bin/cmd activity force-stop com.android.vending` and reopen Play Store.
+Clear only the cache; preserve Google account and app data.
+
 ## Commands
 
 - Build pacman packages: `cargo run --locked -j 1 -p droidloom-package -- build`
@@ -28,6 +36,15 @@ compiler processes; the Rust builder enforces this for nested Android builds.
 Use Rust for new tooling; shell is reserved for required upstream interfaces and
 PKGBUILD functions. Explain why administrator access is needed before requesting
 it. Package builds use rootless Podman and need no host sudo.
+
+## Translation benchmarks
+
+“Translation benchmarks” means `droidloom-translation-bench` for Digitalis/Berberis
+ARM64-to-x86_64: correctness stress followed by seven workloads across three modes.
+See [run/build/compare instructions](docs/BUILDING.md#translation-stress-and-performance-benchmarks).
+Rebuild host tests after translator edits; compare saved runs, accounting for noise.
+Keep at least two cores available; pin benchmarks to one logical CPU (currently 6).
+Local reference: `.work/translation/bench-reference/result.json`; keep results out of Git.
 
 ## Useful files
 

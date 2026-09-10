@@ -684,6 +684,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "droidloom-translation-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "droidloom-transport"
 version = "0.1.0"
 dependencies = [

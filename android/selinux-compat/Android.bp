@@ -10,4 +10,11 @@ cc_library_shared {
         "-Werror",
     ],
     version_script: "exported.map.txt",
+    arch: {
+        x86_64: {
+            // The /newroot procfs alias belongs to the ARM64 phone runtime.
+            // Desktop applications must resolve readlink to ordinary bionic.
+            version_script: "exported.x86_64.map.txt",
+        },
+    },
 }

@@ -27,6 +27,7 @@ members = [
     "tools/droidloom-mesa",
     "tools/droidloom-source",
     "tools/droidloom-dmabuf-probe",
+    "tools/droidloom-translation-bench",
 ]
 resolver = "3"
 

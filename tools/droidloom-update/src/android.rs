@@ -169,6 +169,10 @@ const PATCHES: &[(&str, &str)] = &[
         "frameworks/base",
         "android/framework/0002-droidloom-routed-touch-configuration.patch",
     ),
+    (
+        "frameworks/base",
+        "android/framework/0003-droidloom-launch-resolution.patch",
+    ),
 ];
 #[derive(Serialize, Deserialize)]
 struct Original {

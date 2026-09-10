@@ -7,11 +7,13 @@ use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
+    thread,
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
 use droidloom_supervisor::control::{
-    ControlRequest, DEFAULT_CELL_SPEC, DEFAULT_CONTROL_SOCKET, request,
+    ControlRequest, DEFAULT_CELL_SPEC, DEFAULT_CONTROL_SOCKET, request, request_with_progress,
 };
 use droidloom_window_policy::{
     LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore, WindowPreference,
@@ -54,6 +56,9 @@ enum Command {
     },
     /// Start Droidloom, including Android, native windows, and the app catalog.
     Start {
+        /// Return after starting the services, without waiting for Android readiness.
+        #[arg(long)]
+        no_wait: bool,
         /// Window mode: desktop (default) or mobile (fill available space).
         #[arg(long, default_value = "desktop")]
         mode: SessionMode,
@@ -65,6 +70,9 @@ enum Command {
     Stop,
     /// Restart the complete Droidloom runtime.
     Restart {
+        /// Return after restarting the services, without waiting for Android readiness.
+        #[arg(long)]
+        no_wait: bool,
         /// Window mode; omitted preserves the current session mode.
         #[arg(long)]
         mode: Option<SessionMode>,
@@ -74,6 +82,8 @@ enum Command {
     },
     /// Report whether the cell is running.
     Status,
+    /// Wait for Android boot, showing progress and a deadline without restarting it.
+    Wait,
     /// Show recent Android logs, optionally filtered by an installed app's UID.
     Logs {
         /// Android package, including retained logs after its process exits.
@@ -100,6 +110,9 @@ enum Command {
         /// Optional flattened PACKAGE/ACTIVITY component.
         #[arg(long)]
         component: Option<String>,
+        /// Restart this app with initial Android task size WIDTHxHEIGHT pixels.
+        #[arg(long, value_parser = droidloom_supervisor::control::parse_launch_resolution)]
+        resolution: Option<String>,
         /// Android user identifier.
         #[arg(long, default_value_t = 0)]
         user: u32,
@@ -156,17 +169,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     if !cli.cell && cli.socket == PathBuf::from(DEFAULT_CONTROL_SOCKET) {
         let operation = match &cli.command {
-            Command::Start { spec, mode } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => {
-                Some(("start", Some(*mode)))
+            Command::Start {
+                spec,
+                mode,
+                no_wait,
+            } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => {
+                Some(("start", Some(*mode), *no_wait))
             }
-            Command::Stop => Some(("stop", None)),
-            Command::Restart { spec, mode } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => {
-                Some(("restart", *mode))
-            }
+            Command::Stop => Some(("stop", None, true)),
+            Command::Restart {
+                spec,
+                mode,
+                no_wait,
+            } if spec == &PathBuf::from(DEFAULT_CELL_SPEC) => Some(("restart", *mode, *no_wait)),
             _ => None,
         };
-        if let Some((operation, mode)) = operation {
-            return session_lifecycle(operation, cli.json, mode);
+        if let Some((operation, mode, no_wait)) = operation {
+            return session_lifecycle(operation, cli.json, mode, no_wait);
         }
         if matches!(cli.command, Command::Status) && !cli.socket.exists() {
             if cli.json {
@@ -180,8 +199,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-    let response = if let Command::Install { apk, user } = &cli.command {
-        droidloom_supervisor::control::install_apk(&cli.socket, apk, *user)?
+    let mut report = |message: &str| {
+        if !cli.json {
+            eprintln!("{message}");
+        }
+    };
+    let wait_after_start = !cli.cell
+        && matches!(
+            cli.command,
+            Command::Start { no_wait: false, .. } | Command::Restart { no_wait: false, .. }
+        );
+    let mut response = if let Command::Install { apk, user } = &cli.command {
+        droidloom_supervisor::control::install_apk_with_progress(
+            &cli.socket,
+            apk,
+            *user,
+            &mut report,
+        )?
     } else {
         let control_request = match cli.command {
             Command::Install { .. } => unreachable!("handled with its APK file descriptor"),
@@ -206,6 +240,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Command::Stop => ControlRequest::Stop,
             Command::Restart { spec, .. } => ControlRequest::Restart { spec },
             Command::Status => ControlRequest::Status,
+            Command::Wait => ControlRequest::WaitReady,
             Command::Logs {
                 package,
                 lines,
@@ -225,12 +260,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Command::Launch {
                 package,
                 component,
+                resolution,
                 user,
                 spec,
             } => ControlRequest::Launch {
                 spec,
                 package,
                 component,
+                resolution,
                 user,
             },
             Command::Applications { user } => ControlRequest::ListApplications { user },
@@ -282,8 +319,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         };
-        request(&cli.socket, &control_request)?
+        if cli.cell {
+            request(&cli.socket, &control_request)?
+        } else {
+            request_with_progress(&cli.socket, &control_request, &mut report)?
+        }
     };
+    if response.ok && wait_after_start {
+        response = request_with_progress(&cli.socket, &ControlRequest::WaitReady, &mut report)?;
+    }
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else if response.ok {
@@ -317,11 +361,13 @@ fn session_lifecycle(
     operation: &str,
     json: bool,
     requested_mode: Option<SessionMode>,
+    no_wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if operation != "stop" && PathBuf::from("/usr/share/droidloom/package.json").is_file() {
-        let status = droidloom_cpu_placement::command("/usr/lib/droidloom/droidloom-package-helper")
-            .arg("prepare")
-            .status()?;
+        let status =
+            droidloom_cpu_placement::command("/usr/lib/droidloom/droidloom-package-helper")
+                .arg("prepare")
+                .status()?;
         if !status.success() {
             return Err("Droidloom setup did not complete; the runtime was not started".into());
         }
@@ -399,9 +445,35 @@ fn session_lifecycle(
             }
         }
     }
-    let status = droidloom_cpu_placement::command("systemctl")
+    if !json {
+        eprintln!("Waiting for Droidloom services to {operation} (up to 160 seconds)...");
+    }
+    let mut child = droidloom_cpu_placement::command("systemctl")
         .args(["--user", operation, "droidloom.service"])
-        .status()?;
+        .spawn()?;
+    let started = Instant::now();
+    let mut next_update = Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(160) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Droidloom services did not {operation} within 160 seconds. The systemd job may still be running. Check the logs with:\n  journalctl --user -b -u droidloom.service -n 100 --no-pager\n  journalctl -b -u droidloomd.service -n 200 --no-pager").into());
+        }
+        if started.elapsed() >= next_update {
+            if !json {
+                eprintln!(
+                    "Waiting for Droidloom services to {operation} ({} seconds elapsed; {} seconds remaining)...",
+                    started.elapsed().as_secs(),
+                    160 - started.elapsed().as_secs()
+                );
+            }
+            next_update += Duration::from_secs(10);
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     if !status.success() {
         return Err(
             format!("{operation} failed; see journalctl --user -u droidloom.service").into(),
@@ -409,8 +481,22 @@ fn session_lifecycle(
     }
     let message = if operation == "stop" {
         "Droidloom is stopped"
+    } else if no_wait {
+        "Droidloom services are running; Android readiness has not been checked. Use `droidloomctl wait` to follow boot progress."
     } else {
-        "Droidloom is running"
+        let response = request_with_progress(
+            &PathBuf::from(DEFAULT_CONTROL_SOCKET),
+            &ControlRequest::WaitReady,
+            &mut |message| {
+                if !json {
+                    eprintln!("{message}");
+                }
+            },
+        )?;
+        if !response.ok {
+            return Err(response.message.into());
+        }
+        "Droidloom is running; Android is ready"
     };
     if json {
         println!(

@@ -19,8 +19,10 @@ pub struct Imported {
     pub tree: PathBuf,
     pub license: Vec<u8>,
     pub excluded: Vec<String>,
+    pub native_apk_sources: BTreeMap<String, FileDigest>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     archive_path: &Path,
     expected: &str,
@@ -28,6 +30,9 @@ pub fn prepare(
     aapt2: &Path,
     apksigner: &Path,
     sync: bool,
+    target_architecture: Architecture,
+    play_services_apk: Option<&Path>,
+    play_store_apk: Option<&Path>,
 ) -> Result<Imported> {
     if fs::metadata(archive_path)?.len() > archive::MAX_ARCHIVE {
         return Err("LiteGapps archive exceeds 512 MiB".into());
@@ -102,6 +107,7 @@ pub fn prepare(
     let mut packages = BTreeMap::new();
     let mut files = BTreeMap::new();
     let mut included = BTreeSet::new();
+    let mut native_apk_sources = BTreeMap::new();
     for (package, path) in CORE_APPS
         .into_iter()
         .chain(SYNC_APPS.into_iter().filter(|_| sync))
@@ -112,15 +118,68 @@ pub fn prepare(
         }
         let destination = tree.join(path);
         archive::copy_member(&payload, &member, &destination, archive::MAX_ARCHIVE)?;
-        let (apk, requested) =
+        let (original, original_requested) =
             inspect_apk(&destination, package, path, architecture, aapt2, apksigner)?;
+        let replacement = match package {
+            "com.google.android.gms" => play_services_apk,
+            "com.android.vending" => play_store_apk,
+            _ => None,
+        };
+        let (apk, requested) = if let Some(source) = replacement {
+            let original_path = work.join(format!("{package}.archive.apk"));
+            fs::rename(&destination, &original_path)?;
+            let digest = FileDigest::read(source)?;
+            if digest.size > archive::MAX_ARCHIVE {
+                return Err("replacement APK exceeds 512 MiB".into());
+            }
+            fs::copy(source, &destination)?;
+            if FileDigest::read(&destination)? != digest {
+                return Err("replacement APK changed while copying".into());
+            }
+            let (apk, requested) = inspect_apk(
+                &destination,
+                package,
+                path,
+                target_architecture,
+                aapt2,
+                apksigner,
+            )?;
+            let lineage = if original.signer_sha256 != apk.signer_sha256 {
+                let output = text(
+                    Command::new(apksigner)
+                        .env("JAVA_TOOL_OPTIONS", "-XX:ActiveProcessorCount=1")
+                        .args(["lineage", "--print-certs", "--in"])
+                        .arg(&original_path),
+                )?;
+                output
+                    .lines()
+                    .filter_map(|line| line.split_once(" in lineage certificate SHA-256 digest: "))
+                    .filter(|(prefix, _)| prefix.starts_with("Signer #"))
+                    .map(|(_, digest)| digest.trim().to_ascii_lowercase())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            verify_replacement(&original, &apk, &lineage)?;
+            native_apk_sources.insert(package.to_owned(), digest);
+            (apk, requested)
+        } else {
+            let abi = match target_architecture {
+                Architecture::Aarch64 => "arm64-v8a",
+                Architecture::X86_64 => "x86_64",
+            };
+            if !original.native_abis.is_empty() && !original.native_abis.iter().any(|s| s == abi) {
+                return Err(format!("{package} needs a native {abi} replacement APK").into());
+            }
+            included.insert(member.clone());
+            (original, original_requested)
+        };
         files.insert(path.to_owned(), apk.digest.clone());
         packages.insert(
             package.to_owned(),
             (path.split('/').next().unwrap().to_owned(), requested),
         );
         apks.push(apk);
-        included.insert(member);
     }
     for (member, directory) in &members {
         if *directory {
@@ -182,7 +241,7 @@ pub fn prepare(
         .map(|(name, _)| name)
         .collect();
     Ok(Imported {
-        architecture,
+        architecture: target_architecture,
         version,
         archive: digest,
         apks,
@@ -190,7 +249,28 @@ pub fn prepare(
         tree,
         license,
         excluded,
+        native_apk_sources,
     })
+}
+
+fn verify_replacement(original: &Apk, replacement: &Apk, lineage: &[String]) -> Result<()> {
+    let original_signers: BTreeSet<_> = original.signer_sha256.iter().collect();
+    let replacement_signers: BTreeSet<_> = replacement.signer_sha256.iter().collect();
+    // apksigner verifies the APK and its signed proof of rotation before this
+    // ancestry check. This is an input selection, never a /data downgrade.
+    let ancestor = original.signer_sha256.len() == 1
+        && replacement.signer_sha256.len() == 1
+        && lineage.last() == original.signer_sha256.first()
+        && lineage.contains(&replacement.signer_sha256[0]);
+    if original.package != replacement.package
+        || (original_signers != replacement_signers && !ancestor)
+    {
+        return Err(
+            "native replacement must have the original package ID and verified signing ancestry"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn quoted(line: &str, key: &str) -> Option<String> {
@@ -305,6 +385,30 @@ fn inspect_apk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replacements_require_same_package_and_verified_signing_ancestry() {
+        let mut original = Apk {
+            package: "com.google.android.gms".into(),
+            path: CORE_APPS[1].1.into(),
+            version_code: 1,
+            min_sdk: 35,
+            native_abis: vec!["arm64-v8a".into()],
+            signer_sha256: vec!["b".repeat(64)],
+            digest: FileDigest {
+                size: 1,
+                sha256: "c".repeat(64),
+            },
+        };
+        let mut replacement = original.clone();
+        verify_replacement(&original, &replacement, &[]).unwrap();
+        replacement.signer_sha256 = vec!["a".repeat(64)];
+        assert!(verify_replacement(&original, &replacement, &[]).is_err());
+        let lineage = vec!["a".repeat(64), "b".repeat(64)];
+        verify_replacement(&original, &replacement, &lineage).unwrap();
+        assert!(verify_replacement(&original, &replacement, &["a".repeat(64)]).is_err());
+        original.package = "unrelated".into();
+        assert!(verify_replacement(&original, &replacement, &lineage).is_err());
+    }
     #[test]
     fn supports_old_and_current_aapt_sdk_fields_without_accepting_codenames() {
         assert_eq!(minimum_sdk("sdkVersion:'35'\n").unwrap(), 35);

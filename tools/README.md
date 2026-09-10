@@ -28,7 +28,21 @@ source-generation roles.
 | `droidloom-navigation-services` | Services-JAR provenance used by focused Soong and ARM64 deployment scripts. |
 | `droidloom-systemui-stubs` | Regenerate SystemUI Binder adapters when pinned AOSP interfaces change. The Rust builder checks these adapters. |
 | `droidloom-dmabuf-probe` | GLES/DMA-BUF/explicit-sync diagnostic; does not validate a complete Android app. |
+| `droidloom-translation-bench` | Repeat Digitalis host correctness tests, time seven guest workloads across three translation modes, and compare saved runs. See [translation benchmarking](../docs/BUILDING.md#translation-stress-and-performance-benchmarks). |
+| `droidloom-inspect.rs` | Optional read-only diagnostics for the development workstation's u1000 cell; fixed `features`, `properties`, and `configuration` modes. |
 
 The Rust updater and package workflow own x86_64 installation, init projection
 and Mesa builds. New orchestration should be Rust; legacy scripts are not a
 template for new tooling.
+
+The workstation diagnostic helper can be built with
+`rustc --edition 2024 -O tools/droidloom-inspect.rs -o /tmp/droidloom-inspect`.
+Its optional administrator installation is `/usr/local/sbin/droidloom-inspect`,
+owned by root with mode 0755. A sudoers rule may grant UID 1000's user the three
+exact mode arguments above; validate it with `visudo -cf` before installation.
+Use `sudo -n /usr/local/sbin/droidloom-inspect features` to inspect the live
+feature list. The helper takes no PID, path, shell or extra command arguments,
+selects init only from `/run/netns/droidloom-u1000`, pins its process resources,
+clears the execution environment and bounds commands to 15 seconds.
+It is deliberately workstation-specific and is not installed by the packages.
+Remove `/etc/sudoers.d/droidloom-inspect` to revoke the local passwordless grant.

@@ -42,6 +42,8 @@ pub struct LaunchRequest {
     pub package: String,
     /// Optional flattened component. When absent Android resolves the package's launcher activity.
     pub component: Option<String>,
+    /// Initial Android task width and height in pixels; restart the app when set.
+    pub resolution: Option<(u32, u32)>,
     /// Android user identifier.
     pub user: u32,
 }
@@ -141,6 +143,7 @@ pub fn bind_existing_task(package: &str, user: u32, task: u64) -> Result<TaskBin
     validate_request(&LaunchRequest {
         package: package.into(),
         component: None,
+        resolution: None,
         user,
     })?;
     if user != 0 || task == 0 || task > i32::MAX as u64 {
@@ -542,6 +545,9 @@ fn start_activity(
             "--user",
             &user_argument,
         ]);
+        if let Some((width, height)) = request.resolution {
+            command.args(["-S", "--droidloom-resolution", &format!("{width}x{height}")]);
+        }
         append_launch_intent(&mut command, request);
         match checked_activity_output(&command.output()?, "start-activity") {
             Ok(output) => {
@@ -671,6 +677,11 @@ fn command_as_android_shell(path: &Path) -> Command {
 }
 
 fn validate_request(request: &LaunchRequest) -> Result<(), LaunchError> {
+    if let Some((width, height)) = request.resolution {
+        if !(1..=16_384).contains(&width) || !(1..=16_384).contains(&height) {
+            return Err(LaunchError::InvalidRequest("resolution dimensions must be in 1..=16384".into()));
+        }
+    }
     if request.package.is_empty()
         || !request
             .package
@@ -1047,10 +1058,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolution_restarts_only_explicitly_sized_launches_before_activity_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("cmd");
+        let log = directory.path().join("args");
+        std::fs::write(&command, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'Status: ok\\nActivity: com.google.android.contacts/.Main\\nComplete\\n'\n",
+            log.display()
+        )).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut request = contacts_request();
+        start_activity(&request, &command, 0, None).unwrap();
+        assert!(!std::fs::read_to_string(&log).unwrap().contains("--droidloom-resolution"));
+        request.resolution = Some((2560, 1440));
+        start_activity(&request, &command, 0, None).unwrap();
+        let arguments = std::fs::read_to_string(&log).unwrap();
+        assert!(arguments.contains("-S\n--droidloom-resolution\n2560x1440\n"));
+        assert!(arguments.ends_with("com.google.android.contacts\n"));
+        request.resolution = Some((0, 1440));
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
     fn explicit_completed_component_needs_no_package_manager_command() {
         let request = LaunchRequest {
             package: "org.example.notes".to_owned(),
             component: Some("org.example.notes/.MainActivity".to_owned()),
+            resolution: None,
             user: 0,
         };
         // A nonexistent command also proves the shortcut spawns no process.
@@ -1133,6 +1168,7 @@ mod tests {
         let request = LaunchRequest {
             package: "com.halfbrick.fruitninjafree".into(),
             component: Some("com.halfbrick.fruitninjafree/.Launcher".into()),
+            resolution: None,
             user: 0,
         };
         discover_launch_candidates(
@@ -1256,7 +1292,7 @@ RootTask id=5 bounds=[0,0][900,1600] displayId=42 userId=0
     fn play_store_sign_in_stays_in_its_visible_owned_task() {
         let store = "com.android.vending/com.android.vending.AssetBrowserActivity";
         let auth = "com.google.android.gms/com.google.android.gms.auth.uiflows.minutemaid.MinuteMaidActivity";
-        let request = LaunchRequest { package: "com.android.vending".into(), component: None, user: 0 };
+        let request = LaunchRequest { package: "com.android.vending".into(), component: None, resolution: None, user: 0 };
         let task = |id, owner, top, visible, display, user| format!(
             "RootTask id={id} displayId={display} userId={user}\n  taskId={id}: {owner}/.Main userId={user} visible={visible} topActivity=ComponentInfo{{{top}}}\n"
         );
@@ -1291,6 +1327,7 @@ RootTask id=5 bounds=[0,0][900,1600] displayId=42 userId=0
         LaunchRequest {
             package: "com.google.android.contacts".into(),
             component: None,
+            resolution: None,
             user: 0,
         }
     }
@@ -1518,6 +1555,7 @@ RootTask id=5 bounds=[0,0][900,1600] displayId=42 userId=0
         let request = LaunchRequest {
             package: "org.example.notes".to_owned(),
             component: Some("org.example.other/.Main".to_owned()),
+            resolution: None,
             user: 0,
         };
         assert!(matches!(

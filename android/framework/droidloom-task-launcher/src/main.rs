@@ -54,13 +54,14 @@ fn arguments() -> Result<Operation, String> {
 fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operation, String> {
     let mut package = None;
     let mut component = None;
+    let mut resolution = None;
     let mut user = 0;
     let mut task = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--set-density"
-                if package.is_none() && component.is_none() && user == 0 && task.is_none() =>
+                if package.is_none() && component.is_none() && resolution.is_none() && user == 0 && task.is_none() =>
             {
                 let dpi = arguments
                     .next()
@@ -78,6 +79,19 @@ fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operati
                         .next()
                         .ok_or_else(|| "--component requires PACKAGE/ACTIVITY".to_owned())?,
                 );
+            }
+            "--resolution" if resolution.is_none() => {
+                let value = arguments.next().ok_or("--resolution requires WIDTHxHEIGHT")?;
+                let (width, height) = value.split_once('x').ok_or("resolution must be WIDTHxHEIGHT")?;
+                let dimension = |value: &str| -> Result<u32, String> {
+                    if value.is_empty() || value.len() > 5 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err("resolution dimensions must be integers".into());
+                    }
+                    let size = value.parse::<u32>().map_err(|_| "invalid resolution dimension")?;
+                    if !(1..=16_384).contains(&size) { return Err("resolution dimensions must be in 1..=16384".into()); }
+                    Ok(size)
+                };
+                resolution = Some((dimension(width)?, dimension(height)?));
             }
             "--bind-task" if task.is_none() => {
                 task = Some(
@@ -107,8 +121,8 @@ fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operati
                 .to_owned()
         })?;
     if let Some(task) = task {
-        if component.is_some() {
-            return Err("--bind-task cannot start a component".into());
+        if component.is_some() || resolution.is_some() {
+            return Err("--bind-task cannot start a component or set a resolution".into());
         }
         return Ok(Operation::BindTask {
             package,
@@ -119,6 +133,7 @@ fn arguments_from(arguments: impl IntoIterator<Item = String>) -> Result<Operati
     Ok(Operation::Launch(LaunchRequest {
         package,
         component,
+        resolution,
         user,
     }))
 }
@@ -129,6 +144,16 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Result<Operation, String> {
         arguments_from(values.iter().map(|value| (*value).to_owned()))
+    }
+
+    #[test]
+    fn resolution_is_bounded_and_cannot_be_used_for_binding() {
+        let parsed = arguments(&["--resolution", "2560x1440", "org.example.game"]).unwrap();
+        assert!(matches!(parsed, Operation::Launch(LaunchRequest { resolution: Some((2560, 1440)), .. })));
+        for size in ["0x1440", "2560", "-1x1440", "2560x1440x2", "16385x1080", "1x+2", "1x2;id"] {
+            assert!(arguments(&["--resolution", size, "org.example.game"]).is_err());
+        }
+        assert!(arguments(&["--resolution", "2560x1440", "--bind-task", "1", "org.example.game"]).is_err());
     }
 
     #[test]
@@ -186,6 +211,7 @@ mod tests {
             Ok(Operation::Launch(LaunchRequest {
                 package: "com.android.settings".to_owned(),
                 component: Some("com.android.settings/com.android.settings.Settings".to_owned()),
+                resolution: None,
                 user: 0,
             }))
         );

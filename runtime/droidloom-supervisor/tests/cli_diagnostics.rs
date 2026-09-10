@@ -29,6 +29,7 @@ fn diagnostics_send_typed_requests_and_render_text_or_json() {
             let mut bytes = Vec::new();
             stream.read_to_end(&mut bytes).unwrap();
             let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let request = &request["request"];
             assert_eq!(request["command"], "diagnostics");
             assert_eq!(request["package"], "com.example.app");
             assert_eq!(request["lines"], 42);

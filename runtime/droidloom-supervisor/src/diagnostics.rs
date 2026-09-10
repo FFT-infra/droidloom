@@ -188,6 +188,9 @@ pub(super) fn capture_with_stdin(
     let stdout = read(stdout)?;
     let stderr = read(stderr)?;
     if !status.success() {
+        if matches!(status.code(), Some(124 | 137)) {
+            return Err(super::android_operation_timeout("Android command"));
+        }
         return Err(ControlError::Invalid(format!(
             "Android command failed ({status}): {stderr}{stdout}"
         )));
@@ -253,12 +256,9 @@ mod tests {
         let mut command = droidloom_cpu_placement::command("/usr/bin/timeout");
         command.args(["--kill-after=0.1s", "0.1s", "/usr/bin/sleep", "5"]);
         let started = std::time::Instant::now();
-        assert!(
-            capture(&mut command)
-                .unwrap_err()
-                .to_string()
-                .contains("124")
-        );
+        let error = capture(&mut command).unwrap_err().to_string();
+        assert!(error.contains("Android looks stuck"));
+        assert!(error.contains("journalctl -b -u droidloomd.service"));
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 }

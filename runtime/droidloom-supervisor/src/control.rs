@@ -28,6 +28,11 @@ mod diagnostics;
 #[path = "apk.rs"]
 mod apk;
 
+#[path = "control_progress.rs"]
+mod progress;
+
+use progress::{LOG_HINT, Reporter};
+
 /// Default root-owned lifecycle socket.
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/droidloom/control.sock";
 /// Default package-installed cell specification.
@@ -76,6 +81,8 @@ pub enum ControlRequest {
     },
     /// Report daemon and cell state.
     Status,
+    /// Wait for Android boot and Droidloom's input/task services to be ready.
+    WaitReady,
     /// Read bounded Android logs or a crash report from the caller's cell.
     Diagnostics {
         /// Optional installed package; filters logs or selects exit history.
@@ -96,6 +103,9 @@ pub enum ControlRequest {
         /// Optional flattened `PACKAGE/ACTIVITY` component.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         component: Option<String>,
+        /// Initial Android task extent as WIDTHxHEIGHT pixels; restarts this app.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<String>,
         /// Android user identifier.
         user: u32,
     },
@@ -213,6 +223,7 @@ struct Daemon {
     config: DaemonConfig,
     active: Option<ActiveCell>,
     last_exit: Option<String>,
+    progress: Reporter,
 }
 
 impl Daemon {
@@ -221,6 +232,7 @@ impl Daemon {
             config,
             active: None,
             last_exit: None,
+            progress: Reporter::default(),
         }
     }
 
@@ -258,6 +270,12 @@ impl Daemon {
             ControlRequest::Stop => self.stop(peer_uid),
             ControlRequest::Restart { spec } => self.restart(peer_uid, &spec),
             ControlRequest::Status => self.status(peer_uid),
+            ControlRequest::WaitReady => {
+                self.require_active_cell(peer_uid, None).and_then(|active| {
+                    wait_for_android_init(&active.spec, &self.progress)?;
+                    Ok(self.success("Droidloom is running; Android is ready"))
+                })
+            }
             ControlRequest::Diagnostics {
                 package,
                 user,
@@ -268,8 +286,16 @@ impl Daemon {
                 spec,
                 package,
                 component,
+                resolution,
                 user,
-            } => self.launch(peer_uid, &spec, &package, component.as_deref(), user),
+            } => self.launch(
+                peer_uid,
+                &spec,
+                &package,
+                component.as_deref(),
+                resolution.as_deref(),
+                user,
+            ),
             ControlRequest::ListApplications { user } => self.list_applications(peer_uid, user),
             ControlRequest::ApplicationIcon {
                 component,
@@ -342,10 +368,15 @@ impl Daemon {
     fn status(&self, peer_uid: u32) -> Result<ControlResponse, ControlError> {
         if let Some(active) = &self.active {
             authorize_uid(peer_uid, active.spec.host_uid)?;
+            let (_, phase) = android_boot_snapshot(&active.spec)?;
             Ok(self.success(format!(
-                "cell {} is running from {}",
+                "cell {} is running from {}; {}",
                 active.spec.id(),
-                active.spec_path.display()
+                active.spec_path.display(),
+                phase.map_or_else(
+                    || "Android is ready".to_owned(),
+                    |phase| format!("Android boot phase: {phase}")
+                )
             )))
         } else {
             Ok(self.success(self.last_exit.as_deref().unwrap_or("cell is stopped")))
@@ -358,9 +389,13 @@ impl Daemon {
         spec_path: &Path,
         package: &str,
         component: Option<&str>,
+        resolution: Option<&str>,
         user: u32,
     ) -> Result<ControlResponse, ControlError> {
         validate_package(package)?;
+        if let Some(resolution) = resolution {
+            parse_launch_resolution(resolution)?;
+        }
         if let Some(component) = component {
             validate_component(component)?;
             if component
@@ -375,9 +410,11 @@ impl Daemon {
         validate_android_user(user)?;
         let active = self.require_active_cell(peer_uid, Some(spec_path))?;
         let started = Instant::now();
-        let init_pid = wait_for_android_init(&active.spec)?;
+        let init_pid = wait_for_android_init(&active.spec, &self.progress)?;
         let ready_us = started.elapsed().as_micros();
-        let output = launch_in_cell(init_pid, package, component, user)?;
+        self.progress
+            .report("Android is ready. Launching the application (up to 120 seconds)...");
+        let output = launch_in_cell(init_pid, package, component, resolution, user)?;
         eprintln!(
             "droidloom-launch-host-timing package={package} user={user} ready_us={ready_us} total_us={}",
             started.elapsed().as_micros(),
@@ -397,7 +434,9 @@ impl Daemon {
     fn list_applications(&self, peer_uid: u32, user: u32) -> Result<ControlResponse, ControlError> {
         validate_android_user(user)?;
         let active = self.require_active_cell(peer_uid, None)?;
-        wait_for_android_init(&active.spec)?;
+        wait_for_android_init(&active.spec, &self.progress)?;
+        self.progress
+            .report("Android is ready. Reading the application list (up to 115 seconds)...");
         let framework_pid = android_system_server_pid(&active.spec)?;
         let output = run_application_catalog_in_cell(
             framework_pid,
@@ -438,7 +477,9 @@ impl Daemon {
             )
         })?;
         apk::validate(&file)?;
-        let pid = wait_for_android_init(&active.spec)?;
+        let pid = wait_for_android_init(&active.spec, &self.progress)?;
+        self.progress
+            .report("Android is ready. Installing the APK (up to 115 seconds)...");
         apk::install(pid, user, file)?;
         Ok(self.success(
             "APK installed successfully; the application catalog will refresh automatically",
@@ -460,7 +501,9 @@ impl Daemon {
             )));
         }
         let active = self.require_active_cell(peer_uid, None)?;
-        wait_for_android_init(&active.spec)?;
+        wait_for_android_init(&active.spec, &self.progress)?;
+        self.progress
+            .report("Android is ready. Loading the application icon (up to 115 seconds)...");
         let framework_pid = android_system_server_pid(&active.spec)?;
         let icon = run_application_catalog_in_cell(
             framework_pid,
@@ -504,7 +547,9 @@ impl Daemon {
             .active
             .as_ref()
             .expect("density configuration ensured an active cell");
-        let init_pid = wait_for_android_init(&active.spec)?;
+        let init_pid = wait_for_android_init(&active.spec, &self.progress)?;
+        self.progress
+            .report("Android is ready. Applying display density (up to 120 seconds)...");
         set_dpi_in_cell(init_pid, dpi)?;
         Ok(ControlResponse {
             ok: true,
@@ -652,13 +697,17 @@ fn run_loop(
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let response = match receive_request(&mut stream) {
-                    Ok((peer_uid, request, file)) => daemon.handle(peer_uid, request, file),
+                    Ok((peer_uid, request, file, streaming)) => {
+                        daemon.progress = Reporter::new(&stream, streaming)?;
+                        daemon.handle(peer_uid, request, file)
+                    }
                     Err(error) => daemon.failure(error.to_string()),
                 };
                 // Closing a diagnostic client must not tear down Android.
                 if let Err(error) = send_response(&mut stream, &response) {
                     eprintln!("could not deliver lifecycle response: {error}");
                 }
+                daemon.progress = Reporter::default();
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 wait_for_client(listener)?;
@@ -699,7 +748,19 @@ fn wait_for_client(listener: &UnixListener) -> Result<(), ControlError> {
 ///
 /// Returns connection, I/O, size-bound, or JSON failures.
 pub fn request(socket: &Path, request: &ControlRequest) -> Result<ControlResponse, ControlError> {
-    request_with_file(socket, request, None)
+    progress::request(socket, request, None, None)
+}
+
+/// Send a lifecycle request, reporting boot stages and elapsed waiting time.
+///
+/// # Errors
+/// Returns bounded transport or protocol failures. Requires a progress-capable daemon.
+pub fn request_with_progress(
+    socket: &Path,
+    request: &ControlRequest,
+    report: &mut dyn FnMut(&str),
+) -> Result<ControlResponse, ControlError> {
+    progress::request(socket, request, None, Some(report))
 }
 
 /// Install a standalone APK opened with the calling user's permissions.
@@ -708,6 +769,28 @@ pub fn request(socket: &Path, request: &ControlRequest) -> Result<ControlRespons
 /// Returns invalid-file, transport, or protocol failures. Android failures are
 /// returned in the control response.
 pub fn install_apk(socket: &Path, path: &Path, user: u32) -> Result<ControlResponse, ControlError> {
+    install_apk_reporting(socket, path, user, None)
+}
+
+/// Install an APK with boot and installation progress and a bounded wait.
+///
+/// # Errors
+/// Returns invalid-file, transport, or protocol failures.
+pub fn install_apk_with_progress(
+    socket: &Path,
+    path: &Path,
+    user: u32,
+    report: &mut dyn FnMut(&str),
+) -> Result<ControlResponse, ControlError> {
+    install_apk_reporting(socket, path, user, Some(report))
+}
+
+fn install_apk_reporting(
+    socket: &Path,
+    path: &Path,
+    user: u32,
+    report: Option<&mut dyn FnMut(&str)>,
+) -> Result<ControlResponse, ControlError> {
     use std::os::unix::fs::OpenOptionsExt;
     validate_android_user(user)?;
     let file = fs::OpenOptions::new()
@@ -716,50 +799,12 @@ pub fn install_apk(socket: &Path, path: &Path, user: u32) -> Result<ControlRespo
         .open(path)
         .map_err(|source| io_error(&format!("open APK {}", path.display()), source))?;
     apk::validate(&file)?;
-    request_with_file(socket, &ControlRequest::Install { user }, Some(&file))
-}
-
-fn request_with_file(
-    socket: &Path,
-    request: &ControlRequest,
-    file: Option<&fs::File>,
-) -> Result<ControlResponse, ControlError> {
-    let mut stream =
-        UnixStream::connect(socket).map_err(|source| io_error("connect to droidloomd", source))?;
-    stream
-        .set_read_timeout(Some(if file.is_some() {
-            ANDROID_READY_TIMEOUT + Duration::from_secs(120)
-        } else {
-            ANDROID_READY_TIMEOUT + CLIENT_TIMEOUT
-        }))
-        .map_err(|source| io_error("set lifecycle response timeout", source))?;
-    let encoded = serde_json::to_vec(request)?;
-    if encoded.len() as u64 > MAX_MESSAGE_BYTES {
-        return Err(ControlError::Invalid(
-            "lifecycle request is too large".into(),
-        ));
-    }
-    let remaining = if let Some(file) = file {
-        apk::send_file(&stream, encoded[0], file)?;
-        &encoded[1..]
-    } else {
-        &encoded[..]
-    };
-    stream
-        .write_all(remaining)
-        .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
-        .map_err(|source| io_error("send lifecycle request", source))?;
-    let mut response = Vec::new();
-    stream
-        .take(MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut response)
-        .map_err(|source| io_error("read lifecycle response", source))?;
-    if response.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(ControlError::Invalid(
-            "lifecycle response is too large".into(),
-        ));
-    }
-    Ok(serde_json::from_slice(&response)?)
+    progress::request(
+        socket,
+        &ControlRequest::Install { user },
+        Some(&file),
+        report,
+    )
 }
 
 fn bind_listener(socket: &Path) -> Result<UnixListener, ControlError> {
@@ -803,10 +848,13 @@ fn bind_listener(socket: &Path) -> Result<UnixListener, ControlError> {
 
 fn receive_request(
     stream: &mut UnixStream,
-) -> Result<(u32, ControlRequest, Option<fs::File>), ControlError> {
+) -> Result<(u32, ControlRequest, Option<fs::File>, bool), ControlError> {
     stream
         .set_read_timeout(Some(CLIENT_TIMEOUT))
         .map_err(|source| io_error("set lifecycle request timeout", source))?;
+    stream
+        .set_write_timeout(Some(CLIENT_TIMEOUT))
+        .map_err(|source| io_error("set lifecycle response write timeout", source))?;
     let peer_uid = peer_uid(stream)?;
     let (first, file) = apk::receive_file(stream)?;
     let mut encoded = vec![first];
@@ -819,17 +867,21 @@ fn receive_request(
             "lifecycle request is too large".into(),
         ));
     }
-    let request = serde_json::from_slice(&encoded)?;
+    let (request, streaming) = match serde_json::from_slice(&encoded)? {
+        progress::IncomingRequest::Progress(envelope) => (envelope.request, true),
+        progress::IncomingRequest::Legacy(request) => (request, false),
+    };
     if file.is_some() && !matches!(request, ControlRequest::Install { .. }) {
         return Err(ControlError::Invalid(
             "only install accepts a file descriptor".into(),
         ));
     }
-    Ok((peer_uid, request, file))
+    Ok((peer_uid, request, file, streaming))
 }
 
 fn send_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<(), ControlError> {
-    let encoded = serde_json::to_vec(response)?;
+    let mut encoded = serde_json::to_vec(response)?;
+    encoded.push(b'\n');
     stream
         .write_all(&encoded)
         .map_err(|source| io_error("send lifecycle response", source))
@@ -1017,33 +1069,74 @@ fn validate_application_catalog(applications: &[AndroidApplication]) -> Result<(
     Ok(())
 }
 
-fn wait_for_android_init(spec: &CellSpec) -> Result<u32, ControlError> {
-    let deadline = Instant::now() + ANDROID_READY_TIMEOUT;
+fn wait_for_android_init(spec: &CellSpec, progress: &Reporter) -> Result<u32, ControlError> {
+    wait_for_boot(
+        ANDROID_READY_TIMEOUT,
+        Duration::from_millis(100),
+        || android_boot_snapshot(spec),
+        |message| progress.report(message),
+    )
+}
+
+fn wait_for_boot(
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut() -> Result<(Option<u32>, Option<String>), ControlError>,
+    mut report: impl FnMut(&str),
+) -> Result<u32, ControlError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_phase = String::new();
+    report(&format!(
+        "Waiting for Android to complete boot (up to {} seconds)...",
+        timeout.as_secs()
+    ));
     while Instant::now() < deadline {
-        if let Some(pid) = android_init_pid(spec)? {
-            let launcher = PathBuf::from(format!(
-                "/proc/{pid}/root/vendor/bin/droidloom-task-launcher"
-            ));
-            let task_control = PathBuf::from(format!(
-                "/proc/{pid}/root/dev/socket/droidloom-task-control"
-            ));
-            let control_ready = fs::symlink_metadata(task_control)
-                .is_ok_and(|metadata| metadata.file_type().is_socket());
-            if launcher.is_file() && control_ready && android_runtime_ready(pid)? {
-                return Ok(pid);
-            }
+        let (pid, phase) = observe()?;
+        let Some(phase) = phase else {
+            return pid.ok_or_else(|| {
+                ControlError::Invalid(
+                    "Android readiness probe did not return its init process".into(),
+                )
+            });
+        };
+        if phase != last_phase {
+            report(&format!("Android boot phase: {phase}."));
+            last_phase = phase;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
     }
     Err(ControlError::Invalid(format!(
-        "Android boot, task control, and input bridge did not become ready within {} seconds",
-        ANDROID_READY_TIMEOUT.as_secs()
+        "Android looks stuck: it did not become ready within {} seconds.\nLast boot phase: {last_phase}. First boot can take longer while Android initializes its data.\n{LOG_HINT}\nUse `droidloomctl wait` to check readiness again without restarting Android.",
+        timeout.as_secs()
     )))
 }
 
-fn android_runtime_ready(init_pid: u32) -> Result<bool, ControlError> {
+fn android_boot_snapshot(spec: &CellSpec) -> Result<(Option<u32>, Option<String>), ControlError> {
+    let Some(pid) = android_init_pid(spec)? else {
+        return Ok((None, Some("waiting for Android init".into())));
+    };
+    let launcher = PathBuf::from(format!(
+        "/proc/{pid}/root/vendor/bin/droidloom-task-launcher"
+    ));
+    let task_control = PathBuf::from(format!(
+        "/proc/{pid}/root/dev/socket/droidloom-task-control"
+    ));
+    let control_ready =
+        fs::symlink_metadata(task_control).is_ok_and(|metadata| metadata.file_type().is_socket());
+    let properties = android_properties(pid)?;
+    Ok((
+        Some(pid),
+        properties.map_or_else(
+            || Some("waiting for Android's property service to respond".into()),
+            |properties| android_boot_phase(&properties, launcher.is_file(), control_ready),
+        ),
+    ))
+}
+
+fn android_properties(init_pid: u32) -> Result<Option<Vec<u8>>, ControlError> {
     let pid = init_pid.to_string();
-    let output = droidloom_cpu_placement::command("nsenter")
+    let output = droidloom_cpu_placement::command("timeout")
+        .args(["--kill-after=1s", "5s", "nsenter"])
         .args([
             "--target",
             &pid,
@@ -1060,17 +1153,41 @@ fn android_runtime_ready(init_pid: u32) -> Result<bool, ControlError> {
         ])
         .output()
         .map_err(|source| io_error("read Android readiness properties", source))?;
-    Ok(output.status.success() && android_properties_ready(&output.stdout))
+    Ok(output.status.success().then_some(output.stdout))
 }
 
-fn android_properties_ready(properties: &[u8]) -> bool {
+fn android_boot_phase(properties: &[u8], launcher: bool, task_control: bool) -> Option<String> {
     let properties = String::from_utf8_lossy(properties);
-    properties
-        .lines()
-        .any(|line| line == "[sys.boot_completed]: [1]")
-        && properties
+    let property = |name: &str| {
+        let prefix = format!("[{name}]: [");
+        properties
             .lines()
-            .any(|line| line == "[init.svc.droidloom-input-bridge]: [running]")
+            .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix(']'))
+    };
+    // Show observed service states, not invented percentages or framework phases.
+    let service = |name| {
+        property(name)
+            .filter(|value| matches!(*value, "running" | "stopped" | "restarting" | "stopping"))
+            .unwrap_or("not reported")
+    };
+    if property("sys.boot_completed") != Some("1") {
+        Some(format!(
+            "waiting for Android to complete boot (Android runtime: {}; boot animation: {})",
+            service("init.svc.zygote"),
+            service("init.svc.bootanim")
+        ))
+    } else if property("init.svc.droidloom-input-bridge") != Some("running") {
+        Some(format!(
+            "Android boot completed; waiting for Droidloom input service ({})",
+            service("init.svc.droidloom-input-bridge")
+        ))
+    } else if !launcher {
+        Some("Android boot completed; waiting for Droidloom task launcher".into())
+    } else if !task_control {
+        Some("Android boot completed; waiting for Droidloom task control".into())
+    } else {
+        None
+    }
 }
 
 fn android_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
@@ -1110,8 +1227,8 @@ fn android_system_server_pid(spec: &CellSpec) -> Result<u32, ControlError> {
 
 fn android_namespace_pids(spec: &CellSpec) -> Result<Vec<u32>, ControlError> {
     let namespace = format!("droidloom-u{}", spec.host_uid);
-    let output = droidloom_cpu_placement::command("ip")
-        .args(["netns", "pids", &namespace])
+    let output = droidloom_cpu_placement::command("timeout")
+        .args(["--kill-after=1s", "5s", "ip", "netns", "pids", &namespace])
         .output()
         .map_err(|source| io_error("list exact cell namespace processes", source))?;
     if !output.status.success() {
@@ -1123,15 +1240,42 @@ fn android_namespace_pids(spec: &CellSpec) -> Result<Vec<u32>, ControlError> {
         .collect())
 }
 
+/// Validate a launch extent in Android pixels, with no shell metacharacters.
+///
+/// # Errors
+/// Rejects malformed, zero, or oversized dimensions.
+pub fn parse_launch_resolution(value: &str) -> Result<String, ControlError> {
+    let valid = value.split_once('x').is_some_and(|(width, height)| {
+        [width, height].iter().all(|dimension| {
+            !dimension.is_empty()
+                && dimension.len() <= 5
+                && dimension.bytes().all(|byte| byte.is_ascii_digit())
+                && dimension
+                    .parse::<u32>()
+                    .is_ok_and(|size| (1..=16_384).contains(&size))
+        })
+    });
+    if !valid {
+        return Err(ControlError::Invalid(
+            "resolution must be WIDTHxHEIGHT with each dimension in 1..=16384".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 fn launch_in_cell(
     init_pid: u32,
     package: &str,
     component: Option<&str>,
+    resolution: Option<&str>,
     user: u32,
 ) -> Result<String, ControlError> {
     let mut arguments = vec!["--user".to_owned(), user.to_string()];
     if let Some(component) = component {
         arguments.extend(["--component".to_owned(), component.to_owned()]);
+    }
+    if let Some(resolution) = resolution {
+        arguments.extend(["--resolution".to_owned(), resolution.to_owned()]);
     }
     arguments.push(package.to_owned());
     run_task_launcher_in_cell(init_pid, &arguments, "task launch")
@@ -1176,7 +1320,21 @@ fn run_task_launcher_in_cell(
         .args(arguments);
     let deadline = Instant::now() + ANDROID_READY_TIMEOUT;
     loop {
-        let output = command
+        // Each retry shares the original deadline. A blocked Binder call in
+        // the launcher must not hold every subsequent lifecycle request forever.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(android_operation_timeout(operation));
+        }
+        let mut bounded = droidloom_cpu_placement::command("timeout");
+        bounded
+            .args([
+                "--kill-after=5s",
+                &format!("{:.3}s", remaining.as_secs_f64().max(0.001)),
+                "nsenter",
+            ])
+            .args(command.get_args());
+        let output = bounded
             .output()
             .map_err(|source| io_error("execute Android task launcher", source))?;
         // Preserve per-stage evidence in the daemon journal; stdout remains
@@ -1191,7 +1349,10 @@ fn run_task_launcher_in_cell(
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
         }
-        if !android_services_are_booting(&stderr) || Instant::now() >= deadline {
+        if matches!(output.status.code(), Some(124 | 137)) {
+            return Err(android_operation_timeout(operation));
+        }
+        if !android_services_are_booting(&stderr) {
             return Err(ControlError::Invalid(format!(
                 "Android {operation} failed ({}): {}",
                 output.status,
@@ -1235,6 +1396,9 @@ fn run_application_catalog_in_cell(
         .output()
         .map_err(|source| io_error("execute Android application catalog", source))?;
     if !output.status.success() {
+        if matches!(output.status.code(), Some(124 | 137)) {
+            return Err(android_operation_timeout(operation));
+        }
         return Err(ControlError::Invalid(format!(
             "Android {operation} failed ({}): {}",
             output.status,
@@ -1247,6 +1411,12 @@ fn run_application_catalog_in_cell(
         ))
     })?;
     Ok(stdout.trim().to_owned())
+}
+
+fn android_operation_timeout(operation: &str) -> ControlError {
+    ControlError::Invalid(format!(
+        "Android looks stuck: {operation} did not finish before its deadline.\n{LOG_HINT}"
+    ))
 }
 
 fn validate_display_density(dpi: u32) -> Result<(), ControlError> {
@@ -1289,35 +1459,55 @@ mod tests {
 
     #[test]
     fn install_transport_delivers_open_file_and_preserves_android_failure() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("install.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let path = directory.path().join("app with spaces.apk");
-        fs::write(&path, b"PK\x03\x04test payload").unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let (_, request, file) = receive_request(&mut stream).unwrap();
-            assert_eq!(request, ControlRequest::Install { user: 10 });
-            assert_eq!(apk::validate(&file.unwrap()).unwrap(), 16);
-            send_response(
-                &mut stream,
-                &ControlResponse {
-                    ok: false,
-                    state: CellState::Running,
-                    message: "Failure [INSTALL_FAILED_NO_MATCHING_ABIS]".into(),
-                    host_pid: None,
-                    launch: None,
-                    applications: None,
-                    application_icon: None,
-                    diagnostics: None,
-                },
-            )
+        for use_progress in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("install.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let path = directory.path().join("app with spaces.apk");
+            fs::write(&path, b"PK\x03\x04test payload").unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (_, request, file, streaming) = receive_request(&mut stream).unwrap();
+                assert_eq!(streaming, use_progress);
+                assert_eq!(request, ControlRequest::Install { user: 10 });
+                assert_eq!(apk::validate(&file.unwrap()).unwrap(), 16);
+                Reporter::new(&stream, streaming)
+                    .unwrap()
+                    .report("Android is ready. Installing the APK...");
+                send_response(
+                    &mut stream,
+                    &ControlResponse {
+                        ok: false,
+                        state: CellState::Running,
+                        message: "Failure [INSTALL_FAILED_NO_MATCHING_ABIS]".into(),
+                        host_pid: None,
+                        launch: None,
+                        applications: None,
+                        application_icon: None,
+                        diagnostics: None,
+                    },
+                )
+                .unwrap();
+            });
+            let mut messages = Vec::new();
+            let response = if use_progress {
+                install_apk_with_progress(&socket, &path, 10, &mut |message| {
+                    messages.push(message.to_owned());
+                })
+            } else {
+                install_apk(&socket, &path, 10)
+            }
             .unwrap();
-        });
-        let response = install_apk(&socket, &path, 10).unwrap();
-        assert!(!response.ok);
-        assert!(response.message.contains("INSTALL_FAILED_NO_MATCHING_ABIS"));
-        server.join().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("Installing the APK")),
+                use_progress
+            );
+            assert!(!response.ok);
+            assert!(response.message.contains("INSTALL_FAILED_NO_MATCHING_ABIS"));
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -1338,6 +1528,7 @@ mod tests {
             spec: "/etc/droidloom/cell.json".into(),
             package: "org.mozilla.firefox".into(),
             component: Some("org.mozilla.firefox/.App".into()),
+            resolution: Some("2560x1440".into()),
             user: 0,
         };
         let encoded = serde_json::to_vec(&request).unwrap();
@@ -1345,6 +1536,32 @@ mod tests {
             serde_json::from_slice::<ControlRequest>(&encoded).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn launch_resolution_validation_and_old_clients() {
+        assert_eq!(parse_launch_resolution("2560x1440").unwrap(), "2560x1440");
+        for invalid in [
+            "0x1440",
+            "2560",
+            "-1x1440",
+            "2560x1440x2",
+            "16385x1080",
+            "1x+2",
+            "1x2;id",
+        ] {
+            assert!(parse_launch_resolution(invalid).is_err(), "{invalid}");
+        }
+        let old = br#"{"command":"launch","spec":"/etc/droidloom/cell.json","package":"org.example.game","component":null,"user":0}"#;
+        // Older clients omit the new optional field.
+        let request: ControlRequest = serde_json::from_slice(old).unwrap();
+        assert!(matches!(
+            request,
+            ControlRequest::Launch {
+                resolution: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1364,13 +1581,97 @@ mod tests {
 
     #[test]
     fn boot_complete_does_not_hide_a_failed_input_service() {
-        assert!(!android_properties_ready(b"[sys.boot_completed]: [1]\n"));
-        assert!(!android_properties_ready(
-            b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [restarting]\n"
-        ));
-        assert!(android_properties_ready(
-            b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n"
-        ));
+        assert!(android_boot_phase(b"[sys.boot_completed]: [1]\n", true, true).is_some());
+        assert!(
+            android_boot_phase(
+                b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [restarting]\n",
+                true,
+                true
+            )
+            .unwrap()
+            .contains("input service (restarting)")
+        );
+        assert!(
+            android_boot_phase(
+                b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n",
+                true,
+                true
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn boot_progress_uses_observed_services_and_checks_every_readiness_gate() {
+        let booting = b"[init.svc.zygote]: [restarting]\n[init.svc.bootanim]: [running]\n";
+        let phase = android_boot_phase(booting, true, true).unwrap();
+        assert!(phase.contains("complete boot"));
+        assert!(phase.contains("Android runtime: restarting"));
+        assert!(phase.contains("boot animation: running"));
+        let ready = b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n";
+        assert!(
+            android_boot_phase(ready, false, true)
+                .unwrap()
+                .contains("task launcher")
+        );
+        assert!(
+            android_boot_phase(ready, true, false)
+                .unwrap()
+                .contains("task control")
+        );
+        assert!(android_boot_phase(ready, true, true).is_none());
+    }
+
+    #[test]
+    fn boot_wait_reports_changes_and_a_stall_has_the_last_phase_and_log_commands() {
+        let mut observations = [
+            (None, Some("waiting for Android init".into())),
+            (
+                Some(42),
+                Some("waiting for Android to complete boot".into()),
+            ),
+            (
+                Some(42),
+                Some("waiting for Android to complete boot".into()),
+            ),
+            (Some(42), None),
+        ]
+        .into_iter();
+        let mut messages = Vec::new();
+        assert_eq!(
+            wait_for_boot(
+                Duration::from_secs(1),
+                Duration::ZERO,
+                || Ok(observations.next().unwrap()),
+                |message| messages.push(message.to_owned())
+            )
+            .unwrap(),
+            42
+        );
+        assert_eq!(
+            messages.len(),
+            3,
+            "unchanged phases must not flood the terminal"
+        );
+        let error = wait_for_boot(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || {
+                Ok((
+                    Some(42),
+                    Some("waiting for Droidloom input service (restarting)".into()),
+                ))
+            },
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Android looks stuck"));
+        assert!(
+            error.contains("Last boot phase: waiting for Droidloom input service (restarting)")
+        );
+        assert!(error.contains("journalctl -b -u droidloomd.service"));
+        assert!(error.contains("droidloomctl wait"));
     }
     #[test]
     fn application_catalog_protocol_round_trip_is_explicit() {

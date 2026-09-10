@@ -20,8 +20,11 @@ fn install_preserves_package_manager_results_in_text_and_json() {
             let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 request,
-                serde_json::json!({"command": "install", "user": 10})
+                serde_json::json!({"request": {"command": "install", "user": 10}})
             );
+            stream
+                .write_all(b"{\"progress\":\"Android is ready. Installing the APK...\"}\n")
+                .unwrap();
             stream.write_all(&serde_json::to_vec(&serde_json::json!({
                 "ok": ok, "state": "running",
                 "message": if ok { "APK installed successfully" } else { "Failure [INSTALL_FAILED_INVALID_APK]" }

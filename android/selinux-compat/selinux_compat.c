@@ -19,6 +19,7 @@
 static const char kProcessContext[] = "u:r:droidloom_unconfined:s0";
 static const char kServiceContext[] = "u:r:droidloom_service:s0";
 static const char kFileContext[] = "u:object_r:system_file:s0";
+#if defined(__aarch64__)
 static const char kCellMarker[] = "DROIDLOOM_CELL";
 static const char kProcSelfFdPrefix[] = "/proc/self/fd/";
 static const char kSyntheticRootPrefix[] = "/newroot";
@@ -45,6 +46,7 @@ ssize_t readlink(const char *path, char *buffer, size_t buffer_size) {
   memmove(buffer, buffer + prefix_length, (size_t)result - prefix_length);
   return result - (ssize_t)prefix_length;
 }
+#endif
 
 static int copy_context(char **destination, const char *context,
                         bool return_length) {

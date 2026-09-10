@@ -75,6 +75,7 @@ PRODUCT_VENDOR_PROPERTIES += \
     ro.zygote=zygote64 \
     ro.vendor.droidloom.surfaceflinger_direct=true \
     ro.vendor.droidloom.surfaceflinger_tasks=true \
+    ro.opengles.version=196610 \
     ro.hardware.egl=mesa \
     ro.hardware.vulkan=radeon \
     dalvik.vm.heapstartsize=16m \
