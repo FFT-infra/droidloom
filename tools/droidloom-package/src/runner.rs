@@ -19,6 +19,8 @@ pub enum Action {
     Start,
     /// Stop the runner and remove its GitHub registration; keep build caches.
     Stop,
+    /// Stop remaining containers in this job's package workspace.
+    Cleanup,
     /// Show the user service status and GitHub registration.
     Status,
 }
@@ -174,6 +176,18 @@ pub fn execute(action: Action) -> Result<()> {
                 ])
                 .arg(format!("--working-directory={}", directory.display()))
                 .arg(format!("--setenv=PATH={}", std::env::var("PATH")?))
+                .arg(format!(
+                    "--setenv=DROIDLOOM_PACKAGE_WORK={}/cache/arch",
+                    root.display()
+                ))
+                .arg(format!(
+                    "--setenv=CARGO_TARGET_DIR={}/cache/host-target",
+                    root.display()
+                ))
+                .arg(format!(
+                    "--setenv=CARGO_HOME={}/cache/cargo-home",
+                    root.display()
+                ))
                 .arg(directory.join("run.sh")));
             if result.is_err() {
                 unregister(&directory)?;
@@ -186,6 +200,10 @@ pub fn execute(action: Action) -> Result<()> {
                 run(Command::new("systemctl").args(["--user", "stop", UNIT]))?;
             }
             unregister(&directory)?;
+            let work = root.join("cache/arch");
+            if work.join("containers").exists() {
+                run(super::podman(&work).args(["stop", "--all", "--time", "10"]))?;
+            }
             println!("Runner stopped and unregistered; caches retained in {ROOT}");
         }
         Action::Status => {
@@ -201,6 +219,13 @@ pub fn execute(action: Action) -> Result<()> {
                 if runner["name"] == NAME {
                     println!("{runner}");
                 }
+            }
+        }
+        Action::Cleanup => {
+            let repo = super::repository(None)?;
+            let work = super::build_workspace(&repo)?;
+            if work.join("containers").exists() {
+                run(super::podman(&work).args(["stop", "--all", "--time", "10"]))?;
             }
         }
     }

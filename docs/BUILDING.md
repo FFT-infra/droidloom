@@ -63,14 +63,16 @@ journalctl --user -fu droidloom-actions-runner
 cargo run --locked -j 1 -p droidloom-package -- runner stop
 ```
 
-`stop` also removes a leftover GitHub registration and preserves caches. Cancel
+`stop` also removes a leftover GitHub registration, stops remaining build
+containers, and preserves caches. The workflow calls `runner cleanup` after each
+job to stop leftover containers in its package workspace. Cancel
 an active workflow in GitHub before stopping its worker. Re-arm and rerun a failed
 workflow after fixing its cause. A Pages failure can leave uploaded archives, but
 the previous database remains live until deployment succeeds.
 
 `DROIDLOOM_PACKAGE_WORK` overrides the default `.work/arch` directory for builds
-and package checks; it must be an absolute path. Actions sets it to the persistent
-cache above, outside checkout cleanup. Do not use `--clean` for normal releases.
+and package checks; it must be an absolute path. The Rust runner tool sets it to the persistent
+cache above, outside checkout cleanup; machine paths stay out of the workflow. Do not use `--clean` for normal releases.
 The first build needs the full download/compile; later builds reuse the cache.
 The builder leaves two logical CPUs free and the host Cargo build uses one job.
 

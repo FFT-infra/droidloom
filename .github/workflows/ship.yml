@@ -26,9 +26,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     env:
-      DROIDLOOM_PACKAGE_WORK: /mnt/puck/logix/droidloom/cache/arch
-      CARGO_TARGET_DIR: /mnt/puck/logix/droidloom/cache/host-target
-      CARGO_HOME: /mnt/puck/logix/droidloom/cache/cargo-home
       CARGO_BUILD_JOBS: '1'
     steps:
       - uses: actions/checkout@v5
@@ -54,3 +51,6 @@ jobs:
           path: dist/pages
       - uses: actions/deploy-pages@v4
         id: deployment
+      - name: Stop any remaining build containers
+        if: always()
+        run: cargo run --locked -j 1 -p droidloom-package -- runner cleanup
