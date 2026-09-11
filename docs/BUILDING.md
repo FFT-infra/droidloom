@@ -55,11 +55,22 @@ invokes makepkg inside the rootless container; no manual binary build or separat
 packaging script is required. Shell is used only at required upstream interfaces
 and in PKGBUILD functions.
 
-The builder reserves two logical CPUs. To limit compilation further:
+The builder limits jobs to the available logical CPU count minus two. To limit compilation further:
 
 ```console
 cargo run --locked -j 1 -p droidloom-package -- build --jobs 4
 ```
+
+Container CPU pinning is opt-in, so the default build works without rootless
+`cpuset` delegation. To restrict the container to a CPU subset as well:
+
+```console
+cargo run --locked -j 1 -p droidloom-package -- build --cpuset
+```
+
+This requires the host to delegate the `cpuset` controller to rootless Podman.
+Without it, the job limit still leaves capacity for two logical CPUs and nested
+Android builds retain their own CPU affinity control.
 
 Outputs are written to `dist/arch/<version-release>/`. For revision 0.1.0-7:
 

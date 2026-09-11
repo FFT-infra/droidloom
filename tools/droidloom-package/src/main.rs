@@ -38,6 +38,9 @@ enum Action {
         source: Option<PathBuf>,
         #[arg(long)]
         jobs: Option<usize>,
+        /// Pin the container to a CPU subset (requires rootless cpuset delegation).
+        #[arg(long)]
+        cpuset: bool,
         /// Remove this workflow's compiler outputs while retaining downloaded inputs.
         #[arg(long)]
         clean: bool,
@@ -228,6 +231,7 @@ fn copy_inputs(repo: &Path, snapshot: &Path) -> Result<()> {
 fn build(
     explicit: Option<PathBuf>,
     requested: Option<usize>,
+    cpuset: bool,
     clean: bool,
     source_cache: Option<PathBuf>,
     components: Vec<components::Component>,
@@ -339,7 +343,7 @@ fn build(
         return Err(format!("{} already contains packages; increase packaging/arch/version.json release or move the previous artifacts before rebuilding", output.display()).into());
     }
     eprintln!(
-        "Building {} for x86_64 with {jobs} jobs; two CPUs reserved. No host sudo is used.",
+        "Building {} for x86_64 with {jobs} jobs; job limit leaves capacity for two CPUs. No host sudo is used.",
         version.directory()
     );
     let timestamp = std::time::SystemTime::now()
@@ -377,17 +381,23 @@ fn build(
     }
     container
         .args(["run", "--rm", "--userns=keep-id", "--user"])
-        .arg(format!("{uid}:{gid}"))
-        .arg("--cpuset-cpus")
-        .arg(
+        .arg(format!("{uid}:{gid}"));
+    if cpuset {
+        container.arg("--cpuset-cpus").arg(
             cpus.iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
-        )
+        );
+    }
+    container
         .args([
             "--env",
-            "DROIDLOOM_COMPILER_CPUS_RESERVED=1",
+            if cpuset {
+                "DROIDLOOM_COMPILER_CPUS_RESERVED=1"
+            } else {
+                "DROIDLOOM_COMPILER_CPUS_RESERVED=0"
+            },
             "--env",
             "CARGO_TARGET_DIR=/build/driver",
         ])
@@ -659,12 +669,14 @@ fn execute() -> Result<()> {
             component,
             source,
             jobs,
+            cpuset,
             clean,
             source_cache,
             native_bridge_source,
         } => build(
             source,
             jobs,
+            cpuset,
             clean,
             source_cache,
             component,
