@@ -30,11 +30,12 @@ jobs:
       CARGO_TARGET_DIR: /mnt/puck/logix/droidloom/cache/host-target
       CARGO_HOME: /mnt/puck/logix/droidloom/cache/cargo-home
       CARGO_BUILD_JOBS: '1'
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+      - name: Keep temporary files on the worker disk
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Build packages using persistent local caches
         run: cargo run --locked -j 1 -p droidloom-package -- build
       - name: Check package installation and lifecycle
