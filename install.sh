@@ -33,7 +33,7 @@ REPO
 
 # Refuse conflicting manual configurations instead of creating duplicate repos.
 if pacman-conf --repo-list | grep -qx droidloom; then
-  if ! [ -f "$include" ] || ! cmp -s "$repository" "$include" ||
+  if ! [ -f "$include" ] || [ "$(cat "$repository")" != "$(cat "$include")" ] ||
      ! grep -qxF "Include = $include" "$config"; then
     echo 'An existing Droidloom repository differs. Review /etc/pacman.conf and /etc/pacman.d/droidloom.conf first.' >&2
     exit 1
