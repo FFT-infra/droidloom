@@ -48,7 +48,7 @@ fn archives(packages: &Path, mount: &str) -> Result<Vec<String>> {
 pub fn check(packages: &Path, previous: Option<&Path>) -> Result<()> {
     require_user()?;
     let repo = repository(None)?;
-    let work = repo.join(".work/arch");
+    let work = super::build_workspace(&repo)?;
     fs::create_dir_all(&work)?;
     let packages = packages.canonicalize()?;
     let current = archives(&packages, "/packages")?;

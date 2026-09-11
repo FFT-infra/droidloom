@@ -1,5 +1,7 @@
 //! Rust orchestration around makepkg's standard package interface.
 mod components;
+mod runner;
+mod shipping;
 mod validation;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Prepare or publish the pacman repository used by GitHub Actions.
+    Ship {
+        #[command(subcommand)]
+        action: shipping::Action,
+    },
+    /// Manually control the one-job GitHub runner on this build machine.
+    Runner {
+        #[command(subcommand)]
+        action: runner::Action,
+    },
     /// Compile the complete runtime and produce packages in a rootless Arch builder.
     Build {
         /// Rebuild only selected host components; omitted builds everything.
@@ -209,6 +221,15 @@ fn podman(work: &Path) -> Command {
         .arg(work.join("container-run"));
     command
 }
+fn build_workspace(repo: &Path) -> Result<PathBuf> {
+    let work = std::env::var_os("DROIDLOOM_PACKAGE_WORK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.join(".work/arch"));
+    if !work.is_absolute() {
+        return Err("DROIDLOOM_PACKAGE_WORK must be an absolute path".into());
+    }
+    Ok(work)
+}
 fn copy_inputs(repo: &Path, snapshot: &Path) -> Result<()> {
     fs::create_dir_all(snapshot)?;
     let mut command = Command::new("rsync");
@@ -265,7 +286,7 @@ fn build(
     {
         return Err("rsync is missing. It copies the source snapshot into the isolated build directory. Install it with sudo pacman -S --needed rsync; sudo is needed to write /usr/bin/rsync and update pacman's database. The source copy itself runs without sudo.".into());
     }
-    let work = repo.join(".work/arch");
+    let work = build_workspace(&repo)?;
     fs::create_dir_all(&work)?;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -665,6 +686,8 @@ fn install_tree(source: &Path, destination: &Path) -> Result<()> {
 }
 fn execute() -> Result<()> {
     match Cli::parse().action {
+        Action::Ship { action } => shipping::execute(action),
+        Action::Runner { action } => runner::execute(action),
         Action::Build {
             component,
             source,

@@ -18,9 +18,24 @@ your ordinary user. Do not run `droidloomctl start` or app launches with sudo.
 
 ## 2. Install both packages
 
-Obtain the matching `droidloom-runtime` and `droidloom-image` archives from the
-preview distribution, or build them yourself. Put only one matching pair in a
-directory, then open a terminal there:
+Install or update from the published pacman repository:
+
+```console
+curl -fLO https://denialwm.github.io/droidloom/install.sh
+less install.sh
+sh install.sh
+```
+
+The script adds `/etc/pacman.d/droidloom.conf` to pacman's configuration and runs
+`pacman -Syu --needed droidloom-runtime droidloom-image`, with pacman's normal
+confirmation. This performs a full system upgrade to avoid partial Arch upgrades.
+Run the same script again to update, or use your normal `sudo pacman -Syu`.
+The initial repository publishes **unsigned packages over HTTPS**; `SigLevel =
+Never` applies only to `[droidloom]`. Other repositories keep their signing policy.
+Pages serves the package database; GitHub Releases serves the package archives.
+Google apps are not included.
+
+For locally built packages, put one matching pair in a directory and run:
 
 ```console
 sudo pacman -U ./droidloom-runtime-*.pkg.tar.zst ./droidloom-image-*.pkg.tar.zst

@@ -5,6 +5,88 @@ components, assembles the Android image, and produces a matching runtime/image
 pacman package pair. It uses pinned upstream Android base and toolchain inputs;
 it does not rebuild every upstream Android component from source.
 
+## Shipping with GitHub Actions
+
+`.github/workflows/ship.yml` runs on pushes to `main` or a manual dispatch of
+`main`. It builds the matching package pair, runs the disposable-container package
+checks, uploads archives to the `packages` GitHub Release, then deploys the pacman
+database and `install.sh` to GitHub Pages. There is one job, with no promotion or
+provenance pipeline. Pull requests do not run on this machine.
+
+Before publishing changed packages, increment `packaging/arch/version.json`'s
+`release` (or update `version` and reset `release` to 1). Published filenames are
+never overwritten. A publication retry accepts existing assets only when their
+bytes match. If a rebuilt package differs, increment the release. Old archives
+stay available for users with cached pacman databases. Each package release also
+includes a matching Git source snapshot; pinned upstream sources and licenses
+are documented in that snapshot. Optional Google apps are not published.
+
+### Manually controlled local worker
+
+The runner and all its build state live under `/mnt/puck/logix/droidloom`:
+
+- `runner/`: official GitHub runner, credentials and diagnostic logs.
+- `work/`: Actions checkouts and temporary files, cleaned by checkout each run.
+- `cache/arch/`: rootless Podman storage, downloaded inputs, AOSP sources and
+  incremental compiler output.
+- `cache/host-target/`: host Rust tooling build cache.
+- `cache/cargo-home/`: host Cargo downloads.
+
+The machine needs the usual build prerequisites plus `gh` (authenticated with
+repository administration access for runner registration), `curl`, `tar`,
+`sha256sum`, `cmp`, `jq`, `repo-add` (Arch's `pacman` package), and a working systemd
+user manager. Configure GitHub Pages once with **Source: GitHub Actions**.
+No host sudo is used by the runner or package builds.
+
+Install or refresh the official runner while stopped:
+
+```console
+cargo run --locked -j 1 -p droidloom-package -- runner setup
+```
+
+Before pushing `main`, arm one job, then push:
+
+```console
+cargo run --locked -j 1 -p droidloom-package -- runner start
+git push origin main
+```
+
+The ephemeral runner exits and unregisters after one job. It has no boot service.
+It also stops after 24 hours if unused or stuck. Each queued run needs a new
+`runner start`; concurrency prevents simultaneous publication. Start it only for
+trusted changes. This runner uses the local user's account and is not a security
+boundary around workflow code.
+
+```console
+cargo run --locked -j 1 -p droidloom-package -- runner status
+journalctl --user -fu droidloom-actions-runner
+cargo run --locked -j 1 -p droidloom-package -- runner stop
+```
+
+`stop` also removes a leftover GitHub registration and preserves caches. Cancel
+an active workflow in GitHub before stopping its worker. Re-arm and rerun a failed
+workflow after fixing its cause. A Pages failure can leave uploaded archives, but
+the previous database remains live until deployment succeeds.
+
+`DROIDLOOM_PACKAGE_WORK` overrides the default `.work/arch` directory for builds
+and package checks; it must be an absolute path. Actions sets it to the persistent
+cache above, outside checkout cleanup. Do not use `--clean` for normal releases.
+The first build needs the full download/compile; later builds reuse the cache.
+The builder leaves two logical CPUs free and the host Cargo build uses one job.
+
+To prepare the Pages tree locally after building, without publishing:
+
+```console
+cargo run --locked -j 1 -p droidloom-package -- ship prepare
+```
+
+This writes `dist/pages`. `ship publish` uploads to GitHub and is normally run
+only by Actions with its scoped token. Pages stores only metadata and the
+installer because Android packages approach its 1 GB site limit. Pacman's
+`CacheServer` fetches the archives from Releases without requesting databases
+there. Packages are currently unsigned; see [INSTALL.md](INSTALL.md) for the
+repository's explicit signing policy.
+
 ## 1. Prepare an x86_64 build machine
 
 The supported package workflow uses rootless Podman with an Arch build container.

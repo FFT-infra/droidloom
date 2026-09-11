@@ -46,3 +46,6 @@ selects init only from `/run/netns/droidloom-u1000`, pins its process resources,
 clears the execution environment and bounds commands to 15 seconds.
 It is deliberately workstation-specific and is not installed by the packages.
 Remove `/etc/sudoers.d/droidloom-inspect` to revoke the local passwordless grant.
+
+The package builder also provides `ship prepare`, `ship publish`, and
+`runner setup|start|stop|status` for the [GitHub shipping workflow](../docs/BUILDING.md#shipping-with-github-actions).

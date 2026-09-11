@@ -18,15 +18,18 @@ NVIDIA rendering is not validated.
 Follow the **[step-by-step installation guide](docs/INSTALL.md)**, including
 first-time setup and **[installing APKs](docs/INSTALL.md#5-install-an-apk)**.
 
-1. Download the matching `droidloom-runtime` and `droidloom-image` pacman packages
-   into a directory containing only that release's pair.
-2. In a terminal in that directory, install both packages:
+1. Download and review the installer:
 
    ```console
-   sudo pacman -U ./droidloom-runtime-*.pkg.tar.zst ./droidloom-image-*.pkg.tar.zst
+   curl -fLO https://denialwm.github.io/droidloom/install.sh
+   less install.sh
    ```
 
-   Sudo lets pacman write system files, install dependencies and update its database.
+2. Run `sh install.sh` to add the pacman repository and install or update both
+   packages. It asks for administrator access and keeps pacman's confirmation
+   before a full system upgrade. Droidloom packages are currently unsigned over
+   HTTPS; this policy is scoped to the Droidloom repository. Later updates also
+   arrive through normal `sudo pacman -Syu`.
 3. From your normal Wayland desktop terminal, run `droidloomctl start`. First start
    requests administrator authentication to create Android data, runtime
    configuration and the system-service permission. The guide includes an explicit

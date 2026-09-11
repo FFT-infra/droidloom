@@ -63,3 +63,12 @@ Keep packages, APKs, build outputs, caches and local test journals out of Git.
 Update existing guides instead of adding dated plans. Documentation and ordinary
 development tasks do not authorize installation, hardware operations or restarting
 a user's graphical session.
+
+## Shipping
+
+The basic pipeline is `.github/workflows/ship.yml`. Before an authorized push to
+`main`, run `cargo run --locked -j 1 -p droidloom-package -- runner start` to arm
+the one-job worker under `/mnt/puck/logix/droidloom`. After the job, verify it is
+stopped with `runner status`; use `runner stop` to remove leftover registration.
+Preserve its caches. Increment `packaging/arch/version.json` before shipping
+changed package bytes. See `docs/BUILDING.md` for setup and recovery.
