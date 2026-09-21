@@ -67,7 +67,15 @@ fn prepare_inputs_from(
     arch: &str,
     reuse_installed: bool,
 ) -> Result<PathBuf> {
-    let lock_path = repo.join(format!("android/manifest/source-lock-{arch}.json"));
+    // The generic source-lock.json pins the aarch64 CI base; x86_64 has its
+    // own lock. `arch` is the Android target architecture, which may differ
+    // from the build host during cross builds.
+    let lock_name = match arch {
+        "x86_64" => "source-lock-x86_64.json",
+        "aarch64" => "source-lock.json",
+        _ => return fail("unsupported Android target architecture"),
+    };
+    let lock_path = repo.join(format!("android/manifest/{lock_name}"));
     let lock = json(&lock_path)?;
     let typed = droidloom_image::load_source_lock(&lock_path)?;
     let base = if reuse_installed {
@@ -285,12 +293,13 @@ pub fn assemble(
     host: &Path,
     payload: &Path,
     uid: u32,
+    target_arch: &str,
 ) -> Result<()> {
-    assemble_artifacts(repo, work, base, product, host, payload)?;
+    assemble_artifacts(repo, work, base, product, host, payload, target_arch)?;
     let notices = payload.join("usr/share/licenses/droidloom");
     crate::licenses::project(repo, &notices)?;
     crate::licenses::rust(repo, &notices.join("rust"))?;
-    configure_local(repo, payload, uid)
+    configure_local(repo, payload, uid, target_arch)
 }
 
 /// Stage the complete artifact recipe without reading any build-host configuration.
@@ -301,7 +310,13 @@ pub fn assemble_artifacts(
     product: &Path,
     host: &Path,
     payload: &Path,
+    target_arch: &str,
 ) -> Result<()> {
+    let product_name = product
+        .file_name()
+        .ok_or("Android product output has no name")?
+        .to_string_lossy()
+        .into_owned();
     let runtime = payload.join("usr/lib/droidloom/runtime");
     for name in HOST_BINARIES {
         let dest = payload.join("usr/bin").join(name);
@@ -390,7 +405,9 @@ pub fn assemble_artifacts(
             &runtime.join("lib64").join(name),
         )?;
     }
-    for name in [
+    // The userspace GPU driver differs per target: AMD on x86_64 desktops,
+    // Freedreno on ARM64 MSM hosts. A missing entry fails loudly at copy time.
+    let mut vendor_libs = vec![
         "libdroidloom_surface_bridge.dylib.so",
         "libdroidloom_task_control.dylib.so",
         "libdroidloom_composer_aidl.dylib.so",
@@ -404,8 +421,13 @@ pub fn assemble_artifacts(
         "libdroidloom_selinux_compat.so",
         "libminigbm_gralloc.so",
         "libgallium_dri.so",
-        "libdrm_amdgpu.so",
-    ] {
+    ];
+    vendor_libs.push(match target_arch {
+        "x86_64" => "libdrm_amdgpu.so",
+        "aarch64" => "libdrm_freedreno.so",
+        _ => return fail("unsupported Android target architecture"),
+    });
+    for name in vendor_libs {
         copy(
             &product.join("vendor/lib64").join(name),
             &runtime.join("lib64").join(name),
@@ -429,7 +451,7 @@ pub fn assemble_artifacts(
             "compat/vintf/compatibility_matrix.device.xml",
         ),
         (
-            "android/device/droidloom_arm64/droidloom-composer.rc",
+            &format!("android/device/{product_name}/droidloom-composer.rc"),
             "etc/init/droidloom-composer.rc",
         ),
         ("packaging/ime/setup", "ime/setup"),
@@ -445,6 +467,13 @@ pub fn assemble_artifacts(
     ] {
         copy(&repo.join(src), &runtime.join(dst))?;
     }
+    // The Composer init fragment lives beside its product definition.
+    copy(
+        &repo.join(format!(
+            "android/device/{product_name}/droidloom-composer.rc"
+        )),
+        &runtime.join("etc/init/droidloom-composer.rc"),
+    )?;
     copy(
         &work.join("init.rc"),
         &runtime.join("compat/init-classpath-first-pixels.rc"),
@@ -502,15 +531,49 @@ pub fn assemble_artifacts(
     Ok(())
 }
 
-fn configure_local(repo: &Path, payload: &Path, uid: u32) -> Result<()> {
+fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> Result<()> {
     let runtime = payload.join("usr/lib/droidloom/runtime");
-    let mut spec = json(&repo.join("packaging/cell-spec-x86_64-u1000.json"))?;
+    // The ARM64 cell recipe is the Moto-validated variant; only identity
+    // fields are rewritten below, never the runtime mappings.
+    let spec_name = match target_arch {
+        "x86_64" => "packaging/cell-spec-x86_64-u1000.json",
+        "aarch64" => "packaging/cell-spec-arm64-u1001.json",
+        _ => return fail("unsupported Android target architecture"),
+    };
+    let mut spec = json(&repo.join(spec_name))?;
     let render = render_node()?;
+    // Normalize every identity field to the target desktop user. The base
+    // recipe pins the Moto developer ids; cross bundles must not inherit them.
+    let base_uid = spec["host_uid"].as_u64().unwrap_or(1000);
+    let reroute = |value: &str| value.replace(&format!("/users/{base_uid}/"), &format!("/users/{uid}/"));
     spec["host_uid"] = json!(uid);
+    // The build host may not know the target desktop user (cross bundles).
+    // Explicit overrides win; otherwise resolve through the host user database.
+    let passwd = match std::env::var("DROIDLOOM_TARGET_USER") {
+        Ok(user) if !user.is_empty() => format!("{user}:x:{uid}:"),
+        _ => output(Command::new("getent").args(["passwd", &uid.to_string()]))?,
+    };
+    let mut fields = passwd.split(':');
+    let user = serde_json::to_string(fields.next().ok_or("user absent")?)?;
+    let gid: u32 = match std::env::var("DROIDLOOM_TARGET_GID") {
+        Ok(gid) if !gid.is_empty() => gid.parse().map_err(|_| "bad DROIDLOOM_TARGET_GID")?,
+        _ => fields
+            .nth(2)
+            .ok_or("group absent")?
+            .parse()
+            .map_err(|_| "bad group id")?,
+    };
+    spec["host_gid"] = json!(gid);
+    for field in ["data_dir", "runtime_dir", "denial_socket"] {
+        if let Some(path) = spec[field].as_str() {
+            spec[field] = json!(reroute(path));
+        }
+    }
+    // The shared-storage probe path carries the base recipe's uid as well.
+    if let Some(probe) = spec["shared_storage_probe"].as_str() {
+        spec["shared_storage_probe"] = json!(reroute(probe));
+    }
     spec["render_node"] = json!(render);
-    spec["data_dir"] = json!(format!("/var/lib/droidloom/users/{uid}/data"));
-    spec["runtime_dir"] = json!(format!("/run/droidloom/cells/u{uid}"));
-    spec["denial_socket"] = json!(format!("/run/user/{uid}/droidloom/native-bridge.sock"));
     spec["shared_storage_directories"] = json!([]);
     if Path::new("/etc/droidloom/cell.json").exists() {
         let existing = json(Path::new("/etc/droidloom/cell.json"))?;
@@ -541,11 +604,9 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32) -> Result<()> {
     write(
         &payload.join("usr/lib/environment.d/60-droidloom.conf"),
         format!(
-            "DROIDLOOM_HOST_PEER_PID=0\nDROIDLOOM_HOST_PEER_UID=1000\nDROIDLOOM_HOST_PEER_GID=1000\nDROIDLOOM_RENDER_NODE={render}\n"
+            "DROIDLOOM_HOST_PEER_PID=0\nDROIDLOOM_HOST_PEER_UID={uid}\nDROIDLOOM_HOST_PEER_GID={gid}\nDROIDLOOM_RENDER_NODE={render}\n"
         ),
     )?;
-    let record = output(Command::new("getent").args(["passwd", &uid.to_string()]))?;
-    let user = serde_json::to_string(record.split(':').next().ok_or("user absent")?)?;
     write(
         &payload.join("etc/polkit-1/rules.d/49-droidloom.rules"),
         format!(
@@ -555,6 +616,13 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 fn render_node() -> Result<String> {
+    // Cross bundles target a different machine: the target operator pins its
+    // render node explicitly instead of inheriting the build host's.
+    if let Ok(node) = std::env::var("DROIDLOOM_RENDER_NODE")
+        && !node.is_empty()
+    {
+        return Ok(node);
+    }
     let mut nodes = fs::read_dir("/sys/class/drm")?.collect::<std::io::Result<Vec<_>>>()?;
     nodes.sort_by_key(|e| e.file_name());
     for node in nodes {
@@ -562,14 +630,14 @@ fn render_node() -> Result<String> {
             continue;
         }
         if let Ok(driver) = fs::canonicalize(node.path().join("device/driver"))
-            && driver
-                .file_name()
-                .is_some_and(|n| n == "amdgpu" || n == "i915" || n == "xe")
+            && driver.file_name().is_some_and(|n| {
+                n == "amdgpu" || n == "i915" || n == "xe" || n == "msm" || n == "msm_dpu" || n == "freedreno"
+            })
         {
             return Ok(format!("/dev/dri/{}", node.file_name().to_string_lossy()));
         }
     }
-    fail("this x86_64 product requires an AMD or Intel render node")
+    fail("no supported render node found (AMD, Intel or MSM); pin one with DROIDLOOM_RENDER_NODE")
 }
 fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()> {
     if existing["host_uid"].as_u64() != Some(u64::from(uid)) {

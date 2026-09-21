@@ -30,6 +30,9 @@ struct Args {
     /// Build and verify a complete bundle without installing it.
     #[arg(long)]
     build_only: bool,
+    /// Android product to build: droidloom_x86_64, droidloom_arm64 or droidloom_sheng.
+    #[arg(long)]
+    product: Option<String>,
     /// Maximum parallel jobs, capped at available CPUs minus two.
     #[arg(short = 'j', long)]
     jobs: Option<usize>,
@@ -181,7 +184,23 @@ fn execute(args: Args) -> Result<()> {
     if arch != "x86_64" {
         return fail("the source builder currently requires an x86_64 Linux build host");
     }
-    let product = "droidloom_x86_64";
+    let product = args
+        .product
+        .clone()
+        .unwrap_or_else(|| "droidloom_x86_64".to_string());
+    // AOSP cross-compiles ARM64 userspace on the x86_64 host; only the Rust
+    // host programs need an explicit cross target. The installer side rejects
+    // foreign-architecture bundles, so cross bundles must be applied on target.
+    let target_arch: &str = match product.as_str() {
+        "droidloom_x86_64" => "x86_64",
+        "droidloom_arm64" | "droidloom_sheng" => "aarch64",
+        _ => {
+            return fail(
+                "unknown Android product; expected droidloom_x86_64, droidloom_arm64 or droidloom_sheng",
+            );
+        }
+    };
+    let cross = target_arch != arch;
     let package_work = match &args.command {
         Some(Action::NativeBridgeBuild {
             work: Some(work), ..
@@ -244,7 +263,7 @@ fn execute(args: Args) -> Result<()> {
             &source,
             &out,
             &work,
-            product,
+            &product,
             jobs,
             if tests {
                 &["droidloom-native-bridge", "berberis_arm64_host_tests"]
@@ -262,19 +281,46 @@ fn execute(args: Args) -> Result<()> {
     }
     let identity = bundle::source_identity(&repo)?;
     eprintln!("Building complete Droidloom release from {identity}");
+    if cross {
+        eprintln!(
+            "Cross build for {product}: orchestration continues in this host updater; the staged payload carries the fresh {target_arch} binaries"
+        );
+    }
     eprintln!("Compiler budget: {jobs} parallel jobs; two logical CPUs reserved");
     let mut host_build = Command::new("cargo");
+    // Cross builds keep a separate target directory so native and foreign
+    // artifacts never mix. mesa_tools below intentionally stays native: the
+    // compiler helpers run on the build host during the Android build.
+    let cargo_target_dir = if cross {
+        cargo.join("aarch64")
+    } else {
+        cargo.clone()
+    };
     host_build
         .current_dir(&repo)
-        .env("CARGO_TARGET_DIR", &cargo)
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
         .args(["build", "--locked", "--release"])
         .arg(format!("-j{jobs}"));
+    if cross {
+        host_build.args(["--target", "aarch64-unknown-linux-gnu"]);
+        if std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER").is_none() {
+            host_build.env(
+                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+                "aarch64-linux-gnu-gcc",
+            );
+        }
+    }
     for package in assemble::HOST_PACKAGES {
         host_build.arg("-p").arg(package);
     }
     run_build(&mut host_build)?;
-    let fresh = cargo.join("release/droidloom-update");
-    if !args.bootstrapped {
+    let host_out = if cross {
+        cargo_target_dir.join("aarch64-unknown-linux-gnu/release")
+    } else {
+        cargo.join("release")
+    };
+    let fresh = host_out.join("droidloom-update");
+    if !args.bootstrapped && !cross {
         // The updater is part of the build too. Use its new orchestration in this update.
         // Release locks before exec so the replacement can acquire them normally.
         drop(_source_lock);
@@ -300,10 +346,10 @@ fn execute(args: Args) -> Result<()> {
             .arg("--uid")
             .arg(uid.to_string()))?;
     }
-    let base = assemble::prepare_inputs(&repo, &work, arch)?;
+    let base = assemble::prepare_inputs(&repo, &work, target_arch)?;
     python::prepare(&repo, &work)?;
     assemble::mesa_tools(&work, jobs)?;
-    android::build(&repo, &source, &out, &work, product, jobs)?;
+    android::build(&repo, &source, &out, &work, &product, jobs)?;
     let staging = tempfile::Builder::new()
         .prefix("bundle-")
         .tempdir_in(&work)?;
@@ -311,10 +357,11 @@ fn execute(args: Args) -> Result<()> {
         &repo,
         &work,
         &base,
-        &out.join("target/product").join(product),
-        &cargo.join("release"),
+        &out.join("target/product").join(&product),
+        &host_out,
         staging.path(),
         uid,
+        target_arch,
     )?;
     let id = bundle::seal(staging.path(), identity)?;
     bundle::verify(staging.path())?;

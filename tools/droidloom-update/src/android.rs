@@ -628,7 +628,7 @@ pub fn build_targets(
         &vendor.join("android/prebuilts/framework-res.apk"),
         fs::read(work.join("framework-res.apk"))?,
     )?;
-    let board = vendor.join("android/device/droidloom_x86_64/BoardConfig.mk");
+    let board = vendor.join(format!("android/device/{product}/BoardConfig.mk"));
     let native = work.join("mesa-native.ini");
     write(
         &native,

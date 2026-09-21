@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <!-- Denial routes touch and pointer gestures through Droidloom's targeted
+         MotionEvent bridge. Physical input nodes remain private to the host.
+         Declare the basic touch interface apps can use through that bridge;
+         physical sensors, cameras and microphones are separate capabilities. -->
+    <feature name="android.hardware.touchscreen" />
+    <!-- The routed MotionEvent bridge preserves independent contact IDs and
+         emits POINTER_DOWN/POINTER_UP for simultaneous touches. -->
+    <feature name="android.hardware.touchscreen.multitouch" />
+    <feature name="android.hardware.touchscreen.multitouch.distinct" />
+    <feature name="android.hardware.faketouch" />
+    <!-- Freeform Android tasks support both window orientations. -->
+    <feature name="android.hardware.screen.landscape" />
+    <feature name="android.hardware.screen.portrait" />
+</permissions>

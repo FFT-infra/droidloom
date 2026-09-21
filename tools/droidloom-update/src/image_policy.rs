@@ -27,18 +27,29 @@ fn desktop_vendor(properties: &str) -> Result<()> {
             }
         })
         .collect();
-    if properties.get("ro.product.vendor.device") != Some(&"droidloom_x86_64")
-        || properties.get("ro.vendor.build.version.sdk") != Some(&"37")
-        || !matches!(
-            properties.get("ro.vendor.product.cpu.abilist"),
-            Some(&"x86_64" | &"x86_64,arm64-v8a")
-        )
+    // The vendor device selects its CPU list; cross products must not smuggle
+    // an x86_64 ABI declaration into an ARM64 cell or vice versa.
+    let abilist = match properties.get("ro.product.vendor.device") {
+        Some(&"droidloom_x86_64") => "x86_64",
+        Some(&"droidloom_arm64") | Some(&"droidloom_sheng") => "arm64-v8a",
+        _ => {
+            return fail(
+                "legacy VNDK removal requires a Droidloom vendor without a VNDK selection",
+            );
+        }
+    };
+    if properties.get("ro.vendor.build.version.sdk") != Some(&"37")
+        || !properties
+            .get("ro.vendor.product.cpu.abilist")
+            .is_some_and(|abilist_value| {
+                abilist_value.split(',').any(|entry| entry.trim() == abilist)
+            })
         || ["ro.vndk.version", "ro.product.vndk.version"]
             .iter()
             .any(|key| properties.get(key).is_some_and(|value| !value.is_empty()))
     {
         return fail(
-            "legacy VNDK removal requires the Android 17 Droidloom x86_64 vendor without a VNDK selection",
+            "legacy VNDK removal requires the Android 17 Droidloom vendor without a VNDK selection",
         );
     }
     Ok(())
@@ -221,6 +232,14 @@ mod tests {
     #[test]
     fn rejects_legacy_vendor_and_other_products() {
         desktop_vendor(PROPERTIES).unwrap();
+        for device in ["droidloom_arm64", "droidloom_sheng"] {
+            let properties = PROPERTIES
+                .replace("droidloom_x86_64", device)
+                .replace("abilist=x86_64", "abilist=arm64-v8a");
+            desktop_vendor(&properties).unwrap();
+            // A foreign ABI declaration never belongs to this vendor device.
+            assert!(desktop_vendor(&format!("{properties}ro.vendor.product.cpu.abilist=x86_64\n")).is_err());
+        }
         for properties in [
             PROPERTIES.replace("sdk=37", "sdk=34"),
             PROPERTIES.replace("droidloom_x86_64", "phone"),
