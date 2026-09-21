@@ -309,6 +309,26 @@ fn execute(args: Args) -> Result<()> {
                 "aarch64-linux-gnu-gcc",
             );
         }
+        // pkg-config reports only direct libraries; the sysroot's transitive
+        // closures (libdrm behind gbm, libffi behind wayland-server) must be
+        // spelled out because --as-needed drops unreferenced indirections.
+        // Crates without any pkg-config dependency (e.g. droidloom-doctor)
+        // emit no sysroot -L at all, so append it explicitly as well.
+        const CROSS_RUSTFLAGS: &str = "-C link-arg=-ldrm -C link-arg=-lffi";
+        let mut rustflags = match std::env::var("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+        {
+            Ok(existing) => format!("{existing} {CROSS_RUSTFLAGS}"),
+            Err(_) => CROSS_RUSTFLAGS.to_string(),
+        };
+        if let Ok(sysroot) = std::env::var("PKG_CONFIG_SYSROOT_DIR")
+            && !sysroot.is_empty()
+        {
+            rustflags.push_str(&format!(" -C link-arg=-L{sysroot}/usr/lib"));
+        }
+        host_build.env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            rustflags,
+        );
     }
     for package in assemble::HOST_PACKAGES {
         host_build.arg("-p").arg(package);
