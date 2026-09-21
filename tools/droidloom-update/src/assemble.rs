@@ -238,6 +238,19 @@ pub fn mesa_tools(work: &Path, jobs: usize) -> Result<()> {
     run(Command::new("pkg-config").args(["--exists", "LLVMSPIRVLib"]))?;
     let build = work.join("mesa-tools");
     let mut configure = Command::new("meson");
+    // These compiler helpers always run on the build host (their outputs feed
+    // the Android build). A cross sysroot leaked through the environment would
+    // silently link foreign libraries into native tools, so scrub it here.
+    // The Rust cross flow keeps its own target-scoped variables untouched.
+    for var in [
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_ALLOW_CROSS",
+        "TARGET_PKG_CONFIG_SYSROOT_DIR",
+        "TARGET_PKG_CONFIG_PATH",
+    ] {
+        configure.env_remove(var);
+    }
     configure
         .env("CCACHE_DIR", work.join("ccache"))
         .env("CCACHE_TEMPDIR", work.join("ccache-tmp"));
@@ -270,8 +283,18 @@ pub fn mesa_tools(work: &Path, jobs: usize) -> Result<()> {
         "-Dlibunwind=disabled",
     ]);
     run_build(&mut configure)?;
+    let mut ninja = Command::new("ninja");
+    for var in [
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_ALLOW_CROSS",
+        "TARGET_PKG_CONFIG_SYSROOT_DIR",
+        "TARGET_PKG_CONFIG_PATH",
+    ] {
+        ninja.env_remove(var);
+    }
     run_build(
-        Command::new("ninja")
+        ninja
             .arg("-C")
             .arg(&build)
             .arg(format!("-j{jobs}"))
