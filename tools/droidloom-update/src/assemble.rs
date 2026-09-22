@@ -429,7 +429,9 @@ pub fn assemble_artifacts(
         )?;
     }
     // The userspace GPU driver differs per target: AMD on x86_64 desktops,
-    // Freedreno on ARM64 MSM hosts. A missing entry fails loudly at copy time.
+    // the generic libdrm core on ARM64 MSM hosts (the Freedreno winsys code
+    // ships inside libgallium_dri; no separate libdrm_freedreno is emitted).
+    // A missing entry fails loudly at copy time.
     let mut vendor_libs = vec![
         "libdroidloom_surface_bridge.dylib.so",
         "libdroidloom_task_control.dylib.so",
@@ -447,7 +449,7 @@ pub fn assemble_artifacts(
     ];
     vendor_libs.push(match target_arch {
         "x86_64" => "libdrm_amdgpu.so",
-        "aarch64" => "libdrm_freedreno.so",
+        "aarch64" => "libdrm.so",
         _ => return fail("unsupported Android target architecture"),
     });
     for name in vendor_libs {
