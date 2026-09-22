@@ -46,19 +46,26 @@ pub const TARGETS: &[&str] = &[
 ];
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
-pub fn apex_output(name: &str) -> Option<&'static str> {
-    match name {
-        "netbpfload" => Some(
-            "soong/.intermediates/packages/modules/Connectivity/bpf/loader/netbpfload/android_x86_64/netbpfload",
+// The intermediate variant directory follows the Android target architecture.
+pub fn apex_output(name: &str, target_arch: &str) -> Option<String> {
+    let variant = match target_arch {
+        "x86_64" => "android_x86_64",
+        "aarch64" => "android_arm64",
+        _ => return None,
+    };
+    let path = match name {
+        "netbpfload" => format!(
+            "soong/.intermediates/packages/modules/Connectivity/bpf/loader/netbpfload/{variant}/netbpfload"
         ),
-        "libservice-connectivity" => Some(
-            "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/android_x86_64_shared/libservice-connectivity.so",
+        "libservice-connectivity" => format!(
+            "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/{variant}_shared/libservice-connectivity.so"
         ),
-        "libnetd_updatable" => Some(
-            "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_x86_64_shared_cfi/libnetd_updatable.so",
+        "libnetd_updatable" => format!(
+            "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/{variant}_shared_cfi/libnetd_updatable.so"
         ),
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(path)
 }
 const PATCHES: &[(&str, &str)] = &[
     (
@@ -674,6 +681,7 @@ pub fn build_targets(
         &source.join("prebuilts/build-tools/common/framework/turbine.jar"),
         &out.join("host/linux-x86/framework/turbine.jar"),
     )?;
+    let variant_arch = target_arch(product)?;
     let mut cmd = Command::new(out.join("soong_ui"));
     cmd.current_dir(source)
         .env("SOONG_NINJA", "ninja")
@@ -700,7 +708,8 @@ pub fn build_targets(
         .arg("--make-mode")
         .arg(format!("-j{jobs}"))
         .args(targets.iter().map(|name| {
-            apex_output(name).map_or_else(|| PathBuf::from(name), |path| out.join(path))
+            let path = apex_output(name, variant_arch);
+            path.map_or_else(|| PathBuf::from(name), |path| out.join(path))
         }));
     let result = run_build(&mut cmd);
     p.restore()?;

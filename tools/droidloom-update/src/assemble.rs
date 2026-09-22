@@ -414,7 +414,7 @@ pub fn assemble_artifacts(
         copy(
             &work
                 .join("android-out")
-                .join(crate::android::apex_output(name).unwrap()),
+                .join(crate::android::apex_output(name, target_arch).unwrap()),
             &runtime.join(destination),
         )?;
     }
