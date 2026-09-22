@@ -588,7 +588,8 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> 
             .parse()
             .map_err(|_| "bad group id")?,
     };
-    spec["host_gid"] = json!(gid);
+    // NOTE: no top-level host_gid is written: the lifecycle protocol message
+    // has no such field (per-directory host_gid entries are untouched).
     for field in ["data_dir", "runtime_dir", "denial_socket"] {
         if let Some(path) = spec[field].as_str() {
             spec[field] = json!(reroute(path));
