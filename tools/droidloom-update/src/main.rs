@@ -191,15 +191,7 @@ fn execute(args: Args) -> Result<()> {
     // AOSP cross-compiles ARM64 userspace on the x86_64 host; only the Rust
     // host programs need an explicit cross target. The installer side rejects
     // foreign-architecture bundles, so cross bundles must be applied on target.
-    let target_arch: &str = match product.as_str() {
-        "droidloom_x86_64" => "x86_64",
-        "droidloom_arm64" | "droidloom_sheng" => "aarch64",
-        _ => {
-            return fail(
-                "unknown Android product; expected droidloom_x86_64, droidloom_arm64 or droidloom_sheng",
-            );
-        }
-    };
+    let target_arch = android::target_arch(&product)?;
     let cross = target_arch != arch;
     let package_work = match &args.command {
         Some(Action::NativeBridgeBuild {

@@ -49,6 +49,7 @@ pub fn prepare_build(
     vendor: &Path,
     work: &Path,
     projection: &mut crate::android::Projection,
+    target_arch: &str,
 ) -> Result<()> {
     let bridge = source.join("frameworks/libs/binary_translation");
     // Android 17 forbids global libnativehelper include paths. Export its
@@ -101,11 +102,19 @@ cc_library_headers {
             copy(&library, &link.join(format!("{name}.so")))?;
         }
         let bytes = fs::read(link.join(format!("{name}.so")))?;
+        // The pinned system image matches the Android target: x86_64 cells
+        // link the translator against x86_64 host libraries, ARM64 cells link
+        // natively against aarch64 ones.
+        let machine = match target_arch {
+            "x86_64" => 62u16,
+            "aarch64" => 183u16,
+            _ => return fail("unsupported Android target architecture"),
+        };
         if bytes.len() < 20
             || &bytes[..6] != b"\x7fELF\x02\x01"
-            || u16::from_le_bytes([bytes[18], bytes[19]]) != 62
+            || u16::from_le_bytes([bytes[18], bytes[19]]) != machine
         {
-            return fail(format!("invalid pinned x86_64 API library: {name}"));
+            return fail(format!("invalid pinned {target_arch} API library: {name}"));
         }
         blueprint.push_str(&format!(
             r#"

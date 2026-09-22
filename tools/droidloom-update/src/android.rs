@@ -486,6 +486,16 @@ fn bootstrap(source: &Path, out: &Path) -> Result<()> {
     }
     Ok(())
 }
+// Android target architecture selected by the product. The x86_64 cell runs
+// ARM64 guests through the source-built translator; ARM64 cells execute
+// natively, so their base libraries and vendor modules are aarch64 ELF.
+pub(crate) fn target_arch(product: &str) -> Result<&'static str> {
+    match product {
+        "droidloom_x86_64" => Ok("x86_64"),
+        "droidloom_arm64" | "droidloom_sheng" => Ok("aarch64"),
+        _ => fail("unknown Android product; expected droidloom_x86_64, droidloom_arm64 or droidloom_sheng"),
+    }
+}
 pub fn build(
     repo: &Path,
     source: &Path,
@@ -584,7 +594,7 @@ pub fn build_targets(
             copy(&repo.join(relative), &destination)?;
         }
     }
-    crate::native_bridge::prepare_build(source, &vendor, work, &mut p)?;
+    crate::native_bridge::prepare_build(source, &vendor, work, &mut p, target_arch(product)?)?;
     let mesa = vendor.join("mesa3d");
     fs::create_dir_all(&mesa)?;
     run(Command::new("rsync")
