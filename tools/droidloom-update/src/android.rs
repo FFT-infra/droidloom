@@ -57,7 +57,7 @@ pub fn apex_output(name: &str, target_arch: &str) -> Option<String> {
         ("libnetd_updatable", "x86_64") => "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_x86_64_shared_cfi/libnetd_updatable.so".to_string(),
         ("netbpfload", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/bpf/loader/netbpfload/android_arm64_armv8-a/netbpfload".to_string(),
         ("libservice-connectivity", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/android_arm64_armv8-a_shared/libservice-connectivity.so".to_string(),
-        ("libnetd_updatable", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_arm64_armv8-a_shared_1/libnetd_updatable.so".to_string(),
+        ("libnetd_updatable", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_arm64_armv8-a_shared_cfi/libnetd_updatable.so".to_string(),
         _ => return None,
     };
     Some(path)
