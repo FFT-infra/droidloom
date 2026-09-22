@@ -570,7 +570,12 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> 
     // Normalize every identity field to the target desktop user. The base
     // recipe pins the Moto developer ids; cross bundles must not inherit them.
     let base_uid = spec["host_uid"].as_u64().unwrap_or(1000);
-    let reroute = |value: &str| value.replace(&format!("/users/{base_uid}/"), &format!("/users/{uid}/"));
+    let reroute = |value: &str| {
+        value
+            .replace(&format!("/users/{base_uid}/"), &format!("/users/{uid}/"))
+            .replace(&format!("/user/{base_uid}/"), &format!("/user/{uid}/"))
+            .replace(&format!("cells/u{base_uid}"), &format!("cells/u{uid}"))
+    };
     spec["host_uid"] = json!(uid);
     // The build host may not know the target desktop user (cross bundles).
     // Explicit overrides win; otherwise resolve through the host user database.
