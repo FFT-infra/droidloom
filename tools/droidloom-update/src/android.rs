@@ -48,21 +48,16 @@ pub const TARGETS: &[&str] = &[
 // Request their compiled outputs, without asking AOSP to install them into system.
 // The intermediate variant directory follows the Android target architecture.
 pub fn apex_output(name: &str, target_arch: &str) -> Option<String> {
-    let variant = match target_arch {
-        "x86_64" => "android_x86_64",
-        "aarch64" => "android_arm64",
-        _ => return None,
-    };
-    let path = match name {
-        "netbpfload" => format!(
-            "soong/.intermediates/packages/modules/Connectivity/bpf/loader/netbpfload/{variant}/netbpfload"
-        ),
-        "libservice-connectivity" => format!(
-            "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/{variant}_shared/libservice-connectivity.so"
-        ),
-        "libnetd_updatable" => format!(
-            "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/{variant}_shared_cfi/libnetd_updatable.so"
-        ),
+    // Discovered with `ninja -f combined-<product>.ninja -t targets all`.
+    // x86_64 emits bare android_x86_64 variants; ARM64 appends the arch
+    // variant (armv8-a from BoardConfig) and APEX-specific suffixes.
+    let path = match (name, target_arch) {
+        ("netbpfload", "x86_64") => "soong/.intermediates/packages/modules/Connectivity/bpf/loader/netbpfload/android_x86_64/netbpfload".to_string(),
+        ("libservice-connectivity", "x86_64") => "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/android_x86_64_shared/libservice-connectivity.so".to_string(),
+        ("libnetd_updatable", "x86_64") => "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_x86_64_shared_cfi/libnetd_updatable.so".to_string(),
+        ("netbpfload", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/bpf/loader/netbpfload/android_arm64_armv8-a/netbpfload".to_string(),
+        ("libservice-connectivity", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/android_arm64_armv8-a_shared/libservice-connectivity.so".to_string(),
+        ("libnetd_updatable", "aarch64") => "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_arm64_armv8-a_shared_1/libnetd_updatable.so".to_string(),
         _ => return None,
     };
     Some(path)
