@@ -300,38 +300,60 @@ pub fn derive_image(
     let tree = work.path().join("tree");
     crate::image_policy::extract(image, &tree)?;
     let properties = tree.join("system/build.prop");
-    let updated = bridge_properties(&fs::read_to_string(&properties)?)?;
-    fs::write(&properties, updated)?;
+    // The translator merge below only exists for ARM64 guests on x86_64
+    // hosts. ARM64 cells execute natively: keep the base ABI contract and
+    // record native provenance instead of injecting bridge properties.
+    let product_name = product
+        .file_name()
+        .ok_or("Android product output has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let native_arm64 = match product_name.as_str() {
+        "droidloom_x86_64" => false,
+        "droidloom_arm64" | "droidloom_sheng" => true,
+        _ => return fail("unknown Android product for NativeBridge derivation"),
+    };
+    if !native_arm64 {
+        let updated = bridge_properties(&fs::read_to_string(&properties)?)?;
+        fs::write(&properties, updated)?;
+    } else if !fs::read_to_string(&properties)?
+        .lines()
+        .any(|line| line == "ro.build.version.sdk=37")
+    {
+        return fail("native ARM64 system image requires the pinned Android 17 base");
+    }
 
     let mut paths = Vec::new();
-    for entry in fs::read_dir(product.join("system/lib64"))? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("libberberis_")
-            && entry.file_name().to_string_lossy().ends_with(".so")
-        {
-            paths.push(entry.path());
+    if !native_arm64 {
+        for entry in fs::read_dir(product.join("system/lib64"))? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libberberis_")
+                && entry.file_name().to_string_lossy().ends_with(".so")
+            {
+                paths.push(entry.path());
+            }
         }
-    }
-    guest_files(&product.join("system/lib64/arm64"), &mut paths)?;
-    guest_files(&product.join("system/bin/arm64"), &mut paths)?;
-    paths.push(product.join("system/etc/ld.config.arm64.txt"));
-    paths.sort();
-    for required in [
-        "system/lib64/libberberis_arm64.so",
-        "system/lib64/libberberis_exec_region.so",
-        "system/lib64/libberberis_proxy_libc.so",
-        "system/lib64/libberberis_proxy_libEGL.so",
-        "system/lib64/libberberis_proxy_libGLESv2.so",
-        "system/lib64/libberberis_proxy_libvulkan.so",
-        "system/lib64/arm64/libc.so",
-        "system/lib64/arm64/libnative_bridge_vdso.so",
-        "system/bin/arm64/linker64",
-    ] {
-        if !paths.contains(&product.join(required)) {
-            return fail(format!("missing required NativeBridge output: {required}"));
+        guest_files(&product.join("system/lib64/arm64"), &mut paths)?;
+        guest_files(&product.join("system/bin/arm64"), &mut paths)?;
+        paths.push(product.join("system/etc/ld.config.arm64.txt"));
+        paths.sort();
+        for required in [
+            "system/lib64/libberberis_arm64.so",
+            "system/lib64/libberberis_exec_region.so",
+            "system/lib64/libberberis_proxy_libc.so",
+            "system/lib64/libberberis_proxy_libEGL.so",
+            "system/lib64/libberberis_proxy_libGLESv2.so",
+            "system/lib64/libberberis_proxy_libvulkan.so",
+            "system/lib64/arm64/libc.so",
+            "system/lib64/arm64/libnative_bridge_vdso.so",
+            "system/bin/arm64/linker64",
+        ] {
+            if !paths.contains(&product.join(required)) {
+                return fail(format!("missing required NativeBridge output: {required}"));
+            }
         }
     }
     let mut inventory = BTreeMap::new();
@@ -420,8 +442,9 @@ pub fn derive_image(
         "source": serde_json::from_slice::<serde_json::Value>(&fs::read(source_lock)?)?,
         "build_source": serde_json::from_slice::<serde_json::Value>(&fs::read(
             product.join("droidloom-native-bridge-source.json"))?)?,
-        "guest_abi": "arm64-v8a", "host_abi": "x86_64",
-        "native_executables": false, "files": inventory,
+        "guest_abi": "arm64-v8a",
+        "host_abi": if native_arm64 { "arm64-v8a" } else { "x86_64" },
+        "native_executables": native_arm64, "files": inventory,
     });
     let manifest_path = tree.join("system/etc/droidloom-native-bridge.json");
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
