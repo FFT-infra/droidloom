@@ -34,7 +34,7 @@ index 8225dec..49740f3 100644
  
  } // namespace inputdispatcher
 diff --git a/services/inputflinger/dispatcher/InputDispatcher.cpp b/services/inputflinger/dispatcher/InputDispatcher.cpp
-index 0d27a09..0cee0b6 100644
+index 0d27a09..1618e58 100644
 --- a/services/inputflinger/dispatcher/InputDispatcher.cpp
 +++ b/services/inputflinger/dispatcher/InputDispatcher.cpp
 @@ -611,16 +611,24 @@ bool isWindowOwnedBy(const sp<WindowInfoHandle>& windowHandle, gui::Pid pid, gui
@@ -199,7 +199,16 @@ index 0d27a09..0cee0b6 100644
  
              // Verify targeted injection.
              if (const auto err = verifyTargetedInjection(newTouchedWindowHandle, entry); err) {
-@@ -2846,9 +2900,9 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+@@ -2842,13 +2896,18 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
+     if (entry.injectionState != nullptr) {
+         std::string errs;
+         for (const TouchedWindow& touchedWindow : tempTouchState.windows) {
++            if (entry.injectionState->targetApplicationToken != nullptr &&
++                !touchedWindow.hasTouchingPointers(entry.deviceId) &&
++                !touchedWindow.hasHoveringPointers(entry.deviceId)) {
++                continue;
++            }
+             const auto err = verifyTargetedInjection(touchedWindow.windowHandle, entry);
              if (err) errs += "\n  - " + *err;
          }
          if (!errs.empty()) {
@@ -212,12 +221,7 @@ index 0d27a09..0cee0b6 100644
              return injectionError(InputEventInjectionResult::TARGET_MISMATCH);
          }
      }
-@@ -4943,11 +4997,19 @@ bool InputDispatcher::shouldRejectInjectedMotionLocked(const MotionEvent& motion
-     return false;
- }
- 
- InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* event,
-                                                             std::optional<gui::Uid> targetUid,
+@@ -4948,6 +5007,14 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
                                                              InputEventInjectionSync syncMode,
                                                              std::chrono::milliseconds timeout,
                                                              uint32_t policyFlags) {
@@ -232,7 +236,25 @@ index 0d27a09..0cee0b6 100644
      Result<void> eventValidation = validateInputEvent(*event);
      if (!eventValidation.ok()) {
          LOG(INFO) << "Injection failed: invalid event: " << eventValidation.error();
-@@ -4974,7 +5036,8 @@ InputEventInjectionResult InputDispatcher::injectInputEventToApplication(
+@@ -4971,10 +5038,26 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
+     DeviceId resolvedDeviceId = VIRTUAL_KEYBOARD_ID;
+     if (policyFlags & POLICY_FLAG_FILTERED) {
+         resolvedDeviceId = event->getDeviceId();
++    } else if (targetApplicationToken != nullptr && event->getType() == InputEventType::MOTION) {
++        const MotionEvent& motion = static_cast<const MotionEvent&>(*event);
++        if (isFromSource(motion.getSource(), AINPUT_SOURCE_STYLUS)) {
++            // Each Droidloom tool needs its own touch state. Ordinary injections
++            // still use VIRTUAL_KEYBOARD_ID; these reserved negative IDs cannot
++            // collide with physical devices or Droidloom's injected touch stream.
++            if (motion.getPointerCount() != 1) {
++                return InputEventInjectionResult::FAILED;
++            }
++            const int32_t pointerId = motion.getPointerId(0);
++            if (pointerId < 0 || pointerId > MAX_POINTER_ID) {
++                return InputEventInjectionResult::FAILED;
++            }
++            resolvedDeviceId = DROIDLOOM_STYLUS_DEVICE_ID_BASE - pointerId;
++        }
      }
  
      const bool isAsync = syncMode == InputEventInjectionSync::NONE;
@@ -242,7 +264,7 @@ index 0d27a09..0cee0b6 100644
  
      std::queue<std::unique_ptr<EventEntry>> injectedEntries;
      switch (event->getType()) {
-@@ -5593,20 +5656,31 @@ bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
+@@ -5593,20 +5676,31 @@ bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
          return false;
      }
  
@@ -287,21 +309,21 @@ index 0d27a09..0cee0b6 100644
  
      // Drop touch events if requested by input feature
 diff --git a/services/inputflinger/dispatcher/InputDispatcher.h b/services/inputflinger/dispatcher/InputDispatcher.h
-index a53f492..ad4066b 100644
+index a53f492..6be2824 100644
 --- a/services/inputflinger/dispatcher/InputDispatcher.h
 +++ b/services/inputflinger/dispatcher/InputDispatcher.h
-@@ -114,6 +114,11 @@ public:
-     android::os::InputEventInjectionResult injectInputEvent(
-             const InputEvent* event, std::optional<gui::Uid> targetUid,
+@@ -116,6 +116,11 @@ public:
              android::os::InputEventInjectionSync syncMode, std::chrono::milliseconds timeout,
              uint32_t policyFlags) override;
-+
+ 
 +    android::os::InputEventInjectionResult injectInputEventToApplication(
 +            const InputEvent* event, std::optional<gui::Uid> targetUid,
 +            android::os::InputEventInjectionSync syncMode, std::chrono::milliseconds timeout,
 +            uint32_t policyFlags, const sp<IBinder>& targetApplicationToken);
- 
++
      std::unique_ptr<VerifiedInputEvent> verifyInputEvent(const InputEvent& event) override;
+ 
+     void setFocusedApplication(
 @@ -341,7 +346,12 @@ private:
          // Returns the touched window at the given location, excluding the ignoreWindow if provided.
          sp<android::gui::WindowInfoHandle> findTouchedWindowAt(
@@ -316,3 +338,230 @@ index a53f492..ad4066b 100644
  
          TouchOcclusionInfo computeTouchOcclusionInfo(
                  const sp<android::gui::WindowInfoHandle>& windowHandle, float x, float y) const;
+diff --git a/services/inputflinger/dispatcher/InputState.cpp b/services/inputflinger/dispatcher/InputState.cpp
+index ccf564b..57b7971 100644
+--- a/services/inputflinger/dispatcher/InputState.cpp
++++ b/services/inputflinger/dispatcher/InputState.cpp
+@@ -25,6 +25,31 @@
+ 
+ namespace android::inputdispatcher {
+ 
++namespace {
++
++// Only Droidloom-targeted stylus injection uses this reserved device range.
++// Preserve its independent stream alongside Droidloom's injected touchscreen
++// and other targeted stylus tools, even on builds that disable the general
++// multi-device same-window feature flag.
++bool isDroidloomParallelVirtualStream(DeviceId firstId, uint32_t firstSource,
++                                      DeviceId secondId, uint32_t secondSource) {
++    const auto isDroidloomStylus = [](DeviceId id, uint32_t source) {
++        return id <= DROIDLOOM_STYLUS_DEVICE_ID_BASE &&
++                id >= DROIDLOOM_STYLUS_DEVICE_ID_BASE - MAX_POINTER_ID &&
++                isFromSource(source, AINPUT_SOURCE_STYLUS);
++    };
++    const auto isInjectedTouch = [](DeviceId id, uint32_t source) {
++        return id == VIRTUAL_KEYBOARD_ID && isFromSource(source, AINPUT_SOURCE_TOUCHSCREEN);
++    };
++    const bool firstStylus = isDroidloomStylus(firstId, firstSource);
++    const bool secondStylus = isDroidloomStylus(secondId, secondSource);
++    return firstId != secondId &&
++            ((firstStylus && (secondStylus || isInjectedTouch(secondId, secondSource))) ||
++             (secondStylus && isInjectedTouch(firstId, firstSource)));
++}
++
++} // namespace
++
+ InputState::InputState(const IdGenerator& idGenerator) : mIdGenerator(idGenerator) {}
+ 
+ InputState::~InputState() {}
+@@ -101,7 +126,10 @@ bool InputState::trackMotion(const MotionEntry& entry, ftl::Flags<MotionFlag> fl
+         if (!mMotionMementos.empty()) {
+             const MotionMemento& lastMemento = mMotionMementos.back();
+             if (isStylusEvent(lastMemento.source, lastMemento.pointerProperties) &&
+-                !isStylusEvent(entry.source, entry.pointerProperties)) {
++                !isStylusEvent(entry.source, entry.pointerProperties) &&
++                !(lastMemento.displayId == entry.displayId &&
++                  isDroidloomParallelVirtualStream(lastMemento.deviceId, lastMemento.source,
++                                                   entry.deviceId, entry.source))) {
+                 // We already have a stylus stream, and the new event is not from stylus.
+                 return false;
+             }
+@@ -355,6 +383,12 @@ bool InputState::shouldCancelPreviousStream(const MotionEntry& motionEntry) cons
+         return false;
+     }
+ 
++    if (lastMemento.displayId == motionEntry.displayId &&
++        isDroidloomParallelVirtualStream(lastMemento.deviceId, lastMemento.source,
++                                         motionEntry.deviceId, motionEntry.source)) {
++        return false;
++    }
++
+     if (!input_flags::enable_multi_device_same_window_stream()) {
+         if (isStylusEvent(lastMemento.source, lastMemento.pointerProperties)) {
+             // A stylus is already active.
+diff --git a/services/inputflinger/dispatcher/InputState.h b/services/inputflinger/dispatcher/InputState.h
+index e41c4c1..0653872 100644
+--- a/services/inputflinger/dispatcher/InputState.h
++++ b/services/inputflinger/dispatcher/InputState.h
+@@ -27,6 +27,8 @@ namespace android {
+ namespace inputdispatcher {
+ 
+ static constexpr int32_t INVALID_POINTER_INDEX = -1;
++// Droidloom assigns one virtual device to each targeted injected stylus tool.
++static constexpr DeviceId DROIDLOOM_STYLUS_DEVICE_ID_BASE = -1024;
+ 
+ /* Tracks dispatched key and motion event state so that cancellation events can be
+  * synthesized when events are dropped. */
+diff --git a/services/inputflinger/tests/InputDispatcher_test.cpp b/services/inputflinger/tests/InputDispatcher_test.cpp
+index f5ea1ca..bee1f7c 100644
+--- a/services/inputflinger/tests/InputDispatcher_test.cpp
++++ b/services/inputflinger/tests/InputDispatcher_test.cpp
+@@ -15250,6 +15250,148 @@ TEST_F(InputDispatcherTargetedInjectionTest, CannotInjectIntoUnownedSpyWindow) {
+     window->consumeMotionDown();
+ }
+ 
++TEST_F(InputDispatcherTargetedInjectionTest, KeepsStylusHoverSeparateFromInjectedTouch) {
++    auto application = std::make_shared<FakeApplicationHandle>();
++    auto window = sp<FakeWindowHandle>::make(
++            application, mDispatcher, "Note", ui::LogicalDisplayId::DEFAULT);
++    window->setFrame(Rect(0, 0, 500, 500));
++    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
++
++    const auto injectTargeted = [&](const MotionEvent& event) {
++        return mDispatcher->injectInputEventToApplication(
++                &event, {}, InputEventInjectionSync::WAIT_FOR_RESULT, INJECT_EVENT_TIMEOUT,
++                POLICY_FLAG_PASS_TO_USER | POLICY_FLAG_DISABLE_KEY_REPEAT,
++                window->getApplicationToken());
++    };
++    const MotionEvent touchDown =
++            MotionEventBuilder(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(100).y(100))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(touchDown));
++    window->consumeMotionDown();
++
++    const MotionEvent penHover =
++            MotionEventBuilder(ACTION_HOVER_ENTER, AINPUT_SOURCE_STYLUS)
++                    .pointer(PointerBuilder(0, ToolType::STYLUS).x(120).y(120))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(penHover));
++    window->consumeMotionEvent(WithMotionAction(ACTION_HOVER_ENTER));
++
++    const MotionEvent penExit =
++            MotionEventBuilder(ACTION_HOVER_EXIT, AINPUT_SOURCE_STYLUS)
++                    .pointer(PointerBuilder(0, ToolType::STYLUS).x(120).y(120))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(penExit));
++    window->consumeMotionEvent(WithMotionAction(ACTION_HOVER_EXIT));
++
++    const MotionEvent touchUp =
++            MotionEventBuilder(ACTION_UP, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(100).y(100))
++                    .downTime(touchDown.getDownTime())
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(touchUp));
++    window->consumeMotionUp();
++
++    // Reverse the order as well: a new touchscreen stream must not cancel a
++    // hovering stylus that already owns the same application window.
++    const MotionEvent penHoverAgain =
++            MotionEventBuilder(ACTION_HOVER_ENTER, AINPUT_SOURCE_STYLUS)
++                    .pointer(PointerBuilder(0, ToolType::STYLUS).x(130).y(130))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(penHoverAgain));
++    window->consumeMotionEvent(WithMotionAction(ACTION_HOVER_ENTER));
++
++    const MotionEvent touchDownAgain =
++            MotionEventBuilder(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(140).y(140))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(touchDownAgain));
++    window->consumeMotionDown();
++
++    const MotionEvent touchUpAgain =
++            MotionEventBuilder(ACTION_UP, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(140).y(140))
++                    .downTime(touchDownAgain.getDownTime())
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(touchUpAgain));
++    window->consumeMotionUp();
++
++    const MotionEvent penExitAgain =
++            MotionEventBuilder(ACTION_HOVER_EXIT, AINPUT_SOURCE_STYLUS)
++                    .pointer(PointerBuilder(0, ToolType::STYLUS).x(130).y(130))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(penExitAgain));
++    window->consumeMotionEvent(WithMotionAction(ACTION_HOVER_EXIT));
++}
++
++TEST_F(InputDispatcherTargetedInjectionTest, IgnoresOtherDeviceTouchState) {
++    auto noteApplication = std::make_shared<FakeApplicationHandle>();
++    auto noteWindow = sp<FakeWindowHandle>::make(
++            noteApplication, mDispatcher, "StarNote", ui::LogicalDisplayId::DEFAULT);
++    noteWindow->setFrame(Rect(380, 0, 1618, 1540));
++
++    auto homeApplication = std::make_shared<FakeApplicationHandle>();
++    auto homeWindow = sp<FakeWindowHandle>::make(
++            homeApplication, mDispatcher, "Home", ui::LogicalDisplayId::DEFAULT);
++    homeWindow->setFrame(Rect(0, 0, 3048, 2032));
++
++    auto overlayApplication = std::make_shared<FakeApplicationHandle>();
++    auto overlay = sp<FakeWindowHandle>::make(
++            overlayApplication, mDispatcher, "PointerEventDispatcherOverlay0",
++            ui::LogicalDisplayId::DEFAULT);
++    overlay->setFrame(Rect(0, 0, 3048, 2032));
++    overlay->setFocusable(false);
++    overlay->setSpy(true);
++    overlay->setTrustedOverlay(true);
++    overlay->setDoNotPilfer(true);
++
++    mDispatcher->onWindowInfosChanged(
++            {{*overlay->getInfo(), *noteWindow->getInfo(), *homeWindow->getInfo()}, {}, 0, 0});
++
++    constexpr int32_t rawDeviceId = 10;
++    const nsecs_t rawDownTime = systemTime(SYSTEM_TIME_MONOTONIC);
++    mDispatcher->notifyMotion(
++            MotionArgsBuilder(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN)
++                    .deviceId(rawDeviceId)
++                    .downTime(rawDownTime)
++                    .eventTime(rawDownTime)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(1807).y(508))
++                    .build());
++    overlay->consumeMotionDown();
++    homeWindow->consumeMotionDown();
++
++    const auto injectTargeted = [&](const MotionEvent& event) {
++        return mDispatcher->injectInputEventToApplication(
++                &event, {}, InputEventInjectionSync::WAIT_FOR_RESULT, INJECT_EVENT_TIMEOUT,
++                DEFAULT_POLICY_FLAGS, noteWindow->getApplicationToken());
++    };
++    const MotionEvent targetedDown =
++            MotionEventBuilder(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(1281).y(252))
++                    .deviceId(-1)
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(targetedDown));
++    noteWindow->consumeMotionDown();
++
++    const MotionEvent targetedUp =
++            MotionEventBuilder(ACTION_UP, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(1281).y(252))
++                    .deviceId(-1)
++                    .downTime(targetedDown.getDownTime())
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(targetedUp));
++    noteWindow->consumeMotionUp();
++
++    mDispatcher->notifyMotion(
++            MotionArgsBuilder(ACTION_UP, AINPUT_SOURCE_TOUCHSCREEN)
++                    .deviceId(rawDeviceId)
++                    .downTime(rawDownTime)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(1807).y(508))
++                    .build());
++    overlay->consumeMotionUp();
++    homeWindow->consumeMotionUp();
++}
++
+ TEST_F(InputDispatcherTargetedInjectionTest, CanInjectIntoAnyWindowWhenNotTargeting) {
+     auto owner = User(mDispatcher, gui::Pid{10}, gui::Uid{11});
+     auto window = owner.createWindow("Owned window");

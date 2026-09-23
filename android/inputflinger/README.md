@@ -8,6 +8,17 @@ gesture. Keys select the frontmost eligible window belonging to that token
 instead of consulting Android's global focused task. Targeted streams exclude
 spies, outside-touch listeners, and wallpaper duplication so input cannot leak
 to a different Android task.
+InputDispatcher keeps touch state per display and pointers per input-device ID.
+For token-targeted events, validation must inspect only windows with pointers for
+the current device, including hover pointers. Otherwise a parallel raw stream
+captured by the spy overlay can veto Droidloom's separate app-targeted stream.
+For token-targeted stylus motion, InputDispatcher derives a reserved negative
+virtual device ID from the 0–31 tablet pointer ID. Targeted touch keeps the
+ordinary injected device ID. This lets touch and each pen keep separate pointer
+state without changing Android's input-filter policy. InputState also preserves
+these independent Droidloom virtual streams in the same window when Android's
+general multi-device stream flag is disabled; other device combinations retain
+their normal cancellation behavior.
 
 This is downstream of Denial's ordinary window hit testing. The patch contains
 no Denial policy and never changes Android task focus or stacking.

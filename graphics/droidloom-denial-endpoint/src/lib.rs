@@ -298,6 +298,7 @@ pub struct DenialEndpoint {
     device: SyncobjDevice,
     ready: bool,
     activation_requests: bool,
+    tablet_input: bool,
     tasks: BTreeMap<TaskObjectId, TaskEndpoint>,
 }
 
@@ -311,6 +312,7 @@ impl DenialEndpoint {
             device,
             ready: false,
             activation_requests: false,
+            tablet_input: false,
             tasks: BTreeMap::new(),
         }
     }
@@ -321,6 +323,19 @@ impl DenialEndpoint {
         assert!(!self.ready, "activation must be configured before handshake");
         self.activation_requests = true;
         self
+    }
+
+    /// Opt in to the graphics-tablet input opcode and capability.
+    #[must_use]
+    pub fn with_tablet_input(mut self) -> Self {
+        assert!(!self.ready, "tablet input must be configured before handshake");
+        self.tablet_input = true;
+        self
+    }
+
+    /// Whether the handshake negotiated tablet input with the peer.
+    pub fn supports_tablet_input(&self) -> bool {
+        self.ready && self.tablet_input
     }
 
     /// Borrow the socket for calloop registration and peer diagnostics.
@@ -565,6 +580,9 @@ impl DenialEndpoint {
         event: InputEvent,
     ) -> Result<(), EndpointError> {
         self.task(object)?;
+        if matches!(event, InputEvent::Tablet { .. }) && !self.tablet_input {
+            return Err(EndpointError::IncompatibleClient);
+        }
         self.socket.send_denial(&DenialMessage::Input {
             object,
             serial,
@@ -761,11 +779,20 @@ impl DenialEndpoint {
             return Err(EndpointError::IncompatibleClient);
         }
         self.activation_requests &= capabilities & capability::TASK_ACTIVATION != 0;
+        self.tablet_input &= capabilities & capability::TABLET_INPUT != 0;
+        let minor = if self.tablet_input {
+            PROTOCOL_MINOR
+        } else if self.activation_requests {
+            4
+        } else {
+            droidloom_denial_protocol::BASE_PROTOCOL_MINOR
+        };
         self.socket.send_denial(&DenialMessage::ServerHello {
             major: PROTOCOL_MAJOR,
-            minor: if self.activation_requests { PROTOCOL_MINOR } else { droidloom_denial_protocol::BASE_PROTOCOL_MINOR },
+            minor,
             capabilities: capability::REQUIRED_V1
-                | if self.activation_requests { capability::TASK_ACTIVATION } else { 0 },
+                | if self.activation_requests { capability::TASK_ACTIVATION } else { 0 }
+                | if self.tablet_input { capability::TABLET_INPUT } else { 0 },
             max_task_objects: MAX_TASK_OBJECTS,
             max_buffers_per_task: MAX_BUFFERS_PER_TASK,
             max_damage_rects: u32::try_from(MAX_DAMAGE_RECTS).unwrap_or(u32::MAX),
@@ -1142,6 +1169,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tablet_capability_preserves_legacy_handshakes() {
+        for host in [false, true] {
+            for client in [false, true] {
+                let (android, endpoint) = pair();
+                let mut endpoint = if host { endpoint.with_tablet_input() } else { endpoint };
+                android.send_android(&AndroidMessage::ClientHello {
+                    min_major: 1, max_major: 1,
+                    capabilities: capability::REQUIRED_V1
+                        | if client { capability::TABLET_INPUT } else { 0 },
+                }, &[]).unwrap();
+                endpoint.receive_action().unwrap();
+                let DenialMessage::ServerHello { capabilities, minor, .. } =
+                    android.receive_denial().unwrap().message else { panic!("missing hello") };
+                assert_eq!(capabilities & capability::TABLET_INPUT != 0, host && client);
+                assert_eq!(minor, if host && client { 5 } else { 3 });
+            }
+        }
     }
 
     #[test]

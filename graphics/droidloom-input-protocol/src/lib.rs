@@ -12,7 +12,7 @@ use core::fmt;
 /// Marker at the start of every input record.
 pub const MAGIC: [u8; 4] = *b"DLIN";
 /// Wire protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 5;
+pub const PROTOCOL_MAJOR: u16 = 6;
 
 /// Build metadata retained by the native sender for offline package verification.
 pub const BUILD_COMPATIBILITY: [u8; 26] = compatibility_marker(PROTOCOL_MAJOR);
@@ -32,7 +32,7 @@ const fn compatibility_marker(mut version: u16) -> [u8; 26] {
 }
 
 /// Exact size of one sequenced-packet record.
-pub const RECORD_BYTES: usize = 40;
+pub const RECORD_BYTES: usize = 64;
 /// Record kind for a touchscreen contact update.
 pub const KIND_TOUCH: u8 = 1;
 /// Record kind for one Linux input key transition.
@@ -43,6 +43,48 @@ pub const KIND_TASK_BOUNDS: u8 = 3;
 pub const KIND_TASK_FOCUS: u8 = 4;
 /// Record kind for a request to remove one Android task.
 pub const KIND_TASK_CLOSE: u8 = 5;
+/// Record kind for one graphics-tablet tool update.
+pub const KIND_TABLET: u8 = 6;
+/// Tablet action: tool entered proximity of a task surface.
+pub const TABLET_ACTION_PROXIMITY_IN: u8 = 0;
+/// Tablet action: hover or in-contact motion update.
+pub const TABLET_ACTION_MOTION: u8 = 1;
+/// Tablet action: stylus tip touched the surface.
+pub const TABLET_ACTION_DOWN: u8 = 2;
+/// Tablet action: stylus tip left the surface.
+pub const TABLET_ACTION_UP: u8 = 3;
+/// Tablet action: tool left proximity of a task surface.
+pub const TABLET_ACTION_PROXIMITY_OUT: u8 = 4;
+/// Tablet action: one tool button was pressed.
+pub const TABLET_ACTION_BUTTON_PRESS: u8 = 5;
+/// Tablet action: one tool button was released.
+pub const TABLET_ACTION_BUTTON_RELEASE: u8 = 6;
+/// Tablet action: cancel the current tool state.
+pub const TABLET_ACTION_CANCEL: u8 = 7;
+/// Tablet action: wheel movement was reported.
+pub const TABLET_ACTION_WHEEL: u8 = 8;
+/// Tablet tool type: regular pen-like tool.
+pub const TABLET_TOOL_PEN: u8 = 0;
+/// Tablet tool type: inverted/eraser tool.
+pub const TABLET_TOOL_ERASER: u8 = 1;
+/// Tablet tool type: brush.
+pub const TABLET_TOOL_BRUSH: u8 = 2;
+/// Tablet tool type: pencil.
+pub const TABLET_TOOL_PENCIL: u8 = 3;
+/// Tablet tool type: airbrush.
+pub const TABLET_TOOL_AIRBRUSH: u8 = 4;
+/// Tablet axis-validity bit for pressure.
+pub const TABLET_AXIS_PRESSURE: u8 = 1 << 0;
+/// Tablet axis-validity bit for distance.
+pub const TABLET_AXIS_DISTANCE: u8 = 1 << 1;
+/// Tablet axis-validity bit for tilt.
+pub const TABLET_AXIS_TILT: u8 = 1 << 2;
+/// Tablet axis-validity bit for rotation.
+pub const TABLET_AXIS_ROTATION: u8 = 1 << 3;
+/// Tablet axis-validity bit for slider.
+pub const TABLET_AXIS_SLIDER: u8 = 1 << 4;
+/// Tablet axis-validity bit for wheel.
+pub const TABLET_AXIS_WHEEL: u8 = 1 << 5;
 /// Highest pointer identity accepted by Android `MotionEvent`.
 pub const MAX_POINTER_ID: u32 = 31;
 /// Highest key identity defined by Linux's evdev input ABI.
@@ -63,6 +105,8 @@ pub enum InputProtocolError {
     Scale,
     /// A scaled signed 16.16 coordinate cannot fit on the wire.
     Coordinate,
+    /// A tablet tool type is outside the supported pen/eraser range.
+    ToolType,
     /// Android task identities are positive signed 32-bit integers.
     TaskId,
     /// Task bounds must be non-zero signed 32-bit dimensions.
@@ -78,6 +122,7 @@ impl fmt::Display for InputProtocolError {
             Self::Action => "input action is outside the protocol range",
             Self::Scale => "logical-to-buffer scale components must be non-zero",
             Self::Coordinate => "scaled touch coordinate exceeds the signed 16.16 wire range",
+            Self::ToolType => "tablet tool type is outside the protocol range",
             Self::TaskId => "Android task ID is outside the positive framework range",
             Self::TaskExtent => "Android task bounds are outside the framework range",
         })
@@ -286,6 +331,75 @@ pub fn encode_task_close(task_id: u64) -> Result<[u8; RECORD_BYTES], InputProtoc
     Ok(record)
 }
 
+/// Encode one routed graphics-tablet update.
+///
+/// The angular values use tenths of a degree. wheel_degrees_fixed and the
+/// coordinates use signed 16.16 values. The receiver may ignore axes it does
+/// not understand, but all values remain available for a future Android axis
+/// mapping without changing the record ABI again.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_tablet(
+    android_display: u32,
+    task_id: u64,
+    timestamp_nanos: u64,
+    action: u8,
+    pointer_id: u32,
+    x_fixed: i32,
+    y_fixed: i32,
+    pressure: u16,
+    distance: u16,
+    tilt_x_tenths: i16,
+    tilt_y_tenths: i16,
+    rotation_tenths: i16,
+    wheel_clicks: i16,
+    slider: i32,
+    wheel_degrees_fixed: i32,
+    button: u32,
+    tool_type: u8,
+    axis_flags: u8,
+) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if android_display > i32::MAX as u32 {
+        return Err(InputProtocolError::AndroidDisplay);
+    }
+    let task_id = u32::try_from(task_id).map_err(|_| InputProtocolError::TaskId)?;
+    if task_id == 0 || task_id > i32::MAX as u32 {
+        return Err(InputProtocolError::TaskId);
+    }
+    if pointer_id > MAX_POINTER_ID {
+        return Err(InputProtocolError::PointerId);
+    }
+    if action > TABLET_ACTION_WHEEL {
+        return Err(InputProtocolError::Action);
+    }
+    if tool_type > TABLET_TOOL_AIRBRUSH {
+        return Err(InputProtocolError::ToolType);
+    }
+
+    let mut record = [0_u8; RECORD_BYTES];
+    record[0..4].copy_from_slice(&MAGIC);
+    record[4..6].copy_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
+    record[6] = KIND_TABLET;
+    record[7] = action;
+    record[8..12].copy_from_slice(&android_display.to_le_bytes());
+    record[12..16].copy_from_slice(&pointer_id.to_le_bytes());
+    record[16..24].copy_from_slice(&timestamp_nanos.to_le_bytes());
+    record[24..28].copy_from_slice(&x_fixed.to_le_bytes());
+    record[28..32].copy_from_slice(&y_fixed.to_le_bytes());
+    record[32..34].copy_from_slice(&pressure.to_le_bytes());
+    record[34..36].copy_from_slice(&distance.to_le_bytes());
+    record[36..38].copy_from_slice(&tilt_x_tenths.to_le_bytes());
+    record[38..40].copy_from_slice(&tilt_y_tenths.to_le_bytes());
+    record[40..42].copy_from_slice(&rotation_tenths.to_le_bytes());
+    record[42..44].copy_from_slice(&wheel_clicks.to_le_bytes());
+    record[44..48].copy_from_slice(&slider.to_le_bytes());
+    record[48..52].copy_from_slice(&wheel_degrees_fixed.to_le_bytes());
+    record[52..56].copy_from_slice(&button.to_le_bytes());
+    record[56..60].copy_from_slice(&task_id.to_le_bytes());
+    record[60] = tool_type;
+    record[61] = axis_flags;
+    Ok(record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +447,63 @@ mod tests {
         assert_eq!(&record[32..34], &32_768_u16.to_le_bytes());
         assert_eq!(&record[34..36], &[0, 0]);
         assert_eq!(&record[36..40], &29_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn tablet_record_has_stable_little_endian_layout() {
+        let record = encode_tablet(
+            3,
+            29,
+            0x0102_0304_0506_0708,
+            TABLET_ACTION_MOTION,
+            7,
+            0x0012_8000,
+            0x0034_4000,
+            32_768,
+            1_024,
+            -120,
+            340,
+            900,
+            -2,
+            -12_345,
+            0x0002_0000,
+            0x14a,
+            TABLET_TOOL_ERASER,
+            TABLET_AXIS_PRESSURE | TABLET_AXIS_TILT,
+        )
+        .unwrap();
+
+        assert_eq!(record.len(), RECORD_BYTES);
+        assert_eq!(&record[0..4], b"DLIN");
+        assert_eq!(&record[4..6], &PROTOCOL_MAJOR.to_le_bytes());
+        assert_eq!(record[6], KIND_TABLET);
+        assert_eq!(record[7], TABLET_ACTION_MOTION);
+        assert_eq!(&record[8..12], &3_u32.to_le_bytes());
+        assert_eq!(&record[12..16], &7_u32.to_le_bytes());
+        assert_eq!(&record[16..24], &0x0102_0304_0506_0708_u64.to_le_bytes());
+        assert_eq!(&record[36..38], &(-120_i16).to_le_bytes());
+        assert_eq!(&record[42..44], &(-2_i16).to_le_bytes());
+        assert_eq!(&record[52..56], &0x14a_u32.to_le_bytes());
+        assert_eq!(&record[56..60], &29_u32.to_le_bytes());
+        assert_eq!(record[60], TABLET_TOOL_ERASER);
+        assert_eq!(record[61], TABLET_AXIS_PRESSURE | TABLET_AXIS_TILT);
+        assert!(record[62..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn invalid_tablet_identity_and_tool_fail_closed() {
+        assert_eq!(
+            encode_tablet(0, 29, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0),
+            Err(InputProtocolError::ToolType)
+        );
+        assert_eq!(
+            encode_tablet(0, 29, 1, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            Err(InputProtocolError::PointerId)
+        );
+        assert_eq!(
+            encode_tablet(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            Err(InputProtocolError::TaskId)
+        );
     }
 
     #[test]

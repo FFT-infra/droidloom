@@ -31,6 +31,7 @@ url = "2.5.8"
 zbus = { version = "5.18.0", default-features = false, features = ["async-io"] }
 async-io = "2.6.0"
 futures-lite = "2.6.1"
+sctk-adwaita = "=0.11.0"
 
 [lints.rust]
 unsafe_code = "allow"

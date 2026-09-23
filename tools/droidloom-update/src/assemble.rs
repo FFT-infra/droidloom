@@ -566,7 +566,7 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> 
         _ => return fail("unsupported Android target architecture"),
     };
     let mut spec = json(&repo.join(spec_name))?;
-    let render = render_node()?;
+    let render = render_node(target_arch)?;
     // Normalize every identity field to the target desktop user. The base
     // recipe pins the Moto developer ids; cross bundles must not inherit them.
     let base_uid = spec["host_uid"].as_u64().unwrap_or(1000);
@@ -646,13 +646,16 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> 
     )?;
     Ok(())
 }
-fn render_node() -> Result<String> {
+fn render_node(target_arch: &str) -> Result<String> {
     // Cross bundles target a different machine: the target operator pins its
     // render node explicitly instead of inheriting the build host's.
     if let Ok(node) = std::env::var("DROIDLOOM_RENDER_NODE")
         && !node.is_empty()
     {
         return Ok(node);
+    }
+    if target_arch != std::env::consts::ARCH {
+        return fail("cross bundle requires DROIDLOOM_RENDER_NODE for the target device");
     }
     let mut nodes = fs::read_dir("/sys/class/drm")?.collect::<std::io::Result<Vec<_>>>()?;
     nodes.sort_by_key(|e| e.file_name());

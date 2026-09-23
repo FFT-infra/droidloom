@@ -46,8 +46,8 @@ public final class InputBridge {
     private static final String TAG = "DroidloomInput";
     private static final boolean INPUT_TRACE = "1".equals(System.getenv("DROIDLOOM_INPUT_TRACE"));
     private static final String SOCKET_ENV = "ANDROID_SOCKET_droidloom_input";
-    private static final int RECORD_BYTES = 40;
-    private static final int PROTOCOL_MAJOR = 5;
+    private static final int RECORD_BYTES = 64;
+    private static final int PROTOCOL_MAJOR = 6;
     private static final String BUILD_COMPATIBILITY =
             "DROIDLOOM_INPUT_ABI=" + PROTOCOL_MAJOR + ";";
     private static final int KIND_TOUCH = 1;
@@ -55,10 +55,31 @@ public final class InputBridge {
     private static final int KIND_TASK_BOUNDS = 3;
     private static final int KIND_TASK_FOCUS = 4;
     private static final int KIND_TASK_CLOSE = 5;
+    private static final int KIND_TABLET = 6;
     private static final int TOUCH_ACTION_DOWN = 0;
     private static final int TOUCH_ACTION_MOTION = 1;
     private static final int TOUCH_ACTION_UP = 2;
     private static final int TOUCH_ACTION_CANCEL = 3;
+    private static final int TABLET_ACTION_PROXIMITY_IN = 0;
+    private static final int TABLET_ACTION_MOTION = 1;
+    private static final int TABLET_ACTION_DOWN = 2;
+    private static final int TABLET_ACTION_UP = 3;
+    private static final int TABLET_ACTION_PROXIMITY_OUT = 4;
+    private static final int TABLET_ACTION_BUTTON_PRESS = 5;
+    private static final int TABLET_ACTION_BUTTON_RELEASE = 6;
+    private static final int TABLET_ACTION_CANCEL = 7;
+    private static final int TABLET_ACTION_WHEEL = 8;
+    private static final int TABLET_TOOL_PEN = 0;
+    private static final int TABLET_TOOL_ERASER = 1;
+    private static final int TABLET_TOOL_BRUSH = 2;
+    private static final int TABLET_TOOL_PENCIL = 3;
+    private static final int TABLET_TOOL_AIRBRUSH = 4;
+    private static final int TABLET_AXIS_PRESSURE = 1 << 0;
+    private static final int TABLET_AXIS_DISTANCE = 1 << 1;
+    private static final int TABLET_AXIS_TILT = 1 << 2;
+    private static final int TABLET_AXIS_ROTATION = 1 << 3;
+    private static final int TABLET_AXIS_SLIDER = 1 << 4;
+    private static final int TABLET_AXIS_WHEEL = 1 << 5;
     private static final int KEY_ACTION_DOWN = 0;
     private static final int KEY_ACTION_UP = 1;
     private static final int MAX_EVDEV_KEYCODE = 0x2ff;
@@ -77,6 +98,7 @@ public final class InputBridge {
     private static final String INPUT_DESCRIPTOR = "android.os.IInputFlinger";
 
     private final Map<Long, Gesture> mGestures = new HashMap<>();
+    private final Map<TabletIdentity, TabletState> mTablets = new HashMap<>();
     private final Map<KeyIdentity, KeyState> mKeys = new HashMap<>();
     private final Map<Long, Integer> mMetaStates = new HashMap<>();
     private final Map<Integer, ScheduledFuture<?>> mPendingTaskBounds = new HashMap<>();
@@ -192,15 +214,19 @@ public final class InputBridge {
             } catch (SecurityException error) {
                 Log.e(TAG, "InputManager rejected Droidloom's privileged injector", error);
                 resetTransientInputState();
+                // The sender must reconnect and rebuild its input routes.
+                return;
             } catch (RuntimeException error) {
                 Log.w(TAG, "Rejected routed input record", error);
                 resetTransientInputState();
+                return;
             }
         }
     }
 
     private void resetTransientInputState() {
         mGestures.clear();
+        mTablets.clear();
         mKeys.clear();
         mMetaStates.clear();
     }
@@ -307,7 +333,60 @@ public final class InputBridge {
             return new KeyRecord(
                     displayId, taskId, action, code, timestampNanos, repeat, routeSerial);
         }
+        if (kind == KIND_TABLET) {
+            if (action > TABLET_ACTION_WHEEL || code < 0 || code > 31) {
+                throw new IllegalArgumentException("invalid tablet action or tool field");
+            }
+            final int xFixed = record.getInt();
+            final int yFixed = record.getInt();
+            final int pressure = Short.toUnsignedInt(record.getShort());
+            final int distance = Short.toUnsignedInt(record.getShort());
+            final int tiltXTenths = record.getShort();
+            final int tiltYTenths = record.getShort();
+            final int rotationTenths = record.getShort();
+            final int wheelClicks = record.getShort();
+            final int slider = record.getInt();
+            final int wheelDegreesFixed = record.getInt();
+            final int button = record.getInt();
+            final int taskId = record.getInt();
+            final int toolType = Byte.toUnsignedInt(record.get());
+            final int axisFlags = Byte.toUnsignedInt(record.get());
+            if (taskId <= 0 || toolType > TABLET_TOOL_AIRBRUSH
+                    || (axisFlags & ~(TABLET_AXIS_PRESSURE | TABLET_AXIS_DISTANCE
+                    | TABLET_AXIS_TILT | TABLET_AXIS_ROTATION | TABLET_AXIS_SLIDER
+                    | TABLET_AXIS_WHEEL)) != 0) {
+                throw new IllegalArgumentException("invalid tablet task, tool, or axis field");
+            }
+            requireZeroTail(record, "tablet reserved field");
+            return new TabletRecord(
+                    displayId,
+                    taskId,
+                    action,
+                    code,
+                    timestampNanos,
+                    xFixed / FIXED_SCALE,
+                    yFixed / FIXED_SCALE,
+                    pressure / PRESSURE_SCALE,
+                    distance / PRESSURE_SCALE,
+                    tiltXTenths / 10.0f,
+                    tiltYTenths / 10.0f,
+                    rotationTenths / 10.0f,
+                    wheelClicks,
+                    slider,
+                    wheelDegreesFixed / FIXED_SCALE,
+                    button,
+                    toolType,
+                    axisFlags);
+        }
         throw new IllegalArgumentException("unsupported input record kind");
+    }
+
+    private static void requireZeroTail(ByteBuffer record, String field) {
+        while (record.hasRemaining()) {
+            if (record.get() != 0) {
+                throw new IllegalArgumentException("invalid " + field);
+            }
+        }
     }
 
     private void inject(RoutedRecord record) {
@@ -321,6 +400,8 @@ public final class InputBridge {
             focusTask((TaskFocusRecord) record);
         } else if (record instanceof TaskCloseRecord) {
             closeTask((TaskCloseRecord) record);
+        } else if (record instanceof TabletRecord) {
+            inject((TabletRecord) record);
         } else {
             throw new IllegalArgumentException("unsupported decoded input record");
         }
@@ -535,6 +616,210 @@ public final class InputBridge {
             return bounds;
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("Android task-bounds query failed", error);
+        }
+    }
+
+    private void inject(TabletRecord record) {
+        final TabletIdentity identity =
+                new TabletIdentity(record.displayId, record.taskId, record.pointerId);
+        TabletState state = mTablets.get(identity);
+        switch (record.action) {
+            case TABLET_ACTION_PROXIMITY_IN:
+                if (state != null) {
+                    throw new IllegalStateException("duplicate tablet proximity-in");
+                }
+                state = new TabletState(
+                        record.timestampNanos / 1_000_000L,
+                        taskInputApplicationToken(record.taskId),
+                        record);
+                mTablets.put(identity, state);
+                injectTabletEvent(record, state, MotionEvent.ACTION_HOVER_ENTER, 0);
+                return;
+            case TABLET_ACTION_MOTION:
+                requireTabletState(state, "tablet motion");
+                state.update(record);
+                injectTabletEvent(
+                        record,
+                        state,
+                        state.down ? MotionEvent.ACTION_MOVE : MotionEvent.ACTION_HOVER_MOVE,
+                        0);
+                return;
+            case TABLET_ACTION_DOWN:
+                requireTabletState(state, "tablet down");
+                if (state.down) {
+                    throw new IllegalStateException("duplicate tablet down");
+                }
+                state.update(record);
+                state.down = true;
+                state.downTimeMillis = record.timestampNanos / 1_000_000L;
+                injectTabletEvent(record, state, MotionEvent.ACTION_DOWN, 0);
+                return;
+            case TABLET_ACTION_UP:
+                requireTabletState(state, "tablet up");
+                if (!state.down) {
+                    throw new IllegalStateException("tablet up has no matching down");
+                }
+                state.update(record);
+                injectTabletEvent(record, state, MotionEvent.ACTION_UP, 0);
+                state.down = false;
+                return;
+            case TABLET_ACTION_PROXIMITY_OUT:
+                requireTabletState(state, "tablet proximity-out");
+                if (state.down) {
+                    throw new IllegalStateException("tablet left proximity while down");
+                }
+                state.update(record);
+                injectTabletEvent(record, state, MotionEvent.ACTION_HOVER_EXIT, 0);
+                mTablets.remove(identity);
+                return;
+            case TABLET_ACTION_BUTTON_PRESS:
+            case TABLET_ACTION_BUTTON_RELEASE:
+                requireTabletState(state, "tablet button");
+                state.update(record);
+                final int button = androidTabletButton(record.button);
+                if (button == 0) return;
+                if (record.action == TABLET_ACTION_BUTTON_PRESS) {
+                    state.buttonState |= button;
+                } else {
+                    state.buttonState &= ~button;
+                }
+                injectTabletEvent(record, state,
+                        record.action == TABLET_ACTION_BUTTON_PRESS
+                                ? MotionEvent.ACTION_BUTTON_PRESS
+                                : MotionEvent.ACTION_BUTTON_RELEASE,
+                        button);
+                return;
+            case TABLET_ACTION_CANCEL:
+                requireTabletState(state, "tablet cancel");
+                state.update(record);
+                injectTabletEvent(record, state, MotionEvent.ACTION_CANCEL, 0);
+                mTablets.remove(identity);
+                return;
+            case TABLET_ACTION_WHEEL:
+                requireTabletState(state, "tablet wheel");
+                state.update(record);
+                injectTabletEvent(record, state, MotionEvent.ACTION_SCROLL, 0);
+                return;
+            default:
+                throw new IllegalArgumentException("unsupported tablet action");
+        }
+    }
+
+    private static void requireTabletState(TabletState state, String operation) {
+        if (state == null) {
+            throw new IllegalStateException(operation + " has no matching proximity-in");
+        }
+    }
+
+    private void injectTabletEvent(
+            TabletRecord record, TabletState state, int action, int actionButton) {
+        final Rect taskBounds = taskBounds(record.taskId);
+        final MotionEvent.PointerProperties properties = new MotionEvent.PointerProperties();
+        properties.id = record.pointerId;
+        properties.toolType = androidTabletToolType(record.toolType);
+        final MotionEvent.PointerCoords coordinates = new MotionEvent.PointerCoords();
+        coordinates.x = record.x + taskBounds.left;
+        coordinates.y = record.y + taskBounds.top;
+        coordinates.pressure = (record.axisFlags & TABLET_AXIS_PRESSURE) != 0
+                && action != MotionEvent.ACTION_HOVER_EXIT
+                && action != MotionEvent.ACTION_UP
+                && action != MotionEvent.ACTION_CANCEL
+                ? record.pressure : 0.0f;
+        coordinates.size = 1.0f;
+        if ((record.axisFlags & TABLET_AXIS_DISTANCE) != 0) {
+            coordinates.setAxisValue(MotionEvent.AXIS_DISTANCE, record.distance);
+        }
+        if ((record.axisFlags & TABLET_AXIS_TILT) != 0) {
+            final double tiltX = Math.toRadians(record.tiltXDegrees);
+            final double tiltY = Math.toRadians(record.tiltYDegrees);
+            final double tanX = Math.tan(tiltX);
+            final double tanY = Math.tan(tiltY);
+            coordinates.setAxisValue(
+                    MotionEvent.AXIS_TILT,
+                    (float) Math.atan(Math.hypot(tanX, tanY)));
+            coordinates.setAxisValue(
+                    MotionEvent.AXIS_ORIENTATION,
+                    (float) Math.atan2(tanX, -tanY));
+        }
+        if ((record.axisFlags & TABLET_AXIS_ROTATION) != 0) {
+            coordinates.setAxisValue(
+                    MotionEvent.AXIS_GENERIC_2,
+                    (float) Math.toRadians(record.rotationDegrees));
+        }
+        if ((record.axisFlags & TABLET_AXIS_SLIDER) != 0) {
+            coordinates.setAxisValue(MotionEvent.AXIS_GENERIC_1, record.slider / 65535.0f);
+        }
+        if ((record.axisFlags & TABLET_AXIS_WHEEL) != 0 && action == MotionEvent.ACTION_SCROLL) {
+            final float scroll = record.wheelDegrees != 0.0f
+                    ? record.wheelDegrees / 15.0f : record.wheelClicks;
+            coordinates.setAxisValue(MotionEvent.AXIS_VSCROLL, scroll);
+        }
+
+        final long eventTime = Math.max(state.downTimeMillis, record.timestampNanos / 1_000_000L);
+        final MotionEvent event = MotionEvent.obtain(
+                state.downTimeMillis,
+                eventTime,
+                action,
+                1,
+                new MotionEvent.PointerProperties[] {properties},
+                new MotionEvent.PointerCoords[] {coordinates},
+                0,
+                state.buttonState,
+                1.0f,
+                1.0f,
+                // The targeted InputDispatcher path assigns a distinct virtual
+                // device ID to each stylus pointer, separate from injected touch.
+                0,
+                0,
+                InputDevice.SOURCE_STYLUS,
+                0);
+        try {
+            if (actionButton != 0) {
+                event.setActionButton(actionButton);
+            }
+            mSetDisplayId.invoke(event, record.displayId);
+            final boolean injected =
+                    injectInputEventToApplication(event, state.applicationToken);
+            if (!injected) {
+                // A definite queue failure invalidates the local tablet
+                // lifecycle. Closing this client makes Composer reconnect and
+                // synthesize proximity before the next sample.
+                throw new IllegalStateException("InputManager could not queue tablet input"
+                        + " action=" + MotionEvent.actionToString(action)
+                        + " task=" + record.taskId + " display=" + record.displayId);
+            }
+            if (isTabletBoundaryAction(action)) {
+                Log.i(TAG, "Tablet input queued for InputManager"
+                        + " action=" + MotionEvent.actionToString(action)
+                        + " task=" + record.taskId + " display=" + record.displayId);
+            }
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("Android tablet injection API failed", error);
+        } finally {
+            event.recycle();
+        }
+    }
+    private static boolean isTabletBoundaryAction(int action) {
+        return action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_EXIT
+                || action == MotionEvent.ACTION_DOWN
+                || action == MotionEvent.ACTION_UP
+                || action == MotionEvent.ACTION_CANCEL
+                || action == MotionEvent.ACTION_BUTTON_PRESS
+                || action == MotionEvent.ACTION_BUTTON_RELEASE;
+    }
+
+
+    private static int androidTabletToolType(int toolType) {
+        return toolType == TABLET_TOOL_ERASER
+                ? MotionEvent.TOOL_TYPE_ERASER : MotionEvent.TOOL_TYPE_STYLUS;
+    }
+
+    private static int androidTabletButton(int button) {
+        switch (button) {
+            case 0x14b: return MotionEvent.BUTTON_STYLUS_PRIMARY;
+            case 0x14c: return MotionEvent.BUTTON_STYLUS_SECONDARY;
+            default: return 0; // Android has no third stylus button.
         }
     }
 
@@ -900,6 +1185,135 @@ public final class InputBridge {
             this.timestampNanos = timestampNanos;
             this.repeat = repeat;
             this.routeSerial = routeSerial;
+        }
+    }
+
+    private static final class TabletRecord implements RoutedRecord {
+        final int displayId;
+        final int taskId;
+        final int action;
+        final int pointerId;
+        final long timestampNanos;
+        final float x;
+        final float y;
+        final float pressure;
+        final float distance;
+        final float tiltXDegrees;
+        final float tiltYDegrees;
+        final float rotationDegrees;
+        final int wheelClicks;
+        final int slider;
+        final float wheelDegrees;
+        final int button;
+        final int toolType;
+        final int axisFlags;
+
+        TabletRecord(
+                int displayId,
+                int taskId,
+                int action,
+                int pointerId,
+                long timestampNanos,
+                float x,
+                float y,
+                float pressure,
+                float distance,
+                float tiltXDegrees,
+                float tiltYDegrees,
+                float rotationDegrees,
+                int wheelClicks,
+                int slider,
+                float wheelDegrees,
+                int button,
+                int toolType,
+                int axisFlags) {
+            this.displayId = displayId;
+            this.taskId = taskId;
+            this.action = action;
+            this.pointerId = pointerId;
+            this.timestampNanos = timestampNanos;
+            this.x = x;
+            this.y = y;
+            this.pressure = pressure;
+            this.distance = distance;
+            this.tiltXDegrees = tiltXDegrees;
+            this.tiltYDegrees = tiltYDegrees;
+            this.rotationDegrees = rotationDegrees;
+            this.wheelClicks = wheelClicks;
+            this.slider = slider;
+            this.wheelDegrees = wheelDegrees;
+            this.button = button;
+            this.toolType = toolType;
+            this.axisFlags = axisFlags;
+        }
+    }
+
+    private static final class TabletIdentity {
+        final int displayId;
+        final int taskId;
+        final int pointerId;
+
+        TabletIdentity(int displayId, int taskId, int pointerId) {
+            this.displayId = displayId;
+            this.taskId = taskId;
+            this.pointerId = pointerId;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) return true;
+            if (!(other instanceof TabletIdentity)) return false;
+            final TabletIdentity identity = (TabletIdentity) other;
+            return displayId == identity.displayId
+                    && taskId == identity.taskId
+                    && pointerId == identity.pointerId;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = displayId;
+            result = 31 * result + taskId;
+            return 31 * result + pointerId;
+        }
+    }
+
+    private static final class TabletState {
+        long downTimeMillis;
+        final IBinder applicationToken;
+        boolean down;
+        int buttonState;
+        int toolType;
+        float x;
+        float y;
+        float pressure;
+        float distance;
+        float tiltXDegrees;
+        float tiltYDegrees;
+        float rotationDegrees;
+        int wheelClicks;
+        int slider;
+        float wheelDegrees;
+        int axisFlags;
+
+        TabletState(long downTimeMillis, IBinder applicationToken, TabletRecord record) {
+            this.downTimeMillis = downTimeMillis;
+            this.applicationToken = applicationToken;
+            update(record);
+        }
+
+        void update(TabletRecord record) {
+            toolType = record.toolType;
+            x = record.x;
+            y = record.y;
+            pressure = record.pressure;
+            distance = record.distance;
+            tiltXDegrees = record.tiltXDegrees;
+            tiltYDegrees = record.tiltYDegrees;
+            rotationDegrees = record.rotationDegrees;
+            wheelClicks = record.wheelClicks;
+            slider = record.slider;
+            wheelDegrees = record.wheelDegrees;
+            axisFlags = record.axisFlags;
         }
     }
 

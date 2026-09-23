@@ -141,15 +141,20 @@ markers=(
     "$source_tree/packages/modules/Connectivity/framework/.find-ignore"
     "$source_tree/packages/modules/Connectivity/Tethering/common/TetheringLib/.find-ignore"
 )
-if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" != "1" ]]; then
-    markers+=("$source_tree/frameworks/native/services/serialservice/.find-ignore")
-    markers+=("$source_tree/packages/modules/Virtualization/libs/framework-virtualization/.find-ignore")
+# framework-res consumes flags declared under frameworks/base/services even
+# when building only the focused input bridge or composer.
+if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" != "1" &&
+      "${DROIDLOOM_SOONG_FRAMEWORK_BRIDGE_ONLY:-}" != "1" &&
+      "${DROIDLOOM_SOONG_INPUT_BRIDGE_ONLY:-}" != "1" &&
+      "${DROIDLOOM_SOONG_INPUTFLINGER_ONLY:-}" != "1" ]]; then
     markers+=("$source_tree/frameworks/base/services/.find-ignore")
 else
-    # The focused services artifact does not need Ravenwood/device test graphs.
+    # Focused builds do not need the services test graphs.
     markers+=("$source_tree/frameworks/base/services/tests/.find-ignore")
     markers+=("$source_tree/frameworks/base/services/robotests/.find-ignore")
 fi
+markers+=("$source_tree/frameworks/native/services/serialservice/.find-ignore")
+markers+=("$source_tree/packages/modules/Virtualization/libs/framework-virtualization/.find-ignore")
 
 for marker in "${markers[@]}"; do
     if [[ -e "$marker" ]]; then
@@ -400,17 +405,22 @@ minigbm_amdgpu_patch_applied=true
 for marker in "${markers[@]}"; do
     touch "$marker"
 done
-if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" != "1" ]]; then
-    # Services consumes the complete locked framework sources and needs no
-    # synthetic inputs for the formerly empty vendor-only framework globs.
+if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" != "1" &&
+      "${DROIDLOOM_SOONG_FRAMEWORK_BRIDGE_ONLY:-}" != "1" &&
+      "${DROIDLOOM_SOONG_INPUT_BRIDGE_ONLY:-}" != "1" &&
+      "${DROIDLOOM_SOONG_INPUTFLINGER_ONLY:-}" != "1" ]]; then
+    # The vendor-only graph needs placeholders for otherwise empty globs.
     mkdir -p -- "$(dirname -- "$proto_placeholder")"
     install -m 0644 -- "$proto_fixture" "$proto_placeholder"
     mkdir -p -- "$(dirname -- "$instrumentation_placeholder")" "$(dirname -- "$rkp_placeholder")"
     install -m 0644 -- "$instrumentation_fixture" "$instrumentation_placeholder"
     install -m 0644 -- "$rkp_fixture" "$rkp_placeholder"
-    mkdir -p -- "$display_flags_projection"
-    install -m 0644 -- "$display_flags_bp_fixture" "$display_flags_projection/Android.bp"
-    install -m 0644 -- "$display_flags_fixture" "$display_flags_projection/display_flags.aconfig"
+    if [[ "${DROIDLOOM_SOONG_FRAMEWORK_BRIDGE_ONLY:-}" != "1" &&
+          "${DROIDLOOM_SOONG_INPUT_BRIDGE_ONLY:-}" != "1" ]]; then
+        mkdir -p -- "$display_flags_projection"
+        install -m 0644 -- "$display_flags_bp_fixture" "$display_flags_projection/Android.bp"
+        install -m 0644 -- "$display_flags_fixture" "$display_flags_projection/display_flags.aconfig"
+    fi
 fi
 
 mkdir -p "$source_tree/vendor/droidloom"

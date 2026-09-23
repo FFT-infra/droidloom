@@ -22,6 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use drm_fourcc::DrmFourcc;
@@ -32,7 +33,8 @@ use droidloom_denial_endpoint::{
 use droidloom_denial_ipc::IpcError;
 use droidloom_denial_protocol::{
     AcceptedWireFrame, BufferId, BufferMetadata, FormatModifier, FrameId, InputEvent, KeyAction,
-    PlaneMetadata, TaskObjectId, TouchAction, Transform, Visibility, presentation_flag,
+    PlaneMetadata, TabletAction, TabletToolType, TaskObjectId, TouchAction, Transform, Visibility,
+    presentation_flag,
 };
 use droidloom_syncobj::{SyncobjDevice, WaylandTimeline};
 use droidloom_window_policy::{LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore};
@@ -48,14 +50,24 @@ use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    CursorIcon, PointerData, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec,
+    ThemedPointer,
+};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
-use smithay_client_toolkit::shell::xdg::XdgShell;
+use smithay_client_toolkit::shell::xdg::{XdgShell, XdgSurface};
 use smithay_client_toolkit::shell::xdg::window::{
-    Window, WindowConfigure, WindowDecorations, WindowHandler,
+    DecorationMode, Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
+use smithay_client_toolkit::shm::{Shm, ShmHandler};
+use smithay_client_toolkit::subcompositor::SubcompositorState;
+use smithay_client_toolkit::reexports::csd_frame::{
+    DecorationsFrame, FrameAction, FrameClick, ResizeEdge,
+};
+use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
+use sctk_adwaita::{AdwaitaFrame, FrameConfig};
 use thiserror::Error;
 use wayland_client::globals::{BindError, registry_queue_init};
 use wayland_client::protocol::{
@@ -77,6 +89,15 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{
     self, WpPresentationFeedback,
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    self as tablet, zwp_tablet_manager_v2::ZwpTabletManagerV2,
+    zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+    zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+    zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+    zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+    zwp_tablet_pad_v2::ZwpTabletPadV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    zwp_tablet_tool_v2::ZwpTabletToolV2, zwp_tablet_v2::ZwpTabletV2,
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
@@ -87,6 +108,15 @@ const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const LEFT_BUTTON: u32 = 0x110;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
+
+fn app_display_title(package: &str) -> String {
+    let component = package.rsplit('.').next().filter(|part| !part.is_empty()).unwrap_or(package);
+    let mut characters = component.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => package.to_owned(),
+    }
+}
 
 #[derive(Debug, Error)]
 enum PresenterError {
@@ -127,6 +157,8 @@ enum PresenterError {
     },
     #[error("Droidloom configuration is invalid: {0}")]
     Configuration(&'static str),
+    #[error("Wayland client-side decoration failure: {0}")]
+    WindowDecoration(String),
 }
 
 struct RenderTarget {
@@ -195,6 +227,7 @@ struct TaskWindow {
     package: String,
     android_task: Option<u64>,
     window: Option<Window>,
+    window_frame: Option<AdwaitaFrame<App>>,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
@@ -237,6 +270,16 @@ struct Contact {
     position_fixed: (i32, i32),
 }
 
+struct DecorationTouch {
+    id: i32,
+    touch: wl_touch::WlTouch,
+    object: TaskObjectId,
+    surface: wl_surface::WlSurface,
+    seat: wl_seat::WlSeat,
+    down_serial: u32,
+    acted_on_down: bool,
+}
+
 impl Contact {
     fn event(self, action: TouchAction) -> InputEvent {
         InputEvent::Touch {
@@ -252,6 +295,74 @@ impl Contact {
     }
 }
 
+struct TabletToolState {
+    tool_id: u32,
+    tool_type: TabletToolType,
+    supported: bool,
+    surface: Option<wl_surface::WlSurface>,
+    x_fixed: i32,
+    y_fixed: i32,
+    pressure: u16,
+    distance: u16,
+    tilt_x_tenths: i16,
+    tilt_y_tenths: i16,
+    rotation_tenths: i16,
+    wheel_clicks: i16,
+    slider: i32,
+    wheel_degrees_fixed: i32,
+    axis_flags: u8,
+    dirty_axes: bool,
+    pending_actions: Vec<(TabletAction, u32)>,
+}
+
+impl TabletToolState {
+    fn new(tool_id: u32) -> Self {
+        Self {
+            tool_id,
+            tool_type: TabletToolType::Pen,
+            supported: true,
+            surface: None,
+            x_fixed: 0,
+            y_fixed: 0,
+            pressure: 0,
+            distance: 0,
+            tilt_x_tenths: 0,
+            tilt_y_tenths: 0,
+            rotation_tenths: 0,
+            wheel_clicks: 0,
+            slider: 0,
+            wheel_degrees_fixed: 0,
+            axis_flags: 0,
+            dirty_axes: false,
+            pending_actions: Vec::new(),
+        }
+    }
+}
+
+enum TabletPadChild {
+    Group(ZwpTabletPadGroupV2),
+    Ring(ZwpTabletPadRingV2),
+    Strip(ZwpTabletPadStripV2),
+    Dial(ZwpTabletPadDialV2),
+}
+
+impl TabletPadChild {
+    fn destroy(self) {
+        match self {
+            Self::Group(proxy) => proxy.destroy(),
+            Self::Ring(proxy) => proxy.destroy(),
+            Self::Strip(proxy) => proxy.destroy(),
+            Self::Dial(proxy) => proxy.destroy(),
+        }
+    }
+}
+
+struct TabletPadState {
+    tablet_seat_id: u32,
+    proxy: ZwpTabletPadV2,
+    children: Vec<TabletPadChild>,
+}
+
 struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
@@ -262,9 +373,19 @@ struct App {
     output_state: OutputState,
     presentation_time: PresentationTimeState,
     seat_state: SeatState,
+    subcompositor_state: Arc<SubcompositorState>,
+    shm_state: Shm,
+    tablet_manager: Option<ZwpTabletManagerV2>,
+    tablet_seats: Vec<(wl_seat::WlSeat, ZwpTabletSeatV2)>,
+    tablet_tools: Vec<TabletToolState>,
+    tablet_tool_seats: BTreeMap<u32, u32>,
+    tablet_tool_proxies: BTreeMap<u32, ZwpTabletToolV2>,
+    tablet_proxies: BTreeMap<u32, (u32, ZwpTabletV2)>,
+    tablet_pads: BTreeMap<u32, TabletPadState>,
+    tablet_pad_groups: BTreeMap<u32, u32>,
     dmabuf_state: DmabufState,
     feedback: Option<DmabufFeedback>,
-    compositor: CompositorState,
+    compositor: Arc<CompositorState>,
     xdg_shell: XdgShell,
     insets_manager: Option<insets::DenialInsetsManagerV1>,
     viewporter: WpViewporter,
@@ -277,11 +398,13 @@ struct App {
     endpoint: Option<DenialEndpoint>,
     tasks: BTreeMap<TaskObjectId, TaskWindow>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<ThemedPointer>,
+    cursor_icon: Option<CursorIcon>,
     touch: Option<wl_touch::WlTouch>,
     focused: Option<TaskObjectId>,
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
+    decoration_touch: Option<DecorationTouch>,
     next_buffer_id: u64,
     next_input_serial: u64,
     socket_path: PathBuf,
@@ -295,6 +418,20 @@ impl Drop for App {
 }
 
 impl App {
+    fn bind_tablet_seat(&mut self, seat: wl_seat::WlSeat, qh: &QueueHandle<Self>) {
+        if self.tablet_manager.is_none()
+            || self.tablet_seats.iter().any(|(existing, _)| *existing == seat)
+        {
+            return;
+        }
+        let tablet_seat = self.tablet_manager.as_ref().unwrap().get_tablet_seat(&seat, qh, ());
+        self.tablet_seats.push((seat, tablet_seat));
+        eprintln!(
+            "Droidloom tablet trace: stage=seat-bound count={}",
+            self.tablet_seats.len()
+        );
+    }
+
     fn task_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<TaskObjectId> {
         self.tasks.iter().find_map(|(object, task)| {
             task.surface()
@@ -462,8 +599,8 @@ impl App {
                 let surface = self.compositor.create_surface(qh);
                 let window = self
                     .xdg_shell
-                    .create_window(surface, WindowDecorations::None, qh);
-                window.set_title(package.to_owned());
+                    .create_window(surface, WindowDecorations::RequestServer, qh);
+                window.set_title(app_display_title(package));
                 window.set_app_id(package.to_owned());
                 window.set_min_size(Some((1, 1)));
                 if let Some(manager) = &self.insets_manager {
@@ -495,6 +632,7 @@ impl App {
                 package: package.to_owned(),
                 android_task: None,
                 window,
+                window_frame: None,
                 viewport,
                 fractional_scale,
                 sync_surface,
@@ -537,6 +675,51 @@ impl App {
         Ok(())
     }
 
+    fn content_configure_size(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        object: TaskObjectId,
+        configure: &WindowConfigure,
+    ) -> Result<(Option<NonZeroU32>, Option<NonZeroU32>), PresenterError> {
+        let requested = configure.new_size;
+        let task = self.tasks.get_mut(&object).ok_or(PresenterError::UnknownTask(object))?;
+        if task.headless() {
+            return Ok(requested);
+        }
+        if configure.decoration_mode != DecorationMode::Client {
+            if let Some(frame) = task.window_frame.as_mut() {
+                frame.set_hidden(true);
+            }
+            return Ok(requested);
+        }
+        if task.window_frame.is_none() {
+            let window = task.window.as_ref()
+                .ok_or(PresenterError::Configuration("window frame has no parent"))?;
+            let mut frame = AdwaitaFrame::new(
+                window,
+                &self.shm_state,
+                self.compositor.clone(),
+                self.subcompositor_state.clone(),
+                qh.clone(),
+                FrameConfig::auto(),
+            )
+            .map_err(|error| PresenterError::WindowDecoration(error.to_string()))?;
+            frame.set_title(app_display_title(&task.package));
+            task.window_frame = Some(frame);
+        }
+        let frame = task.window_frame.as_mut().expect("frame initialized above");
+        frame.set_hidden(false);
+        frame.update_state(configure.state);
+        frame.update_wm_capabilities(configure.capabilities);
+        // Either dimension can be unconstrained independently. Resolve policy
+        // defaults later, then draw against the final content size.
+        let (width, height) = frame.subtract_borders(
+            requested.0.unwrap_or(NonZeroU32::MIN),
+            requested.1.unwrap_or(NonZeroU32::MIN),
+        );
+        Ok((requested.0.and(width), requested.1.and(height)))
+    }
+
     fn configure_task(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -558,6 +741,38 @@ impl App {
                 scale_dimension(height, scale_120)?,
             )
         };
+        // Geometry must use the resolved content size, including a compositor's
+        // initial 0x0 configure and later scale-only updates.
+        {
+            let task = self.tasks.get_mut(&object)
+                .ok_or(PresenterError::UnknownTask(object))?;
+            if let Some(window) = task.window.as_ref() {
+                let (x, y, outer_width, outer_height, frame_needs_parent_commit) =
+                    match task.window_frame.as_mut() {
+                        Some(frame) if !frame.is_hidden() => {
+                            frame.set_scaling_factor(f64::from(scale_120) / 120.0);
+                            frame.resize(NonZeroU32::new(width).unwrap(), NonZeroU32::new(height).unwrap());
+                            let (x, y) = frame.location();
+                            let (w, h) = frame.add_borders(width, height);
+                            let needs_parent_commit = frame.draw();
+                            (x, y, w, h, needs_parent_commit)
+                        }
+                        _ => (0, 0, width, height, false),
+                    };
+                window.xdg_surface().set_window_geometry(
+                    x, y,
+                    i32::try_from(outer_width).map_err(|_| PresenterError::Configuration("window width exceeds Wayland"))?,
+                    i32::try_from(outer_height).map_err(|_| PresenterError::Configuration("window height exceeds Wayland"))?,
+                );
+                // Synchronized decoration subsurfaces only become visible after
+                // the parent surface is committed. draw() returns true when it
+                // synchronized its child commits, so commit even if no buffer
+                // pool resize follows this configure.
+                if frame_needs_parent_commit {
+                    window.wl_surface().commit();
+                }
+            }
+        }
         let needs_pool = {
             let task = self
                 .tasks
@@ -889,7 +1104,7 @@ impl App {
             if task.content_opaque {
                 let (width, height) = task.logical_size
                     .ok_or(PresenterError::Configuration("opaque target has no logical size"))?;
-                let region = Region::new(&self.compositor)?;
+                let region = Region::new(self.compositor.as_ref())?;
                 region.add(0, 0, i32::try_from(width).map_err(|_| PresenterError::Configuration("opaque width exceeds Wayland"))?,
                     i32::try_from(height).map_err(|_| PresenterError::Configuration("opaque height exceeds Wayland"))?);
                 surface.set_opaque_region(Some(region.wl_region()));
@@ -1261,6 +1476,7 @@ impl App {
         }
         match self.listener.accept() {
             Ok(endpoint) => {
+                let endpoint = endpoint.with_tablet_input();
                 let endpoint = if self.activation.supported() {
                     endpoint.with_activation_requests()
                 } else { endpoint };
@@ -1314,6 +1530,14 @@ impl App {
             self.clipboard_inputs.push_back((object, event));
             return Ok(());
         }
+        let tablet_trace = match event {
+            InputEvent::Tablet { action, tool_id, .. }
+                if !matches!(action, TabletAction::Motion | TabletAction::Wheel) =>
+            {
+                Some((action, tool_id))
+            }
+            _ => None,
+        };
         self.next_input_serial = self
             .next_input_serial
             .checked_add(1)
@@ -1337,6 +1561,12 @@ impl App {
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
             .send_input(object, self.next_input_serial, timestamp, event)?;
+        if let Some((action, tool_id)) = tablet_trace {
+            eprintln!(
+                "Droidloom tablet trace: stage=denial-sent action={action:?} tool={tool_id} task={}",
+                object.0
+            );
+        }
         Ok(())
     }
 
@@ -1399,8 +1629,262 @@ impl App {
         (fixed_16_16(x), fixed_16_16(y))
     }
 
+    fn decoration_pointer_task(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        x: f64,
+        y: f64,
+    ) -> Option<(TaskObjectId, CursorIcon)> {
+        self.tasks.iter_mut().find_map(|(object, task)| {
+            let frame = task.window_frame.as_mut()?;
+            let cursor = frame.click_point_moved(Duration::ZERO, &surface.id(), x, y)?;
+            if frame.is_dirty() && frame.draw() {
+                if let Some(window) = task.window.as_ref() {
+                    window.wl_surface().commit();
+                }
+            }
+            Some((*object, cursor))
+        })
+    }
+
+    fn decoration_pointer_left(&mut self) {
+        for task in self.tasks.values_mut() {
+            if let Some(frame) = task.window_frame.as_mut() {
+                frame.click_point_left();
+            }
+        }
+    }
+
+    fn frame_action(
+        &mut self,
+        seat: &wl_seat::WlSeat,
+        object: TaskObjectId,
+        serial: u32,
+        action: FrameAction,
+    ) {
+        match action {
+            FrameAction::Close => {
+                if let Some(endpoint) = self.endpoint.as_ref() {
+                    match endpoint.send_close(object) {
+                        Ok(()) => {
+                            if let Some(task) = self.tasks.get_mut(&object) {
+                                task.unmap_requested = true;
+                            }
+                        }
+                        Err(error) => self.fail(&error),
+                    }
+                }
+            }
+            FrameAction::Minimize => {
+                if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
+                    window.set_minimized();
+                }
+            }
+            FrameAction::Maximize => {
+                if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
+                    window.set_maximized();
+                }
+            }
+            FrameAction::UnMaximize => {
+                if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
+                    window.unset_maximized();
+                }
+            }
+            FrameAction::ShowMenu(x, y) => {
+                if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
+                    window.show_window_menu(seat, serial, (x, y));
+                }
+            }
+            FrameAction::Move => {
+                if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
+                    window.move_(seat, serial);
+                }
+            }
+            FrameAction::Resize(edge) => {
+                let edge = match edge {
+                    ResizeEdge::None => XdgResizeEdge::None,
+                    ResizeEdge::Top => XdgResizeEdge::Top,
+                    ResizeEdge::Bottom => XdgResizeEdge::Bottom,
+                    ResizeEdge::Left => XdgResizeEdge::Left,
+                    ResizeEdge::TopLeft => XdgResizeEdge::TopLeft,
+                    ResizeEdge::BottomLeft => XdgResizeEdge::BottomLeft,
+                    ResizeEdge::Right => XdgResizeEdge::Right,
+                    ResizeEdge::TopRight => XdgResizeEdge::TopRight,
+                    ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
+                    _ => return,
+                };
+                if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
+                    window.resize(seat, serial, edge);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn fail(&mut self, error: &dyn ToString) {
         self.fatal = Some(error.to_string());
+    }
+
+    fn destroy_tablet_pad(&mut self, pad_id: u32) {
+        if let Some(pad) = self.tablet_pads.remove(&pad_id) {
+            for child in pad.children.into_iter().rev() {
+                child.destroy();
+            }
+            pad.proxy.destroy();
+        }
+        self.tablet_pad_groups.retain(|_, owner| *owner != pad_id);
+    }
+
+    fn tablet_tool_mut(&mut self, tool_id: u32) -> &mut TabletToolState {
+        if let Some(index) = self.tablet_tools.iter().position(|tool| tool.tool_id == tool_id) {
+            return &mut self.tablet_tools[index];
+        }
+        self.tablet_tools.push(TabletToolState::new(tool_id));
+        self.tablet_tools.last_mut().expect("tablet tool was inserted")
+    }
+
+    fn tablet_tool_snapshot(
+        &self,
+        tool_id: u32,
+    ) -> Option<(
+        Option<wl_surface::WlSurface>,
+        TabletToolType,
+        i32,
+        i32,
+        u16,
+        u16,
+        i16,
+        i16,
+        i16,
+        i16,
+        i32,
+        i32,
+        u8,
+    )> {
+        let tool = self.tablet_tools.iter().find(|tool| tool.tool_id == tool_id)?;
+        if !tool.supported {
+            return None;
+        }
+        Some((
+            tool.surface.clone(),
+            tool.tool_type,
+            tool.x_fixed,
+            tool.y_fixed,
+            tool.pressure,
+            tool.distance,
+            tool.tilt_x_tenths,
+            tool.tilt_y_tenths,
+            tool.rotation_tenths,
+            tool.wheel_clicks,
+            tool.slider,
+            tool.wheel_degrees_fixed,
+            tool.axis_flags,
+        ))
+    }
+
+    fn send_tablet_event(
+        &mut self,
+        tool_id: u32,
+        action: TabletAction,
+        button: u32,
+    ) -> Result<(), PresenterError> {
+        let Some((
+            surface,
+            tool_type,
+            x_fixed,
+            y_fixed,
+            pressure,
+            distance,
+            tilt_x_tenths,
+            tilt_y_tenths,
+            rotation_tenths,
+            wheel_clicks,
+            slider,
+            wheel_degrees_fixed,
+            axis_flags,
+        )) = self.tablet_tool_snapshot(tool_id)
+        else {
+            if !matches!(action, TabletAction::Motion | TabletAction::Wheel) {
+                eprintln!(
+                    "Droidloom tablet trace: stage=drop reason=unknown-tool action={action:?} tool={tool_id}"
+                );
+            }
+            return Ok(());
+        };
+        if !self.endpoint.as_ref().is_some_and(|endpoint| endpoint.supports_tablet_input()) {
+            if !matches!(action, TabletAction::Motion | TabletAction::Wheel) {
+                eprintln!(
+                    "Droidloom tablet trace: stage=drop reason=peer-capability action={action:?} tool={tool_id}"
+                );
+            }
+            return Ok(());
+        }
+        let Some(surface) = surface else {
+            if !matches!(action, TabletAction::Motion | TabletAction::Wheel) {
+                eprintln!(
+                    "Droidloom tablet trace: stage=drop reason=no-proximity-surface action={action:?} tool={tool_id}"
+                );
+            }
+            return Ok(());
+        };
+        let Some(object) = self.task_for_surface(&surface) else {
+            if !matches!(action, TabletAction::Motion | TabletAction::Wheel) {
+                eprintln!(
+                    "Droidloom tablet trace: stage=drop reason=surface-not-task action={action:?} tool={tool_id}"
+                );
+            }
+            return Ok(());
+        };
+        if !matches!(action, TabletAction::Motion | TabletAction::Wheel) {
+            eprintln!(
+                "Droidloom tablet trace: stage=route action={action:?} tool={tool_id} task={}",
+                object.0
+            );
+        }
+        self.send_input(
+            object,
+            InputEvent::Tablet {
+                action,
+                tool_id,
+                tool_type,
+                x_fixed,
+                y_fixed,
+                pressure,
+                distance,
+                tilt_x_tenths,
+                tilt_y_tenths,
+                rotation_tenths,
+                wheel_clicks,
+                slider,
+                wheel_degrees_fixed,
+                button,
+                axis_flags,
+            },
+        )
+    }
+
+    fn flush_tablet_axes(&mut self, tool_id: u32) -> Result<(), PresenterError> {
+        let tool = self.tablet_tool_mut(tool_id);
+        let actions = std::mem::take(&mut tool.pending_actions);
+        let dirty = std::mem::take(&mut tool.dirty_axes);
+        // All axes in a tablet frame describe the same sample, including down/up.
+        if actions.is_empty() && dirty {
+            self.send_tablet_event(tool_id, TabletAction::Motion, 0)?;
+        }
+        for (action, button) in actions {
+            self.send_tablet_event(tool_id, action, button)?;
+            if matches!(action, TabletAction::ProximityOut | TabletAction::Cancel) {
+                self.tablet_tool_mut(tool_id).surface = None;
+            }
+        }
+        let tool = self.tablet_tool_mut(tool_id);
+        tool.wheel_clicks = 0;
+        tool.wheel_degrees_fixed = 0;
+        Ok(())
+    }
+
+    fn fixed_angle_tenths(value: f64) -> i16 {
+        (value * 10.0).round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
     }
 }
 
@@ -1533,8 +2017,14 @@ impl WindowHandler for App {
             || (String::new(), None, false),
             |task| (task.package.clone(), task.logical_size, task.headless()),
         );
-        let requested_width = configure.new_size.0.map(NonZeroU32::get);
-        let requested_height = configure.new_size.1.map(NonZeroU32::get);
+        let (requested_width, requested_height) =
+            match self.content_configure_size(qh, object, &configure) {
+                Ok((width, height)) => (width.map(NonZeroU32::get), height.map(NonZeroU32::get)),
+                Err(error) => {
+                    self.fail(&error);
+                    return;
+                }
+            };
         let size = previous.map_or_else(
             || {
                 let bounds = configure
@@ -1783,7 +2273,9 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.bind_tablet_seat(seat, qh);
+    }
 
     fn new_capability(
         &mut self,
@@ -1805,11 +2297,16 @@ impl SeatHandler for App {
                 .get_keyboard(qh, &seat, None)
                 .map(|keyboard| self.keyboard = Some(keyboard))
                 .map_err(|error| error.to_string()),
-            Capability::Pointer if self.pointer.is_none() => self
-                .seat_state
-                .get_pointer(qh, &seat)
-                .map(|pointer| self.pointer = Some(pointer))
-                .map_err(|error| error.to_string()),
+            Capability::Pointer if self.pointer.is_none() => {
+                let cursor_surface = self.compositor.create_surface(qh);
+                self.seat_state
+                    .get_pointer_with_theme(
+                        qh, &seat, self.shm_state.wl_shm(), cursor_surface,
+                        ThemeSpec::default(),
+                    )
+                    .map(|pointer| self.pointer = Some(pointer))
+                    .map_err(|error| error.to_string())
+            },
             Capability::Touch if self.touch.is_none() => self
                 .seat_state
                 .get_touch(qh, &seat)
@@ -1836,23 +2333,68 @@ impl SeatHandler for App {
             }
             Capability::Pointer => {
                 self.pointer = None;
+                self.cursor_icon = None;
                 self.pointer_contact = None;
             }
             Capability::Touch => {
                 self.touch = None;
                 self.touch_contacts.clear();
+                self.decoration_touch = None;
             }
             _ => {}
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         self.text_input.remove_resource();
         self.keyboard = None;
         self.pointer = None;
+        self.cursor_icon = None;
         self.touch = None;
         self.pointer_contact = None;
         self.touch_contacts.clear();
+        self.decoration_touch = None;
+
+        let Some(index) = self.tablet_seats.iter().position(|(candidate, _)| *candidate == seat) else {
+            return;
+        };
+        let (_, tablet_seat) = self.tablet_seats.remove(index);
+        let tablet_seat_id = tablet_seat.id().protocol_id();
+        let tool_ids = self.tablet_tool_seats.iter()
+            .filter_map(|(tool_id, owner)| (*owner == tablet_seat_id).then_some(*tool_id))
+            .collect::<Vec<_>>();
+        let tablet_ids = self.tablet_proxies.iter()
+            .filter_map(|(id, (owner, _))| (*owner == tablet_seat_id).then_some(*id))
+            .collect::<Vec<_>>();
+        let pad_ids = self.tablet_pads.iter()
+            .filter_map(|(id, pad)| (pad.tablet_seat_id == tablet_seat_id).then_some(*id))
+            .collect::<Vec<_>>();
+        for tool_id in tool_ids {
+            if let Err(error) = self.flush_tablet_axes(tool_id) {
+                self.fail(&error);
+            }
+            // Cancel while the last proximity surface is still known, so the
+            // Android side releases any active tool route before it is dropped.
+            if self.tablet_tool_snapshot(tool_id).is_some_and(|snapshot| snapshot.0.is_some()) {
+                if let Err(error) = self.send_tablet_event(tool_id, TabletAction::Cancel, 0) {
+                    self.fail(&error);
+                }
+            }
+            if let Some(proxy) = self.tablet_tool_proxies.remove(&tool_id) {
+                proxy.destroy();
+            }
+            self.tablet_tool_seats.remove(&tool_id);
+            self.tablet_tools.retain(|tool| tool.tool_id != tool_id);
+        }
+        for pad_id in pad_ids {
+            self.destroy_tablet_pad(pad_id);
+        }
+        for tablet_id in tablet_ids {
+            if let Some((_, proxy)) = self.tablet_proxies.remove(&tablet_id) {
+                proxy.destroy();
+            }
+        }
+        tablet_seat.destroy();
     }
 }
 
@@ -1991,15 +2533,91 @@ impl PointerHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
             if let PointerEventKind::Press { serial, .. } = event.kind
-                && let Some(data) = _pointer.data::<smithay_client_toolkit::seat::pointer::PointerData>() {
+                && let Some(data) = pointer.data::<PointerData>()
+            {
                 self.activation.input(serial, data.seat(), &event.surface);
             }
-            if let PointerEventKind::Press { serial, .. } | PointerEventKind::Release { serial, .. } = event.kind { self.clipboard.serial(serial); }
+            if let PointerEventKind::Press { serial, .. }
+            | PointerEventKind::Release { serial, .. } = event.kind
+            {
+                self.clipboard.serial(serial);
+            }
+
+            // The frame API keeps one hover/click state. A touch gesture owns it
+            // until release, so concurrent mouse motion cannot change its action.
+            let decoration_object = if self.decoration_touch.is_some() {
+                None
+            } else {
+                match event.kind {
+                    PointerEventKind::Enter { .. }
+                    | PointerEventKind::Motion { .. }
+                    | PointerEventKind::Press { .. }
+                    | PointerEventKind::Release { .. } => self.decoration_pointer_task(
+                        &event.surface, event.position.0, event.position.1
+                    ),
+                    PointerEventKind::Leave { .. } => {
+                        self.decoration_pointer_left();
+                        None
+                    }
+                    PointerEventKind::Axis { .. } => None,
+                }
+            };
+            let cursor = decoration_object.as_ref().map_or(CursorIcon::Default, |(_, icon)| *icon);
+            if matches!(event.kind, PointerEventKind::Enter { .. })
+                || (matches!(event.kind, PointerEventKind::Motion { .. })
+                    && self.cursor_icon != Some(cursor))
+            {
+                if let Some(themed) = self.pointer.as_ref()
+                    && let Err(error) = themed.set_cursor(_conn, cursor)
+                {
+                    eprintln!("Droidloom cursor update failed: {error}");
+                }
+                self.cursor_icon = Some(cursor);
+            }
+            if matches!(event.kind, PointerEventKind::Leave { .. }) {
+                self.cursor_icon = None;
+            }
+            if let Some((object, _)) = decoration_object {
+                match event.kind {
+                    PointerEventKind::Press { button, serial, time }
+                    | PointerEventKind::Release { button, serial, time } => {
+                        let click = match button {
+                            0x110 => FrameClick::Normal,
+                            0x111 => FrameClick::Alternate,
+                            _ => continue,
+                        };
+                        let pressed = matches!(event.kind, PointerEventKind::Press { .. });
+                        let action = self
+                            .tasks
+                            .get_mut(&object)
+                            .and_then(|task| task.window_frame.as_mut())
+                            .and_then(|frame| {
+                                frame.on_click(
+                                    Duration::from_millis(time as u64),
+                                    click,
+                                    pressed,
+                                )
+                            });
+                        // AdwaitaFrame returns Resize for both press and release.
+                        // xdg_toplevel.resize needs only the initiating press serial.
+                        if let Some(action) = action
+                            && (pressed || !matches!(action, FrameAction::Resize(_)))
+                            && let Some(data) = pointer.data::<PointerData>()
+                        {
+                            self.frame_action(data.seat(), object, serial, action);
+                        }
+                    }
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {}
+                    _ => {}
+                }
+                continue;
+            }
+
             let object = self.task_for_surface(&event.surface);
             match event.kind {
                 PointerEventKind::Press { button, .. }
@@ -2075,12 +2693,34 @@ impl TouchHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
-        _serial: u32,
-        _time: u32,
+        serial: u32,
+        time: u32,
         surface: wl_surface::WlSurface,
         id: i32,
         position: (f64, f64),
     ) {
+        if self.decoration_touch.is_none()
+            && let Some((object, _)) =
+                self.decoration_pointer_task(&surface, position.0, position.1)
+        {
+            if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
+                let seat = data.seat().clone();
+                let action = self.tasks.get_mut(&object)
+                    .and_then(|task| task.window_frame.as_mut())
+                    .and_then(|frame| frame.on_click(
+                        Duration::from_millis(time as u64), FrameClick::Normal, true
+                    ));
+                let acted_on_down = action.is_some();
+                self.decoration_touch = Some(DecorationTouch {
+                    id, touch: _touch.clone(), object, surface,
+                    seat: seat.clone(), down_serial: serial, acted_on_down,
+                });
+                if let Some(action) = action {
+                    self.frame_action(&seat, object, serial, action);
+                }
+            }
+            return;
+        }
         let Some(object) = self.task_for_surface(&surface) else {
             return;
         };
@@ -2089,7 +2729,7 @@ impl TouchHandler for App {
         };
         self.text_input.note_touch();
         if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
-            self.activation.input(_serial, data.seat(), &surface);
+            self.activation.input(serial, data.seat(), &surface);
         }
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
         let contact = Contact {
@@ -2110,9 +2750,27 @@ impl TouchHandler for App {
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
         _serial: u32,
-        _time: u32,
+        time: u32,
         id: i32,
     ) {
+        if self.decoration_touch.as_ref()
+            .is_some_and(|touch| touch.id == id && touch.touch == *_touch)
+        {
+            let touch = self.decoration_touch.take().expect("matched decoration touch");
+            let action = self.tasks.get_mut(&touch.object)
+                .and_then(|task| task.window_frame.as_mut())
+                .and_then(|frame| {
+                    let action = (!touch.acted_on_down).then(|| frame.on_click(
+                        Duration::from_millis(time as u64), FrameClick::Normal, false
+                    )).flatten();
+                    frame.click_point_left();
+                    action
+                });
+            if let Some(action) = action {
+                self.frame_action(&touch.seat, touch.object, touch.down_serial, action);
+            }
+            return;
+        }
         let Some(contact) = self.touch_contacts.remove(&id) else {
             return;
         };
@@ -2132,6 +2790,13 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if let Some(surface) = self.decoration_touch.as_ref()
+            .filter(|touch| touch.id == id && touch.touch == *_touch)
+            .map(|touch| touch.surface.clone())
+        {
+            self.decoration_pointer_task(&surface, position.0, position.1);
+            return;
+        }
         let Some(mut contact) = self.touch_contacts.get(&id).copied() else {
             return;
         };
@@ -2165,6 +2830,13 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)
+            && let Some(touch) = self.decoration_touch.take()
+            && let Some(frame) = self.tasks.get_mut(&touch.object)
+                .and_then(|task| task.window_frame.as_mut())
+        {
+            frame.click_point_left();
+        }
         let contacts = std::mem::take(&mut self.touch_contacts);
         for (_, contact) in contacts {
             if let Err(error) = self.send_input(
@@ -2181,6 +2853,284 @@ impl TouchHandler for App {
                 break;
             }
         }
+    }
+}
+
+impl Dispatch<ZwpTabletSeatV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletSeatV2,
+        event: tablet::zwp_tablet_seat_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let seat_id = proxy.id().protocol_id();
+        match &event {
+            tablet::zwp_tablet_seat_v2::Event::TabletAdded { id } => {
+                state.tablet_proxies.insert(id.id().protocol_id(), (seat_id, id.clone()));
+            }
+            tablet::zwp_tablet_seat_v2::Event::ToolAdded { id } => {
+                let tool_id = id.id().protocol_id();
+                state.tablet_tool_seats.insert(tool_id, seat_id);
+                state.tablet_tool_proxies.insert(tool_id, id.clone());
+            }
+            tablet::zwp_tablet_seat_v2::Event::PadAdded { id } => {
+                state.tablet_pads.insert(id.id().protocol_id(), TabletPadState {
+                    tablet_seat_id: seat_id,
+                    proxy: id.clone(),
+                    children: Vec::new(),
+                });
+            }
+            _ => {}
+        }
+        eprintln!("Droidloom tablet trace: stage=tablet-seat event={event:?}");
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletSeatV2,
+        [
+            0 => (ZwpTabletV2, ()),
+            1 => (ZwpTabletToolV2, ()),
+            2 => (ZwpTabletPadV2, ())
+        ]
+    );
+}
+
+impl Dispatch<ZwpTabletToolV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletToolV2,
+        event: tablet::zwp_tablet_tool_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let tool_id = proxy.id().protocol_id();
+        match event {
+            tablet::zwp_tablet_tool_v2::Event::Type { tool_type } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                if let WEnum::Value(tool_type) = tool_type {
+                    tool.supported = match tool_type {
+                        tablet::zwp_tablet_tool_v2::Type::Pen => {
+                            tool.tool_type = TabletToolType::Pen;
+                            true
+                        }
+                        tablet::zwp_tablet_tool_v2::Type::Eraser => {
+                            tool.tool_type = TabletToolType::Eraser;
+                            true
+                        }
+                        tablet::zwp_tablet_tool_v2::Type::Brush => {
+                            tool.tool_type = TabletToolType::Brush;
+                            true
+                        }
+                        tablet::zwp_tablet_tool_v2::Type::Pencil => {
+                            tool.tool_type = TabletToolType::Pencil;
+                            true
+                        }
+                        tablet::zwp_tablet_tool_v2::Type::Airbrush => {
+                            tool.tool_type = TabletToolType::Airbrush;
+                            true
+                        }
+                        _ => false,
+                    };
+                } else {
+                    tool.supported = false;
+                }
+                eprintln!(
+                    "Droidloom tablet trace: stage=tool-type tool={tool_id} type={:?} supported={}",
+                    tool.tool_type, tool.supported
+                );
+            }
+            tablet::zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+                eprintln!("Droidloom tablet trace: stage=wayland-event action=ProximityIn tool={tool_id}");
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.surface = Some(surface);
+                tool.axis_flags = 0;
+                tool.pressure = 0;
+                tool.pending_actions.push((TabletAction::ProximityIn, 0));
+            }
+            tablet::zwp_tablet_tool_v2::Event::ProximityOut => {
+                eprintln!("Droidloom tablet trace: stage=wayland-event action=ProximityOut tool={tool_id}");
+                state.tablet_tool_mut(tool_id).pending_actions.push((TabletAction::ProximityOut, 0));
+            }
+            tablet::zwp_tablet_tool_v2::Event::Down { .. } => {
+                eprintln!("Droidloom tablet trace: stage=wayland-event action=Down tool={tool_id}");
+                state.tablet_tool_mut(tool_id).pending_actions.push((TabletAction::Down, 0));
+            }
+            tablet::zwp_tablet_tool_v2::Event::Up => {
+                eprintln!("Droidloom tablet trace: stage=wayland-event action=Up tool={tool_id}");
+                state.tablet_tool_mut(tool_id).pending_actions.push((TabletAction::Up, 0));
+            }
+            tablet::zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.x_fixed = fixed_16_16(x);
+                tool.y_fixed = fixed_16_16(y);
+                tool.dirty_axes = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.pressure = u16::try_from(pressure.min(u32::from(u16::MAX))).unwrap_or(u16::MAX);
+                tool.axis_flags |= 1 << 0;
+                tool.dirty_axes = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Distance { distance } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.distance = u16::try_from(distance.min(u32::from(u16::MAX))).unwrap_or(u16::MAX);
+                tool.axis_flags |= 1 << 1;
+                tool.dirty_axes = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Tilt { tilt_x, tilt_y } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.tilt_x_tenths = App::fixed_angle_tenths(tilt_x);
+                tool.tilt_y_tenths = App::fixed_angle_tenths(tilt_y);
+                tool.axis_flags |= 1 << 2;
+                tool.dirty_axes = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Rotation { degrees } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.rotation_tenths = App::fixed_angle_tenths(degrees);
+                tool.axis_flags |= 1 << 3;
+                tool.dirty_axes = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Slider { position } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.slider = position;
+                tool.axis_flags |= 1 << 4;
+                tool.dirty_axes = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Wheel { degrees, clicks } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.wheel_degrees_fixed = fixed_16_16(degrees);
+                tool.wheel_clicks = clicks.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+                tool.axis_flags |= 1 << 5;
+                tool.pending_actions.push((TabletAction::Wheel, 0));
+            }
+            tablet::zwp_tablet_tool_v2::Event::Button { button, state: button_state, .. } => {
+                let action = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                        TabletAction::ButtonPress
+                    }
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Released) => {
+                        TabletAction::ButtonRelease
+                    }
+                    WEnum::Unknown(_) | WEnum::Value(_) => return,
+                };
+                state.tablet_tool_mut(tool_id).pending_actions.push((action, button));
+            }
+            tablet::zwp_tablet_tool_v2::Event::Frame { .. } => {
+                if let Err(error) = state.flush_tablet_axes(tool_id) {
+                    state.fail(&error);
+                }
+            }
+            tablet::zwp_tablet_tool_v2::Event::Removed => {
+                if let Err(error) = state.flush_tablet_axes(tool_id)
+                    .and_then(|()| state.send_tablet_event(tool_id, TabletAction::Cancel, 0))
+                {
+                    state.fail(&error);
+                }
+                state.tablet_tools.retain(|tool| tool.tool_id != tool_id);
+                state.tablet_tool_seats.remove(&tool_id);
+                state.tablet_tool_proxies.remove(&tool_id);
+                proxy.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletV2,
+        event: tablet::zwp_tablet_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, tablet::zwp_tablet_v2::Event::Removed) {
+            state.tablet_proxies.remove(&proxy.id().protocol_id());
+            proxy.destroy();
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletPadV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletPadV2,
+        event: tablet::zwp_tablet_pad_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let pad_id = proxy.id().protocol_id();
+        match event {
+            tablet::zwp_tablet_pad_v2::Event::Group { pad_group } => {
+                let group_id = pad_group.id().protocol_id();
+                state.tablet_pad_groups.insert(group_id, pad_id);
+                if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                    pad.children.push(TabletPadChild::Group(pad_group));
+                }
+            }
+            tablet::zwp_tablet_pad_v2::Event::Removed => state.destroy_tablet_pad(pad_id),
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletPadV2,
+        [0 => (ZwpTabletPadGroupV2, ())]
+    );
+}
+
+impl Dispatch<ZwpTabletPadGroupV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletPadGroupV2,
+        event: tablet::zwp_tablet_pad_group_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let group_id = proxy.id().protocol_id();
+        let Some(pad_id) = state.tablet_pad_groups.get(&group_id).copied() else {
+            return;
+        };
+        let child = match event {
+            tablet::zwp_tablet_pad_group_v2::Event::Ring { ring } => Some(TabletPadChild::Ring(ring)),
+            tablet::zwp_tablet_pad_group_v2::Event::Strip { strip } => Some(TabletPadChild::Strip(strip)),
+            tablet::zwp_tablet_pad_group_v2::Event::Dial { dial } => Some(TabletPadChild::Dial(dial)),
+            _ => None,
+        };
+        if let Some(child) = child {
+            if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                pad.children.push(child);
+            }
+        }
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletPadGroupV2,
+        [
+            1 => (ZwpTabletPadRingV2, ()),
+            2 => (ZwpTabletPadStripV2, ()),
+            6 => (ZwpTabletPadDialV2, ())
+        ]
+    );
+}
+
+wayland_client::delegate_noop!(App: ignore ZwpTabletManagerV2);
+wayland_client::delegate_noop!(App: ignore ZwpTabletPadRingV2);
+wayland_client::delegate_noop!(App: ignore ZwpTabletPadStripV2);
+wayland_client::delegate_noop!(App: ignore ZwpTabletPadDialV2);
+
+impl ShmHandler for App {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm_state
     }
 }
 
@@ -2202,6 +3152,8 @@ smithay_client_toolkit::delegate_seat!(App);
 smithay_client_toolkit::delegate_keyboard!(App);
 smithay_client_toolkit::delegate_pointer!(App);
 smithay_client_toolkit::delegate_touch!(App);
+smithay_client_toolkit::delegate_subcompositor!(App);
+smithay_client_toolkit::delegate_shm!(App);
 smithay_client_toolkit::delegate_registry!(App);
 
 wayland_client::delegate_noop!(App: ignore WpLinuxDrmSyncobjManagerV1);
@@ -2277,16 +3229,34 @@ fn run() -> Result<(), PresenterError> {
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
-    let compositor = CompositorState::bind(&globals, &qh)?;
+    let compositor = Arc::new(CompositorState::bind(&globals, &qh)?);
     let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
     let fractional_scale_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, ())?;
+    let tablet_manager: Option<ZwpTabletManagerV2> = globals.bind(&qh, 1..=2, ()).ok();
+    eprintln!(
+        "Droidloom tablet trace: stage=wayland-global tablet-v2={}",
+        tablet_manager.is_some()
+    );
     let dmabuf_state = DmabufState::new(&globals, &qh);
     let presentation_time = PresentationTimeState::bind(&globals, &qh);
     if !matches!(dmabuf_state.version(), Some(4..)) {
         return Err(PresenterError::DmabufV4Required);
     }
     let sync_manager: WpLinuxDrmSyncobjManagerV1 = globals.bind(&qh, 1..=1, ())?;
+    let seat_state = SeatState::new(&globals, &qh);
+    let mut tablet_seats = Vec::new();
+    if let Some(manager) = &tablet_manager {
+        for seat in seat_state.seats() {
+            if !tablet_seats.iter().any(|(existing, _)| *existing == seat) {
+                tablet_seats.push((seat.clone(), manager.get_tablet_seat(&seat, &qh, ())));
+            }
+        }
+    }
+    eprintln!(
+        "Droidloom tablet trace: stage=initial-seats-bound count={}",
+        tablet_seats.len()
+    );
     let mut app = App {
         activation: activation::Activation::new(&globals, &qh),
         layer_globals: layers::Globals { subcompositor: globals.bind(&qh, 1..=1, ())?, shm: globals.bind(&qh, 1..=1, ())?, alpha: globals.bind(&qh, 1..=1, ()).ok() },
@@ -2299,7 +3269,21 @@ fn run() -> Result<(), PresenterError> {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         presentation_time,
-        seat_state: SeatState::new(&globals, &qh),
+        seat_state,
+        subcompositor_state: Arc::new(SubcompositorState::bind(
+            compositor.wl_compositor().clone(),
+            &globals,
+            &qh,
+        )?),
+        shm_state: Shm::bind(&globals, &qh)?,
+        tablet_manager,
+        tablet_seats,
+        tablet_tools: Vec::new(),
+        tablet_tool_seats: BTreeMap::new(),
+        tablet_tool_proxies: BTreeMap::new(),
+        tablet_proxies: BTreeMap::new(),
+        tablet_pads: BTreeMap::new(),
+        tablet_pad_groups: BTreeMap::new(),
         dmabuf_state,
         feedback: None,
         compositor,
@@ -2316,10 +3300,12 @@ fn run() -> Result<(), PresenterError> {
         tasks: BTreeMap::new(),
         keyboard: None,
         pointer: None,
+        cursor_icon: None,
         touch: None,
         focused: None,
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
+        decoration_touch: None,
         next_buffer_id: 0,
         next_input_serial: 0,
         socket_path,

@@ -20,7 +20,7 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
 /// Fixed wire-header size.
@@ -62,6 +62,8 @@ pub mod capability {
     pub const DROIDLOOM_COMPOSITION: u64 = 1 << 7;
     /// The host accepts task activation requests under its own focus policy.
     pub const TASK_ACTIVATION: u64 = 1 << 8;
+    /// Denial can route graphics-tablet pen and eraser events to Android.
+    pub const TABLET_INPUT: u64 = 1 << 9;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -449,6 +451,39 @@ pub enum InputEvent {
         /// Host shell action.
         action: NavigationAction,
     },
+    /// One graphics-tablet tool update, including optional axes.
+    Tablet {
+        /// Tool operation.
+        action: TabletAction,
+        /// Stable tool identity while it remains in proximity.
+        tool_id: u32,
+        /// Pen-like tool type.
+        tool_type: TabletToolType,
+        /// Logical x coordinate in signed 16.16 fixed point.
+        x_fixed: i32,
+        /// Logical y coordinate in signed 16.16 fixed point.
+        y_fixed: i32,
+        /// Normalized pressure from zero through 65,535.
+        pressure: u16,
+        /// Distance from the tablet surface from zero through 65,535.
+        distance: u16,
+        /// Tilt around the x axis in tenths of a degree.
+        tilt_x_tenths: i16,
+        /// Tilt around the y axis in tenths of a degree.
+        tilt_y_tenths: i16,
+        /// Tool rotation in tenths of a degree.
+        rotation_tenths: i16,
+        /// Wheel click delta.
+        wheel_clicks: i16,
+        /// Relative slider value.
+        slider: i32,
+        /// Wheel angle in signed 16.16 degrees.
+        wheel_degrees_fixed: i32,
+        /// Linux stylus button identity for button events.
+        button: u32,
+        /// Bitmask of axes valid for this sample.
+        axis_flags: u8,
+    },
 }
 
 /// Touch contact operation.
@@ -473,6 +508,46 @@ pub enum KeyAction {
     Down = 0,
     /// Key release.
     Up = 1,
+}
+
+/// Graphics-tablet tool operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TabletAction {
+    /// Tool entered the surface proximity region.
+    ProximityIn = 0,
+    /// Tool moved while hovering or touching.
+    Motion = 1,
+    /// Tool tip touched the surface.
+    Down = 2,
+    /// Tool tip left the surface.
+    Up = 3,
+    /// Tool left the surface proximity region.
+    ProximityOut = 4,
+    /// A tool button was pressed.
+    ButtonPress = 5,
+    /// A tool button was released.
+    ButtonRelease = 6,
+    /// Cancel the current tablet stream.
+    Cancel = 7,
+    /// Wheel or ring motion.
+    Wheel = 8,
+}
+
+/// Graphics-tablet tool type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TabletToolType {
+    /// Regular pressure-sensitive pen.
+    Pen = 0,
+    /// Inverted pen/eraser.
+    Eraser = 1,
+    /// Brush-shaped tool.
+    Brush = 2,
+    /// Pencil-shaped tool.
+    Pencil = 3,
+    /// Airbrush-shaped tool.
+    Airbrush = 4,
 }
 
 /// Denial mobile-shell navigation action.
@@ -1151,6 +1226,7 @@ const OP_ERROR: u16 = 0x800a;
 const OP_PING: u16 = 0x800b;
 const OP_REGISTER_RENDER_TARGET: u16 = 0x800c;
 const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
+const OP_TABLET_INPUT: u16 = 0x800e;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1676,8 +1752,17 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
             nonzero("input serial", *serial)?;
             payload.u64(*serial);
             payload.u64(*timestamp_nanos);
-            encode_input(&mut payload, *event);
-            (OP_INPUT, valid_object(*object)?)
+            let opcode = match event {
+                InputEvent::Tablet { .. } => {
+                    encode_tablet_input(&mut payload, *event);
+                    OP_TABLET_INPUT
+                }
+                _ => {
+                    encode_input(&mut payload, *event);
+                    OP_INPUT
+                }
+            };
+            (opcode, valid_object(*object)?)
         }
         DenialMessage::Error {
             object,
@@ -1890,15 +1975,27 @@ pub fn decode_denial(
                 flags,
             }
         }
-        OP_INPUT => {
+        OP_INPUT | OP_TABLET_INPUT => {
             valid_object(object)?;
             let serial = payload.u64()?;
             nonzero("input serial", serial)?;
+            let timestamp_nanos = payload.u64()?;
+            let event = if header.opcode == OP_TABLET_INPUT {
+                decode_tablet_input(&mut payload)?
+            } else {
+                decode_input(&mut payload)?
+            };
+            if header.opcode == OP_INPUT && matches!(event, InputEvent::Tablet { .. }) {
+                return Err(WireError::InvalidEnum {
+                    field: "legacy input event",
+                    value: 3,
+                });
+            }
             DenialMessage::Input {
                 object,
                 serial,
-                timestamp_nanos: payload.u64()?,
-                event: decode_input(&mut payload)?,
+                timestamp_nanos,
+                event,
             }
         }
         OP_ERROR => {
@@ -1950,6 +2047,10 @@ impl Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn i16(&mut self, value: i16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn i32(&mut self, value: i32) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -1996,6 +2097,10 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i16(&mut self) -> Result<i16, WireError> {
+        Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
 
     fn i32(&mut self) -> Result<i32, WireError> {
@@ -2053,8 +2158,13 @@ fn finish_packet(
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
     // Existing peers reject a header newer than their implementation before
-    // reading capabilities. Only the negotiated new opcode needs minor 4.
-    let minor = if opcode == OP_REQUEST_ACTIVATION { PROTOCOL_MINOR } else { BASE_PROTOCOL_MINOR };
+    // reading capabilities. Keep legacy records on the base minor and gate
+    // each newer opcode at the minor that introduced it.
+    let minor = match opcode {
+        OP_REQUEST_ACTIVATION => 4,
+        OP_TABLET_INPUT => PROTOCOL_MINOR,
+        _ => BASE_PROTOCOL_MINOR,
+    };
     bytes.extend_from_slice(&minor.to_le_bytes());
     bytes.extend_from_slice(&opcode.to_le_bytes());
     bytes.extend_from_slice(&fd_count.to_le_bytes());
@@ -2083,6 +2193,14 @@ fn parse_header(packet: &[u8], received_descriptors: usize) -> Result<Header<'_>
         return Err(WireError::UnsupportedVersion { major, minor });
     }
     let opcode = reader.u16()?;
+    let minimum_minor = match opcode {
+        OP_REQUEST_ACTIVATION => 4,
+        OP_TABLET_INPUT => PROTOCOL_MINOR,
+        _ => BASE_PROTOCOL_MINOR,
+    };
+    if minor < minimum_minor {
+        return Err(WireError::UnsupportedVersion { major, minor });
+    }
     let fd_count = usize::from(reader.u16()?);
     let flags = reader.u32()?;
     let object = reader.u64()?;
@@ -2167,6 +2285,63 @@ fn decode_buffer(payload: &mut Reader<'_>) -> Result<BufferMetadata, WireError> 
     Ok(buffer)
 }
 
+fn encode_tablet_input(payload: &mut Writer, event: InputEvent) {
+    let InputEvent::Tablet {
+        action,
+        tool_id,
+        tool_type,
+        x_fixed,
+        y_fixed,
+        pressure,
+        distance,
+        tilt_x_tenths,
+        tilt_y_tenths,
+        rotation_tenths,
+        wheel_clicks,
+        slider,
+        wheel_degrees_fixed,
+        button,
+        axis_flags,
+    } = event else {
+        unreachable!("tablet encoder called for a non-tablet event");
+    };
+    payload.u8(action as u8);
+    payload.u32(tool_id);
+    payload.u8(tool_type as u8);
+    payload.i32(x_fixed);
+    payload.i32(y_fixed);
+    payload.u16(pressure);
+    payload.u16(distance);
+    payload.i16(tilt_x_tenths);
+    payload.i16(tilt_y_tenths);
+    payload.i16(rotation_tenths);
+    payload.i16(wheel_clicks);
+    payload.i32(slider);
+    payload.i32(wheel_degrees_fixed);
+    payload.u32(button);
+    payload.u8(axis_flags);
+}
+
+fn decode_tablet_input(payload: &mut Reader<'_>) -> Result<InputEvent, WireError> {
+    Ok(InputEvent::Tablet {
+        action: decode_tablet_action(payload.u8()?)?,
+        tool_id: payload.u32()?,
+        tool_type: decode_tablet_tool_type(payload.u8()?)?,
+        x_fixed: payload.i32()?,
+        y_fixed: payload.i32()?,
+        pressure: payload.u16()?,
+        distance: payload.u16()?,
+        tilt_x_tenths: payload.i16()?,
+        tilt_y_tenths: payload.i16()?,
+        rotation_tenths: payload.i16()?,
+        wheel_clicks: payload.i16()?,
+        slider: payload.i32()?,
+        wheel_degrees_fixed: payload.i32()?,
+        button: payload.u32()?,
+        axis_flags: payload.u8()?,
+    })
+}
+
 fn encode_input(payload: &mut Writer, event: InputEvent) {
     match event {
         InputEvent::Touch {
@@ -2196,6 +2371,9 @@ fn encode_input(payload: &mut Writer, event: InputEvent) {
         InputEvent::Navigation { action } => {
             payload.u8(2);
             payload.u8(action as u8);
+        }
+        InputEvent::Tablet { .. } => {
+            unreachable!("legacy input encoder called for a tablet event");
         }
     }
 }
@@ -2399,6 +2577,24 @@ decode_enum!(decode_touch_action, u8 => TouchAction, "touch action", {
     2 => TouchAction::Up,
     3 => TouchAction::Cancel,
 });
+decode_enum!(decode_tablet_action, u8 => TabletAction, "tablet action", {
+    0 => TabletAction::ProximityIn,
+    1 => TabletAction::Motion,
+    2 => TabletAction::Down,
+    3 => TabletAction::Up,
+    4 => TabletAction::ProximityOut,
+    5 => TabletAction::ButtonPress,
+    6 => TabletAction::ButtonRelease,
+    7 => TabletAction::Cancel,
+    8 => TabletAction::Wheel,
+});
+decode_enum!(decode_tablet_tool_type, u8 => TabletToolType, "tablet tool type", {
+    0 => TabletToolType::Pen,
+    1 => TabletToolType::Eraser,
+    2 => TabletToolType::Brush,
+    3 => TabletToolType::Pencil,
+    4 => TabletToolType::Airbrush,
+});
 decode_enum!(decode_key_action, u8 => KeyAction, "key action", {
     0 => KeyAction::Down,
     1 => KeyAction::Up,
@@ -2472,6 +2668,46 @@ mod tests {
         assert_eq!(&activation.bytes[6..8], &4_u16.to_le_bytes());
         assert!(activation.descriptors.is_empty());
         assert_eq!(activation.bytes.len(), HEADER_BYTES);
+    }
+
+    #[test]
+    fn newer_opcodes_require_their_header_minor() {
+        let activation = encode_android(&AndroidMessage::RequestActivation { object: OBJECT }).unwrap();
+        let mut packet = activation.bytes;
+        packet[6..8].copy_from_slice(&BASE_PROTOCOL_MINOR.to_le_bytes());
+        assert!(matches!(
+            decode_android(&packet, 0),
+            Err(WireError::UnsupportedVersion { minor: BASE_PROTOCOL_MINOR, .. })
+        ));
+
+        let tablet = encode_denial(&DenialMessage::Input {
+            object: OBJECT,
+            serial: 1,
+            timestamp_nanos: 1,
+            event: InputEvent::Tablet {
+                action: TabletAction::ProximityIn,
+                tool_id: 1,
+                tool_type: TabletToolType::Pen,
+                x_fixed: 0,
+                y_fixed: 0,
+                pressure: 0,
+                distance: 0,
+                tilt_x_tenths: 0,
+                tilt_y_tenths: 0,
+                rotation_tenths: 0,
+                wheel_clicks: 0,
+                slider: 0,
+                wheel_degrees_fixed: 0,
+                button: 0,
+                axis_flags: 0,
+            },
+        }).unwrap();
+        let mut packet = tablet.bytes;
+        packet[6..8].copy_from_slice(&BASE_PROTOCOL_MINOR.to_le_bytes());
+        assert!(matches!(
+            decode_denial(&packet, 0),
+            Err(WireError::UnsupportedVersion { minor: BASE_PROTOCOL_MINOR, .. })
+        ));
     }
 
     #[test]
@@ -2667,6 +2903,23 @@ mod tests {
             },
             InputEvent::Navigation {
                 action: NavigationAction::Back,
+            },
+            InputEvent::Tablet {
+                action: TabletAction::Motion,
+                tool_id: 42,
+                tool_type: TabletToolType::Eraser,
+                x_fixed: 10 << 16,
+                y_fixed: 20 << 16,
+                pressure: u16::MAX / 2,
+                distance: 100,
+                tilt_x_tenths: -120,
+                tilt_y_tenths: 340,
+                rotation_tenths: 900,
+                wheel_clicks: 0,
+                slider: 0,
+                wheel_degrees_fixed: 0,
+                button: 0,
+                axis_flags: 1 | 4,
             },
         ] {
             round_trip_denial(&DenialMessage::Input {

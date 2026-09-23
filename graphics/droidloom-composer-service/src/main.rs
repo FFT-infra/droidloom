@@ -174,7 +174,7 @@ fn handshake(socket: &ProtocolSocket) -> Result<bool, String> {
             &AndroidMessage::ClientHello {
                 min_major: PROTOCOL_MAJOR,
                 max_major: PROTOCOL_MAJOR,
-                capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION,
+                capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION | capability::TABLET_INPUT,
             },
             &[],
         )

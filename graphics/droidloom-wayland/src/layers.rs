@@ -631,7 +631,7 @@ impl App {
                         .get_surface(&surface, qh, ());
                 let sync = None;
                 // Route input to the root, retaining task-relative Android coordinates.
-                let empty = Region::new(&self.compositor)?;
+                let empty = Region::new(self.compositor.as_ref())?;
                 surface.set_input_region(Some(empty.wl_region()));
                 stream.views.insert(
                     l.id,
@@ -656,7 +656,7 @@ impl App {
                 v.viewport.set_destination(dw, dh);
                 v.alpha.set_multiplier(geometry.alpha);
                 if geometry.opaque {
-                    let r = Region::new(&self.compositor)?;
+                    let r = Region::new(self.compositor.as_ref())?;
                     r.add(0, 0, dw, dh);
                     v.surface.set_opaque_region(Some(r.wl_region()));
                 } else {
@@ -741,7 +741,7 @@ impl App {
             sync.destroy();
         }
         if !stream.active || root_changed || stream.root_logical_size != Some((lw, lh)) {
-            let region = Region::new(&self.compositor)?;
+            let region = Region::new(self.compositor.as_ref())?;
             region.add(0, 0, lw as i32, lh as i32);
             root.set_opaque_region(Some(region.wl_region()));
             root.set_buffer_transform(wl_output::Transform::Normal);
@@ -804,10 +804,10 @@ impl App {
         false
     }
 }
-wayland_client::delegate_noop!(App: ignore wl_subcompositor::WlSubcompositor);
-wayland_client::delegate_noop!(App: ignore wl_subsurface::WlSubsurface);
 wayland_client::delegate_noop!(App: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
+wayland_client::delegate_noop!(App: ignore wl_subcompositor::WlSubcompositor);
+wayland_client::delegate_noop!(App: ignore wl_subsurface::WlSubsurface);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
 wayland_client::delegate_noop!(App: ignore WpAlphaModifierV1);
 wayland_client::delegate_noop!(App: ignore WpAlphaModifierSurfaceV1);
