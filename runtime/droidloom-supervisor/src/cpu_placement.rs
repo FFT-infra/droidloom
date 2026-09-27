@@ -35,10 +35,19 @@ fn mount(
     Ok(())
 }
 
+/// Which legacy controller backends this host can provide inside the cell, plus
+/// the generated init policy when CPU placement itself is available.
+pub(crate) struct Backends {
+    pub(crate) cpuset: bool,
+    pub(crate) blkio: bool,
+    /// Appended to the platform init file; absent without a cpuset hierarchy.
+    pub(crate) policy: Option<String>,
+}
+
 /// Create the hierarchy in the initial cgroup namespace, enter only our subtree,
 /// then seal the namespace. A missing/busy legacy controller is explicitly
 /// reported; Android may still boot using its original optional descriptors.
-pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
+pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Backends> {
     let normal = CpuSet::current()?;
     let groups = match Groups::detect() {
         Ok(groups) => groups,
@@ -51,7 +60,7 @@ pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
     };
     // Android's scheduling aggregates also contain I/O actions. Without a real
     // blkio hierarchy they report failure even after applying CPU placement.
-    prepare_legacy(root, "blkio", "blkio", cell, |_| Ok(()))?;
+    let blkio = prepare_legacy(root, "blkio", "blkio", cell, |_| Ok(()))?;
     let cpuset = prepare_legacy(
         root,
         "cpuset",
@@ -73,7 +82,7 @@ pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
     if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if cpuset {
+    let policy = if cpuset {
         eprintln!(
             "Droidloom Android cpuset: cell={cell} normal={} big={} little={}",
             normal.list(),
@@ -84,10 +93,15 @@ pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
                 .as_ref()
                 .map_or_else(|| normal.list(), |g| g.background.list())
         );
-        Ok(Some(init_policy(&normal, groups.as_ref())))
+        Some(init_policy(&normal, groups.as_ref()))
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok(Backends {
+        cpuset,
+        blkio,
+        policy,
+    })
 }
 
 fn prepare_legacy(
@@ -202,7 +216,12 @@ fn init_policy(normal: &CpuSet, groups: Option<&Groups>) -> String {
 /// Translate CPU placement profiles onto the actual cell controller. Other
 /// actions (I/O, memory, freezer, scheduler priority, timer slack) are preserved.
 /// Frequency/utilization-clamp attributes deliberately retain their own backend.
-pub(crate) fn task_profiles(source: &str) -> io::Result<String> {
+///
+/// A controller this host cannot provide is removed from every profile instead.
+/// libprocessgroup applies a profile as a unit and reports it failed when any
+/// action fails, so a join that can only fail would also discard the remaining
+/// actions of that profile and make every affected service start log a failure.
+pub(crate) fn task_profiles(source: &str, backends: &Backends) -> io::Result<String> {
     let mut json: serde_json::Value = serde_json::from_str(source)?;
     let Some(profiles) = json
         .get_mut("Profiles")
@@ -216,6 +235,17 @@ pub(crate) fn task_profiles(source: &str) -> io::Result<String> {
             Some("SFMainPolicy" | "SFRenderEnginePolicy")
         );
         if let Some(actions) = profile["Actions"].as_array_mut() {
+            // Memory placement stays: the cell's cgroup2 hierarchy provides it.
+            actions.retain(|action| {
+                if action["Name"] != "JoinCgroup" {
+                    return true;
+                }
+                match action["Params"]["Controller"].as_str() {
+                    Some("cpu" | "cpuset") => backends.cpuset,
+                    Some("blkio") => backends.blkio,
+                    _ => true,
+                }
+            });
             for action in actions {
                 if action["Name"] == "JoinCgroup" && action["Params"]["Controller"] == "cpu" {
                     let path = match action["Params"]["Path"].as_str() {
@@ -249,6 +279,13 @@ pub(crate) fn task_profiles(source: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn backends(cpuset: bool, blkio: bool) -> Backends {
+        Backends {
+            cpuset,
+            blkio,
+            policy: None,
+        }
+    }
     #[test]
     fn boot_policy_respects_capacity_classes_and_homogeneous_fallback() {
         let normal = CpuSet::parse("0-7").unwrap();
@@ -277,7 +314,7 @@ mod tests {
           "AggregateProfiles":[{"Name":"Custom","Profiles":["HighPerformance","Frozen"]}]}"#;
         let before: serde_json::Value = serde_json::from_str(source).unwrap();
         let after: serde_json::Value =
-            serde_json::from_str(&task_profiles(source).unwrap()).unwrap();
+            serde_json::from_str(&task_profiles(source, &backends(true, true)).unwrap()).unwrap();
         assert_eq!(
             after["Profiles"][0]["Actions"][0]["Params"]["Controller"],
             "cpuset"
@@ -288,6 +325,31 @@ mod tests {
         );
         assert_eq!(after["Profiles"][2], before["Profiles"][2]);
         assert_eq!(after["AggregateProfiles"], before["AggregateProfiles"]);
+    }
+    #[test]
+    fn drops_only_placement_the_cell_cannot_provide() {
+        let source = r#"{"Profiles":[
+          {"Name":"ProcessCapacityHigh","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"cpuset","Path":"foreground"}},{"Name":"SetAttribute","Params":{"Name":"uclamp.min","Value":"10"}}]},
+          {"Name":"NormalIoPriority","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"blkio","Path":""}}]},
+          {"Name":"SomeMemoryPolicy","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"memory","Path":"system"}}]},
+          {"Name":"SFMainPolicy","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"cpu","Path":"rt"}}]}],
+          "AggregateProfiles":[{"Name":"SCHED_SP_DEFAULT","Profiles":["SomeMemoryPolicy"]}]}"#;
+        // This host owns blkio and cpuset in cgroup v2, so neither legacy
+        // hierarchy exists inside the cell.
+        let after: serde_json::Value =
+            serde_json::from_str(&task_profiles(source, &backends(false, false)).unwrap()).unwrap();
+        assert_eq!(
+            after["Profiles"][0]["Actions"],
+            serde_json::json!([{"Name":"SetAttribute","Params":{"Name":"uclamp.min","Value":"10"}}])
+        );
+        assert_eq!(after["Profiles"][1]["Actions"], serde_json::json!([]));
+        // A controller the cell provides keeps its placement untouched.
+        assert_eq!(
+            after["Profiles"][2]["Actions"][0]["Params"]["Controller"],
+            "memory"
+        );
+        assert_eq!(after["Profiles"][3]["Actions"], serde_json::json!([]));
+        assert!(after.get("AggregateProfiles").is_some());
     }
 }
 

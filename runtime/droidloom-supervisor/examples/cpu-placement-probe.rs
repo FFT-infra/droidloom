@@ -31,7 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .lines()
             .any(|line| line == pid)
     );
-    assert!(cpu_placement::prepare(root, "integration-probe")?.is_some());
+    assert!(
+        cpu_placement::prepare(root, "integration-probe")?
+            .policy
+            .is_some()
+    );
 
     // Exercise Android's exact remount after the new cgroup namespace exists.
     // Android must not detect pre-mounted declared paths and skip CgroupSetup.

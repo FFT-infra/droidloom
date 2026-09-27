@@ -190,6 +190,30 @@ pub enum LinuxOperation {
         /// Numeric Unix mode.
         mode: u32,
     },
+    /// Recreate the dynamically authenticated Iris decoder as Android video0.
+    CreateIrisVideoDecoderDevice {
+        /// Guest path understood by the Android V4L2 Codec2 implementation.
+        target: PathBuf,
+        /// Cell permissions; host inode permissions remain unchanged.
+        mode: u32,
+        /// Android root UID owning the private node.
+        owner_uid: u32,
+        /// Android camera group, required by media.codec's AOSP service identity.
+        owner_gid: u32,
+    },
+    /// Expose the Android system DMA heap required by Codec2 buffer pools.
+    CreateDmaHeapSystemDevice {
+        /// Validated host DMA heap character device.
+        source: PathBuf,
+        /// Cell-private path used by Android's DMA-BUF heap allocator.
+        target: PathBuf,
+        /// AOSP ueventd permissions for /dev/dma_heap/system.
+        mode: u32,
+        /// Android system UID owning the private node.
+        owner_uid: u32,
+        /// Android system GID owning the private node.
+        owner_gid: u32,
+    },
     /// Recreate a selected graphics character device with a private inode.
     CreateGraphicsDevice {
         /// Validated host device whose major/minor are preserved.
@@ -309,6 +333,8 @@ pub struct PlanInvariants {
     pub render_nodes: Vec<PathBuf>,
     /// Explicit auxiliary rendering/allocator devices, absent for native DRM.
     pub auxiliary_graphics_devices: Vec<PathBuf>,
+    /// At most one authenticated Iris decoder, exposed at Android's stable path.
+    pub video_decoder_nodes: Vec<PathBuf>,
     /// Always false by construction.
     pub drm_card_nodes: bool,
     /// Always false by construction.
@@ -392,8 +418,20 @@ pub fn build_linux_plan(spec: &CellSpec) -> Result<LinuxCellPlan, SpecError> {
         teardown: backend.teardown.clone(),
         invariants: PlanInvariants {
             render_nodes: vec![spec.render_node.clone()],
-            auxiliary_graphics_devices: spec.graphics_backend.auxiliary_devices()
-                .iter().map(PathBuf::from).collect(),
+            auxiliary_graphics_devices: spec
+                .graphics_backend
+                .auxiliary_devices()
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            video_decoder_nodes: if spec.video_decoder == Some(crate::VideoDecoderBackend::Iris) {
+                vec![
+                    PathBuf::from("/dev/video0"),
+                    PathBuf::from("/dev/dma_heap/system"),
+                ]
+            } else {
+                Vec::new()
+            },
             drm_card_nodes: false,
             physical_input_nodes: false,
             private_binderfs: true,
@@ -538,16 +576,36 @@ fn mount_operations(spec: &CellSpec) -> Vec<LinuxOperation> {
         }
     }));
     operations.extend(basic_device_operations());
+    if spec.video_decoder == Some(crate::VideoDecoderBackend::Iris) {
+        operations.push(LinuxOperation::CreateIrisVideoDecoderDevice {
+            target: "/dev/video0".into(),
+            mode: 0o660,
+            owner_uid: 0,
+            owner_gid: 1006,
+        });
+        operations.push(LinuxOperation::CreateDmaHeapSystemDevice {
+            source: "/dev/dma_heap/system".into(),
+            target: "/dev/dma_heap/system".into(),
+            mode: 0o444,
+            owner_uid: 1000,
+            owner_gid: 1000,
+        });
+    }
     operations.push(LinuxOperation::CreateGraphicsDevice {
         source: spec.render_node.clone(),
         target: "/dev/dri/renderD128".into(),
         mode: 0o666,
     });
-    operations.extend(spec.graphics_backend.auxiliary_devices().iter().map(|path| {
-        LinuxOperation::CreateGraphicsDevice {
-            source: path.into(), target: path.into(), mode: 0o666,
-        }
-    }));
+    operations.extend(
+        spec.graphics_backend
+            .auxiliary_devices()
+            .iter()
+            .map(|path| LinuxOperation::CreateGraphicsDevice {
+                source: path.into(),
+                target: path.into(),
+                mode: 0o666,
+            }),
+    );
     operations.push(mount(
         MountKind::FileBind,
         Some(spec.denial_socket.clone()),
@@ -787,9 +845,7 @@ fn teardown_operations(spec: &CellSpec, step: LifecycleStep) -> Vec<LinuxOperati
             if spec.android_init.is_some() {
                 targets.push(PathBuf::from("/system/bin/init"));
             }
-            targets.extend([
-                PathBuf::from("/dev/socket/droidloom/denial"),
-            ]);
+            targets.extend([PathBuf::from("/dev/socket/droidloom/denial")]);
             targets.extend(
                 spec.shared_storage_directories
                     .iter()
@@ -878,6 +934,7 @@ mod tests {
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),
             graphics_backend: crate::GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
     }
@@ -895,7 +952,10 @@ mod tests {
         for operation in &addon[1..3] {
             assert!(matches!(
                 operation,
-                LinuxOperation::Mount { kind: MountKind::ReadOnlyAndroidImage, .. }
+                LinuxOperation::Mount {
+                    kind: MountKind::ReadOnlyAndroidImage,
+                    ..
+                }
             ));
         }
         let encoded = serde_json::to_string(&addon).unwrap();
@@ -964,6 +1024,46 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(basic_devices.contains(&(Path::new("/dev/fuse"), 10, 229, 0o666)));
+    }
+
+    #[test]
+    fn iris_decoder_is_opt_in_and_maps_to_android_video_zero() {
+        let disabled = build_linux_plan(&spec()).unwrap();
+        assert!(disabled.invariants.video_decoder_nodes.is_empty());
+        assert!(
+            !disabled
+                .construction
+                .iter()
+                .flat_map(|step| &step.operations)
+                .any(|operation| matches!(
+                    operation,
+                    LinuxOperation::CreateIrisVideoDecoderDevice { .. }
+                ))
+        );
+
+        let mut enabled_spec = spec();
+        enabled_spec.video_decoder = Some(crate::VideoDecoderBackend::Iris);
+        let enabled = build_linux_plan(&enabled_spec).unwrap();
+        assert_eq!(
+            enabled.invariants.video_decoder_nodes,
+            [
+                PathBuf::from("/dev/video0"),
+                PathBuf::from("/dev/dma_heap/system"),
+            ]
+        );
+        assert!(
+            enabled
+                .construction
+                .iter()
+                .flat_map(|step| &step.operations)
+                .any(|operation| matches!(
+                    operation,
+                    LinuxOperation::CreateIrisVideoDecoderDevice {
+                        target, mode, owner_uid, owner_gid
+                    } if target == Path::new("/dev/video0")
+                        && *mode == 0o660 && *owner_uid == 0 && *owner_gid == 1006
+                ))
+        );
     }
 
     #[test]
@@ -1157,21 +1257,25 @@ mod tests {
             .collect();
         assert_eq!(binder_names, ["binder", "hwbinder", "vndbinder"]);
 
-        let partitions: Vec<_> = operations
-            .iter()
-            .filter_map(|operation| match operation {
-                LinuxOperation::Mount {
-                    kind: MountKind::ErofsImage | MountKind::Ext4Image | MountKind::ReadOnlyAndroidImage,
-                    target,
-                    read_only,
-                    ..
-                } => {
-                    assert!(*read_only);
-                    Some(target.as_path())
-                }
-                _ => None,
-            })
-            .collect();
+        let partitions: Vec<_> =
+            operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    LinuxOperation::Mount {
+                        kind:
+                            MountKind::ErofsImage
+                            | MountKind::Ext4Image
+                            | MountKind::ReadOnlyAndroidImage,
+                        target,
+                        read_only,
+                        ..
+                    } => {
+                        assert!(*read_only);
+                        Some(target.as_path())
+                    }
+                    _ => None,
+                })
+                .collect();
         assert_eq!(
             partitions,
             [
