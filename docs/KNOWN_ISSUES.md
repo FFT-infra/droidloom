@@ -52,6 +52,23 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
   (`com.netease.uuremote` 4.42.0) is installed on sheng, but a signed-in account
   and a test peer are still required before its video and audio paths can be
   judged.
+- **Douyin keeps its phone layout, and product identity is not the gate.**
+  The installed Douyin renders the phone layout, with its bottom navigation bar,
+  in a freeform task. A complete Xiaomi identity measured through a file
+  override (`ro.product.model=24018RPACC`, `brand` and `manufacturer` `Xiaomi`,
+  device and name `sheng`, Xiaomi fingerprint) changed nothing, runtime MIUI
+  properties (`ro.miui.ui.version.name`, notch height) changed nothing, and a
+  fullscreen attempt was letterboxed by the application's own portrait lock, so
+  the landscape fullscreen condition could not be constructed at all. The APKs
+  reference no `Lmiui/` class, so the decision does not read MIUI framework
+  state; every `com.ss.android.ugc.aweme.pad_api` interface ships a
+  `*Downgrade` fallback and the predicates are an `isPadABon` A/B flag and
+  `isPadLandscapeMode`. `isInMultiWindowMode` appears in roughly twenty dex
+  files, and Droidloom fixes the display to freeform, so a multi-window test can
+  suppress a tablet layout before any device check runs. The identity override
+  was removed: it bought nothing and made the device report a tablet it is not.
+  Confirming either cause requires changing the window model, a display per task
+  or no freeform, which affects every application.
 - **Cell internet depends on the host's forwarding chains.** Droidloom adds
   exact-match accept rules for the cell to `ufw-user-forward` and
   `DOCKER-USER`, the two chains that forward traffic ahead of a host drop
