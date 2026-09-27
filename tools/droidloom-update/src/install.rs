@@ -14,6 +14,7 @@ const ALIASES: &[(&str, &str)] = &[
         "usr/bin/droidloom-supervisor",
     ),
     ("/usr/bin/droidloom-wayland", "usr/bin/droidloom-wayland"),
+    ("/usr/bin/droidloom-audio", "usr/bin/droidloom-audio"),
     (
         "/usr/bin/droidloom-applications",
         "usr/bin/droidloom-applications",
@@ -41,6 +42,10 @@ const ALIASES: &[(&str, &str)] = &[
     (
         "/usr/lib/systemd/user/droidloom-applications.service",
         "usr/lib/systemd/user/droidloom-applications.service",
+    ),
+    (
+        "/usr/lib/systemd/user/droidloom-audio.service",
+        "usr/lib/systemd/user/droidloom-audio.service",
     ),
     (
         "/usr/lib/environment.d/60-droidloom.conf",

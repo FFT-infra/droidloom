@@ -28,7 +28,7 @@ class BundleTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name)
         self.put(bundle.COMPOSER, elf())
-        for name in ['droidloomd', 'droidloomctl', 'droidloom-supervisor', 'droidloom-wayland', 'droidloom-applications']:
+        for name in ['droidloomd', 'droidloomctl', 'droidloom-supervisor', 'droidloom-wayland', 'droidloom-audio', 'droidloom-applications']:
             self.put(pathlib.Path('usr/bin') / name, elf())
         self.jar(bundle.BRIDGE, 5)
 

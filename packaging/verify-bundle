@@ -43,7 +43,7 @@ def compatibility(root):
         if sender != receiver:
             raise ValueError(f'input protocol mismatch: Composer v{sender}, {jar.relative_to(root)} v{receiver}')
     for name in ['droidloomd', 'droidloomctl', 'droidloom-supervisor',
-                 'droidloom-wayland', 'droidloom-applications']:
+                 'droidloom-wayland', 'droidloom-audio', 'droidloom-applications']:
         with (root / 'usr/bin' / name).open('rb') as source:
             header = source.read(20)
         if header[:4] != b'\x7fELF' or header[5:6] != b'\x01' or int.from_bytes(header[18:20], 'little') != machine:

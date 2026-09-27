@@ -29,7 +29,9 @@ for required in \
     "$payload/usr/bin/droidloom-applications" \
     "$payload/usr/bin/droidloom-supervisor" \
     "$payload/usr/bin/droidloom-wayland" \
+    "$payload/usr/bin/droidloom-audio" \
     "$payload/usr/lib/systemd/user/droidloom-applications.service" \
+    "$payload/usr/lib/systemd/user/droidloom-audio.service" \
     "$payload/usr/lib/systemd/user/droidloom.service" \
     "$payload/usr/lib/systemd/system/droidloomd.service" \
     "$payload/usr/lib/environment.d/60-droidloom.conf" \
@@ -138,7 +140,7 @@ mv -Tf -- /usr/lib/droidloom/.current-new /usr/lib/droidloom/current
 ln -s -- "$image_link" /var/lib/droidloom/images/.current-new
 mv -Tf -- /var/lib/droidloom/images/.current-new /var/lib/droidloom/images/current
 
-for binary in droidloomd droidloomctl droidloom-applications droidloom-supervisor droidloom-wayland; do
+for binary in droidloomd droidloomctl droidloom-applications droidloom-supervisor droidloom-wayland droidloom-audio; do
     install -m 0755 "$payload/usr/bin/$binary" "/usr/bin/$binary"
 done
 install -D -m 0644 "$payload/etc/droidloom/cell.json" /etc/droidloom/cell.json
@@ -148,6 +150,8 @@ install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom.service" \
     /usr/lib/systemd/user/droidloom.service
 install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-applications.service" \
     /usr/lib/systemd/user/droidloom-applications.service
+install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-audio.service" \
+    /usr/lib/systemd/user/droidloom-audio.service
 install -D -m 0644 "$payload/usr/lib/environment.d/60-droidloom.conf" \
     /usr/lib/environment.d/60-droidloom.conf
 

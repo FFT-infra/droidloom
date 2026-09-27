@@ -32,8 +32,8 @@ constructing the cell again.
 
 `systemd/user/droidloom.service` owns the complete graphical runtime. Packaging
 leaves it disabled by default. `droidloomctl start` starts the complete runtime
-on demand; `droidloomctl stop` stops the presenter, catalog, and privileged
-daemon. Application launches use the already-running runtime.
+on demand; `droidloomctl stop` stops the presenter, catalog, audio bridge, and
+privileged daemon. Application launches use the already-running runtime.
 Its main process is `droidloom-wayland`. The service waits for the Wayland
 session, connects, binds its private endpoint, and reports readiness before
 `ExecStartPost` starts Android. Stopping or crashing the presenter stops the
@@ -46,6 +46,13 @@ atomically reconciles ordinary XDG entries below
 `~/.local/share/applications/` with collision-resistant `droidloom-` names. It periodically checks for package
 changes while retaining the last good catalog across temporary Android
 restarts. The privileged daemon never writes into a user's home directory.
+
+`systemd/user/droidloom-audio.service` is the second non-privileged companion
+and starts before the runtime, because the supervisor exposes its endpoint to the
+cell during cell setup. It serves one raw PCM stream at a time from
+`$XDG_RUNTIME_DIR/droidloom/audio.sock` to the session's PipeWire sink; a missing
+or failing sound server costs audio only. See
+[the audio contract](../docs/contracts/audio-bridge-v1.md).
 
 The user-facing lifecycle is:
 

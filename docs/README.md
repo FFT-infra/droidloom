@@ -6,7 +6,9 @@
 
 - [Architecture](architecture.md): Android cell, graphics path and source boundaries.
 - [Desktop integration](desktop-integration.md): windows, clipboard, notifications and diagnostics.
-- Integration proposals: [audio](audio-integration-proposal.md) and [SMS](sms-integration-proposal.md).
+- Integration proposals: [audio](audio-integration-proposal.md) (the host
+  transport is implemented, see the contract below; the in-cell HAL adapter is
+  still proposed) and [SMS](sms-integration-proposal.md).
 - [Security requirements](threat-model-v1.md): trust boundaries and isolation limitations.
 
 ## Integration contracts
@@ -14,6 +16,7 @@
 - [Runtime layout](contracts/runtime-layout-v1.md): namespaces, mounts and lifecycle.
 - [Private Binder](contracts/binderfs-v1.md): cell-local Binder devices.
 - [Text input](contracts/text-input-v1.md): Android IME and Denial keyboard dismissal.
+- [Cell audio output](contracts/audio-bridge-v1.md): PCM format and host sink.
 - [Navigation insets](contracts/navigation-insets.md): app geometry and host system bars.
 - [Frame timeline](contracts/frame-timeline-v1.md): optional Denial protocol contract.
 

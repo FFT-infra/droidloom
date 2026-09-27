@@ -16,6 +16,8 @@ pub enum Component {
     Supervisor,
     #[value(name = "droidloom-wayland", alias = "wayland")]
     Wayland,
+    #[value(name = "droidloom-audio", alias = "audio")]
+    Audio,
     #[value(name = "droidloom-applications", alias = "applications")]
     Applications,
     #[value(name = "droidloom-doctor", alias = "doctor")]
@@ -29,6 +31,7 @@ impl Component {
         match self {
             Self::Supervisor => "droidloom-supervisor",
             Self::Wayland => "droidloom-wayland",
+            Self::Audio => "droidloom-audio",
             Self::Applications => "droidloom-applications",
             Self::Doctor => "droidloom-doctor",
             Self::PackageSupport => "droidloom-package-support",
@@ -43,6 +46,7 @@ impl Component {
                 ("droidloomd", "usr/bin/droidloomd"),
             ],
             Self::Wayland => &[("droidloom-wayland", "usr/bin/droidloom-wayland")],
+            Self::Audio => &[("droidloom-audio", "usr/bin/droidloom-audio")],
             Self::Applications => &[("droidloom-applications", "usr/bin/droidloom-applications")],
             Self::Doctor => &[("droidloom-doctor", "usr/bin/droidloom-doctor")],
             Self::PackageSupport => &[(
@@ -305,6 +309,14 @@ mod tests {
                 .contains("full build")
         );
     }
+    #[test]
+    fn audio_rebuild_replaces_the_audio_bridge() {
+        assert_eq!(
+            Component::Audio.binaries(),
+            &[("droidloom-audio", "usr/bin/droidloom-audio")]
+        );
+    }
+
     #[test]
     fn supervisor_rebuild_updates_both_protocol_peers() {
         let binaries = Component::Supervisor.binaries();

@@ -486,6 +486,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "droidloom-audio"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "droidloom-classpath-wrapper"
 version = "0.1.0"
 

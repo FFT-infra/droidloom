@@ -402,6 +402,7 @@ fn stop_runtime(spec: Option<&Value>) -> Result<()> {
                 "stop",
                 "droidloom.service",
                 "droidloom-applications.service",
+                "droidloom-audio.service",
             ]))?;
         }
     }

@@ -8,6 +8,7 @@ use std::{
 pub const HOST_PACKAGES: &[&str] = &[
     "droidloom-supervisor",
     "droidloom-wayland",
+    "droidloom-audio",
     "droidloom-applications",
     "droidloom-doctor",
     "droidloom-update",
@@ -18,6 +19,7 @@ pub const HOST_BINARIES: &[&str] = &[
     "droidloomctl",
     "droidloom-supervisor",
     "droidloom-wayland",
+    "droidloom-audio",
     "droidloom-applications",
     "droidloom-doctor",
     "droidloom-update",
@@ -546,6 +548,7 @@ pub fn assemble_artifacts(
     for name in [
         "system/droidloomd.service",
         "user/droidloom.service",
+        "user/droidloom-audio.service",
         "user/droidloom-applications.service",
     ] {
         copy(

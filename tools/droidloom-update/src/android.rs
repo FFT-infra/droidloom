@@ -92,6 +92,10 @@ const PATCHES: &[(&str, &str)] = &[
         "android/aosp-patches/0002-audio-default-only-service.patch",
     ),
     (
+        "hardware/interfaces",
+        "android/aosp-patches/0029-audio-bus-socket-driver.patch",
+    ),
+    (
         "system/memory/libmeminfo",
         "android/aosp-patches/0004-libmeminfo-offline-gpu-accounting.patch",
     ),

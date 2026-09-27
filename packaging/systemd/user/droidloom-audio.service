@@ -1,0 +1,14 @@
+[Unit]
+Description=Droidloom cell audio bridge
+PartOf=droidloom.service
+ConditionPathExists=/etc/droidloom/cell.json
+# The sink is spawned per stream, so a sound server that starts later still
+# works; this only keeps the first stream of a cold session from failing.
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/droidloom-audio
+Restart=on-failure
+RestartSec=2

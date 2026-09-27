@@ -30,6 +30,7 @@ ARM64 workflows remain in `tools/`.
 - `runtime/droidloom-applications`: desktop launcher catalog.
 - `runtime/droidloom-package-support`: first-user setup and package lifecycle.
 - `graphics/droidloom-wayland`: windows, input and desktop integration.
+- `graphics/droidloom-audio`: cell audio output to the session sound server.
 - `graphics/`: Composer, private transport and synchronization libraries.
 - `android/framework/`: launcher, input bridge, IME and minimal system apps.
 - `android/device/`: product configuration, overlays and image contents.

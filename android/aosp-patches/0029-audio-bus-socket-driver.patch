@@ -1,0 +1,362 @@
+diff --git a/audio/aidl/default/Android.bp b/audio/aidl/default/Android.bp
+index 05a4654..70860fc 100644
+--- a/audio/aidl/default/Android.bp
++++ b/audio/aidl/default/Android.bp
+@@ -164,6 +164,7 @@ cc_library_static {
+         "alsa/UtilsAlsa.cpp",
+         "primary/PrimaryMixer.cpp",
+         "primary/StreamPrimary.cpp",
++        "socket/DriverSocketImpl.cpp",
+         "stub/ApeHeader.cpp",
+         "stub/DriverStubImpl.cpp",
+         "stub/MpegAudioHeader.cpp",
+diff --git a/audio/aidl/default/include/core-impl/DriverSocketImpl.h b/audio/aidl/default/include/core-impl/DriverSocketImpl.h
+new file mode 100644
+index 0000000..f1de1a1
+--- /dev/null
++++ b/audio/aidl/default/include/core-impl/DriverSocketImpl.h
+@@ -0,0 +1,76 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "core-impl/DriverStubImpl.h"
++
++namespace aidl::android::hardware::audio::core {
++
++// Sends the primary output mix to Droidloom's host audio bridge.
++//
++// The supervisor mounts the host endpoint into the cell, and the host end
++// renders the bytes on the session sound server. The endpoint carries the mix
++// port's own samples with no header and no conversion, so transfer() writes
++// exactly the buffer it is given.
++//
++// Timing stays DriverStubImpl's: a write that waits for the sink is the pacing,
++// and a sink that cannot take the data within the send timeout costs those
++// frames instead of stalling Android's audio worker. With no endpoint present
++// the driver is the stub, so a cell without the bridge keeps its current silent
++// but correctly paced behavior.
++class DriverSocketImpl : public DriverStubImpl {
++  public:
++    explicit DriverSocketImpl(const StreamContext& context);
++    DriverSocketImpl(const StreamContext& context, std::string path);
++
++    ::android::status_t start() override;
++    ::android::status_t standby() override;
++    ::android::status_t transfer(void* buffer, size_t frameCount, size_t* actualFrameCount,
++                                 int32_t* latencyMs) override;
++    void shutdown() override;
++
++  private:
++    // Longest one transfer may wait for the sink. The primary mix port's buffers
++    // are milliseconds long, so this only expires once the sink has stalled.
++    static constexpr int64_t kSendTimeoutUs = 100000;
++    // Endpoint exposed inside the cell unless a property overrides it.
++    static constexpr const char* kDefaultPath = "/dev/socket/droidloom/audio";
++    static constexpr const char* kPathProperty = "persist.vendor.droidloom.audio.socket";
++
++    static std::string defaultPath();
++
++    bool connect();
++    void disconnect();
++    // Writes as much of one buffer as the endpoint takes within the timeout and
++    // returns the bytes accepted from it.
++    size_t sendBuffer(const void* buffer, size_t byteCount);
++
++    const std::string mPath;
++    int mFd = -1;
++    // Bytes the endpoint refused when a short write ended inside a frame. They
++    // are sent before anything newer, so the sink's stream never loses its
++    // frame alignment.
++    std::vector<uint8_t> mCarry;
++    bool mLoggedStall = false;
++};
++
++}  // namespace aidl::android::hardware::audio::core
+diff --git a/audio/aidl/default/include/core-impl/StreamPrimary.h b/audio/aidl/default/include/core-impl/StreamPrimary.h
+index 87dcc3b..f034de6 100644
+--- a/audio/aidl/default/include/core-impl/StreamPrimary.h
++++ b/audio/aidl/default/include/core-impl/StreamPrimary.h
+@@ -21,7 +21,7 @@
+ 
+ #include <android-base/thread_annotations.h>
+ 
+-#include "DriverStubImpl.h"
++#include "DriverSocketImpl.h"
+ #include "StreamAlsaMonoPipe.h"
+ #include "primary/PrimaryMixer.h"
+ 
+@@ -70,7 +70,7 @@ class StreamPrimary : public StreamAlsaMonoPipe {
+ 
+     bool isStubStreamOnWorker() const { return mCurrAlsaDeviceId == kStubDeviceId; }
+ 
+-    DriverStubImpl mStubDriver;
++    DriverSocketImpl mBusDriver;
+     mutable std::mutex mLock;
+     AlsaDeviceId mAlsaDeviceId GUARDED_BY(mLock) = kStubDeviceId;
+ 
+diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+index 8e9efaf..10542ca 100644
+--- a/audio/aidl/default/primary/StreamPrimary.cpp
++++ b/audio/aidl/default/primary/StreamPrimary.cpp
+@@ -42,32 +42,32 @@ namespace aidl::android::hardware::audio::core {
+ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+     : StreamAlsaMonoPipe(context, metadata, 3 /*readWriteRetries*/),
+       mIsAsynchronous(!!getContext().getAsyncCallback()),
+-      mStubDriver(getContext()) {
++      mBusDriver(getContext()) {
+     context->startStreamDataProcessor();
+ }
+ 
+ ::android::status_t StreamPrimary::init(DriverCallbackInterface* callback) {
+-    RETURN_STATUS_IF_ERROR(mStubDriver.init(callback));
++    RETURN_STATUS_IF_ERROR(mBusDriver.init(callback));
+     return StreamAlsaMonoPipe::init(callback);
+ }
+ 
+ ::android::status_t StreamPrimary::drain(StreamDescriptor::DrainMode mode) {
+-    return isStubStreamOnWorker() ? mStubDriver.drain(mode) : StreamAlsaMonoPipe::drain(mode);
++    return isStubStreamOnWorker() ? mBusDriver.drain(mode) : StreamAlsaMonoPipe::drain(mode);
+ }
+ 
+ ::android::status_t StreamPrimary::flush() {
+-    RETURN_STATUS_IF_ERROR(isStubStreamOnWorker() ? mStubDriver.flush()
++    RETURN_STATUS_IF_ERROR(isStubStreamOnWorker() ? mBusDriver.flush()
+                                                   : StreamAlsaMonoPipe::flush());
+     // TODO(b/372951987): consider if this needs to be done from 'StreamInWorkerLogic::cycle'.
+     return mIsInput ? standby() : ::android::OK;
+ }
+ 
+ ::android::status_t StreamPrimary::pause() {
+-    return isStubStreamOnWorker() ? mStubDriver.pause() : StreamAlsaMonoPipe::pause();
++    return isStubStreamOnWorker() ? mBusDriver.pause() : StreamAlsaMonoPipe::pause();
+ }
+ 
+ ::android::status_t StreamPrimary::standby() {
+-    return isStubStreamOnWorker() ? mStubDriver.standby() : StreamAlsaMonoPipe::standby();
++    return isStubStreamOnWorker() ? mBusDriver.standby() : StreamAlsaMonoPipe::standby();
+ }
+ 
+ ::android::status_t StreamPrimary::start() {
+@@ -83,7 +83,7 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+         StreamAlsaMonoPipe::shutdown();  // Close currently opened ALSA devices.
+     }
+     if (isStub) {
+-        return mStubDriver.start();
++        return mBusDriver.start();
+     }
+     RETURN_STATUS_IF_ERROR(StreamAlsaMonoPipe::start());
+     mStartTimeNs = ::android::uptimeNanos();
+@@ -95,7 +95,7 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+ ::android::status_t StreamPrimary::transfer(void* buffer, size_t frameCount,
+                                             size_t* actualFrameCount, int32_t* latencyMs) {
+     if (isStubStreamOnWorker()) {
+-        return mStubDriver.transfer(buffer, frameCount, actualFrameCount, latencyMs);
++        return mBusDriver.transfer(buffer, frameCount, actualFrameCount, latencyMs);
+     }
+     // This is a workaround for the emulator implementation which has a host-side buffer
+     // and is not being able to achieve real-time behavior similar to ADSPs (b/302587331).
+@@ -138,7 +138,7 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+ 
+ void StreamPrimary::shutdown() {
+     StreamAlsaMonoPipe::shutdown();
+-    mStubDriver.shutdown();
++    mBusDriver.shutdown();
+ }
+ 
+ ndk::ScopedAStatus StreamPrimary::setConnectedDevices(const ConnectedDevices& devices) {
+diff --git a/audio/aidl/default/socket/DriverSocketImpl.cpp b/audio/aidl/default/socket/DriverSocketImpl.cpp
+new file mode 100644
+index 0000000..2382588
+--- /dev/null
++++ b/audio/aidl/default/socket/DriverSocketImpl.cpp
+@@ -0,0 +1,170 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstring>
++#include <utility>
++
++#define LOG_TAG "AHAL_DriverSocket"
++#include <Log.h>
++#include <android-base/properties.h>
++
++#include "core-impl/DriverSocketImpl.h"
++
++namespace aidl::android::hardware::audio::core {
++
++// static
++std::string DriverSocketImpl::defaultPath() {
++    return ::android::base::GetProperty(kPathProperty, kDefaultPath);
++}
++
++DriverSocketImpl::DriverSocketImpl(const StreamContext& context)
++    : DriverSocketImpl(context, defaultPath()) {}
++
++DriverSocketImpl::DriverSocketImpl(const StreamContext& context, std::string path)
++    : DriverStubImpl(context), mPath(std::move(path)) {}
++
++bool DriverSocketImpl::connect() {
++    if (mIsInput) {
++        // Capture is not part of the bridge; the stub keeps its place.
++        return false;
++    }
++    if (mFd >= 0) {
++        return true;
++    }
++    if (mPath.size() >= sizeof(sockaddr_un::sun_path)) {
++        LOG(ERROR) << __func__ << ": endpoint path is too long: " << mPath;
++        return false;
++    }
++    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (fd < 0) {
++        LOG(ERROR) << __func__ << ": cannot create the endpoint socket: " << strerror(errno);
++        return false;
++    }
++    sockaddr_un address{};
++    address.sun_family = AF_UNIX;
++    std::memcpy(address.sun_path, mPath.c_str(), mPath.size());
++    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
++        const int error = errno;
++        ::close(fd);
++        // A cell whose host end is absent stays silent, but keeps running.
++        LOG(WARNING) << __func__ << ": " << mPath << " is not available: " << strerror(error);
++        return false;
++    }
++    timeval timeout;
++    timeout.tv_sec = kSendTimeoutUs / 1000000;
++    timeout.tv_usec = kSendTimeoutUs % 1000000;
++    if (::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
++        LOG(WARNING) << __func__ << ": cannot bound the send timeout: " << strerror(errno);
++    }
++    mFd = fd;
++    mLoggedStall = false;
++    LOG(INFO) << __func__ << ": sending " << mSampleRate << " Hz, " << mFrameSizeBytes
++              << "-byte frames to " << mPath;
++    return true;
++}
++
++void DriverSocketImpl::disconnect() {
++    // A carry belongs to the connection that produced it.
++    mCarry.clear();
++    if (mFd < 0) {
++        return;
++    }
++    // Closing the last writer is what tells the host bridge the stream ended.
++    ::close(mFd);
++    mFd = -1;
++}
++
++size_t DriverSocketImpl::sendBuffer(const void* buffer, size_t byteCount) {
++    const auto* bytes = static_cast<const uint8_t*>(buffer);
++    // Whatever a short write left behind belongs to an earlier frame and goes out
++    // first, so the sink never sees the stream out of order.
++    if (!mCarry.empty()) {
++        const ssize_t written = ::write(mFd, mCarry.data(), mCarry.size());
++        if (written > 0) {
++            mCarry.erase(mCarry.begin(),
++                         mCarry.begin() + static_cast<std::ptrdiff_t>(written));
++        } else if (written < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
++            LOG(WARNING) << __func__ << ": " << mPath << " failed: " << strerror(errno);
++            disconnect();
++            return 0;
++        }
++        if (!mCarry.empty()) {
++            // The sink has not caught up; this buffer is an underrun.
++            return 0;
++        }
++    }
++    size_t offset = 0;
++    while (offset < byteCount && mFd >= 0) {
++        const ssize_t written = ::write(mFd, bytes + offset, byteCount - offset);
++        if (written > 0) {
++            offset += static_cast<size_t>(written);
++            continue;
++        }
++        if (written < 0 && errno == EINTR) {
++            continue;
++        }
++        const int error = written < 0 ? errno : 0;
++        const size_t partial = offset % mFrameSizeBytes;
++        if (partial != 0) {
++            mCarry.assign(bytes + offset, bytes + offset + (mFrameSizeBytes - partial));
++        }
++        if (error != 0 && error != EAGAIN && error != EWOULDBLOCK) {
++            LOG(WARNING) << __func__ << ": " << mPath << " failed: " << strerror(error);
++            disconnect();
++        } else if (!mLoggedStall) {
++            mLoggedStall = true;
++            // Dropping is what an underrun sounds like; holding Android's audio
++            // worker until the sink recovers is not an option.
++            LOG(WARNING) << __func__ << ": " << mPath << " is behind; dropping frames";
++        }
++        break;
++    }
++    return offset;
++}
++
++::android::status_t DriverSocketImpl::start() {
++    connect();
++    return DriverStubImpl::start();
++}
++
++::android::status_t DriverSocketImpl::standby() {
++    // An idle stream holds the bridge's single stream slot, and a host player
++    // that exists to render silence is worse than none.
++    disconnect();
++    return DriverStubImpl::standby();
++}
++
++::android::status_t DriverSocketImpl::transfer(void* buffer, size_t frameCount,
++                                               size_t* actualFrameCount, int32_t* latencyMs) {
++    if (mFd >= 0 && !mIsInput) {
++        sendBuffer(buffer, frameCount * mFrameSizeBytes);
++    }
++    // A write that waited for the sink has already consumed the buffer's
++    // duration, and the stub's own accounting notices that and adds nothing.
++    return DriverStubImpl::transfer(buffer, frameCount, actualFrameCount, latencyMs);
++}
++
++void DriverSocketImpl::shutdown() {
++    disconnect();
++    DriverStubImpl::shutdown();
++}
++
++}  // namespace aidl::android::hardware::audio::core

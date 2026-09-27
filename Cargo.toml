@@ -9,6 +9,7 @@ members = [
     "runtime/droidloom-doctor",
     "runtime/droidloom-supervisor",
     "runtime/droidloom-window-policy",
+    "graphics/droidloom-audio",
     "graphics/droidloom-composer",
     "graphics/droidloom-denial-ipc",
     "graphics/droidloom-denial-endpoint",
