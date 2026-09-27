@@ -230,24 +230,34 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 - **Standalone APKs only.** `droidloomctl install` accepts one standalone APK.
   Split bundles, drag-and-drop installation and separate game assets are not
   supported by the command. Older preview packages need an update to provide it.
-- **An app that dereferences absent hardware fails, and Bilibili is the current
-  case.** The device products declare only the features Droidloom implements:
-  there is no `android.hardware.wifi`, camera, Bluetooth, GNSS or telephony
+- **An app that dereferences absent hardware crashed, and Bilibili was the
+  case.** The device products declared only the features Droidloom implements:
+  there was no `android.hardware.wifi`, camera, Bluetooth, GNSS or telephony
   declaration, and the Wi-Fi module in the images ships no `wificond`.
-  `getSystemService("wifi")` therefore returns null, and an app that uses the
-  result without a null check dies. Bilibili 9.13.0, the Xiaomi channel build,
-  reads the Wi-Fi MAC address for its device-id library that way and crashes
+  `getSystemService("wifi")` therefore returned null, and an app that used the
+  result without a null check died. Bilibili 9.13.0, the Xiaomi channel build,
+  read the Wi-Fi MAC address for its device-id library that way and crashed
   with `NullPointerException: null receiver` in
   `com.bilibili.lib.biliid.api.internal`. Its earlier two-second `SIGKILL` is
   fixed: that came from a thread pool sized by `availableProcessors()`, which
   the cell's synthetic CPU topology now answers correctly, and a launch creates
   a task whose process now lives until this crash. Dexopt works as well:
   `cmd package compile -m speed` produced an 883 MB `base.odex` through
-  `dex2oat64` on eight threads with no `dex2oat32` attempt. What remains is the
-  missing Wi-Fi service, not the port. Declaring the feature without a Wi-Fi
-  stack would replace the null with a missing binder service, so app parity with
-  a HyperOS tablet needs a real Wi-Fi backend; the experimental location and
-  Bluetooth declarations above stay out of the release for the same reason.
+  `dex2oat64` on eight threads with no `dex2oat32` attempt.
+  Declaring `android.hardware.wifi` in the vendor permissions is the fix, and
+  the device products now carry it. SystemServer starts `WifiService` behind the
+  declaration and the AOSP default implementation answers without a radio:
+  `service list` reports `wifi: [android.net.wifi.IWifiManager]` and
+  `wifiscanner`, `pm list features` reports the feature, and Bilibili renders
+  its video pages with nothing in the crash buffer. An earlier note here claimed
+  the declaration would only trade the null for a missing binder service and
+  that app parity needs a real Wi-Fi backend; sheng measured the opposite, and
+  the same declaration is what Waydroid ships in its vendor image
+  (`android.hardware.wifi.xml` with the identical `<feature>` element) although
+  its guest has no radio either. Scanning and connecting still fail, so this
+  does not make Wi-Fi work for apps that need a connection, and the experimental
+  location and Bluetooth declarations above remain device-local tests that are
+  not enabled in the release product.
 
 ## ARM64 translation accuracy findings
 
