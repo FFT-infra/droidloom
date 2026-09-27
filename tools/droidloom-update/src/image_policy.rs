@@ -186,12 +186,7 @@ pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Resu
         std::time::UNIX_EPOCH
             + std::time::Duration::new(apex.modified.0.try_into()?, apex.modified.1.try_into()?),
     )?;
-    let rebuilt = rebake_verified(
-        work.path(),
-        &tree,
-        &expected,
-        "7b895cb0-54d5-4a4d-950d-50cda078053f",
-    )?;
+    let rebuilt = rebake_verified(work.path(), image, &tree, &expected)?;
     eprintln!(
         "Removed four legacy VNDK APEXes; system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
         fs::metadata(image)?.len(),
@@ -241,7 +236,9 @@ pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<
         .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
     let tree = work.path().join("tree");
     extract(image, &tree)?;
-    let properties = tree.join("product/etc/build.prop");
+    // A product image is an EROFS filesystem for /product, so its root is the
+    // partition root: the properties file sits directly under etc.
+    let properties = tree.join("etc/build.prop");
     // The pinned base image declares the phone class once, without a prefix.
     const PHONE: &str = "ro.build.characteristics=default";
     const TABLET: &str = "ro.build.characteristics=tablet";
@@ -267,12 +264,7 @@ pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<
     fs::write(&properties, declared)?;
     fs::File::open(&properties)?.set_modified(modified)?;
     let expected = inventory(&tree)?;
-    let rebuilt = rebake_verified(
-        work.path(),
-        &tree,
-        &expected,
-        "c7e0d4b2-9a51-4f36-8c2e-6d1a7f5b9043",
-    )?;
+    let rebuilt = rebake_verified(work.path(), image, &tree, &expected)?;
     eprintln!(
         "Declared the tablet device class; product: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
         fs::metadata(image)?.len(),
@@ -282,14 +274,32 @@ pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<
     Ok(())
 }
 
-/// Rebuild an extracted tree as EROFS with the pinned image identity, then
+/// The EROFS identity a derived image has to keep. Android mounts these images
+/// by path, but every other reader of the image sees the filesystem UUID, so a
+/// derivation keeps the value its source states instead of inventing one.
+fn filesystem_uuid(image: &Path) -> Result<String> {
+    let report = output(Command::new("dump.erofs").arg("-s").arg(image))?;
+    match report
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Filesystem UUID:"))
+    {
+        Some(uuid) => Ok(uuid.trim().to_owned()),
+        None => fail(format!(
+            "no EROFS filesystem identity in {}; erofs-utils could not read it",
+            image.display()
+        )),
+    }
+}
+
+/// Rebuild an extracted tree as EROFS with the source image's identity, then
 /// prove that every retained entry survived the round trip byte for byte.
 fn rebake_verified(
     work: &Path,
+    source: &Path,
     tree: &Path,
     expected: &BTreeMap<PathBuf, Entry>,
-    uuid: &str,
 ) -> Result<PathBuf> {
+    let uuid = filesystem_uuid(source)?;
     let rebuilt = work.join("rebuilt.img");
     run(Command::new("mkfs.erofs")
         // makepkg exports SOURCE_DATE_EPOCH, which otherwise silently clamps
@@ -325,6 +335,9 @@ fn rebake_verified(
         return fail(format!(
             "derived image changed retained file contents or metadata: {changed:?}"
         ));
+    }
+    if filesystem_uuid(&rebuilt)? != uuid {
+        return fail("derived image did not keep its source filesystem identity");
     }
     Ok(rebuilt)
 }
@@ -370,8 +383,8 @@ mod tests {
         }
         let work = tempfile::tempdir().unwrap();
         let root = work.path().join("input");
-        fs::create_dir_all(root.join("product/etc")).unwrap();
-        let properties = root.join("product/etc/build.prop");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let properties = root.join("etc/build.prop");
         fs::write(
             &properties,
             "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=default\nro.vendor.build.characteristics=default\n",
@@ -384,21 +397,32 @@ mod tests {
             .arg(&root))
         .unwrap();
         let destination = work.path().join("product.img");
-        declare_tablet(&original, &destination).unwrap();
+        // This test already runs inside the fakeroot session `declare_tablet`
+        // would otherwise start, and a nested session is refused, so it drives
+        // the declaration itself. The wrapper around it only copies this
+        // executable into the work directory and starts that one session.
+        declare_tablet_product_image(&original, &destination).unwrap();
         let check = work.path().join("verify");
         extract(&destination, &check).unwrap();
         // The declared class changes; the product identity and every other
         // characteristic keep the value the base image states.
         assert_eq!(
-            fs::read_to_string(check.join("product/etc/build.prop")).unwrap(),
+            fs::read_to_string(check.join("etc/build.prop")).unwrap(),
             "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=tablet\nro.vendor.build.characteristics=default\n"
         );
         assert!(
             fs::metadata(&destination).unwrap().len() > 0,
             "derived product image is empty"
         );
+        // The derivation re-states the source filesystem identity rather than
+        // inventing one, so every reader of the image keeps seeing the same
+        // filesystem.
+        assert_eq!(
+            filesystem_uuid(&destination).unwrap(),
+            filesystem_uuid(&original).unwrap(),
+        );
         // One derivation per base image: reusing the destination is refused.
-        assert!(declare_tablet(&original, &destination).is_err());
+        assert!(declare_tablet_product_image(&original, &destination).is_err());
         // An image without the phone class can not declare the tablet class.
         fs::write(&properties, "ro.product.model=Cuttlefish arm64 phone\n").unwrap();
         let absent = work.path().join("absent.img");
@@ -407,7 +431,9 @@ mod tests {
             .arg(&absent)
             .arg(&root))
         .unwrap();
-        assert!(declare_tablet(&absent, &work.path().join("absent-out.img")).is_err());
+        assert!(
+            declare_tablet_product_image(&absent, &work.path().join("absent-out.img")).is_err()
+        );
     }
     #[test]
     fn repack_preserves_android_metadata_and_adbd() {
