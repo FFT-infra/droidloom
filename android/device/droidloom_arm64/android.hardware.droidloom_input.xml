@@ -13,4 +13,10 @@
     <!-- Freeform Android tasks support both window orientations. -->
     <feature name="android.hardware.screen.landscape" />
     <feature name="android.hardware.screen.portrait" />
+    <!-- SystemServer starts WifiService behind this declaration and the AOSP
+         default implementation answers without a radio. Scanning and connecting
+         still fail, but apps that dereference the manager instead of checking
+         it stop crashing; Bilibili's device-id library is the measured case.
+         The x86_64 product copies this file, so both products share it. -->
+    <feature name="android.hardware.wifi" />
 </permissions>
