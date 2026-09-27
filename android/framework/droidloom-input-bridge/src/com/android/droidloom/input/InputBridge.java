@@ -201,6 +201,8 @@ public final class InputBridge {
     private void serve(InputStream input) throws IOException {
         final byte[] record = new byte[RECORD_BYTES];
         while (true) {
+            // init creates this as SOCK_SEQPACKET: each read consumes one fixed-size record.
+            // Do not stream-reassemble a short packet with the following input event.
             final int count = input.read(record);
             if (count < 0) {
                 return;
@@ -1087,6 +1089,10 @@ public final class InputBridge {
             case 139: return KeyEvent.KEYCODE_MENU;
             case 158: return KeyEvent.KEYCODE_BACK;
             case 159: return KeyEvent.KEYCODE_FORWARD;
+            // Linux evdev BTN_STYLUS / BTN_STYLUS2. Preserve a separate
+            // button-only route when the host exposes the pen buttons as keys.
+            case 331: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;
+            case 332: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;
             default: return KeyEvent.KEYCODE_UNKNOWN;
         }
     }

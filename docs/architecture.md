@@ -152,12 +152,20 @@ returns. Late `Presented` events remain valid after `BufferReleased`.
 
 The presenter sleeps until a Wayland, Android transport, text-input, clipboard,
 or release-eventfd event arrives. It has no periodic idle poll. A 4 ms timeout
-is used only while a busy target lacks kernel release notifications; queued
-input waiting for clipboard synchronization retains its existing ten-second
-deadline. Pending Wayland callbacks are dispatched before sleeping, and output
-backpressure waits for socket writability. These waits preserve frame and
+is used only while a busy target lacks kernel release notifications.
+Physical input is forwarded immediately and never waits for clipboard import;
+clipboard protocol work remains asynchronous. Pending Wayland callbacks are
+dispatched before sleeping, and output backpressure waits for socket
+writability. These waits preserve frame and
 clipboard ordering without checking sockets and GPU timelines 250 times per
 second on a still screen.
+
+The Composer-to-Android input handoff uses bounded input and window-control
+queues. Window controls are serviced ahead of buffered motion, and repeated
+motion samples coalesce under pressure while contact and button transitions
+retain reserved queue space. Framework socket writes have a 100 ms timeout;
+timeouts reset the bridge connection and its host-side pointer routes rather
+than blocking the compositor receive path indefinitely.
 
 For diagnosis, `DROIDLOOM_PRESENT_AUDIT=1` enables aggregate commit-to-reported-
 presentation, feedback-delivery and buffer-release timings. These exclude

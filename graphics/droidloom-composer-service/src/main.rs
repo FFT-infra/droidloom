@@ -75,7 +75,7 @@ fn run() -> Result<(), String> {
     });
     let lifecycle = service.lifecycle();
     let coordinator = TaskCoordinator::new(sink.clone(), lifecycle.clone());
-    let input = InputBridge::new(INPUT_SOCKET);
+    let input = InputBridge::new(INPUT_SOCKET)?;
 
     ProcessState::set_thread_pool_max_thread_count(4);
     ProcessState::start_thread_pool();
@@ -310,12 +310,12 @@ fn dispatch_event(
                     scale_denominator,
                 ) {
                     Ok(()) => eprintln!(
-                        "Droidloom requested Android task {} bounds {width}x{height} at scale \
+                        "Droidloom queued Android task {} bounds {width}x{height} at scale \
                          {scale_numerator}/{scale_denominator}",
                         task.0,
                     ),
                     Err(error) => eprintln!(
-                        "Droidloom deferred Android task {} bounds {width}x{height}: {error}",
+                        "Droidloom could not queue Android task {} bounds {width}x{height}: {error}",
                         task.0
                     ),
                 }
@@ -340,7 +340,7 @@ fn dispatch_event(
                 let (task, _) = coordinator.direct_task_route_for_object(object)?;
                 if let Err(error) = input.send_task_focus(task.0, true) {
                     eprintln!(
-                        "Droidloom deferred Android task {} keyboard focus: {error}",
+                        "Droidloom could not queue Android task {} keyboard focus: {error}",
                         task.0
                     );
                 }
@@ -360,11 +360,11 @@ fn dispatch_event(
             let (task, _) = coordinator.direct_task_route_for_object(object)?;
             match input.send_task_close(task.0) {
                 Ok(()) => eprintln!(
-                    "Droidloom requested Android task {} removal for host close object={}",
+                    "Droidloom queued Android task {} removal for host close object={}",
                     task.0, object.0
                 ),
                 Err(error) => eprintln!(
-                    "Droidloom could not request Android task {} removal for host close: {error}",
+                    "Droidloom could not queue Android task {} removal for host close: {error}",
                     task.0
                 ),
             }
@@ -402,7 +402,7 @@ fn dispatch_event(
                     event,
                 ) {
                     eprintln!(
-                        "Droidloom dropped input serial {serial} for display {display:?}: {error}"
+                        "Droidloom could not queue input serial {serial} for display {display:?}: {error}"
                     );
                 }
             }

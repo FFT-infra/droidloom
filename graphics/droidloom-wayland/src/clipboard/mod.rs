@@ -104,7 +104,6 @@ pub(super) struct Clipboard {
     focused: bool,
     serial: Option<u32>,
     awaiting: Option<String>,
-    pending_since: Option<Instant>,
 }
 impl Clipboard {
     #[cfg(test)]
@@ -167,7 +166,6 @@ impl Clipboard {
             focused: false,
             serial: None,
             awaiting: None,
-            pending_since: None,
         })
     }
     pub fn seat(&mut self, seat: &wl_seat::WlSeat, qh: &QueueHandle<App>) {
@@ -183,15 +181,6 @@ impl Clipboard {
     pub fn serial(&mut self, serial: u32) {
         self.ready = true;
         self.serial = Some(serial);
-    }
-    pub fn blocked(&self) -> bool {
-        self.pending_since
-            .is_some_and(|s| s.elapsed() < Duration::from_secs(10))
-            && self.peer.is_some()
-    }
-    pub fn unblock_deadline(&self) -> Option<Instant> {
-        self.peer.as_ref()?;
-        self.pending_since.map(|since| since + Duration::from_secs(10))
     }
     pub fn fds(&self) -> [(RawFd, i16); 2] {
         [
@@ -210,7 +199,6 @@ impl Clipboard {
     fn import(&mut self, clip: Clip) {
         let clip = Arc::new(clip);
         self.awaiting = Some(clip.description.id.clone());
-        self.pending_since = Some(Instant::now());
         self.current = Some(clip.clone());
         self.outbound(Outbound::Clip(clip));
     }
@@ -236,7 +224,6 @@ impl Clipboard {
         self.generation.store(self.revision, Ordering::Release);
         self.publish_pending = false;
         self.awaiting = None;
-        self.pending_since = Some(Instant::now());
         self.outbound(Outbound::Sync(self.revision));
         let desc = Description {
             id: self.id(),
@@ -287,7 +274,6 @@ impl Clipboard {
         if self.workers.fetch_add(1, Ordering::AcqRel) >= 8 {
             self.workers.fetch_sub(1, Ordering::AcqRel);
             self.offer = Some(offer);
-            self.pending_since = None;
             return;
         }
         let mut pipes = Vec::new();
@@ -299,8 +285,7 @@ impl Clipboard {
                 }
                 Err(_) => {
                     self.workers.fetch_sub(1, Ordering::AcqRel);
-                    self.pending_since = None;
-                    self.offer = Some(offer);
+                            self.offer = Some(offer);
                     return;
                 }
             }
@@ -407,8 +392,7 @@ impl Clipboard {
             match event {
                 Event::Native(rev, Ok(clip)) if rev == self.revision => self.import(clip),
                 Event::Native(rev, Err(_)) if rev == self.revision => {
-                    self.pending_since = None;
-                    eprintln!("Droidloom clipboard: source transfer failed or exceeded limits");
+                            eprintln!("Droidloom clipboard: source transfer failed or exceeded limits");
                 }
                 Event::Android(connection, Received::Clip(mut clip))
                     if connection == self.connection =>
@@ -421,8 +405,7 @@ impl Clipboard {
                     self.generation.store(self.revision, Ordering::Release);
                     clip.description.base = self.revision;
                     self.awaiting = None;
-                    self.pending_since = None;
-                    self.current = Some(Arc::new(clip));
+                            self.current = Some(Arc::new(clip));
                     self.publish_pending = true;
                     self.outbound(Outbound::Sync(self.revision));
                 }
@@ -431,14 +414,12 @@ impl Clipboard {
                 {
                     if self.awaiting.as_ref() == Some(&id) {
                         self.awaiting = None;
-                        self.pending_since = None;
-                    }
+                                }
                 }
                 Event::Disconnected(connection) if connection == self.connection => {
                     self.peer = None;
                     self.awaiting = None;
-                    self.pending_since = None;
-                    eprintln!("Droidloom clipboard: Android disconnected");
+                            eprintln!("Droidloom clipboard: Android disconnected");
                 }
                 _ => {}
             }

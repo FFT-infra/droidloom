@@ -23,7 +23,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use drm_fourcc::DrmFourcc;
 use droidloom_denial_endpoint::{
@@ -367,7 +367,6 @@ struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
     clipboard: clipboard::Clipboard,
-    clipboard_inputs: VecDeque<(TaskObjectId, InputEvent)>,
     text_input: text_input::TextInput,
     registry_state: RegistryState,
     output_state: OutputState,
@@ -1526,10 +1525,6 @@ impl App {
         event: InputEvent,
     ) -> Result<(), PresenterError> {
         static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if self.clipboard.blocked() && self.clipboard_inputs.len() < 512 {
-            self.clipboard_inputs.push_back((object, event));
-            return Ok(());
-        }
         let tablet_trace = match event {
             InputEvent::Tablet { action, tool_id, .. }
                 if !matches!(action, TabletAction::Motion | TabletAction::Wheel) =>
@@ -3261,7 +3256,6 @@ fn run() -> Result<(), PresenterError> {
         activation: activation::Activation::new(&globals, &qh),
         layer_globals: layers::Globals { subcompositor: globals.bind(&qh, 1..=1, ())?, shm: globals.bind(&qh, 1..=1, ())?, alpha: globals.bind(&qh, 1..=1, ()).ok() },
         clipboard: clipboard::Clipboard::new(socket_path.with_file_name("clipboard.sock"), &globals, &qh)?,
-        clipboard_inputs: VecDeque::new(),
         text_input: text_input::TextInput::new(
             socket_path.with_file_name("text-input.sock"),
             globals.bind(&qh, 1..=1, ()).ok(),
@@ -3340,11 +3334,6 @@ fn run_presenter_loop(
         app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();
         app.clipboard.pump(&qh);
-        if !app.clipboard.blocked() {
-            while let Some((object, input)) = app.clipboard_inputs.pop_front() {
-                if app.tasks.contains_key(&object) { app.send_input(object, input)?; }
-            }
-        }
         app.unmap_requested_tasks()?;
         app.release_ready_frames()?;
         poll_sources(conn, &mut event_queue, &mut app, &mut poll_descriptors)?;
@@ -3433,9 +3422,7 @@ fn poll_sources(
             }
         }
     }
-    let clipboard_deadline = (!app.clipboard_inputs.is_empty())
-        .then(|| app.clipboard.unblock_deadline()).flatten();
-    let timeout = poll_timeout_millis(release_fallback, clipboard_deadline, Instant::now());
+    let timeout = poll_timeout_millis(release_fallback);
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
@@ -3482,17 +3469,13 @@ fn poll_sources(
     Ok(())
 }
 
-fn poll_timeout_millis(release_fallback: bool, deadline: Option<Instant>, now: Instant) -> i32 {
-    let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
-    let timeout = if release_fallback {
-        Some(timeout.map_or(RELEASE_POLL_FALLBACK, |timeout| timeout.min(RELEASE_POLL_FALLBACK)))
+fn poll_timeout_millis(release_fallback: bool) -> i32 {
+    if release_fallback {
+        i32::try_from(RELEASE_POLL_FALLBACK.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(i32::MAX)
     } else {
-        timeout
-    };
-    // Round up so sub-millisecond deadlines cannot turn into a busy loop.
-    timeout.map_or(-1, |duration| {
-        i32::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
-    })
+        -1
+    }
 }
 
 fn split_point(point: u64) -> (u32, u32) {
@@ -3728,21 +3711,9 @@ mod tests {
     }
 
     #[test]
-    fn idle_wait_has_no_periodic_timer_but_release_fallback_remains_bounded() {
-        let now = Instant::now();
-        assert_eq!(poll_timeout_millis(false, None, now), -1);
-        assert_eq!(poll_timeout_millis(true, None, now), 4);
-        let deadline = Some(now + Duration::from_secs(10));
-        assert_eq!(poll_timeout_millis(false, deadline, now), 10_000);
-        assert_eq!(poll_timeout_millis(true, deadline, now), 4);
-    }
-
-    #[test]
-    fn clipboard_deadline_wakes_even_without_socket_traffic() {
-        let now = Instant::now();
-        assert_eq!(poll_timeout_millis(false, Some(now), now), 0);
-        assert_eq!(poll_timeout_millis(true, Some(now + Duration::from_micros(50)), now), 1);
-        assert_eq!(poll_timeout_millis(false, Some(now - Duration::from_millis(1)), now), 0);
+    fn idle_wait_has_no_clipboard_deadline_but_release_fallback_remains_bounded() {
+        assert_eq!(poll_timeout_millis(false), -1);
+        assert_eq!(poll_timeout_millis(true), 4);
     }
 
     #[test]

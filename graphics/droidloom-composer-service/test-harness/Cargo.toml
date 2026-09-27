@@ -1,0 +1,11 @@
+[package]
+name = "droidloom-composer-input-tests"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+droidloom-denial-ipc = { path = "../../droidloom-denial-ipc" }
+droidloom-denial-protocol = { path = "../../droidloom-denial-protocol" }
+droidloom-input-protocol = { path = "../../droidloom-input-protocol" }

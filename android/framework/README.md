@@ -112,7 +112,11 @@ Denial into ordinary Android input events. Its two private operations terminate
 in Droidloom's native SurfaceFlinger and InputFlinger builds: SurfaceFlinger
 resolves a rendered task to its existing input-application token, and
 InputFlinger constrains normal dispatch to that token. The bridge never changes
-task focus or stacking. The input integration leaves boot `framework.jar`,
+task focus or stacking. The tablet path keeps ordinary Android stylus
+motion/button events; when a host reports BTN_STYLUS or BTN_STYLUS2 on the
+independent key path, the bridge maps them to Android's standard primary and
+secondary stylus-button key codes. The bridge applies no application-specific
+button actions. The input integration leaves boot `framework.jar`,
 public AIDL, and all stock Binder transaction numbers unchanged.
 
 The same package contains the one-shot `ApplicationCatalog` framework adapter.

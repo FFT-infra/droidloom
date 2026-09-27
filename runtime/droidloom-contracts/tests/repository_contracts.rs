@@ -304,6 +304,46 @@ fn native_targeted_input_keeps_the_boot_framework_abi_untouched() {
 }
 
 #[test]
+fn unvalidated_sheng_iris_codecs_are_not_advertised_by_default() {
+    let root = repository_root();
+    let product = fs::read_to_string(root.join("android/device/droidloom_sheng/droidloom_sheng.mk"))
+        .expect("read sheng product makefile");
+    let experimental_gate = "ifeq ($(DROIDLOOM_ENABLE_EXPERIMENTAL_IRIS_CODEC2),true)";
+    let (default_product, experimental_product) = product
+        .split_once(experimental_gate)
+        .expect("Iris codec opt-in gate must be explicit");
+    assert!(
+        !default_product.contains("droidloom-v4l2-codec2-service"),
+        "release builds must not install the unvalidated Iris service"
+    );
+    assert!(
+        !default_product.contains("media_codecs_c2.xml"),
+        "release builds must not advertise unvalidated hardware decoders"
+    );
+    assert!(experimental_product.contains("PRODUCT_PACKAGES += droidloom-v4l2-codec2-service"));
+    assert!(experimental_product.contains("media_codecs_c2.xml"));
+    assert!(experimental_product.contains("endif"));
+}
+
+#[test]
+fn stylus_buttons_keep_standard_motion_and_key_paths() {
+    let root = repository_root();
+    let bridge = fs::read_to_string(root.join(
+        "android/framework/droidloom-input-bridge/src/com/android/droidloom/input/InputBridge.java",
+    ))
+    .expect("read Droidloom input bridge");
+
+    for expected in [
+        "case 331: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;",
+        "case 332: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;",
+        "case 0x14b: return MotionEvent.BUTTON_STYLUS_PRIMARY;",
+        "case 0x14c: return MotionEvent.BUTTON_STYLUS_SECONDARY;",
+    ] {
+        assert!(bridge.contains(expected), "missing standard stylus route: {expected}");
+    }
+}
+
+#[test]
 fn android_task_geometry_does_not_conflate_density_with_wayland_scale() {
     let root = repository_root();
     let bridge = fs::read_to_string(root.join(

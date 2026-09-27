@@ -13,6 +13,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
+use std::time::Duration;
 
 use droidloom_denial_protocol::{
     AndroidMessage, DecodedPacket, DenialMessage, DescriptorKind, MAX_PACKET_BYTES,
@@ -402,6 +403,48 @@ impl SeqPacket {
         };
         // SAFETY: `updated` changes only file-status flags on the live socket.
         if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, updated) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    /// Bound how long a blocking record send can wait for peer capacity.
+    ///
+    /// Passing `None` clears the timeout. A nonzero sub-microsecond duration
+    /// is rounded up to one microsecond because `SO_SNDTIMEO` uses `timeval`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects durations that do not fit the platform `timeval` and
+    /// propagates `setsockopt(2)` failures.
+    pub fn set_send_timeout(&self, timeout: Option<Duration>) -> Result<(), IpcError> {
+        let timeout = timeout.unwrap_or_default();
+        let seconds = libc::time_t::try_from(timeout.as_secs()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "send timeout is too large")
+        })?;
+        let microseconds = if timeout.is_zero() {
+            0
+        } else {
+            libc::suseconds_t::from(timeout.subsec_micros().max(1))
+        };
+        let value = libc::timeval {
+            tv_sec: seconds,
+            tv_usec: microseconds,
+        };
+        let length = libc::socklen_t::try_from(mem::size_of_val(&value))
+            .map_err(|_| IpcError::NotSeqPacket)?;
+        // SAFETY: `value` is a valid timeval which remains live for the syscall;
+        // `self.fd` is an owned socket descriptor.
+        let result = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDTIMEO,
+                ptr::from_ref(&value).cast(),
+                length,
+            )
+        };
+        if result != 0 {
             return Err(io::Error::last_os_error().into());
         }
         Ok(())
