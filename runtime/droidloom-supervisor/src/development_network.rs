@@ -1,9 +1,10 @@
 //! Bounded network plumbing for the executable development cell.
 //!
 //! Linux remains the network implementation. This module only creates a veth
-//! pair, assigns the host gateway, and installs narrowly named nftables rules
-//! for outbound forwarding/NAT. Android owns `eth0` and its normal networking
-//! services inside the private namespace.
+//! pair, assigns the host gateway, installs narrowly named nftables rules for
+//! outbound forwarding/NAT, and adds exact-match accept rules to host firewall
+//! chains that forward traffic ahead of their own drop policy. Android owns
+//! `eth0` and its normal networking services inside the private namespace.
 
 use std::ffi::OsString;
 use std::fs;
@@ -17,6 +18,11 @@ const HOST_IPV4_CIDR: &str = "10.177.0.1/30";
 const CELL_IPV4_CIDR: &str = "10.177.0.2/32";
 const IPV4_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 const IPV4_FORWARD_STATE_FILE: &str = "host-ipv4-forward.before";
+/// Chains owned by other host firewalls that see forwarded traffic before the
+/// host's own drop policy. Droidloom adds and removes exact-match accept rules
+/// here and never edits the owning program's configuration.
+const UFW_FORWARD_CHAIN: &str = "ufw-user-forward";
+const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NetworkNames {
@@ -55,6 +61,7 @@ enum NetworkResource {
     FilterTable,
     NatTable,
     UfwForwardRule,
+    DockerForwardRules,
 }
 
 impl DevelopmentNetwork {
@@ -87,16 +94,33 @@ impl DevelopmentNetwork {
         self.enable_forwarding()?;
         self.setup_filter()?;
         self.setup_nat()?;
-        self.setup_ufw_forwarding()
+        self.setup_ufw_forwarding()?;
+        self.setup_docker_forwarding()
     }
 
     fn setup_ufw_forwarding(&mut self) -> Result<(), DevelopmentError> {
         // A separate nftables accept verdict cannot override UFW's later drop.
         // Add only our exact outbound source/interface rule to its user chain.
         // It is transient and never modifies UFW's persistent configuration.
-        if ufw_chain_exists()? {
-            run("iptables", ufw_rule_arguments("-I", &self.names))?;
+        if iptables_chain_exists(UFW_FORWARD_CHAIN)? {
             self.resources.push(NetworkResource::UfwForwardRule);
+            run("iptables", ufw_rule_arguments("-I", &self.names))?;
+        }
+        Ok(())
+    }
+
+    fn setup_docker_forwarding(&mut self) -> Result<(), DevelopmentError> {
+        // Docker's DOCKER-USER chain is reached from FORWARD before the host's
+        // drop policy, and its accept verdict ends that traversal for the
+        // packet. Add our exact cell rules there: outbound traffic from the
+        // cell, and replies to it. Transient, like the UFW rule above.
+        if iptables_chain_exists(DOCKER_USER_CHAIN)? {
+            self.resources.push(NetworkResource::DockerForwardRules);
+            run(
+                "iptables",
+                docker_outbound_rule_arguments("-I", &self.names),
+            )?;
+            run("iptables", docker_return_rule_arguments("-I", &self.names))?;
         }
         Ok(())
     }
@@ -351,6 +375,7 @@ impl DevelopmentNetwork {
         while let Some(resource) = self.resources.pop() {
             let result = match resource {
                 NetworkResource::UfwForwardRule => remove_ufw_rule(&self.names),
+                NetworkResource::DockerForwardRules => remove_docker_rules(&self.names),
                 NetworkResource::Namespace => run("ip", ["netns", "delete", &self.names.namespace]),
                 NetworkResource::HostInterface => {
                     run("ip", ["link", "delete", &self.names.host_interface])
@@ -391,6 +416,7 @@ impl DevelopmentNetwork {
         let mut first_error = None;
 
         record_error(&mut first_error, remove_ufw_rule(&names));
+        record_error(&mut first_error, remove_docker_rules(&names));
         if nft_table_exists("ip", &names.nat_table)? {
             record_error(
                 &mut first_error,
@@ -456,7 +482,7 @@ fn ufw_rule_arguments<'a>(operation: &'a str, names: &'a NetworkNames) -> [&'a s
     [
         "-w",
         operation,
-        "ufw-user-forward",
+        UFW_FORWARD_CHAIN,
         "-i",
         &names.host_interface,
         "-s",
@@ -470,22 +496,100 @@ fn ufw_rule_arguments<'a>(operation: &'a str, names: &'a NetworkNames) -> [&'a s
     ]
 }
 
-fn ufw_chain_exists() -> Result<bool, DevelopmentError> {
+/// Accept the cell's own outbound traffic. The comment names the owning
+/// namespace, so `iptables -S` shows which cell a leftover rule belongs to.
+fn docker_outbound_rule_arguments<'a>(
+    operation: &'a str,
+    names: &'a NetworkNames,
+) -> [&'a str; 13] {
+    [
+        "-w",
+        operation,
+        DOCKER_USER_CHAIN,
+        "-i",
+        &names.host_interface,
+        "-s",
+        CELL_IPV4_CIDR,
+        "-m",
+        "comment",
+        "--comment",
+        &names.namespace,
+        "-j",
+        "ACCEPT",
+    ]
+}
+
+/// Accept replies to traffic the cell initiated. The host's FORWARD policy
+/// drops whatever its own chains do not claim, so established return traffic
+/// needs its own exception.
+fn docker_return_rule_arguments<'a>(
+    operation: &'a str,
+    names: &'a NetworkNames,
+) -> [&'a str; 17] {
+    [
+        "-w",
+        operation,
+        DOCKER_USER_CHAIN,
+        "-o",
+        &names.host_interface,
+        "-d",
+        CELL_IPV4_CIDR,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-m",
+        "comment",
+        "--comment",
+        &names.namespace,
+        "-j",
+        "ACCEPT",
+    ]
+}
+
+fn iptables_chain_exists(chain: &str) -> Result<bool, DevelopmentError> {
     match droidloom_cpu_placement::command("iptables")
-        .args(["-w", "-S", "ufw-user-forward"])
+        .args(["-w", "-S", chain])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
     {
         Ok(status) => Ok(status.success()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error("inspect UFW forwarding chain", error)),
+        Err(error) => Err(io_error("inspect host firewall chain", error)),
     }
 }
 
 fn remove_ufw_rule(names: &NetworkNames) -> Result<(), DevelopmentError> {
-    if ufw_chain_exists()? && command_succeeds("iptables", ufw_rule_arguments("-C", names))? {
-        run("iptables", ufw_rule_arguments("-D", names))?;
+    if !iptables_chain_exists(UFW_FORWARD_CHAIN)? {
+        return Ok(());
+    }
+    remove_rule_if_present(
+        ufw_rule_arguments("-C", names),
+        ufw_rule_arguments("-D", names),
+    )
+}
+
+fn remove_docker_rules(names: &NetworkNames) -> Result<(), DevelopmentError> {
+    if !iptables_chain_exists(DOCKER_USER_CHAIN)? {
+        return Ok(());
+    }
+    remove_rule_if_present(
+        docker_outbound_rule_arguments("-C", names),
+        docker_outbound_rule_arguments("-D", names),
+    )?;
+    remove_rule_if_present(
+        docker_return_rule_arguments("-C", names),
+        docker_return_rule_arguments("-D", names),
+    )
+}
+
+fn remove_rule_if_present<const N: usize>(
+    check: [&str; N],
+    delete: [&str; N],
+) -> Result<(), DevelopmentError> {
+    if command_succeeds("iptables", check)? {
+        run("iptables", delete)?;
     }
     Ok(())
 }
@@ -615,6 +719,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/droidloom/cells/test"),
             render_node: PathBuf::from("/dev/dri/renderD128"),
             graphics_backend: crate::GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: PathBuf::from("/run/user/1001/denial.sock"),
         }
     }
@@ -633,5 +738,70 @@ mod tests {
     fn cell_and_gateway_use_the_same_bounded_subnet() {
         assert_eq!(HOST_IPV4_CIDR, "10.177.0.1/30");
         assert_eq!(CELL_IPV4_CIDR, "10.177.0.2/32");
+    }
+
+    fn assert_arguments_contain(arguments: &[&str], pairs: &[(&str, &str)]) {
+        for (flag, value) in pairs {
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == *flag && pair[1] == *value),
+                "{arguments:?} is missing {flag} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_rules_match_only_the_cell_and_its_replies() {
+        let names = NetworkNames::for_spec(&spec(1000));
+
+        let outbound = docker_outbound_rule_arguments("-I", &names);
+        assert_eq!(outbound[..3], ["-w", "-I", DOCKER_USER_CHAIN]);
+        assert_eq!(outbound[12], "ACCEPT");
+        assert_arguments_contain(
+            &outbound,
+            &[
+                ("-i", "dlh1000"),
+                ("-s", CELL_IPV4_CIDR),
+                ("--comment", "droidloom-u1000"),
+            ],
+        );
+
+        let replies = docker_return_rule_arguments("-I", &names);
+        assert_eq!(replies[..3], ["-w", "-I", DOCKER_USER_CHAIN]);
+        assert_eq!(replies[16], "ACCEPT");
+        assert_arguments_contain(
+            &replies,
+            &[
+                ("-o", "dlh1000"),
+                ("-d", CELL_IPV4_CIDR),
+                ("--ctstate", "RELATED,ESTABLISHED"),
+                ("--comment", "droidloom-u1000"),
+            ],
+        );
+    }
+
+    #[test]
+    fn docker_rule_check_and_delete_match_the_inserted_rule() {
+        let names = NetworkNames::for_spec(&spec(1000));
+        let (check, delete, insert) = (
+            docker_outbound_rule_arguments("-C", &names),
+            docker_outbound_rule_arguments("-D", &names),
+            docker_outbound_rule_arguments("-I", &names),
+        );
+        assert_eq!(check[1], "-C");
+        assert_eq!(delete[1], "-D");
+        assert_eq!(check[2..], insert[2..]);
+        assert_eq!(delete[2..], insert[2..]);
+
+        let (check, delete, insert) = (
+            docker_return_rule_arguments("-C", &names),
+            docker_return_rule_arguments("-D", &names),
+            docker_return_rule_arguments("-I", &names),
+        );
+        assert_eq!(check[1], "-C");
+        assert_eq!(delete[1], "-D");
+        assert_eq!(check[2..], insert[2..]);
+        assert_eq!(delete[2..], insert[2..]);
     }
 }
