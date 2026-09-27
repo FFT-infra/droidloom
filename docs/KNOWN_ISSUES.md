@@ -4,6 +4,57 @@ These limitations apply to the current pacman preview. Installation and APK
 commands are in [INSTALL.md](INSTALL.md); source builds are in
 [BUILDING.md](BUILDING.md).
 
+## Video decode
+
+- **Sheng Iris hardware decode is opt-in, and preferred once enabled.** The path
+  is Android `MediaCodec` → Codec2 AIDL → AOSP `v4l2_codec2` → the host's
+  Qualcomm Iris stateful V4L2 decoder, with DMA-BUF buffers. Only builds made
+  with `DROIDLOOM_ENABLE_EXPERIMENTAL_IRIS_CODEC2=true` include the Codec2
+  service and capability XML, and a cell exposes the decoder only when its
+  `cell.json` sets `"video_decoder": "iris"`. Codec2 sizes input buffers from
+  the OUTPUT `sizeimage` that Iris reports when the service starts: 7,077,888
+  bytes for H.264, HEVC and AV1 and 14,155,776 bytes for VP9 on sheng. That
+  size is a floor. A client `max-input-size` can raise the buffers but never
+  shrink them below it, which the driver rejects with `EFAULT` at the first
+  `VIDIOC_QBUF` instead of decoding anything. A qualification run on sheng
+  decoded a 60-frame clip with H.264, HEVC, VP9 and AV1 at 1080p and 4K, with
+  both ByteBuffer and Surface output. Longer playback, seeking, mid-stream
+  resolution changes and concurrent decoders are untested. The capability XML
+  now advertises 4K30 or 1080p60, bitrate up to 120 Mbps and four concurrent
+  decoder instances, and all four `c2.v4l2` decoders rank 256, ahead of
+  Android's software codecs at 512. An app that selects a decoder by format
+  therefore gets hardware, and falls back to software only outside those limits
+  or once the vendor service has admitted four instances. The 120 Mbps ceiling
+  is an advertised bound, not a measured throughput, and decoding more than one
+  stream at a time has not been measured.
+
+## Sheng daily-use integration
+
+- **Android audio still does not reach the speaker.** The host side of the audio
+  bridge exists: `graphics/droidloom-audio` serves raw s16le 48 kHz stereo PCM
+  from `/dev/socket/droidloom/audio` to the session's PipeWire sink, and a
+  test writer inside the running cell produced audible sound on sheng through the
+  built-in speaker. What is missing is the in-cell source: the AIDL audio policy
+  still uses BUS devices backed by timed silent streams, so application playback
+  and recording neither reach that socket nor return microphone data. Do not
+  describe audio or microphone support as available until an Android app's own
+  playback is heard on the host and the capture direction passes its test.
+- **Pen and window acceptance is still partial.** The Android bridge maps Linux
+  `BTN_STYLUS` and `BTN_STYLUS2` to Android's standard primary and secondary
+  stylus-button key codes; Droidloom contains no StarNote-specific action. The
+  user has confirmed pen input and finger dragging work on sheng, but button
+  press/release traces, pressure, tilt, palm rejection, reconnect, edge resize,
+  and saved window size still need repeatable device tests.
+- **UU remote-play acceptance is pending external test inputs.** UU Remote
+  (`com.netease.uuremote` 4.42.0) is installed on sheng, but a signed-in account
+  and a test peer are still required before its video and audio paths can be
+  judged.
+- **Cell internet depends on the host's forwarding chains.** Droidloom adds
+  exact-match accept rules for the cell to `ufw-user-forward` and
+  `DOCKER-USER`, the two chains that forward traffic ahead of a host drop
+  policy. A host that drops forwarded traffic from some other chain leaves the
+  cell without internet until an equivalent rule exists.
+
 ## Application compatibility
 
 - **Clash of Clans on the x86_64 desktop.** Version 18.600.5 rejected inherited
@@ -473,6 +524,26 @@ The subsequent source fixes and full-suite results are recorded above.
   notification replies and custom Android notification layouts are unsupported.
 - **Shared host kernel.** This is an Android container runtime, not a virtual
   machine. See [security requirements](threat-model-v1.md) for isolation boundaries.
+- **Android task profiles lose CPU and I/O placement on cgroup-v2-only hosts.**
+  Android expresses CPU sets and I/O priorities by joining the legacy `cpuset`,
+  `cpu` and `blkio` hierarchies. A host that already owns those controllers in
+  cgroup v2 cannot provide the v1 hierarchies, and the sheng target is such a
+  host: Droidloom reports both backends unavailable (`blkio` busy, `cpuset`
+  invalid) before Android starts. The cell now removes those joins from the platform's
+  task profiles instead of letting each one fail, so services start without
+  `failed to set task profiles` and keep their remaining actions (memory,
+  freezer, scheduler policy, timer slack). What is missing is the placement
+  itself: SurfaceFlinger and applications are not pinned to capacity classes and
+  I/O priorities do not apply, so the host scheduler places every cell thread.
+  A cgroup v2 backend that declares `cpuset` next to the existing `memory` and
+  `freezer` controllers, creates Android's `apps`/`system` sub-hierarchies and
+  expresses the same groups through the v2 controller is the follow-up.
+- **The cell's synthetic sysfs exposes CPU topology but no frequency metadata.**
+  `/sys/devices/system/cpu/{possible,present,online}` report the CPUs the cell
+  actually inherits, which is what `get_nprocs()` and Java's
+  `availableProcessors()` read. Per-CPU directories, `cpufreq`, `cpu_capacity`,
+  idle states and cache topology remain absent, so applications that classify
+  cores by frequency or capacity still see a flat, unclassified machine.
 
 ## Performance review targets
 
@@ -480,30 +551,22 @@ These findings describe the current source, including working-tree changes;
 they are not measurements of an installed build. Priorities indicate where to
 investigate first, not measured shares of CPU time or latency.
 
-1. **High: clipboard synchronization stalls unrelated input.**
-   The presenter's `send_input` queues touch and keys while clipboard import is
-   pending, with a ten-second blocking timeout. Once the 512-event queue fills,
-   newer events bypass it, potentially arriving before older DOWN/MOVE records.
-   Timestamps are assigned on send, so queued time is also absent from those
-   timestamps. Restrict clipboard ordering to operations that require it,
-   preserve gesture/key ordering under overload, and timestamp at receipt.
-   Validate with a stalled clipboard peer while delivering touch and keys.
-   Sources: [presenter](../graphics/droidloom-wayland/src/main.rs),
-   [clipboard state](../graphics/droidloom-wayland/src/clipboard/mod.rs).
-
-2. **High: slow input consumption can block graphics control reception.**
-   Composer dispatches input inline in the same receive loop that handles
-   configure, presentation and buffer-release records. Its framework sender
-   uses a blocking sequenced-packet socket while holding the input-state mutex.
-   If the Java reader stalls and the socket fills, that receive loop waits too.
-   Decouple input writes from graphics control reception with bounded,
-   order-preserving backpressure; do not indiscriminately drop input events.
-   Validate by pausing a synthetic input peer and checking continued control
-   message processing. Sources: [receive loop](../graphics/droidloom-composer-service/src/main.rs),
+1. **High: sustained framework input overload can still lose input transitions.**
+   Source now uses a bounded 16,384-record input lane and an independent
+   256-command control lane. Window bounds/focus/close commands are serviced
+   ahead of queued motion; repeated bounds updates coalesce, and pointer/pen
+   motion coalesces under pressure while preserving contact and button edges.
+   Framework socket sends time out after 100 ms; a failed send drops the socket
+   and clears host-side pointer routes. Ten isolated production-module tests
+   pass, including a stalled socket, priority controls, move coalescing, and
+   send timeout. This has not yet been exercised in a sheng interaction soak.
+   If the input lane fills with 16,384 critical transitions, the producer now
+   returns an error instead of blocking, and that transition can be lost.
+   Sources: [receive loop](../graphics/droidloom-composer-service/src/main.rs),
    [input sender](../graphics/droidloom-composer-service/src/input.rs),
    [socket transport](../graphics/droidloom-denial-ipc/src/lib.rs).
 
-3. **Medium: app catalog repeatedly scans unchanged state.**
+2. **Medium: app catalog repeatedly scans unchanged state.**
    The catalog queries Android and reconciles launcher files every 30 seconds
    by default. Icon keys and write-if-changed avoid some work, but the query and
    filesystem comparisons still run. Prefer package/user/locale change events
@@ -512,7 +575,7 @@ investigate first, not measured shares of CPU time or latency.
    [polling loop](../runtime/droidloom-applications/src/main.rs),
    [reconciliation](../runtime/droidloom-applications/src/lib.rs).
 
-4. **Medium: notification changes resend the full active snapshot.**
+3. **Medium: notification changes resend the full active snapshot.**
    After coalescing callbacks, the Java writer re-encodes every active entry,
    including each 48-by-48 RGBA icon as 9,216 JSON numbers. Icon rendering is
    cached and the host avoids unchanged desktop Notify calls, but serialization,
