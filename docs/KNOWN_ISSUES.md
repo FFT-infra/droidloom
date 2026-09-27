@@ -30,15 +30,18 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 
 ## Sheng daily-use integration
 
-- **Android audio still does not reach the speaker.** The host side of the audio
-  bridge exists: `graphics/droidloom-audio` serves raw s16le 48 kHz stereo PCM
-  from `/dev/socket/droidloom/audio` to the session's PipeWire sink, and a
-  test writer inside the running cell produced audible sound on sheng through the
-  built-in speaker. What is missing is the in-cell source: the AIDL audio policy
-  still uses BUS devices backed by timed silent streams, so application playback
-  and recording neither reach that socket nor return microphone data. Do not
-  describe audio or microphone support as available until an Android app's own
-  playback is heard on the host and the capture direction passes its test.
+- **Android playback reaches the host sink, with underruns; capture does not
+  exist yet.** The cell's primary output is an `AUDIO_DEVICE_OUT_BUS` port whose
+  stream Droidloom's patched audio HAL writes to `/dev/socket/droidloom/audio`,
+  the endpoint the supervisor projects into the cell; the `droidloom-audio` user
+  service forwards one stream at a time to the session's PipeWire sink. On sheng
+  the in-cell HAL logged `AHAL_DriverSocket: connect: sending 48000 Hz`, Douyin
+  video playback produced a 56.8 s host stream and a notification sound a 4.8 s
+  one, so application audio leaves the cell. The longer stream also logged
+  `AudioFlinger: prepareTracks_l BUFFER TIMEOUT` underruns, so sustained
+  playback still needs measuring. Nothing captures in the other direction:
+  recording returns silence, and microphone support must not be described as
+  available.
 - **Pen and window acceptance is still partial.** The Android bridge maps Linux
   `BTN_STYLUS` and `BTN_STYLUS2` to Android's standard primary and secondary
   stylus-button key codes; Droidloom contains no StarNote-specific action. The
@@ -227,6 +230,24 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 - **Standalone APKs only.** `droidloomctl install` accepts one standalone APK.
   Split bundles, drag-and-drop installation and separate game assets are not
   supported by the command. Older preview packages need an update to provide it.
+- **An app that dereferences absent hardware fails, and Bilibili is the current
+  case.** The device products declare only the features Droidloom implements:
+  there is no `android.hardware.wifi`, camera, Bluetooth, GNSS or telephony
+  declaration, and the Wi-Fi module in the images ships no `wificond`.
+  `getSystemService("wifi")` therefore returns null, and an app that uses the
+  result without a null check dies. Bilibili 9.13.0, the Xiaomi channel build,
+  reads the Wi-Fi MAC address for its device-id library that way and crashes
+  with `NullPointerException: null receiver` in
+  `com.bilibili.lib.biliid.api.internal`. Its earlier two-second `SIGKILL` is
+  fixed: that came from a thread pool sized by `availableProcessors()`, which
+  the cell's synthetic CPU topology now answers correctly, and a launch creates
+  a task whose process now lives until this crash. Dexopt works as well:
+  `cmd package compile -m speed` produced an 883 MB `base.odex` through
+  `dex2oat64` on eight threads with no `dex2oat32` attempt. What remains is the
+  missing Wi-Fi service, not the port. Declaring the feature without a Wi-Fi
+  stack would replace the null with a missing binder service, so app parity with
+  a HyperOS tablet needs a real Wi-Fi backend; the experimental location and
+  Bluetooth declarations above stay out of the release for the same reason.
 
 ## ARM64 translation accuracy findings
 
