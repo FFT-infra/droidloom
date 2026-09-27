@@ -1,0 +1,34 @@
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -48,8 +48,28 @@
+     case V4L2AllocatorId::SECURE_LINEAR: {
+         std::shared_ptr<_C2BlockPoolData> blockPoolData =
+                 _C2BlockFactory::GetGraphicBlockPoolData(block);
+-        if (blockPoolData->getType() != _C2BlockPoolData::TYPE_BUFFERPOOL) {
+-            ALOGE("Obtained C2GraphicBlock is not bufferpool-backed.");
++        if (!blockPoolData ||
++            blockPoolData->getType() != _C2BlockPoolData::TYPE_BUFFERPOOL) {
++            if (blockPool.getAllocatorId() == C2PlatformAllocatorStore::GRALLOC) {
++                // BASIC_GRAPHIC blocks do not carry buffer-pool metadata. Use their
++                // dma-buf identity so non-surface MediaCodec output remains usable.
++                const C2Handle* const handle = block.handle();
++                if (handle == nullptr || handle->numFds <= 0) {
++                    ALOGE("GRALLOC graphic block has no dma-buf handle.");
++                    return std::nullopt;
++                }
++                auto dmabufId = android::getDmabufId(handle->data[0]);
++                if (!dmabufId) {
++                    ALOGE("Failed to get dma-buf identity for GRALLOC graphic block.");
++                    return std::nullopt;
++                }
++                return dmabufId.value();
++            }
++            if (!blockPoolData) {
++                ALOGE("Graphic block pool metadata unavailable.");
++            } else {
++                ALOGE("Obtained C2GraphicBlock is not bufferpool-backed.");
++            }
+             return std::nullopt;
+         }
+         std::shared_ptr<BufferPoolData> bpData;

@@ -558,3 +558,22 @@ sign-in does not guarantee that Google has refreshed its device profile or that
 every app is compatible. Only declare capabilities the runtime implements;
 Google certification and missing camera, microphone or sensor integration are
 not repaired by adding feature names.
+
+The product class follows the display the product presents. A product that
+presents one large landscape display derives its `product.img` with
+`ro.build.characteristics=tablet`; products that present a phone-sized display
+keep the class their pinned base image states. That single line is the whole
+derivation: the flow extracts the base image, rewrites it in place, keeps the
+file's owner, mode and modification time, rebuilds EROFS with the pinned image
+identity, and then re-extracts the result and compares every retained entry's
+contents, ownership, modes, timestamps and extended attributes. It needs
+`fakeroot`, `erofs-utils` and `attr`: the package workflow supplies them in the
+Arch build container, and a device build driven directly on a build host needs
+them installed there.
+
+Platform identity that Android and stores also read stays pinned: model, brand,
+device, build fingerprint and signing keys remain the upstream Cuttlefish phone
+values (`userdebug`, test keys). Applications and the store can see them, so a
+product that claims to be another device changes what those peers believe about
+the hardware. Treat that as a separate, deliberate decision with certification
+consequences, not as part of the class declaration.

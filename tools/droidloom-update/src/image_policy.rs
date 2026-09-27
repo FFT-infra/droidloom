@@ -1,4 +1,6 @@
-//! Derive the desktop system_ext image without legacy vendor compatibility APEXes.
+//! Derive the pinned images whose device-facing policy Droidloom changes: the
+//! desktop system_ext without legacy vendor compatibility APEXes, and the
+//! tablet product whose build characteristic declares its device class.
 use crate::util::*;
 use std::{
     collections::BTreeMap,
@@ -184,22 +186,130 @@ pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Resu
         std::time::UNIX_EPOCH
             + std::time::Duration::new(apex.modified.0.try_into()?, apex.modified.1.try_into()?),
     )?;
-    let rebuilt = work.path().join("system_ext.img");
+    let rebuilt = rebake_verified(
+        work.path(),
+        &tree,
+        &expected,
+        "7b895cb0-54d5-4a4d-950d-50cda078053f",
+    )?;
+    eprintln!(
+        "Removed four legacy VNDK APEXes; system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
+        fs::metadata(image)?.len(),
+        fs::metadata(&rebuilt)?.len()
+    );
+    fs::rename(rebuilt, destination)?;
+    Ok(())
+}
+
+/// Declare the tablet device class in the product image of the tablet product.
+///
+/// Platforms and applications read this characteristic to choose between phone
+/// and tablet presentation. The tablet product presents one large landscape
+/// display, so its image declares the class that display establishes, while the
+/// products that present a phone-sized display keep the class the pinned base
+/// image states. Only that one line changes; every other property, file and
+/// metadata entry keeps its pinned value.
+pub fn declare_tablet(image: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination.parent().ok_or("image has no parent")?)?;
+    // A single fakeroot session preserves otherwise privileged ownership and
+    // security xattrs across extraction, mkfs, and independent re-extraction.
+    let worker = tempfile::Builder::new()
+        .prefix("tablet-declaration-")
+        .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
+    let executable = worker.path().join("droidloom-update");
+    fs::copy("/proc/self/exe", &executable)?;
+    mode(&executable, 0o755)?;
+    run(Command::new("fakeroot")
+        .arg("--")
+        .arg(&executable)
+        .arg("declare-tablet-product-image")
+        .arg("--image")
+        .arg(image)
+        .arg("--destination")
+        .arg(destination))
+}
+
+pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<()> {
+    if std::env::var_os("FAKEROOTKEY").is_none() {
+        return fail("tablet declaration must run inside fakeroot to preserve Android metadata");
+    }
+    if destination.exists() {
+        return fail("declared product image destination already exists");
+    }
+    let work = tempfile::Builder::new()
+        .prefix("tablet-declaration-")
+        .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
+    let tree = work.path().join("tree");
+    extract(image, &tree)?;
+    let properties = tree.join("product/etc/build.prop");
+    // The pinned base image declares the phone class once, without a prefix.
+    const PHONE: &str = "ro.build.characteristics=default";
+    const TABLET: &str = "ro.build.characteristics=tablet";
+    let contents = fs::read_to_string(&properties)?;
+    let declared = match contents.matches(PHONE).count() {
+        1 => contents.replace(PHONE, TABLET),
+        0 => {
+            return fail(format!(
+                "tablet product image declares no phone characteristic to replace: {}",
+                properties.display()
+            ));
+        }
+        count => {
+            return fail(format!(
+                "tablet product image declares the phone characteristic {count} times"
+            ));
+        }
+    };
+    // Rewriting the file in place keeps its owner, mode and security label; the
+    // original modification time is restored so a derived image stays
+    // reproducible from its base.
+    let modified = fs::metadata(&properties)?.modified()?;
+    fs::write(&properties, declared)?;
+    fs::File::open(&properties)?.set_modified(modified)?;
+    let expected = inventory(&tree)?;
+    let rebuilt = rebake_verified(
+        work.path(),
+        &tree,
+        &expected,
+        "c7e0d4b2-9a51-4f36-8c2e-6d1a7f5b9043",
+    )?;
+    eprintln!(
+        "Declared the tablet device class; product: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
+        fs::metadata(image)?.len(),
+        fs::metadata(&rebuilt)?.len()
+    );
+    fs::rename(rebuilt, destination)?;
+    Ok(())
+}
+
+/// Rebuild an extracted tree as EROFS with the pinned image identity, then
+/// prove that every retained entry survived the round trip byte for byte.
+fn rebake_verified(
+    work: &Path,
+    tree: &Path,
+    expected: &BTreeMap<PathBuf, Entry>,
+    uuid: &str,
+) -> Result<PathBuf> {
+    let rebuilt = work.join("rebuilt.img");
     run(Command::new("mkfs.erofs")
+        // makepkg exports SOURCE_DATE_EPOCH, which otherwise silently clamps
+        // newer mtimes despite --preserve-mtime. Preserve the staged metadata
+        // exactly; the filesystem creation timestamp is explicitly pinned below.
+        .env_remove("SOURCE_DATE_EPOCH")
         .args([
             "-zlz4hc,level=9",
             "--workers=2",
             "-T1230768000",
             "--mkfs-time",
             "--preserve-mtime",
-            "-U7b895cb0-54d5-4a4d-950d-50cda078053f",
         ])
+        .arg(format!("-U{uuid}"))
         .arg(&rebuilt)
-        .arg(&tree))?;
-    let checked = work.path().join("checked");
+        .arg(tree))?;
+    let checked = work.join("checked");
     extract(&rebuilt, &checked)?;
     let actual = inventory(&checked)?;
-    if actual != expected {
+    if &actual != expected {
         let changed: Vec<_> = expected
             .keys()
             .chain(actual.keys())
@@ -213,16 +323,10 @@ pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Resu
             );
         }
         return fail(format!(
-            "derived system_ext changed retained file contents or metadata: {changed:?}"
+            "derived image changed retained file contents or metadata: {changed:?}"
         ));
     }
-    eprintln!(
-        "Removed four legacy VNDK APEXes; system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
-        fs::metadata(image)?.len(),
-        fs::metadata(&rebuilt)?.len()
-    );
-    fs::rename(rebuilt, destination)?;
-    Ok(())
+    Ok(rebuilt)
 }
 
 #[cfg(test)]
@@ -248,6 +352,62 @@ mod tests {
         ] {
             assert!(desktop_vendor(&properties).is_err());
         }
+    }
+    #[test]
+    fn tablet_declaration_changes_only_the_device_class() {
+        if std::env::var_os("DROIDLOOM_TABLET_DECLARATION_TEST").is_none() {
+            run(Command::new("fakeroot")
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "image_policy::tests::tablet_declaration_changes_only_the_device_class",
+                    "--nocapture",
+                ])
+                .env("DROIDLOOM_TABLET_DECLARATION_TEST", "1"))
+            .unwrap();
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("input");
+        fs::create_dir_all(root.join("product/etc")).unwrap();
+        let properties = root.join("product/etc/build.prop");
+        fs::write(
+            &properties,
+            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=default\nro.vendor.build.characteristics=default\n",
+        )
+        .unwrap();
+        let original = work.path().join("original.img");
+        run(Command::new("mkfs.erofs")
+            .args(["-zlz4hc", "--workers=2"])
+            .arg(&original)
+            .arg(&root))
+        .unwrap();
+        let destination = work.path().join("product.img");
+        declare_tablet(&original, &destination).unwrap();
+        let check = work.path().join("verify");
+        extract(&destination, &check).unwrap();
+        // The declared class changes; the product identity and every other
+        // characteristic keep the value the base image states.
+        assert_eq!(
+            fs::read_to_string(check.join("product/etc/build.prop")).unwrap(),
+            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=tablet\nro.vendor.build.characteristics=default\n"
+        );
+        assert!(
+            fs::metadata(&destination).unwrap().len() > 0,
+            "derived product image is empty"
+        );
+        // One derivation per base image: reusing the destination is refused.
+        assert!(declare_tablet(&original, &destination).is_err());
+        // An image without the phone class can not declare the tablet class.
+        fs::write(&properties, "ro.product.model=Cuttlefish arm64 phone\n").unwrap();
+        let absent = work.path().join("absent.img");
+        run(Command::new("mkfs.erofs")
+            .args(["-zlz4hc", "--workers=2"])
+            .arg(&absent)
+            .arg(&root))
+        .unwrap();
+        assert!(declare_tablet(&absent, &work.path().join("absent-out.img")).is_err());
     }
     #[test]
     fn repack_preserves_android_metadata_and_adbd() {

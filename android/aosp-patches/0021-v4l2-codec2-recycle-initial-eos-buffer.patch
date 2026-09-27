@@ -1,0 +1,62 @@
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -111,6 +111,7 @@
+ 
+     // Contains the initial EOS buffer, until DRC event is dequeued.
+     sp<GraphicBuffer> mInitialEosBuffer;
++    std::optional<size_t> mInitialEosBufferId;
+ 
+     std::queue<DecodeRequest> mDecodeRequests;
+     std::map<int32_t, DecodeCB> mPendingDecodeCbs;
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -244,6 +244,7 @@
+         ALOGE("Failed to acquire initial EOS buffer");
+         return false;
+     }
++    mInitialEosBufferId = eosBuffer->bufferId();
+ 
+     mInitialEosBuffer =
+             new GraphicBuffer(mCodedSize.getWidth(), mCodedSize.getHeight(),
+@@ -670,6 +671,31 @@
+ 
+         // Get the corresponding VideoFrame of the dequeued buffer.
+         auto it = mFrameAtDevice.find(bufferId);
++        if (it == mFrameAtDevice.end() && bytesUsed == 0 && mInitialEosBuffer &&
++            mInitialEosBufferId && bufferId == *mInitialEosBufferId) {
++            ALOGW("Recycling empty initial CAPTURE buffer: id=%zu bitstreamId=%d isLast=%d",
++                  bufferId, bitstreamId, isLast);
++            if (!mInitialEosBuffer->handle || mInitialEosBuffer->handle->numFds <= 0) {
++                ALOGE("Initial EOS buffer has no dma-buf handle.");
++                onError();
++                return;
++            }
++            dequeuedBuffer.reset();
++            auto outputBuffer = mOutputQueue->getFreeBuffer(bufferId);
++            ALOG_ASSERT(outputBuffer, "V4L2 output queue slot %zu is not freed.", bufferId);
++            std::vector<int> fds;
++            for (size_t i = 0; i < mInitialEosBuffer->handle->numFds; ++i) {
++                fds.push_back(mInitialEosBuffer->handle->data[i]);
++            }
++            if (!std::move(*outputBuffer).queueDMABuf(fds)) {
++                ALOGE("%s(): Failed to recycle initial EOS buffer.", __func__);
++                onError();
++                return;
++            }
++            // This is the decoder's initial EOS sentinel, not the client's
++            // end-of-stream buffer. Do not let its LAST flag finish a drain.
++            continue;
++        }
+         if (it == mFrameAtDevice.end()) {
+             ALOGE("CAPTURE DQBUF returned an unmapped buffer: id=%zu bitstreamId=%d "
+                   "bytesUsed=%zu mapped=%zu allocated=%zu",
+@@ -753,6 +779,7 @@
+ 
+     if (mInitialEosBuffer) {
+         mInitialEosBuffer = nullptr;
++        mInitialEosBufferId.reset();
+     }
+ 
+     if (!startOutputQueue(mMinNumOutputBuffers, V4L2_MEMORY_DMABUF)) {

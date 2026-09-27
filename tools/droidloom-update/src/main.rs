@@ -70,6 +70,13 @@ enum Action {
         #[arg(long)]
         vendor_properties: PathBuf,
     },
+    #[command(hide = true)]
+    DeclareTabletProductImage {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     /// Compile and stage a portable pacman payload; does not install or start services.
     PackageStage {
         #[arg(long)]
@@ -142,6 +149,9 @@ fn execute(args: Args) -> Result<()> {
             vendor_properties,
         }) => {
             return image_policy::prune(image, destination, vendor_properties);
+        }
+        Some(Action::DeclareTabletProductImage { image, destination }) => {
+            return image_policy::declare_tablet_product_image(image, destination);
         }
         Some(Action::PackageStage {
             work,

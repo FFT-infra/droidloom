@@ -64,6 +64,42 @@ pub fn apex_output(name: &str, target_arch: &str) -> Option<String> {
 }
 const PATCHES: &[(&str, &str)] = &[
     (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0015-v4l2-codec2-zero-unknown-dimensions.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0025-v4l2-codec2-query-required-input-buffer-size.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0027-v4l2-codec2-av1-decoder.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0018-v4l2-codec2-drc-output-reconfigure.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0019-v4l2-codec2-gralloc-dmabuf-identity.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0020-v4l2-codec2-guard-unmapped-capture-buffer.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0021-v4l2-codec2-recycle-initial-eos-buffer.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0024-v4l2-codec2-igba-surface-output.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0028-v4l2-codec2-keep-input-buffer-size-floor.patch",
+    ),
+    (
         "frameworks/native",
         "android/surfaceflinger/0009-droidloom-cpu-placement.patch",
     ),
@@ -502,6 +538,16 @@ pub(crate) fn target_arch(product: &str) -> Result<&'static str> {
         _ => fail("unknown Android product; expected droidloom_x86_64, droidloom_arm64 or droidloom_sheng"),
     }
 }
+// The product class follows the display the product presents. The tablet
+// product drives one large landscape display; the others present a phone-sized
+// display and keep the class their pinned base image already states.
+pub(crate) fn declares_tablet(product: &str) -> Result<bool> {
+    match product {
+        "droidloom_sheng" => Ok(true),
+        "droidloom_x86_64" | "droidloom_arm64" => Ok(false),
+        _ => fail("unknown Android product; expected droidloom_x86_64, droidloom_arm64 or droidloom_sheng"),
+    }
+}
 pub fn build(
     repo: &Path,
     source: &Path,
@@ -793,11 +839,49 @@ mod tests {
             assert!(TARGETS.contains(&name));
         }
     }
+    #[test]
+    fn every_product_declares_its_architecture_and_device_class() {
+        for product in ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"] {
+            assert!(target_arch(product).is_ok());
+            assert!(declares_tablet(product).is_ok());
+        }
+        assert!(declares_tablet("droidloom_sheng").unwrap());
+        for phone in ["droidloom_x86_64", "droidloom_arm64"] {
+            assert!(!declares_tablet(phone).unwrap());
+        }
+        // A product that is not listed must fail rather than silently keep the
+        // class of whatever image happens to be pinned for it.
+        assert!(declares_tablet("droidloom_new").is_err());
+    }
 }
 
 #[cfg(test)]
 mod patch_tests {
     use super::*;
+
+    #[test]
+    fn sheng_codec2_patch_set_is_reproducible_and_excludes_diagnostics() {
+        let patches = PATCHES
+            .iter()
+            .filter_map(|(project, patch)| (*project == "external/v4l2_codec2").then_some(*patch))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            patches,
+            vec![
+                "android/aosp-patches/0015-v4l2-codec2-zero-unknown-dimensions.patch",
+                "android/aosp-patches/0025-v4l2-codec2-query-required-input-buffer-size.patch",
+                "android/aosp-patches/0027-v4l2-codec2-av1-decoder.patch",
+                "android/aosp-patches/0018-v4l2-codec2-drc-output-reconfigure.patch",
+                "android/aosp-patches/0019-v4l2-codec2-gralloc-dmabuf-identity.patch",
+                "android/aosp-patches/0020-v4l2-codec2-guard-unmapped-capture-buffer.patch",
+                "android/aosp-patches/0021-v4l2-codec2-recycle-initial-eos-buffer.patch",
+                "android/aosp-patches/0024-v4l2-codec2-igba-surface-output.patch",
+                "android/aosp-patches/0028-v4l2-codec2-keep-input-buffer-size-floor.patch",
+            ]
+        );
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(patches.iter().all(|patch| repo_root.join(patch).is_file()));
+    }
     #[test]
     fn patch_in_source_without_git_root_is_restored_inside_enclosing_checkout() {
         let d = tempfile::tempdir().unwrap();

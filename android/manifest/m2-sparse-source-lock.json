@@ -50,11 +50,31 @@
   ],
   "projects": [
     {
+      "path": "external/libjpeg-turbo",
+      "name": "platform/external/libjpeg-turbo",
+      "commit": "a83d12ab3266dae9a9a0ab8f3c1799459d24ed96",
+      "purpose": "Pinned AOSP Android 17 libjpeg provider required by libyuv in Codec2 utilities"
+    },
+    {
+      "path": "external/libyuv",
+      "name": "platform/external/libyuv",
+      "commit": "49130481509c59cdd486a05595fd809adafedf39",
+      "purpose": "Pinned AOSP Android 17 libyuv dependency required by Codec2 framework utilities"
+    },
+    {
+      "path": "external/minijail",
+      "name": "platform/external/minijail",
+      "commit": "26ff82bac9c77ef25d0a913ee09ed11ccdfdab78",
+      "purpose": "Pinned Android 17 minijail library required by the AIDL Codec2 service sandbox"
+    },
+    {
       "path": "frameworks/wilhelm",
       "name": "platform/frameworks/wilhelm",
       "commit": "cbc8f246cd0c18d3c286ab39620846badd0676fb",
       "purpose": "OpenSL ES and OpenMAX AL public headers for the NativeBridge audio proxies",
-      "sparse_paths": ["include"]
+      "sparse_paths": [
+        "include"
+      ]
     },
     {
       "path": "frameworks/libs/native_bridge_support",
@@ -577,6 +597,19 @@
       "purpose": "Pinned TensorFlow Lite static runtime required by Android input motion prediction"
     },
     {
+      "path": "external/v4l2_codec2",
+      "name": "platform/external/v4l2_codec2",
+      "commit": "1226adff48e591f0b6cac8d3a271a7324d8fc0ec",
+      "purpose": "Pinned AOSP Android 17 V4L2 Codec2 components and libraries for the sheng AIDL service",
+      "sparse_paths": [
+        "common",
+        "components",
+        "plugin_store",
+        "service",
+        "v4l2"
+      ]
+    },
+    {
       "path": "external/vulkan-headers",
       "name": "platform/external/vulkan-headers",
       "commit": "ee4343a1f27d9faca189b9ac2c064254e23ba2e2",
@@ -645,6 +678,7 @@
         "keystore/aaid/aidl",
         "keystore/java",
         "libs/WindowManager/Shell/aconfig",
+        "libs/WindowManager/Shell/src",
         "libs/securebox",
         "location",
         "media",
@@ -842,7 +876,8 @@
         "soundtrigger/2.2",
         "tv/cec/1.0",
         "tv/tuner/aidl",
-        "soundtrigger/aidl"
+        "soundtrigger/aidl",
+        "drm/aidl"
       ]
     },
     {
@@ -1652,7 +1687,8 @@
       "commit": "333bc8067efc529ef4d197fec2f4f2cae1ad2ece",
       "purpose": "Configuration flags used by system-server services",
       "sparse_paths": [
-        "aconfigd/proto"
+        "aconfigd/proto",
+        "framework/flags.aconfig"
       ]
     },
     {

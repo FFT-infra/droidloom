@@ -1,6 +1,7 @@
 use crate::util::*;
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -324,7 +325,8 @@ pub fn assemble(
     let notices = payload.join("usr/share/licenses/droidloom");
     crate::licenses::project(repo, &notices)?;
     crate::licenses::rust(repo, &notices.join("rust"))?;
-    configure_local(repo, payload, uid, target_arch)
+    let product_name = product.file_name().and_then(OsStr::to_str).ok_or("Android product output has no name")?;
+    configure_local(repo, payload, uid, target_arch, product_name)
 }
 
 /// Stage the complete artifact recipe without reading any build-host configuration.
@@ -520,8 +522,13 @@ pub fn assemble_artifacts(
         )?;
     }
     let images = payload.join("var/lib/droidloom/images/images");
-    for name in ["product.img"] {
-        copy(&base.join(name), &images.join(name))?;
+    if crate::android::declares_tablet(&product_name)? {
+        crate::image_policy::declare_tablet(
+            &base.join("product.img"),
+            &images.join("product.img"),
+        )?;
+    } else {
+        copy(&base.join("product.img"), &images.join("product.img"))?;
     }
     crate::native_bridge::stage_image(
         repo,
@@ -559,7 +566,7 @@ pub fn assemble_artifacts(
     Ok(())
 }
 
-fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> Result<()> {
+fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str, product_name: &str) -> Result<()> {
     let runtime = payload.join("usr/lib/droidloom/runtime");
     // The ARM64 cell recipe is the Moto-validated variant; only identity
     // fields are rewritten below, never the runtime mappings.
@@ -609,10 +616,30 @@ fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str) -> 
     }
     spec["render_node"] = json!(render);
     spec["shared_storage_directories"] = json!([]);
-    if Path::new("/etc/droidloom/cell.json").exists() {
-        let existing = json(Path::new("/etc/droidloom/cell.json"))?;
+    let target_cell_config = std::env::var_os("DROIDLOOM_TARGET_CELL_CONFIG").map(PathBuf::from);
+    let existing_cell_config = existing_cell_config_path(
+        target_arch,
+        std::env::consts::ARCH,
+        Path::new("/etc/droidloom/cell.json"),
+        target_cell_config.as_deref(),
+    )?;
+    let allow_product_video_decoder_default = if let Some(path) = existing_cell_config {
+        let existing = json(&path)?;
+        let has_video_decoder_setting = existing
+            .as_object()
+            .is_some_and(|object| object.contains_key("video_decoder"));
         preserve_settings(&mut spec, &existing, uid)?;
-    }
+        // Removing the optional field from an existing cell is an explicit
+        // request to keep using Android's software codecs after updates.
+        has_video_decoder_setting
+    } else {
+        true
+    };
+    apply_product_video_decoder_default(
+        &mut spec,
+        product_name,
+        allow_product_video_decoder_default,
+    );
     for entry in spec["android_file_overrides"]
         .as_array()
         .ok_or("missing overrides")?
@@ -676,6 +703,34 @@ fn render_node(target_arch: &str) -> Result<String> {
     }
     fail("no supported render node found (AMD, Intel or MSM); pin one with DROIDLOOM_RENDER_NODE")
 }
+fn existing_cell_config_path(
+    target_arch: &str,
+    host_arch: &str,
+    host_config: &Path,
+    target_config: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    if target_arch == host_arch {
+        return Ok(host_config.is_file().then(|| host_config.to_path_buf()));
+    }
+    let path = target_config.ok_or("cross bundle requires DROIDLOOM_TARGET_CELL_CONFIG for the target device")?;
+    if !path.is_file() {
+        return fail("DROIDLOOM_TARGET_CELL_CONFIG does not name a regular file");
+    }
+    Ok(Some(path.to_path_buf()))
+}
+fn apply_product_video_decoder_default(spec: &mut Value, product_name: &str, allowed: bool) {
+    if allowed && spec.get("video_decoder").is_none() {
+        if let Some(decoder) = video_decoder_for_product(product_name) {
+            spec["video_decoder"] = json!(decoder);
+        }
+    }
+}
+fn video_decoder_for_product(_product_name: &str) -> Option<&'static str> {
+    // No sheng decoder combination has passed sustained real-stream validation.
+    // Keep Android's software codecs as the default until a tested capability is
+    // explicitly enabled by the device configuration.
+    None
+}
 fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()> {
     if existing["host_uid"].as_u64() != Some(u64::from(uid)) {
         return fail("the existing Droidloom installation belongs to another desktop user");
@@ -686,6 +741,7 @@ fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()>
         "subordinate_uids",
         "subordinate_gids",
         "shared_storage_directories",
+        "video_decoder",
     ] {
         if let Some(value) = existing.get(field) {
             spec[field] = value.clone();
@@ -698,8 +754,57 @@ fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()>
 mod tests {
     use super::*;
     #[test]
+    fn no_product_enables_an_unvalidated_video_decoder_by_default() {
+        for product in ["droidloom_sheng", "droidloom_arm64", "droidloom_x86_64"] {
+            assert_eq!(video_decoder_for_product(product), None);
+        }
+    }
+
+    #[test]
+    fn cross_bundle_uses_an_explicit_target_cell_config() {
+        let d = tempfile::tempdir().unwrap();
+        let host = d.path().join("host-cell.json");
+        let target = d.path().join("sheng-cell.json");
+        std::fs::write(&host, b"{}").unwrap();
+        std::fs::write(&target, b"{}").unwrap();
+        assert!(existing_cell_config_path("aarch64", "x86_64", &host, None).is_err());
+        assert_eq!(
+            existing_cell_config_path("aarch64", "x86_64", &host, Some(&target)).unwrap(),
+            Some(target),
+        );
+        assert_eq!(
+            existing_cell_config_path("x86_64", "x86_64", &host, None).unwrap(),
+            Some(host),
+        );
+    }
+
+    #[test]
+    fn removed_video_decoder_setting_stays_disabled_on_update() {
+        let existing = json!({"host_uid":1000});
+        let mut candidate = json!({});
+        preserve_settings(&mut candidate, &existing, 1000).unwrap();
+        apply_product_video_decoder_default(&mut candidate, "droidloom_sheng", false);
+        assert!(candidate.get("video_decoder").is_none());
+    }
+
+    #[test]
+    fn unvalidated_sheng_decoder_remains_disabled_even_when_defaults_are_allowed() {
+        let mut candidate = json!({});
+        apply_product_video_decoder_default(&mut candidate, "droidloom_sheng", true);
+        assert!(candidate.get("video_decoder").is_none());
+
+        let mut explicitly_disabled = json!({"video_decoder":null});
+        apply_product_video_decoder_default(
+            &mut explicitly_disabled,
+            "droidloom_sheng",
+            true,
+        );
+        assert!(explicitly_disabled["video_decoder"].is_null());
+    }
+
+    #[test]
     fn update_keeps_personal_state_but_replaces_runtime_mappings() {
-        let existing = json!({"host_uid":1000,"data_dir":"/var/lib/droidloom/custom-data","shared_storage_directories":[{"source":"/home/test/Downloads"}],"android_file_overrides":["old"]});
+        let existing = json!({"host_uid":1000,"data_dir":"/var/lib/droidloom/custom-data","shared_storage_directories":[{"source":"/home/test/Downloads"}],"video_decoder":"iris","android_file_overrides":["old"]});
         let mut candidate = json!({"android_file_overrides":["new"]});
         preserve_settings(&mut candidate, &existing, 1000).unwrap();
         assert_eq!(candidate["data_dir"], existing["data_dir"]);
@@ -708,6 +813,7 @@ mod tests {
             existing["shared_storage_directories"]
         );
         assert_eq!(candidate["android_file_overrides"], json!(["new"]));
+        assert_eq!(candidate["video_decoder"], json!("iris"));
         assert!(preserve_settings(&mut candidate, &existing, 1001).is_err());
     }
 }

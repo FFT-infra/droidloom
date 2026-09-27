@@ -34,6 +34,21 @@ droidloomctl update --clean
 droidloom-update verify .work/update/release-<build-id>
 ```
 
+Cross builds for an ARM64 device product (`--product droidloom_arm64` or
+`droidloom_sheng`) must read configuration from the target device, not the build
+host. Copy the target cell configuration to the builder and set
+DROIDLOOM_TARGET_CELL_CONFIG alongside DROIDLOOM_RENDER_NODE. The target
+configuration preserves per-device settings; an omitted video_decoder keeps
+Android's software codecs as the default. No hardware decoder is enabled by a
+product default until its real-stream tests pass.
+
+The host programs in an ARM64 bundle link Wayland, GBM, xkbcommon, libdrm and
+libffi, so the cross build also needs an ARM64 library sysroot: set
+PKG_CONFIG_SYSROOT_DIR and PKG_CONFIG_PATH to it and set PKG_CONFIG_ALLOW_CROSS=1.
+Without them the build stops in the `wayland-sys` build script, which cannot
+find the host's x86_64 descriptions of those libraries. Android itself needs no
+such sysroot; it cross-compiles ARM64 userspace on the x86_64 host directly.
+
 Compilation leaves two logical CPUs outside the compiler process affinity,
 including nested Ninja and JVM workers. Parallel jobs are also capped at
 `nproc - 2`, even if a larger `--jobs` value is requested.

@@ -84,3 +84,8 @@ PRODUCT_VENDOR_PROPERTIES += \
     dalvik.vm.heaptargetutilization=0.75 \
     dalvik.vm.heapminfree=512k \
     dalvik.vm.heapmaxfree=8m
+
+# A 64-bit-only cell ships no dex2oat32 in the ART apex. Without this property
+# artd selects dex2oat32, every dexopt aborts, and all applications stay on the
+# interpreter.
+PRODUCT_VENDOR_PROPERTIES += dalvik.vm.dex2oat64.enabled=true

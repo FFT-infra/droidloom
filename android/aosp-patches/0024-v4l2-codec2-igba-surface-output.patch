@@ -1,0 +1,88 @@
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -11,6 +11,7 @@
+ #include <memory>
+ 
+ #include <C2BlockInternal.h>
++#include <C2AllocatorGralloc.h>
+ #include <bufferpool/BufferPoolTypes.h>
+ 
+ #include <android/hardware/graphics/common/1.0/types.h>
+@@ -27,6 +28,36 @@
+ using android::hardware::media::bufferpool::BufferPoolData;
+ 
+ namespace android {
++namespace {
++
++std::optional<uint32_t> getDmabufIdFromCodec2Handle(const C2Handle* handle) {
++    if (handle == nullptr) {
++        ALOGE("Codec2 graphic block has no handle.");
++        return std::nullopt;
++    }
++
++    // C2Handle is opaque. This helper unwraps both Gralloc and IGBA/AHardwareBuffer handles.
++    native_handle_t* nativeHandle = UnwrapNativeCodec2GrallocHandle(handle);
++    if (nativeHandle == nullptr) {
++        ALOGE("Failed to unwrap Codec2 graphic block handle.");
++        return std::nullopt;
++    }
++
++    std::optional<uint32_t> dmabufId;
++    if (nativeHandle->numFds <= 0) {
++        ALOGE("Unwrapped graphic block handle has no dma-buf fd.");
++    } else {
++        auto id = android::getDmabufId(nativeHandle->data[0]);
++        if (id) {
++            dmabufId = id.value();
++        }
++    }
++    // The unwrapped handle does not own the fds; delete the temporary wrapper only.
++    native_handle_delete(nativeHandle);
++    return dmabufId;
++}
++
++}  // namespace
+ 
+ // static
+ std::optional<uint32_t> VideoFramePool::getBufferIdFromGraphicBlock(C2BlockPool& blockPool,
+@@ -34,15 +65,22 @@
+     ALOGV("%s() blockPool.getAllocatorId() = %u", __func__, blockPool.getAllocatorId());
+ 
+     switch (blockPool.getAllocatorId()) {
+-    case V4L2AllocatorId::SECURE_GRAPHIC:
+-        FALLTHROUGH;
+-    case C2PlatformAllocatorStore::BUFFERQUEUE: {
+-        auto dmabufId = android::getDmabufId(block.handle()->data[0]);
++    case V4L2AllocatorId::SECURE_GRAPHIC: {
++        const C2Handle* const handle = block.handle();
++        if (handle == nullptr || handle->numFds <= 0) {
++            ALOGE("Secure graphic block has no dma-buf handle.");
++            return std::nullopt;
++        }
++        auto dmabufId = android::getDmabufId(handle->data[0]);
+         if (!dmabufId) {
+             return std::nullopt;
+         }
+         return dmabufId.value();
+     }
++    case C2PlatformAllocatorStore::BUFFERQUEUE:
++        return getDmabufIdFromCodec2Handle(block.handle());
++    case C2PlatformAllocatorStore::IGBA:
++        return getDmabufIdFromCodec2Handle(block.handle());
+     case C2PlatformAllocatorStore::GRALLOC:
+         FALLTHROUGH;
+     case V4L2AllocatorId::SECURE_LINEAR: {
+@@ -58,12 +96,7 @@
+                     ALOGE("GRALLOC graphic block has no dma-buf handle.");
+                     return std::nullopt;
+                 }
+-                auto dmabufId = android::getDmabufId(handle->data[0]);
+-                if (!dmabufId) {
+-                    ALOGE("Failed to get dma-buf identity for GRALLOC graphic block.");
+-                    return std::nullopt;
+-                }
+-                return dmabufId.value();
++                return getDmabufIdFromCodec2Handle(handle);
+             }
+             if (!blockPoolData) {
+                 ALOGE("Graphic block pool metadata unavailable.");

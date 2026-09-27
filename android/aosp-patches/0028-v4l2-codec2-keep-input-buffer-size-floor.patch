@@ -1,0 +1,44 @@
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 206f490..85cdddb 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -100,9 +100,16 @@ C2R DecodeInterface::MergedColorAspectsSetter(bool /* mayBlock */,
+ 
+ // static
+ C2R DecodeInterface::MaxInputBufferSizeCalculator(
+-        bool /* mayBlock */, C2P<C2StreamMaxBufferSizeInfo::input>& me,
++        bool /* mayBlock */, const C2P<C2StreamMaxBufferSizeInfo::input>& old,
++        C2P<C2StreamMaxBufferSizeInfo::input>& me,
+         const C2P<C2StreamPictureSizeInfo::output>& size) {
+-    size_t calculatedSize = calculateInputBufferSize(size.v.width * size.v.height);
++    // The bitstream buffer must be at least as large as the sizeimage the V4L2 driver reports
++    // for its OUTPUT queue; queryDecodingCapabilities() probes that size into this parameter's
++    // default. CCodec forwards the client's max-input-size here, so the previous value is kept
++    // as a floor: a client may ask for a larger buffer, but the driver rejects a smaller one at
++    // QBUF instead of decoding it.
++    size_t calculatedSize = std::max(calculateInputBufferSize(size.v.width * size.v.height),
++                                     static_cast<size_t>(old.v.value));
+ 
+     if (me.v.value < calculatedSize) me.set().value = calculatedSize;
+ 
+@@ -336,7 +343,7 @@ DecodeInterface::DecodeInterface(const std::string& name,
+                             C2F(mMaxInputSize, value).any(),
+                     })
+                     .withSetter(InputSizeSetter)
+-                    .calculatedAs(MaxInputBufferSizeCalculator, mSize)
++                    .withSetter(MaxInputBufferSizeCalculator, mSize)
+                     .build());
+ 
+     bool secureMode = name.find(".secure") != std::string::npos;
+diff --git a/components/include/v4l2_codec2/components/DecodeInterface.h b/components/include/v4l2_codec2/components/DecodeInterface.h
+index 7e513c5..d53b41a 100644
+--- a/components/include/v4l2_codec2/components/DecodeInterface.h
++++ b/components/include/v4l2_codec2/components/DecodeInterface.h
+@@ -42,6 +42,7 @@ private:
+     static C2R SizeSetter(bool mayBlock, C2P<C2StreamPictureSizeInfo::output>& videoSize);
+     static C2R InputSizeSetter(bool mayBlock, C2P<C2StreamMaxBufferSizeInfo::input>& inputSize);
+     static C2R MaxInputBufferSizeCalculator(bool mayBlock,
++                                            const C2P<C2StreamMaxBufferSizeInfo::input>& old,
+                                             C2P<C2StreamMaxBufferSizeInfo::input>& me,
+                                             const C2P<C2StreamPictureSizeInfo::output>& size);
+ 

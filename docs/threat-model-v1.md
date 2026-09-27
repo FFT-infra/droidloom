@@ -52,18 +52,24 @@ and `droidloomd` remain trusted computing base.
    trusted kernel interface. Validate device identities and use private inodes
    so cell permissions cannot alter host nodes. DRM card/KMS and physical input
    nodes are forbidden.
-5. Put Android networking behind a private veth and host-owned policy. Android
+5. When a cell explicitly opts into Iris decoding, identify the host node by
+   its `qcom-iris` driver and V4L2 `QUERYCAP`, then expose only a private
+   `/dev/video0` plus the system DMA heap. Do not project the host video-device
+   tree into Android. Compressed media reaches the shared-kernel Iris driver and
+   its firmware, so both are part of the trusted computing base; software stays
+   preferred until end-to-end decoding is validated.
+6. Put Android networking behind a private veth and host-owned policy. Android
    `netd` never shares host route/firewall authority.
-6. Authenticate the private compositor and lifecycle sockets with filesystem
+7. Authenticate the private compositor and lifecycle sockets with filesystem
    ownership plus peer credentials. Treat task/package identity sent by the
    Android side as untrusted until reconciled with the session service.
-7. Validate and bound every message, string, object count, dimension, file
+8. Validate and bound every message, string, object count, dimension, file
    descriptor, DMA-BUF plane, format/modifier, fence, and lifecycle transition.
-8. Apply no-new-privileges and seccomp after construction; retain only the
+9. Apply no-new-privileges and seccomp after construction; retain only the
    capabilities proven necessary for Android boot.
-9. Keep system/vendor/product immutable and package signed. `/data` is the only
-   normal mutable Android state.
-10. Make teardown idempotent and host-owned. A dead or hostile cell must not be
+10. Keep system/vendor/product immutable and package signed. `/data` is the only
+    normal mutable Android state.
+11. Make teardown idempotent and host-owned. A dead or hostile cell must not be
     needed to release its cgroup, mounts, veth, Binder instance, or buffers.
 
 ## Boundary-specific attacks

@@ -199,6 +199,7 @@ fn configuration(
             "data_dir",
             "gapps_dir",
             "shared_storage_directories",
+            "video_decoder",
             "subordinate_uids",
             "subordinate_gids",
         ] {

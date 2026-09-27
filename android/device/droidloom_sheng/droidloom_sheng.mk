@@ -7,7 +7,9 @@ PRODUCT_BRAND := Droidloom
 PRODUCT_MODEL := Droidloom sheng cell
 PRODUCT_MANUFACTURER := Droidloom
 
-PRODUCT_SOONG_NAMESPACES += vendor/droidloom
+PRODUCT_SOONG_NAMESPACES += \
+    vendor/droidloom \
+    external/v4l2_codec2
 
 PRODUCT_BUILD_SYSTEM_IMAGE := false
 PRODUCT_BUILD_SYSTEM_OTHER_IMAGE := false
@@ -90,4 +92,21 @@ PRODUCT_VENDOR_PROPERTIES += \
     dalvik.vm.heapsize=512m \
     dalvik.vm.heaptargetutilization=0.75 \
     dalvik.vm.heapminfree=512k \
-    dalvik.vm.heapmaxfree=8m
+    dalvik.vm.heapmaxfree=8m \
+    media.c2.hal.selection=aidl
+
+# A 64-bit-only cell ships no dex2oat32 in the ART apex. Without this property
+# artd selects dex2oat32, every dexopt aborts, and all applications stay on the
+# interpreter.
+PRODUCT_VENDOR_PROPERTIES += dalvik.vm.dex2oat64.enabled=true
+
+# The Iris decoders pass the AVC/HEVC/VP9/AV1 qualifier matrix, but the vendor
+# HAL stays opt-in: it is the only hardware decode path here, and every
+# advertised format has to keep passing before it becomes unconditional.
+ifeq ($(DROIDLOOM_ENABLE_EXPERIMENTAL_IRIS_CODEC2),true)
+PRODUCT_PACKAGES += droidloom-v4l2-codec2-service
+PRODUCT_COPY_FILES += \
+    vendor/droidloom/android/device/droidloom_sheng/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml
+# Must stay equal to concurrent-instances in media_codecs_c2.xml.
+PRODUCT_VENDOR_PROPERTIES += ro.vendor.v4l2_codec2.decode_concurrent_instances=4
+endif

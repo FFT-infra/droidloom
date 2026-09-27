@@ -21,7 +21,8 @@ use tempfile::Builder;
 use thiserror::Error;
 
 const MAX_LOCK_BYTES: u64 = 1024 * 1024;
-const MAX_PROJECTS: usize = 224;
+// Keep dependency growth finite while leaving room for pinned build-only projects.
+const MAX_PROJECTS: usize = 256;
 const MAX_LINKS: usize = 64;
 const MAX_SPARSE_PATHS: usize = 128;
 const OFFICIAL_REMOTE: &str = "https://android.googlesource.com/";
@@ -935,6 +936,36 @@ mod tests {
                 sparse_paths: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn project_count_limit_is_bounded_and_allows_locked_dependencies() {
+        let base = valid_lock();
+        let project = base.projects[0].clone();
+        let mut lock = base.clone();
+        lock.projects = (0..MAX_PROJECTS)
+            .map(|index| SparseProject {
+                path: format!("project/{index}").into(),
+                name: format!("platform/project-{index}"),
+                ..project.clone()
+            })
+            .collect();
+        let mut problems = Vec::new();
+        validate_projects(&lock, &mut problems);
+        assert!(problems.is_empty());
+
+        lock.projects.push(SparseProject {
+            path: "project/overflow".into(),
+            name: "platform/project-overflow".into(),
+            ..project
+        });
+        problems.clear();
+        validate_projects(&lock, &mut problems);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("projects must contain"))
+        );
     }
 
     #[test]
