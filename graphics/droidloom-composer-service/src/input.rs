@@ -10,10 +10,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use droidloom_denial_ipc::SeqPacket;
-use droidloom_denial_protocol::{InputEvent, TabletAction, TouchAction};
+use droidloom_denial_protocol::{InputEvent, MouseAction, TabletAction, TouchAction};
 use droidloom_input_protocol::{
-    MAX_POINTER_ID, encode_key, encode_tablet, encode_task_bounds, encode_task_close,
-    encode_task_focus, encode_touch,
+    MAX_POINTER_ID, encode_key, encode_mouse, encode_tablet, encode_task_bounds,
+    encode_task_close, encode_task_focus, encode_touch,
 };
 
 #[derive(Default)]
@@ -318,6 +318,10 @@ enum MotionStream {
         task: u64,
         tool_id: u32,
     },
+    Mouse {
+        display: u32,
+        task: u64,
+    },
 }
 
 struct CommandQueues {
@@ -512,6 +516,13 @@ fn motion_stream(command: &BridgeCommand) -> Option<MotionStream> {
             task: *task,
             tool_id: *tool_id,
         }),
+        InputEvent::Mouse {
+            action: MouseAction::Motion,
+            ..
+        } => Some(MotionStream::Mouse {
+            display: *android_display,
+            task: *task,
+        }),
         _ => None,
     }
 }
@@ -555,6 +566,13 @@ fn is_stream_boundary(command: &BridgeCommand, stream: MotionStream) -> bool {
         ) if display == *android_display && stream_task == *task && tool_id == *queued_id => {
             *action != TabletAction::Motion
         }
+        (
+            MotionStream::Mouse {
+                display,
+                task: stream_task,
+            },
+            InputEvent::Mouse { action, .. },
+        ) if display == *android_display && stream_task == *task => *action != MouseAction::Motion,
         _ => false,
     }
 }
@@ -787,6 +805,28 @@ impl BridgeState {
                     self.send_record(path, &proximity)?;
                 }
                 Ok(record)
+            }
+            InputEvent::Mouse {
+                action,
+                x_fixed,
+                y_fixed,
+                button,
+                scroll_x_fixed,
+                scroll_y_fixed,
+            } => {
+                let x_fixed = scale_fixed_coordinate(x_fixed, scale_numerator, scale_denominator)?;
+                let y_fixed = scale_fixed_coordinate(y_fixed, scale_numerator, scale_denominator)?;
+                encode_mouse(
+                    android_display,
+                    task,
+                    timestamp_nanos,
+                    action as u8,
+                    x_fixed,
+                    y_fixed,
+                    button,
+                    scroll_x_fixed,
+                    scroll_y_fixed,
+                )
             }
             InputEvent::Navigation { .. } => {
                 return Err("navigation injection is not implemented yet".to_owned());
@@ -1339,6 +1379,62 @@ mod tests {
         let started = Instant::now();
         assert!(writer.send_record(&filler, &[]).is_err());
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn mouse_motion_coalesces_only_between_mouse_transitions() {
+        let mouse = |action, x: i32| InputEvent::Mouse {
+            action,
+            x_fixed: x << 16,
+            y_fixed: 0,
+            button: if matches!(action, MouseAction::ButtonPress) { 0x110 } else { 0 },
+            scroll_x_fixed: 0,
+            scroll_y_fixed: 0,
+        };
+        let bridge = InputBridge::with_capacity_for_test(4, 1);
+        bridge.send(1, 0, 7, 1, 1, 1, mouse(MouseAction::Motion, 1)).unwrap();
+        bridge.send(2, 0, 7, 1, 1, 2, mouse(MouseAction::ButtonPress, 2)).unwrap();
+        bridge.send(3, 0, 7, 1, 1, 3, mouse(MouseAction::Motion, 3)).unwrap();
+        // The queue is past its coalescing threshold, so this motion replaces
+        // the pending one after the press instead of crossing it.
+        bridge.send(4, 0, 7, 1, 1, 4, mouse(MouseAction::Motion, 4)).unwrap();
+        let mut serials = Vec::new();
+        while let Some(BridgeCommand::Input { route_serial, .. }) = bridge.queue.try_pop() {
+            serials.push(route_serial);
+        }
+        assert_eq!(serials, [1, 2, 4]);
+    }
+
+    #[test]
+    fn mouse_records_carry_scaled_coordinates_and_raw_scroll() {
+        let (sender, receiver) = SeqPacket::pair().unwrap();
+        let mut state = BridgeState::default();
+        state.socket = Some(sender);
+        state
+            .send(
+                Path::new("/unused"),
+                1,
+                0,
+                29,
+                2,
+                1,
+                5,
+                InputEvent::Mouse {
+                    action: MouseAction::Scroll,
+                    x_fixed: 100 << 16,
+                    y_fixed: 50 << 16,
+                    button: 0,
+                    scroll_x_fixed: 0,
+                    scroll_y_fixed: -(2 << 16),
+                },
+            )
+            .unwrap();
+        let record = receiver.receive_record().unwrap().bytes;
+        assert_eq!(record[6], droidloom_input_protocol::KIND_MOUSE);
+        assert_eq!(record[7], MouseAction::Scroll as u8);
+        assert_eq!(&record[24..28], &(200_i32 << 16).to_le_bytes());
+        assert_eq!(&record[28..32], &(100_i32 << 16).to_le_bytes());
+        assert_eq!(&record[36..40], &(-(2_i32 << 16)).to_le_bytes());
     }
 
     #[test]

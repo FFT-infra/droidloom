@@ -1,8 +1,8 @@
 //! Fixed-size, descriptor-free records for the Android framework bridge.
 //!
 //! The Wayland compositor remains the physical-input authority. This protocol
-//! carries touch and keyboard events already routed to one authenticated
-//! Android task surface.
+//! carries touch, tablet, mouse and keyboard events already routed to one
+//! authenticated Android task surface.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -12,7 +12,7 @@ use core::fmt;
 /// Marker at the start of every input record.
 pub const MAGIC: [u8; 4] = *b"DLIN";
 /// Wire protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 6;
+pub const PROTOCOL_MAJOR: u16 = 7;
 
 /// Build metadata retained by the native sender for offline package verification.
 pub const BUILD_COMPATIBILITY: [u8; 26] = compatibility_marker(PROTOCOL_MAJOR);
@@ -45,6 +45,22 @@ pub const KIND_TASK_FOCUS: u8 = 4;
 pub const KIND_TASK_CLOSE: u8 = 5;
 /// Record kind for one graphics-tablet tool update.
 pub const KIND_TABLET: u8 = 6;
+/// Record kind for one mouse pointer update.
+pub const KIND_MOUSE: u8 = 7;
+/// Mouse action: pointer entered a task surface.
+pub const MOUSE_ACTION_ENTER: u8 = 0;
+/// Mouse action: pointer moved over a task surface.
+pub const MOUSE_ACTION_MOTION: u8 = 1;
+/// Mouse action: pointer left a task surface.
+pub const MOUSE_ACTION_LEAVE: u8 = 2;
+/// Mouse action: one button was pressed.
+pub const MOUSE_ACTION_BUTTON_PRESS: u8 = 3;
+/// Mouse action: one button was released.
+pub const MOUSE_ACTION_BUTTON_RELEASE: u8 = 4;
+/// Mouse action: wheel or touchpad scroll.
+pub const MOUSE_ACTION_SCROLL: u8 = 5;
+/// Mouse action: cancel the pointer stream and release every button.
+pub const MOUSE_ACTION_CANCEL: u8 = 6;
 /// Tablet action: tool entered proximity of a task surface.
 pub const TABLET_ACTION_PROXIMITY_IN: u8 = 0;
 /// Tablet action: hover or in-contact motion update.
@@ -400,6 +416,58 @@ pub fn encode_tablet(
     Ok(record)
 }
 
+/// Encode one routed mouse pointer update.
+///
+/// Coordinates and scroll deltas use signed 16.16 values. Scroll deltas count
+/// wheel detents and follow the Wayland sign convention: positive is right or
+/// down. `button` is the Linux evdev button code for press and release.
+///
+/// # Errors
+///
+/// Rejects display and task identities Android cannot represent and unknown
+/// actions.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mouse(
+    android_display: u32,
+    task_id: u64,
+    timestamp_nanos: u64,
+    action: u8,
+    x_fixed: i32,
+    y_fixed: i32,
+    button: u32,
+    scroll_x_fixed: i32,
+    scroll_y_fixed: i32,
+) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if android_display > i32::MAX as u32 {
+        return Err(InputProtocolError::AndroidDisplay);
+    }
+    let task_id = u32::try_from(task_id).map_err(|_| InputProtocolError::TaskId)?;
+    if task_id == 0 || task_id > i32::MAX as u32 {
+        return Err(InputProtocolError::TaskId);
+    }
+    if action > MOUSE_ACTION_CANCEL {
+        return Err(InputProtocolError::Action);
+    }
+    if button > MAX_EVDEV_KEYCODE {
+        return Err(InputProtocolError::KeyCode);
+    }
+
+    let mut record = [0_u8; RECORD_BYTES];
+    record[0..4].copy_from_slice(&MAGIC);
+    record[4..6].copy_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
+    record[6] = KIND_MOUSE;
+    record[7] = action;
+    record[8..12].copy_from_slice(&android_display.to_le_bytes());
+    record[12..16].copy_from_slice(&button.to_le_bytes());
+    record[16..24].copy_from_slice(&timestamp_nanos.to_le_bytes());
+    record[24..28].copy_from_slice(&x_fixed.to_le_bytes());
+    record[28..32].copy_from_slice(&y_fixed.to_le_bytes());
+    record[32..36].copy_from_slice(&scroll_x_fixed.to_le_bytes());
+    record[36..40].copy_from_slice(&scroll_y_fixed.to_le_bytes());
+    record[40..44].copy_from_slice(&task_id.to_le_bytes());
+    Ok(record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +556,52 @@ mod tests {
         assert_eq!(record[60], TABLET_TOOL_ERASER);
         assert_eq!(record[61], TABLET_AXIS_PRESSURE | TABLET_AXIS_TILT);
         assert!(record[62..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn mouse_record_has_stable_little_endian_layout() {
+        let record = encode_mouse(
+            3,
+            29,
+            0x0102_0304_0506_0708,
+            MOUSE_ACTION_SCROLL,
+            0x0012_8000,
+            0x0034_4000,
+            0x111,
+            -(1 << 15),
+            3 << 16,
+        )
+        .unwrap();
+
+        assert_eq!(&record[0..4], b"DLIN");
+        assert_eq!(&record[4..6], &PROTOCOL_MAJOR.to_le_bytes());
+        assert_eq!(record[6], KIND_MOUSE);
+        assert_eq!(record[7], MOUSE_ACTION_SCROLL);
+        assert_eq!(&record[8..12], &3_u32.to_le_bytes());
+        assert_eq!(&record[12..16], &0x111_u32.to_le_bytes());
+        assert_eq!(&record[16..24], &0x0102_0304_0506_0708_u64.to_le_bytes());
+        assert_eq!(&record[24..28], &0x0012_8000_i32.to_le_bytes());
+        assert_eq!(&record[28..32], &0x0034_4000_i32.to_le_bytes());
+        assert_eq!(&record[32..36], &(-(1_i32 << 15)).to_le_bytes());
+        assert_eq!(&record[36..40], &(3_i32 << 16).to_le_bytes());
+        assert_eq!(&record[40..44], &29_u32.to_le_bytes());
+        assert!(record[44..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn invalid_mouse_records_fail_closed() {
+        assert_eq!(
+            encode_mouse(0, 29, 1, MOUSE_ACTION_CANCEL + 1, 0, 0, 0, 0, 0),
+            Err(InputProtocolError::Action)
+        );
+        assert_eq!(
+            encode_mouse(0, 0, 1, MOUSE_ACTION_MOTION, 0, 0, 0, 0, 0),
+            Err(InputProtocolError::TaskId)
+        );
+        assert_eq!(
+            encode_mouse(0, 29, 1, MOUSE_ACTION_BUTTON_PRESS, 0, 0, MAX_EVDEV_KEYCODE + 1, 0, 0),
+            Err(InputProtocolError::KeyCode)
+        );
     }
 
     #[test]

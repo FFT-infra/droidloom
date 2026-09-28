@@ -20,7 +20,11 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MINOR: u16 = 6;
+/// Minor that introduced graphics-tablet input.
+pub const TABLET_PROTOCOL_MINOR: u16 = 5;
+/// Minor that introduced mouse pointer input.
+pub const MOUSE_PROTOCOL_MINOR: u16 = 6;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
 /// Fixed wire-header size.
@@ -64,6 +68,8 @@ pub mod capability {
     pub const TASK_ACTIVATION: u64 = 1 << 8;
     /// Denial can route graphics-tablet pen and eraser events to Android.
     pub const TABLET_INPUT: u64 = 1 << 9;
+    /// Denial can route mouse pointer, button and scroll events to Android.
+    pub const MOUSE_INPUT: u64 = 1 << 10;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -484,6 +490,21 @@ pub enum InputEvent {
         /// Bitmask of axes valid for this sample.
         axis_flags: u8,
     },
+    /// One mouse pointer update over a task surface.
+    Mouse {
+        /// Pointer operation.
+        action: MouseAction,
+        /// Logical x coordinate in signed 16.16 fixed point.
+        x_fixed: i32,
+        /// Logical y coordinate in signed 16.16 fixed point.
+        y_fixed: i32,
+        /// Linux evdev button code for press and release events, else zero.
+        button: u32,
+        /// Horizontal scroll in signed 16.16 wheel detents; positive is right.
+        scroll_x_fixed: i32,
+        /// Vertical scroll in signed 16.16 wheel detents; positive is down.
+        scroll_y_fixed: i32,
+    },
 }
 
 /// Touch contact operation.
@@ -532,6 +553,26 @@ pub enum TabletAction {
     Cancel = 7,
     /// Wheel or ring motion.
     Wheel = 8,
+}
+
+/// Mouse pointer operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum MouseAction {
+    /// Pointer entered the task surface.
+    Enter = 0,
+    /// Pointer moved over the task surface.
+    Motion = 1,
+    /// Pointer left the task surface.
+    Leave = 2,
+    /// One button was pressed.
+    ButtonPress = 3,
+    /// One button was released.
+    ButtonRelease = 4,
+    /// Wheel or touchpad scroll.
+    Scroll = 5,
+    /// Cancel the current pointer stream and release every button.
+    Cancel = 6,
 }
 
 /// Graphics-tablet tool type.
@@ -1227,6 +1268,7 @@ const OP_PING: u16 = 0x800b;
 const OP_REGISTER_RENDER_TARGET: u16 = 0x800c;
 const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
 const OP_TABLET_INPUT: u16 = 0x800e;
+const OP_MOUSE_INPUT: u16 = 0x800f;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1757,6 +1799,10 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
                     encode_tablet_input(&mut payload, *event);
                     OP_TABLET_INPUT
                 }
+                InputEvent::Mouse { .. } => {
+                    encode_mouse_input(&mut payload, *event);
+                    OP_MOUSE_INPUT
+                }
                 _ => {
                     encode_input(&mut payload, *event);
                     OP_INPUT
@@ -1975,15 +2021,15 @@ pub fn decode_denial(
                 flags,
             }
         }
-        OP_INPUT | OP_TABLET_INPUT => {
+        OP_INPUT | OP_TABLET_INPUT | OP_MOUSE_INPUT => {
             valid_object(object)?;
             let serial = payload.u64()?;
             nonzero("input serial", serial)?;
             let timestamp_nanos = payload.u64()?;
-            let event = if header.opcode == OP_TABLET_INPUT {
-                decode_tablet_input(&mut payload)?
-            } else {
-                decode_input(&mut payload)?
+            let event = match header.opcode {
+                OP_TABLET_INPUT => decode_tablet_input(&mut payload)?,
+                OP_MOUSE_INPUT => decode_mouse_input(&mut payload)?,
+                _ => decode_input(&mut payload)?,
             };
             if header.opcode == OP_INPUT && matches!(event, InputEvent::Tablet { .. }) {
                 return Err(WireError::InvalidEnum {
@@ -2162,7 +2208,8 @@ fn finish_packet(
     // each newer opcode at the minor that introduced it.
     let minor = match opcode {
         OP_REQUEST_ACTIVATION => 4,
-        OP_TABLET_INPUT => PROTOCOL_MINOR,
+        OP_TABLET_INPUT => TABLET_PROTOCOL_MINOR,
+        OP_MOUSE_INPUT => MOUSE_PROTOCOL_MINOR,
         _ => BASE_PROTOCOL_MINOR,
     };
     bytes.extend_from_slice(&minor.to_le_bytes());
@@ -2195,7 +2242,8 @@ fn parse_header(packet: &[u8], received_descriptors: usize) -> Result<Header<'_>
     let opcode = reader.u16()?;
     let minimum_minor = match opcode {
         OP_REQUEST_ACTIVATION => 4,
-        OP_TABLET_INPUT => PROTOCOL_MINOR,
+        OP_TABLET_INPUT => TABLET_PROTOCOL_MINOR,
+        OP_MOUSE_INPUT => MOUSE_PROTOCOL_MINOR,
         _ => BASE_PROTOCOL_MINOR,
     };
     if minor < minimum_minor {
@@ -2342,6 +2390,37 @@ fn decode_tablet_input(payload: &mut Reader<'_>) -> Result<InputEvent, WireError
     })
 }
 
+fn encode_mouse_input(payload: &mut Writer, event: InputEvent) {
+    let InputEvent::Mouse {
+        action,
+        x_fixed,
+        y_fixed,
+        button,
+        scroll_x_fixed,
+        scroll_y_fixed,
+    } = event
+    else {
+        unreachable!("mouse encoder called for a non-mouse event");
+    };
+    payload.u8(action as u8);
+    payload.i32(x_fixed);
+    payload.i32(y_fixed);
+    payload.u32(button);
+    payload.i32(scroll_x_fixed);
+    payload.i32(scroll_y_fixed);
+}
+
+fn decode_mouse_input(payload: &mut Reader<'_>) -> Result<InputEvent, WireError> {
+    Ok(InputEvent::Mouse {
+        action: decode_mouse_action(payload.u8()?)?,
+        x_fixed: payload.i32()?,
+        y_fixed: payload.i32()?,
+        button: payload.u32()?,
+        scroll_x_fixed: payload.i32()?,
+        scroll_y_fixed: payload.i32()?,
+    })
+}
+
 fn encode_input(payload: &mut Writer, event: InputEvent) {
     match event {
         InputEvent::Touch {
@@ -2372,8 +2451,8 @@ fn encode_input(payload: &mut Writer, event: InputEvent) {
             payload.u8(2);
             payload.u8(action as u8);
         }
-        InputEvent::Tablet { .. } => {
-            unreachable!("legacy input encoder called for a tablet event");
+        InputEvent::Tablet { .. } | InputEvent::Mouse { .. } => {
+            unreachable!("legacy input encoder called for a typed-opcode event");
         }
     }
 }
@@ -2588,6 +2667,15 @@ decode_enum!(decode_tablet_action, u8 => TabletAction, "tablet action", {
     7 => TabletAction::Cancel,
     8 => TabletAction::Wheel,
 });
+decode_enum!(decode_mouse_action, u8 => MouseAction, "mouse action", {
+    0 => MouseAction::Enter,
+    1 => MouseAction::Motion,
+    2 => MouseAction::Leave,
+    3 => MouseAction::ButtonPress,
+    4 => MouseAction::ButtonRelease,
+    5 => MouseAction::Scroll,
+    6 => MouseAction::Cancel,
+});
 decode_enum!(decode_tablet_tool_type, u8 => TabletToolType, "tablet tool type", {
     0 => TabletToolType::Pen,
     1 => TabletToolType::Eraser,
@@ -2703,10 +2791,32 @@ mod tests {
             },
         }).unwrap();
         let mut packet = tablet.bytes;
+        assert_eq!(&packet[6..8], &TABLET_PROTOCOL_MINOR.to_le_bytes());
         packet[6..8].copy_from_slice(&BASE_PROTOCOL_MINOR.to_le_bytes());
         assert!(matches!(
             decode_denial(&packet, 0),
             Err(WireError::UnsupportedVersion { minor: BASE_PROTOCOL_MINOR, .. })
+        ));
+
+        let mouse = encode_denial(&DenialMessage::Input {
+            object: OBJECT,
+            serial: 1,
+            timestamp_nanos: 1,
+            event: InputEvent::Mouse {
+                action: MouseAction::Enter,
+                x_fixed: 0,
+                y_fixed: 0,
+                button: 0,
+                scroll_x_fixed: 0,
+                scroll_y_fixed: 0,
+            },
+        }).unwrap();
+        let mut packet = mouse.bytes;
+        assert_eq!(&packet[6..8], &MOUSE_PROTOCOL_MINOR.to_le_bytes());
+        packet[6..8].copy_from_slice(&TABLET_PROTOCOL_MINOR.to_le_bytes());
+        assert!(matches!(
+            decode_denial(&packet, 0),
+            Err(WireError::UnsupportedVersion { minor: TABLET_PROTOCOL_MINOR, .. })
         ));
     }
 
@@ -2920,6 +3030,22 @@ mod tests {
                 wheel_degrees_fixed: 0,
                 button: 0,
                 axis_flags: 1 | 4,
+            },
+            InputEvent::Mouse {
+                action: MouseAction::ButtonPress,
+                x_fixed: 12 << 16,
+                y_fixed: 34 << 16,
+                button: 0x111,
+                scroll_x_fixed: 0,
+                scroll_y_fixed: 0,
+            },
+            InputEvent::Mouse {
+                action: MouseAction::Scroll,
+                x_fixed: 12 << 16,
+                y_fixed: 34 << 16,
+                button: 0,
+                scroll_x_fixed: -(1 << 15),
+                scroll_y_fixed: 3 << 16,
             },
         ] {
             round_trip_denial(&DenialMessage::Input {

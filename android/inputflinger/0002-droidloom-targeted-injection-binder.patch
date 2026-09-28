@@ -1,5 +1,5 @@
 diff --git a/services/inputflinger/InputManager.cpp b/services/inputflinger/InputManager.cpp
-index 469a616..57f28dc 100644
+index 469a616..66a8481 100644
 --- a/services/inputflinger/InputManager.cpp
 +++ b/services/inputflinger/InputManager.cpp
 @@ -18,7 +18,11 @@
@@ -152,19 +152,20 @@ index b1133fd..02c0cb7 100644
      binder::Status createInputChannel(const std::string& name,
                                        android::os::InputChannelCore* outChannel) override;
 diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/reader/EventHub.cpp
-index 2ac37b6..cb56f03 100644
+index ca79fc5..0929f5c 100644
 --- a/services/inputflinger/reader/EventHub.cpp
 +++ b/services/inputflinger/reader/EventHub.cpp
-@@ -2967,6 +2967,25 @@ void EventHub::createVirtualKeyboardLocked() {
+@@ -2967,6 +2967,26 @@ void EventHub::createVirtualKeyboardLocked() {
              InputDeviceClass::DPAD | InputDeviceClass::VIRTUAL;
      device->loadKeyMapLocked();
      addDeviceLocked(std::move(device));
 +
 +    // Droidloom's real keyboard remains owned and routed by Denial. Advertise
-+    // that host capability as a positive Android input-device identity so the
-+    // framework selects hardware-keyboard mode without exposing /dev/input or
-+    // /dev/uinput to the Android cell. Actual key events still use the exact
-+    // task-token injection path above.
++    // that host capability as a positive, external Android input-device
++    // identity so the framework selects hardware-keyboard mode without exposing
++    // /dev/input or /dev/uinput to the Android cell. Routed key events carry
++    // this device's ID through the task-token injection path, so applications
++    // see the same attached keyboard a directly connected one would present.
 +    InputDeviceIdentifier hostKeyboardIdentifier;
 +    hostKeyboardIdentifier.name = "Droidloom Host Keyboard";
 +    hostKeyboardIdentifier.location = "droidloom/host-keyboard";
@@ -175,7 +176,7 @@ index 2ac37b6..cb56f03 100644
 +            -1, mNextDeviceId++, "<droidloom-host-keyboard>", hostKeyboardIdentifier,
 +            /*associatedDevice=*/nullptr);
 +    hostKeyboard->classes = InputDeviceClass::KEYBOARD | InputDeviceClass::ALPHAKEY |
-+            InputDeviceClass::DPAD | InputDeviceClass::VIRTUAL;
++            InputDeviceClass::DPAD | InputDeviceClass::EXTERNAL;
 +    hostKeyboard->loadKeyMapLocked();
 +    addDeviceLocked(std::move(hostKeyboard));
  }

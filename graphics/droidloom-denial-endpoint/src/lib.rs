@@ -17,7 +17,7 @@ use droidloom_denial_ipc::{
 use droidloom_denial_protocol::{
     AcceptedWireFrame, AndroidDisplayId, AndroidMessage, AndroidTaskId, BufferId, BufferMetadata,
     DenialMessage, DescriptorKind, FormatModifier, FrameId, InputEvent, MAX_BUFFERS_PER_TASK,
-    MAX_DAMAGE_RECTS, MAX_TASK_OBJECTS, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolErrorCode,
+    MAX_DAMAGE_RECTS, MAX_TASK_OBJECTS, PROTOCOL_MAJOR, ProtocolErrorCode,
     TaskObjectId, TaskPresentationState, TaskStateError, Visibility, capability,
 };
 use droidloom_syncobj::{DenialTaskTimelines, SyncobjDevice, SyncobjError};
@@ -297,8 +297,9 @@ pub struct DenialEndpoint {
     receive_buffer: Box<[u8]>,
     device: SyncobjDevice,
     ready: bool,
-    activation_requests: bool,
-    tablet_input: bool,
+    /// Optional capabilities: the host's opt-ins before the handshake, then
+    /// the subset the peer also supports.
+    optional: u64,
     tasks: BTreeMap<TaskObjectId, TaskEndpoint>,
 }
 
@@ -311,8 +312,7 @@ impl DenialEndpoint {
             receive_buffer: vec![0; droidloom_denial_protocol::MAX_PACKET_BYTES].into_boxed_slice(),
             device,
             ready: false,
-            activation_requests: false,
-            tablet_input: false,
+            optional: 0,
             tasks: BTreeMap::new(),
         }
     }
@@ -321,7 +321,7 @@ impl DenialEndpoint {
     #[must_use]
     pub fn with_activation_requests(mut self) -> Self {
         assert!(!self.ready, "activation must be configured before handshake");
-        self.activation_requests = true;
+        self.optional |= capability::TASK_ACTIVATION;
         self
     }
 
@@ -329,13 +329,26 @@ impl DenialEndpoint {
     #[must_use]
     pub fn with_tablet_input(mut self) -> Self {
         assert!(!self.ready, "tablet input must be configured before handshake");
-        self.tablet_input = true;
+        self.optional |= capability::TABLET_INPUT;
         self
     }
 
     /// Whether the handshake negotiated tablet input with the peer.
     pub fn supports_tablet_input(&self) -> bool {
-        self.ready && self.tablet_input
+        self.ready && self.optional & capability::TABLET_INPUT != 0
+    }
+
+    /// Opt in to the mouse pointer input opcode and capability.
+    #[must_use]
+    pub fn with_mouse_input(mut self) -> Self {
+        assert!(!self.ready, "mouse input must be configured before handshake");
+        self.optional |= capability::MOUSE_INPUT;
+        self
+    }
+
+    /// Whether the handshake negotiated mouse pointer input with the peer.
+    pub fn supports_mouse_input(&self) -> bool {
+        self.ready && self.optional & capability::MOUSE_INPUT != 0
     }
 
     /// Borrow the socket for calloop registration and peer diagnostics.
@@ -413,7 +426,9 @@ impl DenialEndpoint {
                 Ok(EndpointAction::SetFrameRate { object, millihz })
             }
             AndroidMessage::RequestActivation { object } => {
-                if !self.activation_requests { return Err(EndpointError::IncompatibleClient); }
+                if self.optional & capability::TASK_ACTIVATION == 0 {
+                    return Err(EndpointError::IncompatibleClient);
+                }
                 if self.task(object)?.task.is_none() {
                     return Err(EndpointError::UnknownObject(object));
                 }
@@ -580,7 +595,12 @@ impl DenialEndpoint {
         event: InputEvent,
     ) -> Result<(), EndpointError> {
         self.task(object)?;
-        if matches!(event, InputEvent::Tablet { .. }) && !self.tablet_input {
+        let required = match event {
+            InputEvent::Tablet { .. } => capability::TABLET_INPUT,
+            InputEvent::Mouse { .. } => capability::MOUSE_INPUT,
+            _ => 0,
+        };
+        if self.optional & required != required {
             return Err(EndpointError::IncompatibleClient);
         }
         self.socket.send_denial(&DenialMessage::Input {
@@ -778,11 +798,12 @@ impl DenialEndpoint {
         {
             return Err(EndpointError::IncompatibleClient);
         }
-        self.activation_requests &= capabilities & capability::TASK_ACTIVATION != 0;
-        self.tablet_input &= capabilities & capability::TABLET_INPUT != 0;
-        let minor = if self.tablet_input {
-            PROTOCOL_MINOR
-        } else if self.activation_requests {
+        self.optional &= capabilities;
+        let minor = if self.optional & capability::MOUSE_INPUT != 0 {
+            droidloom_denial_protocol::MOUSE_PROTOCOL_MINOR
+        } else if self.optional & capability::TABLET_INPUT != 0 {
+            droidloom_denial_protocol::TABLET_PROTOCOL_MINOR
+        } else if self.optional & capability::TASK_ACTIVATION != 0 {
             4
         } else {
             droidloom_denial_protocol::BASE_PROTOCOL_MINOR
@@ -790,9 +811,7 @@ impl DenialEndpoint {
         self.socket.send_denial(&DenialMessage::ServerHello {
             major: PROTOCOL_MAJOR,
             minor,
-            capabilities: capability::REQUIRED_V1
-                | if self.activation_requests { capability::TASK_ACTIVATION } else { 0 }
-                | if self.tablet_input { capability::TABLET_INPUT } else { 0 },
+            capabilities: capability::REQUIRED_V1 | self.optional,
             max_task_objects: MAX_TASK_OBJECTS,
             max_buffers_per_task: MAX_BUFFERS_PER_TASK,
             max_damage_rects: u32::try_from(MAX_DAMAGE_RECTS).unwrap_or(u32::MAX),
@@ -1187,6 +1206,31 @@ mod tests {
                     android.receive_denial().unwrap().message else { panic!("missing hello") };
                 assert_eq!(capabilities & capability::TABLET_INPUT != 0, host && client);
                 assert_eq!(minor, if host && client { 5 } else { 3 });
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_capability_is_negotiated_independently_of_tablet_input() {
+        for host in [false, true] {
+            for client in [false, true] {
+                let (android, endpoint) = pair();
+                let mut endpoint = endpoint.with_tablet_input();
+                if host {
+                    endpoint = endpoint.with_mouse_input();
+                }
+                android.send_android(&AndroidMessage::ClientHello {
+                    min_major: 1, max_major: 1,
+                    capabilities: capability::REQUIRED_V1 | capability::TABLET_INPUT
+                        | if client { capability::MOUSE_INPUT } else { 0 },
+                }, &[]).unwrap();
+                endpoint.receive_action().unwrap();
+                let DenialMessage::ServerHello { capabilities, minor, .. } =
+                    android.receive_denial().unwrap().message else { panic!("missing hello") };
+                assert_eq!(capabilities & capability::MOUSE_INPUT != 0, host && client);
+                assert_ne!(capabilities & capability::TABLET_INPUT, 0);
+                assert_eq!(endpoint.supports_mouse_input(), host && client);
+                assert_eq!(minor, if host && client { 6 } else { 5 });
             }
         }
     }

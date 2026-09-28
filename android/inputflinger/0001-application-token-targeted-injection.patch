@@ -34,7 +34,7 @@ index 8225dec..49740f3 100644
  
  } // namespace inputdispatcher
 diff --git a/services/inputflinger/dispatcher/InputDispatcher.cpp b/services/inputflinger/dispatcher/InputDispatcher.cpp
-index 0d27a09..1618e58 100644
+index 0d27a09..9333027 100644
 --- a/services/inputflinger/dispatcher/InputDispatcher.cpp
 +++ b/services/inputflinger/dispatcher/InputDispatcher.cpp
 @@ -611,16 +611,24 @@ bool isWindowOwnedBy(const sp<WindowInfoHandle>& windowHandle, gui::Pid pid, gui
@@ -236,10 +236,17 @@ index 0d27a09..1618e58 100644
      Result<void> eventValidation = validateInputEvent(*event);
      if (!eventValidation.ok()) {
          LOG(INFO) << "Injection failed: invalid event: " << eventValidation.error();
-@@ -4971,10 +5038,26 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
+@@ -4971,10 +5038,40 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
      DeviceId resolvedDeviceId = VIRTUAL_KEYBOARD_ID;
      if (policyFlags & POLICY_FLAG_FILTERED) {
          resolvedDeviceId = event->getDeviceId();
++    } else if (targetApplicationToken != nullptr && event->getType() == InputEventType::KEY &&
++               event->getDeviceId() > 0) {
++        // Droidloom routes the host keyboard as Android's registered host
++        // keyboard device. Keeping its ID lets applications resolve the
++        // hardware keyboard, its character map and its type from the event,
++        // exactly as they would for a directly attached keyboard.
++        resolvedDeviceId = event->getDeviceId();
 +    } else if (targetApplicationToken != nullptr && event->getType() == InputEventType::MOTION) {
 +        const MotionEvent& motion = static_cast<const MotionEvent&>(*event);
 +        if (isFromSource(motion.getSource(), AINPUT_SOURCE_STYLUS)) {
@@ -254,6 +261,13 @@ index 0d27a09..1618e58 100644
 +                return InputEventInjectionResult::FAILED;
 +            }
 +            resolvedDeviceId = DROIDLOOM_STYLUS_DEVICE_ID_BASE - pointerId;
++        } else if (isFromSource(motion.getSource(), AINPUT_SOURCE_MOUSE)) {
++            // The host mouse hovers, clicks and scrolls independently of
++            // Droidloom's injected touch and stylus streams.
++            if (motion.getPointerCount() != 1) {
++                return InputEventInjectionResult::FAILED;
++            }
++            resolvedDeviceId = DROIDLOOM_MOUSE_DEVICE_ID;
 +        }
      }
  
@@ -264,7 +278,7 @@ index 0d27a09..1618e58 100644
  
      std::queue<std::unique_ptr<EventEntry>> injectedEntries;
      switch (event->getType()) {
-@@ -5593,20 +5676,31 @@ bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
+@@ -5593,20 +5690,31 @@ bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
          return false;
      }
  
@@ -339,34 +353,33 @@ index a53f492..6be2824 100644
          TouchOcclusionInfo computeTouchOcclusionInfo(
                  const sp<android::gui::WindowInfoHandle>& windowHandle, float x, float y) const;
 diff --git a/services/inputflinger/dispatcher/InputState.cpp b/services/inputflinger/dispatcher/InputState.cpp
-index ccf564b..57b7971 100644
+index ccf564b..a3c0813 100644
 --- a/services/inputflinger/dispatcher/InputState.cpp
 +++ b/services/inputflinger/dispatcher/InputState.cpp
-@@ -25,6 +25,31 @@
+@@ -25,6 +25,30 @@
  
  namespace android::inputdispatcher {
  
 +namespace {
 +
-+// Only Droidloom-targeted stylus injection uses this reserved device range.
-+// Preserve its independent stream alongside Droidloom's injected touchscreen
-+// and other targeted stylus tools, even on builds that disable the general
-+// multi-device same-window feature flag.
++// Only Droidloom-targeted stylus and mouse injection use these reserved device
++// IDs. Preserve each independent stream alongside Droidloom's injected
++// touchscreen and the other targeted tools, even on builds that disable the
++// general multi-device same-window feature flag.
 +bool isDroidloomParallelVirtualStream(DeviceId firstId, uint32_t firstSource,
 +                                      DeviceId secondId, uint32_t secondSource) {
-+    const auto isDroidloomStylus = [](DeviceId id, uint32_t source) {
-+        return id <= DROIDLOOM_STYLUS_DEVICE_ID_BASE &&
++    const auto isDroidloomVirtual = [](DeviceId id, uint32_t source) {
++        const bool stylus = id <= DROIDLOOM_STYLUS_DEVICE_ID_BASE &&
 +                id >= DROIDLOOM_STYLUS_DEVICE_ID_BASE - MAX_POINTER_ID &&
 +                isFromSource(source, AINPUT_SOURCE_STYLUS);
++        const bool mouse =
++                id == DROIDLOOM_MOUSE_DEVICE_ID && isFromSource(source, AINPUT_SOURCE_MOUSE);
++        const bool injectedTouch =
++                id == VIRTUAL_KEYBOARD_ID && isFromSource(source, AINPUT_SOURCE_TOUCHSCREEN);
++        return stylus || mouse || injectedTouch;
 +    };
-+    const auto isInjectedTouch = [](DeviceId id, uint32_t source) {
-+        return id == VIRTUAL_KEYBOARD_ID && isFromSource(source, AINPUT_SOURCE_TOUCHSCREEN);
-+    };
-+    const bool firstStylus = isDroidloomStylus(firstId, firstSource);
-+    const bool secondStylus = isDroidloomStylus(secondId, secondSource);
-+    return firstId != secondId &&
-+            ((firstStylus && (secondStylus || isInjectedTouch(secondId, secondSource))) ||
-+             (secondStylus && isInjectedTouch(firstId, firstSource)));
++    return firstId != secondId && isDroidloomVirtual(firstId, firstSource) &&
++            isDroidloomVirtual(secondId, secondSource);
 +}
 +
 +} // namespace
@@ -374,7 +387,7 @@ index ccf564b..57b7971 100644
  InputState::InputState(const IdGenerator& idGenerator) : mIdGenerator(idGenerator) {}
  
  InputState::~InputState() {}
-@@ -101,7 +126,10 @@ bool InputState::trackMotion(const MotionEntry& entry, ftl::Flags<MotionFlag> fl
+@@ -101,7 +125,10 @@ bool InputState::trackMotion(const MotionEntry& entry, ftl::Flags<MotionFlag> fl
          if (!mMotionMementos.empty()) {
              const MotionMemento& lastMemento = mMotionMementos.back();
              if (isStylusEvent(lastMemento.source, lastMemento.pointerProperties) &&
@@ -386,7 +399,7 @@ index ccf564b..57b7971 100644
                  // We already have a stylus stream, and the new event is not from stylus.
                  return false;
              }
-@@ -355,6 +383,12 @@ bool InputState::shouldCancelPreviousStream(const MotionEntry& motionEntry) cons
+@@ -355,6 +382,12 @@ bool InputState::shouldCancelPreviousStream(const MotionEntry& motionEntry) cons
          return false;
      }
  
@@ -400,23 +413,25 @@ index ccf564b..57b7971 100644
          if (isStylusEvent(lastMemento.source, lastMemento.pointerProperties)) {
              // A stylus is already active.
 diff --git a/services/inputflinger/dispatcher/InputState.h b/services/inputflinger/dispatcher/InputState.h
-index e41c4c1..0653872 100644
+index e41c4c1..833e54d 100644
 --- a/services/inputflinger/dispatcher/InputState.h
 +++ b/services/inputflinger/dispatcher/InputState.h
-@@ -27,6 +27,8 @@ namespace android {
+@@ -27,6 +27,10 @@ namespace android {
  namespace inputdispatcher {
  
  static constexpr int32_t INVALID_POINTER_INDEX = -1;
 +// Droidloom assigns one virtual device to each targeted injected stylus tool.
 +static constexpr DeviceId DROIDLOOM_STYLUS_DEVICE_ID_BASE = -1024;
++// Droidloom's targeted injected host mouse uses one reserved virtual device.
++static constexpr DeviceId DROIDLOOM_MOUSE_DEVICE_ID = -1100;
  
  /* Tracks dispatched key and motion event state so that cancellation events can be
   * synthesized when events are dropped. */
 diff --git a/services/inputflinger/tests/InputDispatcher_test.cpp b/services/inputflinger/tests/InputDispatcher_test.cpp
-index f5ea1ca..bee1f7c 100644
+index f5ea1ca..948edc6 100644
 --- a/services/inputflinger/tests/InputDispatcher_test.cpp
 +++ b/services/inputflinger/tests/InputDispatcher_test.cpp
-@@ -15250,6 +15250,148 @@ TEST_F(InputDispatcherTargetedInjectionTest, CannotInjectIntoUnownedSpyWindow) {
+@@ -15250,6 +15250,214 @@ TEST_F(InputDispatcherTargetedInjectionTest, CannotInjectIntoUnownedSpyWindow) {
      window->consumeMotionDown();
  }
  
@@ -492,6 +507,72 @@ index f5ea1ca..bee1f7c 100644
 +                    .build();
 +    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(penExitAgain));
 +    window->consumeMotionEvent(WithMotionAction(ACTION_HOVER_EXIT));
++}
++
++TEST_F(InputDispatcherTargetedInjectionTest, KeepsMouseHoverSeparateFromInjectedTouch) {
++    auto application = std::make_shared<FakeApplicationHandle>();
++    auto window = sp<FakeWindowHandle>::make(
++            application, mDispatcher, "Remote", ui::LogicalDisplayId::DEFAULT);
++    window->setFrame(Rect(0, 0, 500, 500));
++    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
++
++    const auto injectTargeted = [&](const MotionEvent& event) {
++        return mDispatcher->injectInputEventToApplication(
++                &event, {}, InputEventInjectionSync::WAIT_FOR_RESULT, INJECT_EVENT_TIMEOUT,
++                POLICY_FLAG_PASS_TO_USER | POLICY_FLAG_DISABLE_KEY_REPEAT,
++                window->getApplicationToken());
++    };
++    const MotionEvent mouseHover =
++            MotionEventBuilder(ACTION_HOVER_MOVE, AINPUT_SOURCE_MOUSE)
++                    .pointer(PointerBuilder(0, ToolType::MOUSE).x(120).y(120))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(mouseHover));
++    window->consumeMotionEvent(
++            AllOf(WithMotionAction(ACTION_HOVER_ENTER), WithDeviceId(DROIDLOOM_MOUSE_DEVICE_ID)));
++
++    const MotionEvent touchDown =
++            MotionEventBuilder(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(100).y(100))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(touchDown));
++    window->consumeMotionDown();
++
++    const MotionEvent touchUp =
++            MotionEventBuilder(ACTION_UP, AINPUT_SOURCE_TOUCHSCREEN)
++                    .pointer(PointerBuilder(0, ToolType::FINGER).x(100).y(100))
++                    .downTime(touchDown.getDownTime())
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(touchUp));
++    window->consumeMotionUp();
++
++    const MotionEvent mouseExit =
++            MotionEventBuilder(ACTION_HOVER_EXIT, AINPUT_SOURCE_MOUSE)
++                    .pointer(PointerBuilder(0, ToolType::MOUSE).x(120).y(120))
++                    .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectTargeted(mouseExit));
++    window->consumeMotionEvent(
++            AllOf(WithMotionAction(ACTION_HOVER_EXIT), WithDeviceId(DROIDLOOM_MOUSE_DEVICE_ID)));
++}
++
++TEST_F(InputDispatcherTargetedInjectionTest, KeepsTargetedKeyboardDeviceId) {
++    auto application = std::make_shared<FakeApplicationHandle>();
++    auto window = sp<FakeWindowHandle>::make(
++            application, mDispatcher, "Editor", ui::LogicalDisplayId::DEFAULT);
++    window->setFocusable(true);
++    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
++
++    constexpr int32_t hostKeyboardId = 7;
++    KeyEvent key = KeyEventBuilder(AKEY_EVENT_ACTION_DOWN, AINPUT_SOURCE_KEYBOARD)
++                           .deviceId(hostKeyboardId)
++                           .keyCode(AKEYCODE_A)
++                           .build();
++    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED,
++              mDispatcher->injectInputEventToApplication(
++                      &key, {}, InputEventInjectionSync::WAIT_FOR_RESULT, INJECT_EVENT_TIMEOUT,
++                      POLICY_FLAG_PASS_TO_USER | POLICY_FLAG_DISABLE_KEY_REPEAT,
++                      window->getApplicationToken()));
++    window->consumeKeyEvent(
++            AllOf(WithKeyAction(AKEY_EVENT_ACTION_DOWN), WithDeviceId(hostKeyboardId)));
 +}
 +
 +TEST_F(InputDispatcherTargetedInjectionTest, IgnoresOtherDeviceTouchState) {

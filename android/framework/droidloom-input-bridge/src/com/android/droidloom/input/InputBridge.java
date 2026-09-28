@@ -20,6 +20,8 @@ import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
@@ -47,7 +49,7 @@ public final class InputBridge {
     private static final boolean INPUT_TRACE = "1".equals(System.getenv("DROIDLOOM_INPUT_TRACE"));
     private static final String SOCKET_ENV = "ANDROID_SOCKET_droidloom_input";
     private static final int RECORD_BYTES = 64;
-    private static final int PROTOCOL_MAJOR = 6;
+    private static final int PROTOCOL_MAJOR = 7;
     private static final String BUILD_COMPATIBILITY =
             "DROIDLOOM_INPUT_ABI=" + PROTOCOL_MAJOR + ";";
     private static final int KIND_TOUCH = 1;
@@ -56,6 +58,7 @@ public final class InputBridge {
     private static final int KIND_TASK_FOCUS = 4;
     private static final int KIND_TASK_CLOSE = 5;
     private static final int KIND_TABLET = 6;
+    private static final int KIND_MOUSE = 7;
     private static final int TOUCH_ACTION_DOWN = 0;
     private static final int TOUCH_ACTION_MOTION = 1;
     private static final int TOUCH_ACTION_UP = 2;
@@ -69,6 +72,13 @@ public final class InputBridge {
     private static final int TABLET_ACTION_BUTTON_RELEASE = 6;
     private static final int TABLET_ACTION_CANCEL = 7;
     private static final int TABLET_ACTION_WHEEL = 8;
+    private static final int MOUSE_ACTION_ENTER = 0;
+    private static final int MOUSE_ACTION_MOTION = 1;
+    private static final int MOUSE_ACTION_LEAVE = 2;
+    private static final int MOUSE_ACTION_BUTTON_PRESS = 3;
+    private static final int MOUSE_ACTION_BUTTON_RELEASE = 4;
+    private static final int MOUSE_ACTION_SCROLL = 5;
+    private static final int MOUSE_ACTION_CANCEL = 6;
     private static final int TABLET_TOOL_PEN = 0;
     private static final int TABLET_TOOL_ERASER = 1;
     private static final int TABLET_TOOL_BRUSH = 2;
@@ -83,6 +93,11 @@ public final class InputBridge {
     private static final int KEY_ACTION_DOWN = 0;
     private static final int KEY_ACTION_UP = 1;
     private static final int MAX_EVDEV_KEYCODE = 0x2ff;
+    // Registered by Droidloom's EventHub patch as Android's attached keyboard.
+    private static final String HOST_KEYBOARD_NAME = "Droidloom Host Keyboard";
+    // The same layout Android applies to a physical keyboard without a
+    // vendor-specific file.
+    private static final String GENERIC_KEY_LAYOUT = "/system/usr/keylayout/Generic.kl";
     private static final float FIXED_SCALE = 65536.0f;
     private static final float PRESSURE_SCALE = 65535.0f;
     private static final int INJECT_ASYNC = 0;
@@ -101,6 +116,9 @@ public final class InputBridge {
     private final Map<TabletIdentity, TabletState> mTablets = new HashMap<>();
     private final Map<KeyIdentity, KeyState> mKeys = new HashMap<>();
     private final Map<Long, Integer> mMetaStates = new HashMap<>();
+    private final Map<Long, MouseState> mMice = new HashMap<>();
+    private final Map<Integer, Integer> mKeyLayout = loadKeyLayout();
+    private int mHostKeyboardDeviceId = KeyCharacterMap.VIRTUAL_KEYBOARD;
     private final Map<Integer, ScheduledFuture<?>> mPendingTaskBounds = new HashMap<>();
     private final ScheduledExecutorService mTaskResizeExecutor =
             Executors.newSingleThreadScheduledExecutor();
@@ -213,6 +231,10 @@ public final class InputBridge {
             }
             try {
                 inject(decode(record));
+            } catch (InconsistentInputException error) {
+                // One lost transition must not discard every other routed
+                // stream: drop this record and keep the connection's state.
+                Log.w(TAG, "Dropped inconsistent input record: " + error.getMessage());
             } catch (SecurityException error) {
                 Log.e(TAG, "InputManager rejected Droidloom's privileged injector", error);
                 resetTransientInputState();
@@ -231,6 +253,7 @@ public final class InputBridge {
         mTablets.clear();
         mKeys.clear();
         mMetaStates.clear();
+        mMice.clear();
     }
 
     private static RoutedRecord decode(byte[] bytes) {
@@ -335,6 +358,30 @@ public final class InputBridge {
             return new KeyRecord(
                     displayId, taskId, action, code, timestampNanos, repeat, routeSerial);
         }
+        if (kind == KIND_MOUSE) {
+            if (action > MOUSE_ACTION_CANCEL || code < 0 || code > MAX_EVDEV_KEYCODE) {
+                throw new IllegalArgumentException("invalid mouse action or button field");
+            }
+            final int xFixed = record.getInt();
+            final int yFixed = record.getInt();
+            final int scrollXFixed = record.getInt();
+            final int scrollYFixed = record.getInt();
+            final int taskId = record.getInt();
+            if (taskId <= 0) {
+                throw new IllegalArgumentException("invalid mouse task field");
+            }
+            requireZeroTail(record, "mouse reserved field");
+            return new MouseRecord(
+                    displayId,
+                    taskId,
+                    action,
+                    code,
+                    timestampNanos,
+                    xFixed / FIXED_SCALE,
+                    yFixed / FIXED_SCALE,
+                    scrollXFixed / FIXED_SCALE,
+                    scrollYFixed / FIXED_SCALE);
+        }
         if (kind == KIND_TABLET) {
             if (action > TABLET_ACTION_WHEEL || code < 0 || code > 31) {
                 throw new IllegalArgumentException("invalid tablet action or tool field");
@@ -404,6 +451,8 @@ public final class InputBridge {
             closeTask((TaskCloseRecord) record);
         } else if (record instanceof TabletRecord) {
             inject((TabletRecord) record);
+        } else if (record instanceof MouseRecord) {
+            inject((MouseRecord) record);
         } else {
             throw new IllegalArgumentException("unsupported decoded input record");
         }
@@ -519,7 +568,7 @@ public final class InputBridge {
                 mGestures.put(gestureIdentity, gesture);
             }
             if (gesture.pointers.containsKey(record.pointerId)) {
-                throw new IllegalStateException("duplicate touch down");
+                throw new InconsistentInputException("duplicate touch down");
             }
             gesture.pointers.put(record.pointerId, Pointer.from(record));
             final int pointerIndex = gesture.indexOf(record.pointerId);
@@ -532,7 +581,7 @@ public final class InputBridge {
         }
 
         if (gesture == null || !gesture.pointers.containsKey(record.pointerId)) {
-            throw new IllegalStateException("touch update has no matching down");
+            throw new InconsistentInputException("touch update has no matching down");
         }
         gesture.pointers.put(record.pointerId, Pointer.from(record));
 
@@ -828,7 +877,7 @@ public final class InputBridge {
     private void inject(KeyRecord record) {
         final int keyCode = androidKeyCode(record.scanCode);
         if (keyCode == KeyEvent.KEYCODE_UNKNOWN) {
-            throw new IllegalArgumentException("unsupported evdev key code " + record.scanCode);
+            throw new InconsistentInputException("unmapped evdev key code " + record.scanCode);
         }
         final KeyIdentity identity = new KeyIdentity(
                 record.displayId, record.taskId, record.scanCode);
@@ -838,17 +887,17 @@ public final class InputBridge {
         final long downTimeMillis;
         final IBinder applicationToken;
         if (pressed) {
-            if (record.repeat == 0 && existing != null) {
-                throw new IllegalStateException("duplicate key down");
-            }
-            downTimeMillis = existing == null ? eventTimeMillis : existing.downTimeMillis;
-            applicationToken = existing == null
-                    ? taskInputApplicationToken(record.taskId)
-                    : existing.applicationToken;
+            // A fresh press over a key still held here means its release was
+            // lost; start a new press rather than extend the stale one.
+            final boolean continued = existing != null && record.repeat != 0;
+            downTimeMillis = continued ? existing.downTimeMillis : eventTimeMillis;
+            applicationToken = continued
+                    ? existing.applicationToken
+                    : taskInputApplicationToken(record.taskId);
             mKeys.put(identity, new KeyState(downTimeMillis, applicationToken));
         } else {
             if (existing == null) {
-                throw new IllegalStateException("key up has no matching down");
+                throw new InconsistentInputException("key up has no matching down");
             }
             downTimeMillis = existing.downTimeMillis;
             applicationToken = existing.applicationToken;
@@ -857,30 +906,248 @@ public final class InputBridge {
 
         final int metaState = updateMetaState(
                 record.displayId, record.taskId, keyCode, pressed);
-        final KeyEvent event = new KeyEvent(
+        final boolean injected = injectKey(
+                record.displayId,
+                applicationToken,
                 downTimeMillis,
                 Math.max(downTimeMillis, eventTimeMillis),
+                pressed,
+                keyCode,
+                record.scanCode,
+                record.repeat,
+                metaState);
+        if (!injected) {
+            Log.w(TAG, "InputManager rejected key for display " + record.displayId);
+        } else if (INPUT_TRACE) {
+            Log.i(TAG, "Key trace stage=android serial=" + record.routeSerial
+                    + " task=" + record.taskId + " display=" + record.displayId
+                    + " action=" + record.action + " scanCode=" + record.scanCode
+                    + " repeat=" + record.repeat + " device=" + hostKeyboardDeviceId());
+        }
+    }
+
+    private boolean injectKey(int displayId, IBinder applicationToken, long downTimeMillis,
+            long eventTimeMillis, boolean pressed, int keyCode, int scanCode, int repeat,
+            int metaState) {
+        // Keys come from the host's physical keyboard, so they carry Android's
+        // registered host keyboard: applications resolve a real, external,
+        // alphabetic keyboard and its character map from the event.
+        final KeyEvent event = new KeyEvent(
+                downTimeMillis,
+                eventTimeMillis,
                 pressed ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP,
                 keyCode,
-                record.repeat,
+                repeat,
                 metaState,
-                KeyCharacterMap.VIRTUAL_KEYBOARD,
-                record.scanCode,
-                KeyEvent.FLAG_FROM_SYSTEM | KeyEvent.FLAG_VIRTUAL_HARD_KEY,
+                hostKeyboardDeviceId(),
+                scanCode,
+                KeyEvent.FLAG_FROM_SYSTEM,
                 InputDevice.SOURCE_KEYBOARD);
         try {
-            mSetDisplayId.invoke(event, record.displayId);
-            if (!injectInputEventToApplication(event, applicationToken)) {
-                Log.w(TAG, "InputManager rejected key for display " + record.displayId);
-            } else if (INPUT_TRACE) {
-                Log.i(TAG, "Key trace stage=android serial=" + record.routeSerial
-                        + " task=" + record.taskId + " display=" + record.displayId
-                        + " action=" + record.action + " scanCode=" + record.scanCode
-                        + " repeat=" + record.repeat);
-            }
+            mSetDisplayId.invoke(event, displayId);
+            return injectInputEventToApplication(event, applicationToken);
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("Android key injection API failed", error);
         }
+    }
+
+    private int hostKeyboardDeviceId() {
+        if (mHostKeyboardDeviceId != KeyCharacterMap.VIRTUAL_KEYBOARD) {
+            return mHostKeyboardDeviceId;
+        }
+        for (int id : InputDevice.getDeviceIds()) {
+            final InputDevice device = InputDevice.getDevice(id);
+            if (device != null && HOST_KEYBOARD_NAME.equals(device.getName())) {
+                mHostKeyboardDeviceId = id;
+                Log.i(TAG, "Routed keys use Android input device " + id + " (" + HOST_KEYBOARD_NAME
+                        + ")");
+                return id;
+            }
+        }
+        return KeyCharacterMap.VIRTUAL_KEYBOARD;
+    }
+
+    private void inject(MouseRecord record) {
+        final long identity = taskIdentity(record.displayId, record.taskId);
+        MouseState state = mMice.get(identity);
+        if (state == null) {
+            if (record.action == MOUSE_ACTION_LEAVE || record.action == MOUSE_ACTION_CANCEL) {
+                return;
+            }
+            state = new MouseState(taskInputApplicationToken(record.taskId));
+            mMice.put(identity, state);
+        }
+        state.x = record.x;
+        state.y = record.y;
+        final long eventTimeMillis = record.timestampNanos / 1_000_000L;
+        switch (record.action) {
+            case MOUSE_ACTION_ENTER:
+            case MOUSE_ACTION_MOTION:
+                // InputDispatcher derives per-window hover enter and exit from
+                // a hover-move stream, exactly as it does for a real mouse.
+                injectMouseEvent(record, state, state.buttonState != 0
+                        ? MotionEvent.ACTION_MOVE : MotionEvent.ACTION_HOVER_MOVE, 0,
+                        eventTimeMillis);
+                state.hovering = state.buttonState == 0;
+                return;
+            case MOUSE_ACTION_LEAVE:
+                if (state.buttonState == 0) {
+                    if (state.hovering) {
+                        injectMouseEvent(record, state, MotionEvent.ACTION_HOVER_EXIT, 0,
+                                eventTimeMillis);
+                    }
+                    mMice.remove(identity);
+                }
+                return;
+            case MOUSE_ACTION_BUTTON_PRESS: {
+                final int button = androidMouseButton(record.button);
+                if (button == 0) {
+                    return;
+                }
+                if ((state.buttonState & button) != 0) {
+                    throw new InconsistentInputException("duplicate mouse button press");
+                }
+                if (state.buttonState == 0) {
+                    state.downTimeMillis = eventTimeMillis;
+                    state.buttonState = button;
+                    state.hovering = false;
+                    injectMouseEvent(record, state, MotionEvent.ACTION_DOWN, 0, eventTimeMillis);
+                } else {
+                    state.buttonState |= button;
+                }
+                injectMouseEvent(record, state, MotionEvent.ACTION_BUTTON_PRESS, button,
+                        eventTimeMillis);
+                injectNavigationKey(record, state, button, true, eventTimeMillis);
+                return;
+            }
+            case MOUSE_ACTION_BUTTON_RELEASE: {
+                final int button = androidMouseButton(record.button);
+                if (button == 0) {
+                    return;
+                }
+                if ((state.buttonState & button) == 0) {
+                    throw new InconsistentInputException("mouse release has no matching press");
+                }
+                state.buttonState &= ~button;
+                injectMouseEvent(record, state, MotionEvent.ACTION_BUTTON_RELEASE, button,
+                        eventTimeMillis);
+                if (state.buttonState == 0) {
+                    injectMouseEvent(record, state, MotionEvent.ACTION_UP, 0, eventTimeMillis);
+                }
+                injectNavigationKey(record, state, button, false, eventTimeMillis);
+                return;
+            }
+            case MOUSE_ACTION_SCROLL:
+                if (record.scrollX != 0.0f || record.scrollY != 0.0f) {
+                    injectMouseEvent(record, state, MotionEvent.ACTION_SCROLL, 0,
+                            eventTimeMillis);
+                }
+                return;
+            case MOUSE_ACTION_CANCEL:
+                if (state.buttonState != 0) {
+                    state.buttonState = 0;
+                    injectMouseEvent(record, state, MotionEvent.ACTION_CANCEL, 0,
+                            eventTimeMillis);
+                } else if (state.hovering) {
+                    injectMouseEvent(record, state, MotionEvent.ACTION_HOVER_EXIT, 0,
+                            eventTimeMillis);
+                }
+                mMice.remove(identity);
+                return;
+            default:
+                throw new IllegalArgumentException("unsupported mouse action");
+        }
+    }
+
+    private void injectMouseEvent(MouseRecord record, MouseState state, int action,
+            int actionButton, long eventTimeMillis) {
+        final Rect taskBounds = taskBounds(record.taskId);
+        final MotionEvent.PointerProperties properties = new MotionEvent.PointerProperties();
+        properties.id = 0;
+        properties.toolType = MotionEvent.TOOL_TYPE_MOUSE;
+        final MotionEvent.PointerCoords coordinates = new MotionEvent.PointerCoords();
+        coordinates.x = state.x + taskBounds.left;
+        coordinates.y = state.y + taskBounds.top;
+        coordinates.pressure = state.buttonState != 0 ? 1.0f : 0.0f;
+        coordinates.size = 1.0f;
+        if (action == MotionEvent.ACTION_SCROLL) {
+            // Wayland scrolls down and right for positive values; Android's
+            // vertical scroll axis is positive upward.
+            coordinates.setAxisValue(MotionEvent.AXIS_VSCROLL, -record.scrollY);
+            coordinates.setAxisValue(MotionEvent.AXIS_HSCROLL, record.scrollX);
+        }
+        final boolean down = state.buttonState != 0 || action == MotionEvent.ACTION_UP
+                || action == MotionEvent.ACTION_CANCEL;
+        final long downTimeMillis = down ? state.downTimeMillis : eventTimeMillis;
+        final MotionEvent event = MotionEvent.obtain(
+                downTimeMillis,
+                Math.max(downTimeMillis, eventTimeMillis),
+                action,
+                1,
+                new MotionEvent.PointerProperties[] {properties},
+                new MotionEvent.PointerCoords[] {coordinates},
+                metaState(record.displayId, record.taskId),
+                state.buttonState,
+                1.0f,
+                1.0f,
+                // The targeted InputDispatcher path assigns the reserved mouse
+                // device ID, separate from injected touch and stylus streams.
+                0,
+                0,
+                InputDevice.SOURCE_MOUSE,
+                action == MotionEvent.ACTION_CANCEL ? MotionEvent.FLAG_CANCELED : 0);
+        try {
+            if (actionButton != 0) {
+                event.setActionButton(actionButton);
+            }
+            mSetDisplayId.invoke(event, record.displayId);
+            if (!injectInputEventToApplication(event, state.applicationToken)) {
+                Log.w(TAG, "InputManager rejected mouse " + MotionEvent.actionToString(action)
+                        + " for task " + record.taskId);
+            }
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("Android mouse injection API failed", error);
+        } finally {
+            event.recycle();
+        }
+    }
+
+    // Android's cursor mapper turns the side buttons into navigation keys as
+    // well as motion buttons; applications rely on the key for back handling.
+    private void injectNavigationKey(MouseRecord record, MouseState state, int button,
+            boolean pressed, long eventTimeMillis) {
+        final int keyCode;
+        if (button == MotionEvent.BUTTON_BACK) {
+            keyCode = KeyEvent.KEYCODE_BACK;
+        } else if (button == MotionEvent.BUTTON_FORWARD) {
+            keyCode = KeyEvent.KEYCODE_FORWARD;
+        } else {
+            return;
+        }
+        if (pressed) {
+            state.navigationDownTimeMillis = eventTimeMillis;
+        }
+        injectKey(record.displayId, state.applicationToken, state.navigationDownTimeMillis,
+                eventTimeMillis, pressed, keyCode, record.button, 0,
+                metaState(record.displayId, record.taskId));
+    }
+
+    private static int androidMouseButton(int button) {
+        switch (button) {
+            case 0x110: return MotionEvent.BUTTON_PRIMARY; // BTN_LEFT
+            case 0x111: return MotionEvent.BUTTON_SECONDARY; // BTN_RIGHT
+            case 0x112: return MotionEvent.BUTTON_TERTIARY; // BTN_MIDDLE
+            case 0x113: // BTN_SIDE
+            case 0x116: return MotionEvent.BUTTON_BACK; // BTN_BACK
+            case 0x114: // BTN_EXTRA
+            case 0x115: return MotionEvent.BUTTON_FORWARD; // BTN_FORWARD
+            default: return 0;
+        }
+    }
+
+    private int metaState(int displayId, int taskId) {
+        final Integer state = mMetaStates.get(taskIdentity(displayId, taskId));
+        return state == null ? 0 : KeyEvent.normalizeMetaState(state);
     }
 
     private int updateMetaState(int displayId, int taskId, int keyCode, boolean pressed) {
@@ -1000,7 +1267,44 @@ public final class InputBridge {
         return ((long) displayId << 32) | Integer.toUnsignedLong(taskId);
     }
 
-    private static int androidKeyCode(int scanCode) {
+    private int androidKeyCode(int scanCode) {
+        final Integer mapped = mKeyLayout.get(scanCode);
+        return mapped != null ? mapped : fallbackKeyCode(scanCode);
+    }
+
+    private static Map<Integer, Integer> loadKeyLayout() {
+        final Map<Integer, Integer> layout = new HashMap<>();
+        try (BufferedReader reader = new BufferedReader(new FileReader(GENERIC_KEY_LAYOUT))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                // Only plain scan-code mappings: "key <scan> <KEYCODE> [flags]".
+                final String[] fields = line.trim().split("\\s+");
+                if (fields.length < 3 || !"key".equals(fields[0])) {
+                    continue;
+                }
+                final int scanCode;
+                try {
+                    scanCode = Integer.decode(fields[1]);
+                } catch (NumberFormatException error) {
+                    continue; // "key usage ..." lines map HID usages instead.
+                }
+                if (fields.length > 3 && fields[3].contains("FUNCTION")) {
+                    continue; // Fn-layer duplicates of keys mapped above.
+                }
+                final int keyCode = KeyEvent.keyCodeFromString("KEYCODE_" + fields[2]);
+                if (scanCode >= 0 && scanCode <= MAX_EVDEV_KEYCODE
+                        && keyCode != KeyEvent.KEYCODE_UNKNOWN && !layout.containsKey(scanCode)) {
+                    layout.put(scanCode, keyCode);
+                }
+            }
+        } catch (IOException error) {
+            Log.w(TAG, "Using the built-in key table; " + GENERIC_KEY_LAYOUT + " is unreadable",
+                    error);
+        }
+        return layout;
+    }
+
+    private static int fallbackKeyCode(int scanCode) {
         switch (scanCode) {
             case 1: return KeyEvent.KEYCODE_ESCAPE;
             case 2: return KeyEvent.KEYCODE_1;
@@ -1386,6 +1690,60 @@ public final class InputBridge {
 
         KeyState(long downTimeMillis, IBinder applicationToken) {
             this.downTimeMillis = downTimeMillis;
+            this.applicationToken = applicationToken;
+        }
+    }
+
+    /** A routed record contradicts this connection's stream state and is dropped alone. */
+    private static final class InconsistentInputException extends IllegalStateException {
+        InconsistentInputException(String message) {
+            super(message);
+        }
+    }
+
+    private static final class MouseRecord implements RoutedRecord {
+        final int displayId;
+        final int taskId;
+        final int action;
+        final int button;
+        final long timestampNanos;
+        final float x;
+        final float y;
+        final float scrollX;
+        final float scrollY;
+
+        MouseRecord(
+                int displayId,
+                int taskId,
+                int action,
+                int button,
+                long timestampNanos,
+                float x,
+                float y,
+                float scrollX,
+                float scrollY) {
+            this.displayId = displayId;
+            this.taskId = taskId;
+            this.action = action;
+            this.button = button;
+            this.timestampNanos = timestampNanos;
+            this.x = x;
+            this.y = y;
+            this.scrollX = scrollX;
+            this.scrollY = scrollY;
+        }
+    }
+
+    private static final class MouseState {
+        final IBinder applicationToken;
+        long downTimeMillis;
+        long navigationDownTimeMillis;
+        int buttonState;
+        boolean hovering;
+        float x;
+        float y;
+
+        MouseState(IBinder applicationToken) {
             this.applicationToken = applicationToken;
         }
     }

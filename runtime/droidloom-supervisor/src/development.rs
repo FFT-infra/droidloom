@@ -1596,6 +1596,36 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         fs::create_dir_all(dev.join(directory))
             .map_err(|source| io_error("create private device directory", source))?;
     }
+
+    // Kernel hotplug uevents reach every listener, including the cell's
+    // ueventd, so a device attached to the host is otherwise published here as
+    // /dev/input/event* even though this private /dev never creates it. Input
+    // is routed per Android task instead, and a raw evdev node would both
+    // bypass that routing and hand every application the host's physical
+    // devices. Mask the directory with an empty read-only filesystem so the
+    // cell's ueventd cannot publish devices into it.
+    let input = dev.join("input");
+    fs::create_dir_all(&input)
+        .map_err(|source| io_error("create private input directory", source))?;
+    run_os(
+        "mount",
+        [
+            OsString::from("-t"),
+            OsString::from("tmpfs"),
+            OsString::from("-o"),
+            OsString::from("size=4k,mode=0755,nosuid,nodev,noexec"),
+            OsString::from("tmpfs"),
+            input.as_os_str().to_owned(),
+        ],
+    )?;
+    run_os(
+        "mount",
+        [
+            OsString::from("-o"),
+            OsString::from("remount,ro,nosuid,nodev,noexec"),
+            input.into_os_string(),
+        ],
+    )?;
     for (name, major, minor, mode) in [
         ("null", 1, 3, "666"),
         ("zero", 1, 5, "666"),
