@@ -11,7 +11,7 @@ mod insets;
 mod presentation_audit;
 mod text_input;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -33,8 +33,8 @@ use droidloom_denial_endpoint::{
 use droidloom_denial_ipc::IpcError;
 use droidloom_denial_protocol::{
     AcceptedWireFrame, BufferId, BufferMetadata, FormatModifier, FrameId, InputEvent, KeyAction,
-    PlaneMetadata, TabletAction, TabletToolType, TaskObjectId, TouchAction, Transform, Visibility,
-    presentation_flag,
+    MouseAction, PlaneMetadata, TabletAction, TabletToolType, TaskObjectId, TouchAction, Transform,
+    Visibility, presentation_flag,
 };
 use droidloom_syncobj::{SyncobjDevice, WaylandTimeline};
 use droidloom_window_policy::{LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore};
@@ -51,8 +51,11 @@ use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
 use smithay_client_toolkit::seat::pointer::{
-    CursorIcon, PointerData, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec,
+    AxisScroll, CursorIcon, PointerData, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec,
     ThemedPointer,
+};
+use smithay_client_toolkit::seat::pointer_constraints::{
+    PointerConstraintsHandler, PointerConstraintsState,
 };
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
@@ -101,11 +104,30 @@ use wayland_protocols::wp::tablet::zv2::client::{
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
+    zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+    zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+};
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1::ZwpConfinedPointerV1, zwp_locked_pointer_v1::ZwpLockedPointerV1,
+    zwp_pointer_constraints_v1,
+};
 
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
 const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const LEFT_BUTTON: u32 = 0x110;
+/// Linux evdev `BTN_0`: tablet pad button N is routed as `BTN_0 + N`, the
+/// code Android's generic key layout maps to `KEYCODE_BUTTON_<N + 1>`.
+const PAD_BUTTON_BASE: u32 = 0x100;
+/// Android names sixteen generic buttons.
+const PAD_BUTTON_COUNT: u32 = 16;
+/// Linux evdev key codes of the presenter's own window shortcuts.
+const KEY_F11: u32 = 87;
+const KEY_M: u32 = 50;
+/// One scroll step for a continuous (touchpad or finger) Wayland scroll,
+/// measured in surface pixels, following common toolkit behaviour.
+const CONTINUOUS_SCROLL_PIXELS_PER_STEP: f64 = 10.0;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
 
@@ -245,6 +267,7 @@ struct TaskWindow {
     content_opaque: bool,
     applied_opaque: Option<bool>,
     focused: bool,
+    fullscreen: bool,
     unmap_requested: bool,
     closing: bool,
 }
@@ -313,6 +336,8 @@ struct TabletToolState {
     axis_flags: u8,
     dirty_axes: bool,
     pending_actions: Vec<(TabletAction, u32)>,
+    down_serial: u32,
+    decoration_down: Option<TaskObjectId>,
 }
 
 impl TabletToolState {
@@ -335,6 +360,8 @@ impl TabletToolState {
             axis_flags: 0,
             dirty_axes: false,
             pending_actions: Vec::new(),
+            down_serial: 0,
+            decoration_down: None,
         }
     }
 }
@@ -361,6 +388,25 @@ struct TabletPadState {
     tablet_seat_id: u32,
     proxy: ZwpTabletPadV2,
     children: Vec<TabletPadChild>,
+    focus: Option<TaskObjectId>,
+    pressed: BTreeSet<u32>,
+}
+
+/// The pointer confined to one Android window, with compositor shortcuts
+/// delivered to the application instead of the desktop.
+struct Immersion {
+    object: TaskObjectId,
+    confined: ZwpConfinedPointerV1,
+    inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+}
+
+impl Immersion {
+    fn release(self) {
+        self.confined.destroy();
+        if let Some(inhibitor) = self.inhibitor {
+            inhibitor.destroy();
+        }
+    }
 }
 
 struct App {
@@ -397,10 +443,22 @@ struct App {
     endpoint: Option<DenialEndpoint>,
     tasks: BTreeMap<TaskObjectId, TaskWindow>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    keyboard_seat: Option<wl_seat::WlSeat>,
+    modifiers: Modifiers,
+    /// Keys whose press was routed, with the task that must receive the release.
+    pressed_keys: BTreeMap<u32, TaskObjectId>,
+    /// Shortcut keys consumed by the presenter; their release is consumed too.
+    consumed_keys: BTreeSet<u32>,
     pointer: Option<ThemedPointer>,
+    pointer_constraints: PointerConstraintsState,
+    shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    immersion: Option<Immersion>,
     cursor_icon: Option<CursorIcon>,
     touch: Option<wl_touch::WlTouch>,
     focused: Option<TaskObjectId>,
+    /// Task under the mouse for native mouse routing, and its pressed buttons.
+    mouse_focus: Option<TaskObjectId>,
+    mouse_buttons: BTreeSet<u32>,
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
     decoration_touch: Option<DecorationTouch>,
@@ -650,6 +708,7 @@ impl App {
                 presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref() == Some(std::ffi::OsStr::new("1")))
                     .then(presentation_audit::Audit::default),
                 focused: false,
+                fullscreen: false,
                 unmap_requested: false,
                 closing: false,
             },
@@ -1293,6 +1352,7 @@ impl App {
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.forget_task_input(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             if let Some(fractional_scale) = task.fractional_scale.take() {
@@ -1324,6 +1384,7 @@ impl App {
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.release_task_input(object);
         self.activation.remove(object);
         let task = self
             .tasks
@@ -1475,7 +1536,7 @@ impl App {
         }
         match self.listener.accept() {
             Ok(endpoint) => {
-                let endpoint = endpoint.with_tablet_input();
+                let endpoint = endpoint.with_tablet_input().with_mouse_input();
                 let endpoint = if self.activation.supported() {
                     endpoint.with_activation_requests()
                 } else { endpoint };
@@ -1508,6 +1569,13 @@ impl App {
     }
 
     fn disconnect_endpoint(&mut self) {
+        if let Some(immersion) = self.immersion.take() {
+            immersion.release();
+        }
+        self.pressed_keys.clear();
+        self.consumed_keys.clear();
+        self.mouse_focus = None;
+        self.mouse_buttons.clear();
         self.activation.clear();
         self.text_input.disconnect();
         self.endpoint = None;
@@ -1563,6 +1631,299 @@ impl App {
             );
         }
         Ok(())
+    }
+
+    /// Release every key and button this task still holds, as a physical
+    /// keyboard or mouse would when its window stops receiving input.
+    fn release_task_input(&mut self, object: TaskObjectId) {
+        let held = self
+            .pressed_keys
+            .iter()
+            .filter_map(|(key, owner)| (*owner == object).then_some(*key))
+            .collect::<Vec<_>>();
+        for keycode in held {
+            self.pressed_keys.remove(&keycode);
+            if let Err(error) = self.send_input(
+                object,
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode,
+                    repeat: 0,
+                },
+            ) {
+                self.fail(&error);
+            }
+        }
+        if self.mouse_focus == Some(object) {
+            self.mouse_focus = None;
+            self.mouse_buttons.clear();
+            if let Err(error) = self.send_mouse(object, MouseAction::Cancel, (0.0, 0.0), 0, (0.0, 0.0))
+            {
+                self.fail(&error);
+            }
+        }
+        if self.immersion.as_ref().is_some_and(|immersion| immersion.object == object) {
+            self.end_immersion();
+        }
+    }
+
+    /// Drop routing state for a task that no longer accepts input at all.
+    fn forget_task_input(&mut self, object: TaskObjectId) {
+        self.pressed_keys.retain(|_, owner| *owner != object);
+        if self.mouse_focus == Some(object) {
+            self.mouse_focus = None;
+            self.mouse_buttons.clear();
+        }
+        for pad in self.tablet_pads.values_mut() {
+            if pad.focus == Some(object) {
+                pad.focus = None;
+                pad.pressed.clear();
+            }
+        }
+        if self.immersion.as_ref().is_some_and(|immersion| immersion.object == object) {
+            self.end_immersion();
+        }
+    }
+
+    fn send_mouse(
+        &mut self,
+        object: TaskObjectId,
+        action: MouseAction,
+        position: (f64, f64),
+        button: u32,
+        scroll: (f64, f64),
+    ) -> Result<(), PresenterError> {
+        let (x_fixed, y_fixed) = self.fixed_position(object, position);
+        self.send_input(
+            object,
+            InputEvent::Mouse {
+                action,
+                x_fixed,
+                y_fixed,
+                button,
+                scroll_x_fixed: fixed_16_16(scroll.0),
+                scroll_y_fixed: fixed_16_16(scroll.1),
+            },
+        )
+    }
+
+    fn mouse_input_supported(&self) -> bool {
+        self.endpoint.as_ref().is_some_and(DenialEndpoint::supports_mouse_input)
+    }
+
+    /// Handle the presenter's own window shortcuts before routing a key.
+    /// Returns whether the key was consumed.
+    fn window_shortcut(&mut self, qh: &QueueHandle<Self>, keycode: u32) -> bool {
+        let Some(object) = self.focused else { return false };
+        let modifiers = self.modifiers;
+        let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.logo && !modifiers.shift;
+        if keycode == KEY_F11 && plain {
+            self.toggle_fullscreen(object);
+            return true;
+        }
+        if keycode == KEY_M && modifiers.ctrl && modifiers.alt && !modifiers.logo {
+            if self.immersion.is_some() {
+                self.end_immersion();
+            } else {
+                self.begin_immersion(qh, object);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn toggle_fullscreen(&mut self, object: TaskObjectId) {
+        let Some(task) = self.tasks.get(&object) else { return };
+        let Some(window) = task.window.as_ref() else { return };
+        if task.fullscreen {
+            window.unset_fullscreen();
+        } else {
+            window.set_fullscreen(None);
+        }
+    }
+
+    /// Confine the pointer to one Android window and let it receive the
+    /// desktop's own shortcuts, as remote-desktop and game clients expect.
+    fn begin_immersion(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
+        let Some(surface) = self.tasks.get(&object).and_then(TaskWindow::surface).cloned() else {
+            return;
+        };
+        let Some(pointer) = self.pointer.as_ref().map(|themed| themed.pointer().clone()) else {
+            eprintln!("Droidloom mouse immersion needs a pointer device");
+            return;
+        };
+        let confined = match self.pointer_constraints.confine_pointer(
+            &surface,
+            &pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            qh,
+        ) {
+            Ok(confined) => confined,
+            Err(error) => {
+                eprintln!("Droidloom mouse immersion is unavailable: {error}");
+                return;
+            }
+        };
+        let inhibitor = self
+            .shortcuts_inhibit_manager
+            .as_ref()
+            .zip(self.keyboard_seat.as_ref())
+            .map(|(manager, seat)| manager.inhibit_shortcuts(&surface, seat, qh, ()));
+        eprintln!(
+            "Droidloom mouse immersion started object={} shortcuts-inhibited={}",
+            object.0,
+            inhibitor.is_some()
+        );
+        self.immersion = Some(Immersion {
+            object,
+            confined,
+            inhibitor,
+        });
+    }
+
+    fn end_immersion(&mut self) {
+        if let Some(immersion) = self.immersion.take() {
+            eprintln!("Droidloom mouse immersion ended object={}", immersion.object.0);
+            immersion.release();
+        }
+    }
+
+    fn scroll_steps(axis: &AxisScroll) -> f64 {
+        if axis.value120 != 0 {
+            f64::from(axis.value120) / 120.0
+        } else if axis.discrete != 0 {
+            f64::from(axis.discrete)
+        } else {
+            axis.absolute / CONTINUOUS_SCROLL_PIXELS_PER_STEP
+        }
+    }
+
+    /// Route a mouse event natively when the peer accepts mouse input.
+    fn route_mouse(&mut self, event: &PointerEvent) {
+        let object = self.task_for_surface(&event.surface);
+        let result = match event.kind {
+            PointerEventKind::Enter { .. } => match object {
+                Some(object) => {
+                    self.mouse_focus = Some(object);
+                    self.send_mouse(object, MouseAction::Enter, event.position, 0, (0.0, 0.0))
+                }
+                None => Ok(()),
+            },
+            PointerEventKind::Leave { .. } => match self.mouse_focus {
+                Some(focus) if object.is_none_or(|object| object == focus) => {
+                    self.mouse_focus = None;
+                    self.mouse_buttons.clear();
+                    self.send_mouse(focus, MouseAction::Leave, event.position, 0, (0.0, 0.0))
+                }
+                _ => Ok(()),
+            },
+            PointerEventKind::Motion { .. } => match self.mouse_focus {
+                Some(focus) => {
+                    self.send_mouse(focus, MouseAction::Motion, event.position, 0, (0.0, 0.0))
+                }
+                None => Ok(()),
+            },
+            PointerEventKind::Press { button, .. } => match self.mouse_focus.or(object) {
+                Some(focus) if self.mouse_buttons.insert(button) => {
+                    self.mouse_focus = Some(focus);
+                    self.text_input.note_touch();
+                    self.send_mouse(focus, MouseAction::ButtonPress, event.position, button,
+                        (0.0, 0.0))
+                }
+                _ => Ok(()),
+            },
+            PointerEventKind::Release { button, .. } => match self.mouse_focus {
+                Some(focus) if self.mouse_buttons.remove(&button) => self.send_mouse(
+                    focus,
+                    MouseAction::ButtonRelease,
+                    event.position,
+                    button,
+                    (0.0, 0.0),
+                ),
+                _ => Ok(()),
+            },
+            PointerEventKind::Axis { ref horizontal, ref vertical, .. } => match self.mouse_focus {
+                Some(focus) => {
+                    let scroll = (Self::scroll_steps(horizontal), Self::scroll_steps(vertical));
+                    if scroll == (0.0, 0.0) {
+                        Ok(())
+                    } else {
+                        self.send_mouse(focus, MouseAction::Scroll, event.position, 0, scroll)
+                    }
+                }
+                None => Ok(()),
+            },
+        };
+        if let Err(error) = result {
+            self.fail(&error);
+        }
+    }
+
+    /// Handle a tablet tool acting on a window decoration instead of task
+    /// content, so a pen moves, resizes and closes windows like a pointer.
+    /// Returns whether the action was consumed.
+    fn tablet_decoration(&mut self, tool_id: u32, action: TabletAction) -> bool {
+        let Some(tool) = self.tablet_tools.iter().find(|tool| tool.tool_id == tool_id) else {
+            return false;
+        };
+        let Some(surface) = tool.surface.clone() else { return false };
+        if self.task_for_surface(&surface).is_some() {
+            return false;
+        }
+        let position = (f64::from(tool.x_fixed) / 65_536.0, f64::from(tool.y_fixed) / 65_536.0);
+        let serial = tool.down_serial;
+        let seat = self
+            .tablet_tool_seats
+            .get(&tool_id)
+            .and_then(|tablet_seat| {
+                self.tablet_seats
+                    .iter()
+                    .find(|(_, candidate)| candidate.id().protocol_id() == *tablet_seat)
+            })
+            .map(|(seat, _)| seat.clone());
+        match action {
+            TabletAction::Down => {
+                let Some((object, _)) =
+                    self.decoration_pointer_task(&surface, position.0, position.1)
+                else {
+                    return false;
+                };
+                self.tablet_tool_mut(tool_id).decoration_down = Some(object);
+                let frame_action = self
+                    .tasks
+                    .get_mut(&object)
+                    .and_then(|task| task.window_frame.as_mut())
+                    .and_then(|frame| frame.on_click(Duration::ZERO, FrameClick::Normal, true));
+                if let (Some(frame_action), Some(seat)) = (frame_action, seat) {
+                    self.frame_action(&seat, object, serial, frame_action);
+                }
+            }
+            TabletAction::Up => {
+                let Some(object) = self.tablet_tool_mut(tool_id).decoration_down.take() else {
+                    return true;
+                };
+                let frame_action = self
+                    .tasks
+                    .get_mut(&object)
+                    .and_then(|task| task.window_frame.as_mut())
+                    .and_then(|frame| frame.on_click(Duration::ZERO, FrameClick::Normal, false));
+                // Resize is started by the press; the release only finishes it.
+                if let (Some(frame_action), Some(seat)) = (frame_action, seat)
+                    && !matches!(frame_action, FrameAction::Resize(_))
+                {
+                    self.frame_action(&seat, object, serial, frame_action);
+                }
+            }
+            TabletAction::ProximityOut | TabletAction::Cancel => {
+                self.tablet_tool_mut(tool_id).decoration_down = None;
+                self.decoration_pointer_left();
+            }
+            _ => {
+                let _ = self.decoration_pointer_task(&surface, position.0, position.1);
+            }
+        }
+        true
     }
 
     fn update_text_input(&mut self) {
@@ -1720,6 +2081,49 @@ impl App {
         self.fatal = Some(error.to_string());
     }
 
+    /// Route one pad button to the task under the pad's focus as a generic
+    /// gamepad-style button key, so Android applications and key layouts can
+    /// bind pen-side and pad buttons the way they bind them on a tablet.
+    fn pad_button(&mut self, pad_id: u32, button: u32, pressed: bool) {
+        if button >= PAD_BUTTON_COUNT {
+            return;
+        }
+        let Some(pad) = self.tablet_pads.get_mut(&pad_id) else { return };
+        let target = pad.focus.or(self.focused);
+        let Some(object) = target else { return };
+        let changed = if pressed { pad.pressed.insert(button) } else { pad.pressed.remove(&button) };
+        if !changed {
+            return;
+        }
+        if pressed {
+            pad.focus = Some(object);
+        }
+        eprintln!(
+            "Droidloom tablet trace: stage=pad-button pad={pad_id} button={button} pressed={pressed} task={}",
+            object.0
+        );
+        if let Err(error) = self.send_input(
+            object,
+            InputEvent::Key {
+                action: if pressed { KeyAction::Down } else { KeyAction::Up },
+                keycode: PAD_BUTTON_BASE + button,
+                repeat: 0,
+            },
+        ) {
+            self.fail(&error);
+        }
+    }
+
+    fn release_pad_buttons(&mut self, pad_id: u32) {
+        let Some(pad) = self.tablet_pads.get(&pad_id) else { return };
+        for button in pad.pressed.iter().copied().collect::<Vec<_>>() {
+            self.pad_button(pad_id, button, false);
+        }
+        if let Some(pad) = self.tablet_pads.get_mut(&pad_id) {
+            pad.focus = None;
+        }
+    }
+
     fn destroy_tablet_pad(&mut self, pad_id: u32) {
         if let Some(pad) = self.tablet_pads.remove(&pad_id) {
             for child in pad.children.into_iter().rev() {
@@ -1863,11 +2267,13 @@ impl App {
         let actions = std::mem::take(&mut tool.pending_actions);
         let dirty = std::mem::take(&mut tool.dirty_axes);
         // All axes in a tablet frame describe the same sample, including down/up.
-        if actions.is_empty() && dirty {
+        if actions.is_empty() && dirty && !self.tablet_decoration(tool_id, TabletAction::Motion) {
             self.send_tablet_event(tool_id, TabletAction::Motion, 0)?;
         }
         for (action, button) in actions {
-            self.send_tablet_event(tool_id, action, button)?;
+            if !self.tablet_decoration(tool_id, action) {
+                self.send_tablet_event(tool_id, action, button)?;
+            }
             if matches!(action, TabletAction::ProximityOut | TabletAction::Cancel) {
                 self.tablet_tool_mut(tool_id).surface = None;
             }
@@ -2012,6 +2418,9 @@ impl WindowHandler for App {
             || (String::new(), None, false),
             |task| (task.package.clone(), task.logical_size, task.headless()),
         );
+        if let Some(task) = self.tasks.get_mut(&object) {
+            task.fullscreen = configure.is_fullscreen();
+        }
         let (requested_width, requested_height) =
             match self.content_configure_size(qh, object, &configure) {
                 Ok((width, height)) => (width.map(NonZeroU32::get), height.map(NonZeroU32::get)),
@@ -2290,7 +2699,10 @@ impl SeatHandler for App {
             Capability::Keyboard if self.keyboard.is_none() => self
                 .seat_state
                 .get_keyboard(qh, &seat, None)
-                .map(|keyboard| self.keyboard = Some(keyboard))
+                .map(|keyboard| {
+                    self.keyboard = Some(keyboard);
+                    self.keyboard_seat = Some(seat.clone());
+                })
                 .map_err(|error| error.to_string()),
             Capability::Pointer if self.pointer.is_none() => {
                 let cursor_surface = self.compositor.create_surface(qh);
@@ -2324,6 +2736,7 @@ impl SeatHandler for App {
         match capability {
             Capability::Keyboard => {
                 self.keyboard = None;
+                self.keyboard_seat = None;
                 self.text_input.remove_resource();
             }
             Capability::Pointer => {
@@ -2343,6 +2756,7 @@ impl SeatHandler for App {
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         self.text_input.remove_resource();
         self.keyboard = None;
+        self.keyboard_seat = None;
         self.pointer = None;
         self.cursor_icon = None;
         self.touch = None;
@@ -2421,6 +2835,31 @@ impl KeyboardHandler for App {
         _serial: u32,
     ) {
         self.clipboard.focus(false);
+        if let Some(object) = self.task_for_surface(surface) {
+            // wl_keyboard.leave ends every press this surface received, so
+            // Android must see the matching releases.
+            let held = self
+                .pressed_keys
+                .iter()
+                .filter_map(|(key, owner)| (*owner == object).then_some(*key))
+                .collect::<Vec<_>>();
+            for keycode in held {
+                self.pressed_keys.remove(&keycode);
+                if let Err(error) = self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode,
+                        repeat: 0,
+                    },
+                ) {
+                    self.fail(&error);
+                }
+            }
+            if self.immersion.as_ref().is_some_and(|immersion| immersion.object == object) {
+                self.end_immersion();
+            }
+        }
         if self.focused == self.task_for_surface(surface)
             && let Err(error) = self.set_focus(None)
         {
@@ -2431,7 +2870,7 @@ impl KeyboardHandler for App {
     fn press_key(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         serial: u32,
         event: KeyEvent,
@@ -2441,17 +2880,36 @@ impl KeyboardHandler for App {
             && let Some(surface) = self.focused.and_then(|id| self.tasks.get(&id)).and_then(TaskWindow::surface) {
             self.activation.input(serial, data.seat(), surface);
         }
-        if let Some(object) = self.focused
-            && let Err(error) = self.send_input(
+        if self.window_shortcut(qh, event.raw_code) {
+            self.consumed_keys.insert(event.raw_code);
+            return;
+        }
+        if let Some(object) = self.focused {
+            // A key already held by another task is released there first, so
+            // every Android task sees balanced transitions.
+            if let Some(previous) = self.pressed_keys.insert(event.raw_code, object)
+                && previous != object
+                && let Err(error) = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                )
+            {
+                self.fail(&error);
+            }
+            if let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
                     action: KeyAction::Down,
                     keycode: event.raw_code,
                     repeat: 0,
                 },
-            )
-        {
-            self.fail(&error);
+            ) {
+                self.fail(&error);
+            }
         }
     }
 
@@ -2465,6 +2923,7 @@ impl KeyboardHandler for App {
     ) {
         self.clipboard.serial(serial);
         if let Some(object) = self.focused
+            && self.pressed_keys.get(&event.raw_code) == Some(&object)
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
@@ -2487,7 +2946,13 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
-        if let Some(object) = self.focused
+        if self.consumed_keys.remove(&event.raw_code) {
+            return;
+        }
+        // The release goes to the task that received the press, even if the
+        // routed focus moved in between; a release without a routed press is
+        // not forwarded.
+        if let Some(object) = self.pressed_keys.remove(&event.raw_code)
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
@@ -2507,10 +2972,11 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _modifiers: Modifiers,
+        modifiers: Modifiers,
         _raw_modifiers: RawModifiers,
         _layout: u32,
     ) {
+        self.modifiers = modifiers;
     }
 
     fn update_repeat_info(
@@ -2613,6 +3079,11 @@ impl PointerHandler for App {
                 continue;
             }
 
+            if self.mouse_input_supported() {
+                self.route_mouse(event);
+                continue;
+            }
+            // A peer without mouse input receives the left button as touch.
             let object = self.task_for_surface(&event.surface);
             match event.kind {
                 PointerEventKind::Press { button, .. }
@@ -2875,6 +3346,8 @@ impl Dispatch<ZwpTabletSeatV2, ()> for App {
                     tablet_seat_id: seat_id,
                     proxy: id.clone(),
                     children: Vec::new(),
+                    focus: None,
+                    pressed: BTreeSet::new(),
                 });
             }
             _ => {}
@@ -2950,9 +3423,11 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 eprintln!("Droidloom tablet trace: stage=wayland-event action=ProximityOut tool={tool_id}");
                 state.tablet_tool_mut(tool_id).pending_actions.push((TabletAction::ProximityOut, 0));
             }
-            tablet::zwp_tablet_tool_v2::Event::Down { .. } => {
+            tablet::zwp_tablet_tool_v2::Event::Down { serial } => {
                 eprintln!("Droidloom tablet trace: stage=wayland-event action=Down tool={tool_id}");
-                state.tablet_tool_mut(tool_id).pending_actions.push((TabletAction::Down, 0));
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.down_serial = serial;
+                tool.pending_actions.push((TabletAction::Down, 0));
             }
             tablet::zwp_tablet_tool_v2::Event::Up => {
                 eprintln!("Droidloom tablet trace: stage=wayland-event action=Up tool={tool_id}");
@@ -3069,7 +3544,25 @@ impl Dispatch<ZwpTabletPadV2, ()> for App {
                     pad.children.push(TabletPadChild::Group(pad_group));
                 }
             }
-            tablet::zwp_tablet_pad_v2::Event::Removed => state.destroy_tablet_pad(pad_id),
+            tablet::zwp_tablet_pad_v2::Event::Enter { surface, .. } => {
+                let object = state.task_for_surface(&surface);
+                if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                    pad.focus = object;
+                }
+            }
+            tablet::zwp_tablet_pad_v2::Event::Leave { .. } => state.release_pad_buttons(pad_id),
+            tablet::zwp_tablet_pad_v2::Event::Button { button, state: button_state, .. } => {
+                let pressed = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_pad_v2::ButtonState::Pressed) => true,
+                    WEnum::Value(tablet::zwp_tablet_pad_v2::ButtonState::Released) => false,
+                    _ => return,
+                };
+                state.pad_button(pad_id, button, pressed);
+            }
+            tablet::zwp_tablet_pad_v2::Event::Removed => {
+                state.release_pad_buttons(pad_id);
+                state.destroy_tablet_pad(pad_id);
+            }
             _ => {}
         }
     }
@@ -3123,6 +3616,54 @@ wayland_client::delegate_noop!(App: ignore ZwpTabletPadRingV2);
 wayland_client::delegate_noop!(App: ignore ZwpTabletPadStripV2);
 wayland_client::delegate_noop!(App: ignore ZwpTabletPadDialV2);
 
+impl PointerConstraintsHandler for App {
+    fn confined(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _confined_pointer: &ZwpConfinedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn unconfined(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        confined_pointer: &ZwpConfinedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {
+        // A persistent confinement is only suspended while the window lacks
+        // focus; the compositor reactivates it when focus returns.
+        let _ = confined_pointer;
+    }
+
+    fn locked(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _locked_pointer: &ZwpLockedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn unlocked(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _locked_pointer: &ZwpLockedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {
+    }
+}
+
+wayland_client::delegate_noop!(App: ignore ZwpKeyboardShortcutsInhibitManagerV1);
+wayland_client::delegate_noop!(App: ignore ZwpKeyboardShortcutsInhibitorV1);
+
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm_state
@@ -3146,6 +3687,7 @@ smithay_client_toolkit::delegate_presentation_time!(App);
 smithay_client_toolkit::delegate_seat!(App);
 smithay_client_toolkit::delegate_keyboard!(App);
 smithay_client_toolkit::delegate_pointer!(App);
+smithay_client_toolkit::delegate_pointer_constraints!(App);
 smithay_client_toolkit::delegate_touch!(App);
 smithay_client_toolkit::delegate_subcompositor!(App);
 smithay_client_toolkit::delegate_shm!(App);
@@ -3293,10 +3835,19 @@ fn run() -> Result<(), PresenterError> {
         endpoint: None,
         tasks: BTreeMap::new(),
         keyboard: None,
+        keyboard_seat: None,
+        modifiers: Modifiers::default(),
+        pressed_keys: BTreeMap::new(),
+        consumed_keys: BTreeSet::new(),
         pointer: None,
+        pointer_constraints: PointerConstraintsState::bind(&globals, &qh),
+        shortcuts_inhibit_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        immersion: None,
         cursor_icon: None,
         touch: None,
         focused: None,
+        mouse_focus: None,
+        mouse_buttons: BTreeSet::new(),
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
         decoration_touch: None,
@@ -3814,5 +4365,29 @@ mod tests {
         assert_eq!(presentation_refresh_period(0, 120_000).unwrap(), 8_333_333);
         assert!(presentation_timestamp_nanos(0, 1_000_000_000).is_err());
         assert!(presentation_refresh_period(0, 0).is_err());
+    }
+
+    #[test]
+    fn mouse_scroll_prefers_named_wheel_steps_over_pixels() {
+        // A named wheel reports detents; touchpads report pixels or fractions
+        // of a step.
+        let scroll = |value120: i32, discrete: i32, absolute: f64| AxisScroll {
+            value120,
+            discrete,
+            absolute,
+            ..AxisScroll::default()
+        };
+        assert_eq!(App::scroll_steps(&scroll(360, 3, 500.0)), 3.0);
+        assert_eq!(App::scroll_steps(&scroll(0, -2, 500.0)), -2.0);
+        assert_eq!(App::scroll_steps(&scroll(0, 0, -25.0)), -2.5);
+        assert_eq!(App::scroll_steps(&AxisScroll::default()), 0.0);
+    }
+
+    #[test]
+    fn pad_buttons_stay_inside_android_generic_button_codes() {
+        // BTN_0 through BTN_15 are what Generic.kl maps to BUTTON_1..16.
+        assert_eq!(PAD_BUTTON_BASE, 0x100);
+        assert!(PAD_BUTTON_COUNT <= 16);
+        assert!(PAD_BUTTON_BASE + PAD_BUTTON_COUNT - 1 <= 0x10f);
     }
 }
