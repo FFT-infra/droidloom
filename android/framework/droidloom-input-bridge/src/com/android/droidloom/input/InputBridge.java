@@ -1432,12 +1432,11 @@ public final class InputBridge {
             case 139: return KeyEvent.KEYCODE_MENU;
             case 158: return KeyEvent.KEYCODE_BACK;
             case 159: return KeyEvent.KEYCODE_FORWARD;
-            // The pen's side buttons keep Android's stylus key codes. The
-            // Focus Pen Pro's four gesture buttons arrive as BTN_6..BTN_9 and
-            // become BUTTON_7..BUTTON_10, the codes the pen's own key layout
-            // assigns on a tablet that passes the pen devices through.
-            case 331: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;
-            case 332: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;
+            // Xiaomi Focus Pen side buttons and Pro gestures map to canonical
+            // KEYCODE_BUTTON_7..BUTTON_10 (194..197) which Xiaomi note-taking
+            // applications (StarNote, Notein, etc.) bind to.
+            case 331: return KeyEvent.KEYCODE_BUTTON_7;
+            case 332: return KeyEvent.KEYCODE_BUTTON_8;
             case 262: return KeyEvent.KEYCODE_BUTTON_7;
             case 263: return KeyEvent.KEYCODE_BUTTON_8;
             case 264: return KeyEvent.KEYCODE_BUTTON_9;

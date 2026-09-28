@@ -1,8 +1,6 @@
 # Xiaomi Focus Pen (M80p).
 #
-# The barrel buttons must reach the application as the standard stylus key
-# codes: note-taking applications wait for those two keys rather than reading
-# the motion button state. The pen compatibility layer these applications ship
-# synthesizes exactly this pair from the motion stream.
-key 331   STYLUS_BUTTON_PRIMARY
-key 332   STYLUS_BUTTON_SECONDARY
+# Map barrel buttons to Android canonical keys BUTTON_7 / BUTTON_8 (194 / 195)
+# which Xiaomi note-taking applications (StarNote, Notein, etc.) bind to.
+key 331   BUTTON_7
+key 332   BUTTON_8

@@ -13,6 +13,7 @@ pub const TARGETS: &[&str] = &[
     "droidloom-input-bridge",
     "DroidloomIME",
     "DroidloomHome",
+    "TouchService",
     "DroidloomSystemUI",
     "droidloom-lmkd-compat",
     "droidloom-classpath-wrapper",

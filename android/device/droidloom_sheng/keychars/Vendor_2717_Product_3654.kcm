@@ -1,0 +1,10 @@
+# Xiaomi Focus Pen (M80p) Key Character Map.
+type FULL
+
+key BUTTON_7 {
+    base: none
+}
+
+key BUTTON_8 {
+    base: none
+}

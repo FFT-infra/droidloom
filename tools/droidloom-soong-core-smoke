@@ -444,6 +444,7 @@ mkdir -p "$source_tree/vendor/droidloom"
         ./android/framework/droidloom-input-bridge \
         ./android/framework/droidloom-ime \
         ./android/framework/droidloom-home \
+        ./android/framework/droidloom-touchservice \
         ./android/framework/droidloom-systemui \
         ./android/lmkd-compat \
         ./android/runtime/droidloom-classpath-wrapper \
@@ -598,7 +599,7 @@ mkdir -p "$source_tree/vendor/droidloom"
         android.hardware.graphics.composer3-service.droidloom \
         droidloom-task-launcher \
         droidloom-input-bridge \
-        DroidloomIME DroidloomHome DroidloomSystemUI \
+        DroidloomIME DroidloomHome TouchService DroidloomSystemUI \
         droidloom-lmkd-compat \
         droidloom-classpath-wrapper \
         netbpfload \

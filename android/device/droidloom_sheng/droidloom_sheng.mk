@@ -101,7 +101,9 @@ PRODUCT_VENDOR_PROPERTIES += \
 # note-taking applications act on.
 PRODUCT_COPY_FILES += \
     vendor/droidloom/android/device/droidloom_sheng/keylayout/Vendor_2717_Product_3654.kl:$(TARGET_COPY_OUT_VENDOR)/usr/keylayout/Vendor_2717_Product_3654.kl \
-    vendor/droidloom/android/device/droidloom_sheng/keylayout/Vendor_2717_Product_3655.kl:$(TARGET_COPY_OUT_VENDOR)/usr/keylayout/Vendor_2717_Product_3655.kl
+    vendor/droidloom/android/device/droidloom_sheng/keylayout/Vendor_2717_Product_3655.kl:$(TARGET_COPY_OUT_VENDOR)/usr/keylayout/Vendor_2717_Product_3655.kl \
+    vendor/droidloom/android/device/droidloom_sheng/keychars/Vendor_2717_Product_3654.kcm:$(TARGET_COPY_OUT_VENDOR)/usr/keychars/Vendor_2717_Product_3654.kcm \
+    vendor/droidloom/android/device/droidloom_sheng/keychars/Vendor_2717_Product_3655.kcm:$(TARGET_COPY_OUT_VENDOR)/usr/keychars/Vendor_2717_Product_3655.kcm
 
 # A 64-bit-only cell ships no dex2oat32 in the ART apex. Without this property
 # artd selects dex2oat32, every dexopt aborts, and all applications stay on the

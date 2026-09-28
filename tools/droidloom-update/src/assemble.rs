@@ -389,6 +389,10 @@ pub fn assemble_artifacts(
             "ime/DroidloomHome.apk",
         ),
         (
+            "system/app/TouchService/TouchService.apk",
+            "ime/TouchService.apk",
+        ),
+        (
             "system/system_ext/priv-app/DroidloomSystemUI/DroidloomSystemUI.apk",
             "systemui/SystemUI.apk",
         ),

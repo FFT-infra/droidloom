@@ -16,3 +16,30 @@ fi
 cmd input_method ime enable com.android.droidloom.ime/.HostInputMethod
 cmd input_method ime set com.android.droidloom.ime/.HostInputMethod
 cmd settings put secure show_ime_with_hard_keyboard 1
+
+# Install TouchService (com.xiaomi.touchservice) if provided
+touch_apk=/droidloom/ime/TouchService.apk
+if [ -f "$touch_apk" ]; then
+    touch_marker=/data/local/tmp/droidloom-touchservice.sha256
+    touch_digest="$(sha256sum "$touch_apk" | cut -d ' ' -f 1)"
+    touch_installed="$(cmd package path com.xiaomi.touchservice 2>/dev/null || true)"
+    touch_previous=""
+    if [ -f "$touch_marker" ]; then touch_previous="$(cat "$touch_marker")"; fi
+    if [ -z "$touch_installed" ] || [ "$touch_previous" != "$touch_digest" ]; then
+        touch_result="$(cmd package install -r "$touch_apk")"
+        case "$touch_result" in *Success*) ;; *) echo "$touch_result" >&2; exit 1;; esac
+        printf '%s\n' "$touch_digest" > "$touch_marker"
+    fi
+fi
+
+# Xiaomi Focus Pen & Pro stylus identity and capability settings for note applications
+cmd settings put secure setting_stylus_version 8
+cmd settings put system setting_stylus_version 8
+cmd settings put system stylus_pencil_engine_version 0.3.2
+cmd settings put system touch_film_stylus_first_connect 1
+cmd settings put system stylus_hover_enable 1
+cmd settings put system stylus_brush_preview_enable 1
+cmd settings put system stylus_pinch_status 1
+cmd settings put system stylus_double_click_status 2
+cmd settings put system stylus_quick_note_screen_off 1
+
