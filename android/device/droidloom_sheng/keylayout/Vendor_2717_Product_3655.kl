@@ -1,0 +1,13 @@
+# Xiaomi Focus Pen Pro.
+#
+# The barrel buttons must reach the application as the standard stylus key
+# codes: note-taking applications wait for those two keys rather than reading
+# the motion button state. The Focus Pen Pro's four gesture buttons keep the
+# generic buttons the pen's own key layout assigns them, which is the range
+# these applications bind their gesture actions to.
+key 331   STYLUS_BUTTON_PRIMARY
+key 332   STYLUS_BUTTON_SECONDARY
+key 262   BUTTON_7
+key 263   BUTTON_8
+key 264   BUTTON_9
+key 265   BUTTON_10

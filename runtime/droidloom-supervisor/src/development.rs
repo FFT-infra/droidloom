@@ -62,6 +62,8 @@ const V4L2_CAP_DEVICE_CAPS: u32 = 0x8000_0000;
 const V4L2_QUERYCAP_IOCTL: libc::c_ulong = 0x8068_5600;
 const ANDROID_IRIS_VIDEO_NODE: &str = "video0";
 const ANDROID_CAMERA_GID: u32 = 1006;
+/// Android's `input` group, which the platform gives to input devices.
+const ANDROID_INPUT_GID: u32 = 1004;
 const ANDROID_SYSTEM_UID: u32 = 1000;
 const ANDROID_SYSTEM_GID: u32 = 1000;
 const PRIVATE_SYSCTL_DIRECTORY: &str = "android-private-sysctls";
@@ -1598,31 +1600,35 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     }
 
     // Kernel hotplug uevents reach every listener, including the cell's
-    // ueventd, so a device attached to the host is otherwise published here as
-    // /dev/input/event* even though this private /dev never creates it. Input
-    // is routed per Android task instead, and a raw evdev node would both
-    // bypass that routing and hand every application the host's physical
-    // devices. Mask the directory with an empty read-only filesystem so the
-    // cell's ueventd cannot publish devices into it.
+    // ueventd, so a device attached to the host would otherwise be published
+    // here as /dev/input/event* even though this private /dev never creates
+    // it, and Android would read that device directly alongside this
+    // runtime's routed input.
+    //
+    // The pen relay's button and gesture devices are the exception: it creates
+    // them for an Android reader and nothing else on the host reads them, so
+    // the cell takes exactly those two and Android's InputReader turns them
+    // into the key events note-taking applications bind their eraser and
+    // gesture actions to. The pen tip stays on the routed path, so no stroke
+    // is delivered twice. The directory is read-only afterwards, which keeps
+    // every other host device out.
     let input = dev.join("input");
     fs::create_dir_all(&input)
         .map_err(|source| io_error("create private input directory", source))?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("tmpfs"),
-            OsString::from("-o"),
-            OsString::from("size=4k,mode=0755,nosuid,nodev,noexec"),
-            OsString::from("tmpfs"),
-            input.as_os_str().to_owned(),
-        ],
-    )?;
+    for (index, device) in discover_pen_input_devices()?.into_iter().enumerate() {
+        let node = input.join(format!("event{index}"));
+        make_device_node(&node, "c", device.major, device.minor, "660")?;
+        set_owner(&node, 0, ANDROID_INPUT_GID)?;
+    }
+    // Read-only keeps the cell's ueventd from publishing anything else here,
+    // but the mount must stay device-bearing: a `nodev` remount would make the
+    // two nodes above unopenable.
+    bind_mount(&input, &input, false)?;
     run_os(
         "mount",
         [
             OsString::from("-o"),
-            OsString::from("remount,ro,nosuid,nodev,noexec"),
+            OsString::from("remount,bind,ro,nosuid"),
             input.into_os_string(),
         ],
     )?;
@@ -1858,6 +1864,45 @@ fn create_iris_device_nodes(dev: &Path) -> Result<(), DevelopmentError> {
         let _ = fs::remove_file(&heap_node);
     }
     result
+}
+
+/// One host input device the pen relay created for an Android reader.
+struct PenInputDevice {
+    major: u32,
+    minor: u32,
+}
+
+/// The pen relay's Android-facing input devices, matched by their physical
+/// device path. The relay keeps the pen's own device tree to itself and
+/// publishes these for the platform that reads them.
+fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError> {
+    const PEN_PHYS: [&str; 2] = ["waydroid-pen-buttons", "waydroid-gesture-android"];
+    let mut devices = Vec::new();
+    let entries = fs::read_dir("/sys/class/input")
+        .map_err(|source| io_error("enumerate host input devices", source))?;
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error("read host input entry", source))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name
+            .strip_prefix("event")
+            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let phys = match fs::read_to_string(entry.path().join("device/phys")) {
+            Ok(phys) => phys,
+            Err(_) => continue,
+        };
+        if !PEN_PHYS.contains(&phys.trim()) {
+            continue;
+        }
+        let (major, minor) =
+            verified_char_device_numbers(&Path::new("/dev/input").join(&name))?;
+        devices.push(PenInputDevice { major, minor });
+    }
+    Ok(devices)
 }
 
 fn discover_iris_video_decoder() -> Result<IrisVideoDecoder, DevelopmentError> {

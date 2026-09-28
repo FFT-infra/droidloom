@@ -729,6 +729,18 @@ public final class InputBridge {
                 state.update(record);
                 final int button = androidTabletButton(record.button);
                 if (button == 0) return;
+                // A pen button reaches an application as a key on a tablet
+                // that passes the pen devices through, so send the same key
+                // alongside the motion button state.
+                final int buttonKey = tabletButtonKeyCode(record.button);
+                if (buttonKey != KeyEvent.KEYCODE_UNKNOWN) {
+                    injectKey(record.displayId, state.applicationToken,
+                            record.timestampNanos / 1_000_000L,
+                            record.timestampNanos / 1_000_000L,
+                            record.action == TABLET_ACTION_BUTTON_PRESS, buttonKey,
+                            record.button, 0, metaState(record.displayId, record.taskId),
+                            InputDevice.SOURCE_STYLUS);
+                }
                 if (record.action == TABLET_ACTION_BUTTON_PRESS) {
                     state.buttonState |= button;
                 } else {
@@ -874,6 +886,17 @@ public final class InputBridge {
         }
     }
 
+    /// The key a pen button press reports. Applications that take notes wait
+    /// for these two key codes rather than reading the motion button state;
+    /// the pen compatibility layer they ship relies on the same pair.
+    private static int tabletButtonKeyCode(int button) {
+        switch (button) {
+            case 0x14b: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;
+            case 0x14c: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;
+            default: return KeyEvent.KEYCODE_UNKNOWN;
+        }
+    }
+
     private void inject(KeyRecord record) {
         final int keyCode = androidKeyCode(record.scanCode);
         if (keyCode == KeyEvent.KEYCODE_UNKNOWN) {
@@ -929,6 +952,13 @@ public final class InputBridge {
     private boolean injectKey(int displayId, IBinder applicationToken, long downTimeMillis,
             long eventTimeMillis, boolean pressed, int keyCode, int scanCode, int repeat,
             int metaState) {
+        return injectKey(displayId, applicationToken, downTimeMillis, eventTimeMillis, pressed,
+                keyCode, scanCode, repeat, metaState, InputDevice.SOURCE_KEYBOARD);
+    }
+
+    private boolean injectKey(int displayId, IBinder applicationToken, long downTimeMillis,
+            long eventTimeMillis, boolean pressed, int keyCode, int scanCode, int repeat,
+            int metaState, int source) {
         // Keys come from the host's physical keyboard, so they carry Android's
         // registered host keyboard: applications resolve a real, external,
         // alphabetic keyboard and its character map from the event.
@@ -942,7 +972,7 @@ public final class InputBridge {
                 hostKeyboardDeviceId(),
                 scanCode,
                 KeyEvent.FLAG_FROM_SYSTEM,
-                InputDevice.SOURCE_KEYBOARD);
+                source);
         try {
             mSetDisplayId.invoke(event, displayId);
             return injectInputEventToApplication(event, applicationToken);
@@ -1402,10 +1432,16 @@ public final class InputBridge {
             case 139: return KeyEvent.KEYCODE_MENU;
             case 158: return KeyEvent.KEYCODE_BACK;
             case 159: return KeyEvent.KEYCODE_FORWARD;
-            // Linux evdev BTN_STYLUS / BTN_STYLUS2. Preserve a separate
-            // button-only route when the host exposes the pen buttons as keys.
+            // The pen's side buttons keep Android's stylus key codes. The
+            // Focus Pen Pro's four gesture buttons arrive as BTN_6..BTN_9 and
+            // become BUTTON_7..BUTTON_10, the codes the pen's own key layout
+            // assigns on a tablet that passes the pen devices through.
             case 331: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;
             case 332: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;
+            case 262: return KeyEvent.KEYCODE_BUTTON_7;
+            case 263: return KeyEvent.KEYCODE_BUTTON_8;
+            case 264: return KeyEvent.KEYCODE_BUTTON_9;
+            case 265: return KeyEvent.KEYCODE_BUTTON_10;
             default: return KeyEvent.KEYCODE_UNKNOWN;
         }
     }

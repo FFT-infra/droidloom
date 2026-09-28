@@ -117,11 +117,12 @@ const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
 const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const LEFT_BUTTON: u32 = 0x110;
-/// Linux evdev `BTN_0`: tablet pad button N is routed as `BTN_0 + N`, the
-/// code Android's generic key layout maps to `KEYCODE_BUTTON_<N + 1>`.
-const PAD_BUTTON_BASE: u32 = 0x100;
-/// Android names sixteen generic buttons.
-const PAD_BUTTON_COUNT: u32 = 16;
+/// Linux evdev `BTN_6`: tablet pad button N is routed as `BTN_6 + N`. The
+/// bridge maps these to `KEYCODE_BUTTON_7` upwards, the way the pen devices'
+/// own key layout does on a tablet that passes them through.
+const PAD_BUTTON_BASE: u32 = 0x106;
+/// The pen's buttons reach Android as four consecutive generic buttons.
+const PAD_BUTTON_COUNT: u32 = 4;
 /// Linux evdev key codes of the presenter's own window shortcuts.
 /// Set once from the environment to trace routed keys and mouse events.
 static INPUT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4416,9 +4417,11 @@ mod tests {
 
     #[test]
     fn pad_buttons_stay_inside_android_generic_button_codes() {
-        // BTN_0 through BTN_15 are what Generic.kl maps to BUTTON_1..16.
-        assert_eq!(PAD_BUTTON_BASE, 0x100);
-        assert!(PAD_BUTTON_COUNT <= 16);
-        assert!(PAD_BUTTON_BASE + PAD_BUTTON_COUNT - 1 <= 0x10f);
+        // BTN_6 through BTN_9 are what the bridge maps to BUTTON_7..10, the
+        // codes the pen's key layouts use on a tablet that passes the pen
+        // devices through to Android.
+        assert_eq!(PAD_BUTTON_BASE, 0x106);
+        assert_eq!(PAD_BUTTON_COUNT, 4);
+        assert_eq!(PAD_BUTTON_BASE + PAD_BUTTON_COUNT - 1, 0x109);
     }
 }
