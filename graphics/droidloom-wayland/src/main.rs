@@ -123,6 +123,8 @@ const PAD_BUTTON_BASE: u32 = 0x100;
 /// Android names sixteen generic buttons.
 const PAD_BUTTON_COUNT: u32 = 16;
 /// Linux evdev key codes of the presenter's own window shortcuts.
+/// Set once from the environment to trace routed keys and mouse events.
+static INPUT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 const KEY_F11: u32 = 87;
 const KEY_M: u32 = 50;
 /// One scroll step for a continuous (touchpad or finger) Wayland scroll,
@@ -1592,7 +1594,6 @@ impl App {
         object: TaskObjectId,
         event: InputEvent,
     ) -> Result<(), PresenterError> {
-        static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let tablet_trace = match event {
             InputEvent::Tablet { action, tool_id, .. }
                 if !matches!(action, TabletAction::Motion | TabletAction::Wheel) =>
@@ -1606,7 +1607,7 @@ impl App {
             .checked_add(1)
             .ok_or(PresenterError::Configuration("input serial exhausted"))?;
         let timestamp = monotonic_timestamp_nanos()?;
-        if *KEY_TRACE.get_or_init(|| {
+        if *INPUT_TRACE.get_or_init(|| {
             env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
         })
             && let InputEvent::Key {
@@ -1810,39 +1811,60 @@ impl App {
                 }
                 None => Ok(()),
             },
-            PointerEventKind::Leave { .. } => match self.mouse_focus {
-                Some(focus) if object.is_none_or(|object| object == focus) => {
-                    self.mouse_focus = None;
-                    self.mouse_buttons.clear();
-                    self.send_mouse(focus, MouseAction::Leave, event.position, 0, (0.0, 0.0))
+            PointerEventKind::Leave { .. } => {
+                let Some(focus) = self.mouse_focus.take() else { return };
+                if object.is_some_and(|object| object != focus) {
+                    self.mouse_focus = Some(focus);
+                    return;
                 }
-                _ => Ok(()),
-            },
+                // A window that loses the pointer while a button is down has
+                // no way to receive the release, so hand Android a cancel.
+                if self.mouse_buttons.is_empty() {
+                    self.send_mouse(focus, MouseAction::Leave, event.position, 0, (0.0, 0.0))
+                } else {
+                    self.mouse_buttons.clear();
+                    self.send_mouse(focus, MouseAction::Cancel, event.position, 0, (0.0, 0.0))
+                }
+            }
             PointerEventKind::Motion { .. } => match self.mouse_focus {
                 Some(focus) => {
                     self.send_mouse(focus, MouseAction::Motion, event.position, 0, (0.0, 0.0))
                 }
                 None => Ok(()),
             },
-            PointerEventKind::Press { button, .. } => match self.mouse_focus.or(object) {
-                Some(focus) if self.mouse_buttons.insert(button) => {
-                    self.mouse_focus = Some(focus);
+            PointerEventKind::Press { button, .. } => {
+                let Some(focus) = self.mouse_focus.or(object) else { return };
+                self.mouse_focus = Some(focus);
+                // The stream can miss a release while the compositor owns the
+                // grab; resynchronize instead of swallowing the new press.
+                if self.mouse_buttons.insert(button) {
                     self.text_input.note_touch();
                     self.send_mouse(focus, MouseAction::ButtonPress, event.position, button,
                         (0.0, 0.0))
+                } else {
+                    self.send_mouse(focus, MouseAction::Cancel, event.position, 0, (0.0, 0.0))
+                        .and_then(|()| {
+                            self.mouse_buttons.insert(button);
+                            self.send_mouse(focus, MouseAction::ButtonPress, event.position,
+                                button, (0.0, 0.0))
+                        })
                 }
-                _ => Ok(()),
-            },
-            PointerEventKind::Release { button, .. } => match self.mouse_focus {
-                Some(focus) if self.mouse_buttons.remove(&button) => self.send_mouse(
-                    focus,
-                    MouseAction::ButtonRelease,
-                    event.position,
-                    button,
-                    (0.0, 0.0),
-                ),
-                _ => Ok(()),
-            },
+            }
+            PointerEventKind::Release { button, .. } => {
+                // Clear the tracked press whether or not a target is known, so
+                // a lost focus cannot wedge the button down forever.
+                let pressed = self.mouse_buttons.remove(&button);
+                match self.mouse_focus.or(object) {
+                    Some(focus) if pressed => self.send_mouse(
+                        focus,
+                        MouseAction::ButtonRelease,
+                        event.position,
+                        button,
+                        (0.0, 0.0),
+                    ),
+                    _ => Ok(()),
+                }
+            }
             PointerEventKind::Axis { ref horizontal, ref vertical, .. } => match self.mouse_focus {
                 Some(focus) => {
                     let scroll = (Self::scroll_steps(horizontal), Self::scroll_steps(vertical));
@@ -1855,6 +1877,15 @@ impl App {
                 None => Ok(()),
             },
         };
+        if *INPUT_TRACE.get_or_init(|| {
+            env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        }) {
+            eprintln!(
+                "Droidloom mouse trace: object={:?} focus={:?} buttons={:?} event={:?}",
+                object.map(|object| object.0), self.mouse_focus.map(|object| object.0),
+                self.mouse_buttons, event.kind
+            );
+        }
         if let Err(error) = result {
             self.fail(&error);
         }

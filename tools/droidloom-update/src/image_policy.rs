@@ -257,6 +257,20 @@ pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<
             ));
         }
     };
+    // SurfaceFlinger takes an internal display's density from this property
+    // and falls back to its TV density when nothing defines it, which is what
+    // a panel without EDID gets. State it here: the product partition loads
+    // last, so this value wins over anything the pinned system image states,
+    // and a per-user `droidloomctl dpi` override still outranks it.
+    const DENSITY_PREFIX: &str = "ro.sf.lcd_density=";
+    const DENSITY: &str = "ro.sf.lcd_density=320";
+    let declared = match declared
+        .lines()
+        .find(|line| line.starts_with(DENSITY_PREFIX))
+    {
+        Some(existing) => declared.replace(existing, DENSITY),
+        None => format!("{declared}{DENSITY}\n"),
+    };
     // Rewriting the file in place keeps its owner, mode and security label; the
     // original modification time is restored so a derived image stays
     // reproducible from its base.
@@ -387,7 +401,7 @@ mod tests {
         let properties = root.join("etc/build.prop");
         fs::write(
             &properties,
-            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=default\nro.vendor.build.characteristics=default\n",
+            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=default\nro.sf.lcd_density=213\nro.vendor.build.characteristics=default\n",
         )
         .unwrap();
         let original = work.path().join("original.img");
@@ -404,11 +418,11 @@ mod tests {
         declare_tablet_product_image(&original, &destination).unwrap();
         let check = work.path().join("verify");
         extract(&destination, &check).unwrap();
-        // The declared class changes; the product identity and every other
-        // characteristic keep the value the base image states.
+        // The declared class and density change; the product identity and
+        // every other characteristic keep the value the base image states.
         assert_eq!(
             fs::read_to_string(check.join("etc/build.prop")).unwrap(),
-            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=tablet\nro.vendor.build.characteristics=default\n"
+            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=tablet\nro.sf.lcd_density=320\nro.vendor.build.characteristics=default\n"
         );
         assert!(
             fs::metadata(&destination).unwrap().len() > 0,
@@ -423,6 +437,23 @@ mod tests {
         );
         // One derivation per base image: reusing the destination is refused.
         assert!(declare_tablet_product_image(&original, &destination).is_err());
+        // A base image that states no density gains the line.
+        fs::write(&properties, "ro.build.characteristics=default\n").unwrap();
+        let undeclared = work.path().join("undeclared.img");
+        run(Command::new("mkfs.erofs")
+            .args(["-zlz4hc", "--workers=2"])
+            .arg(&undeclared)
+            .arg(&root))
+        .unwrap();
+        let declared = work.path().join("undeclared-out.img");
+        declare_tablet_product_image(&undeclared, &declared).unwrap();
+        let check = work.path().join("verify-undeclared");
+        extract(&declared, &check).unwrap();
+        assert_eq!(
+            fs::read_to_string(check.join("etc/build.prop")).unwrap(),
+            "ro.build.characteristics=tablet\nro.sf.lcd_density=320\n"
+        );
+
         // An image without the phone class can not declare the tablet class.
         fs::write(&properties, "ro.product.model=Cuttlefish arm64 phone\n").unwrap();
         let absent = work.path().join("absent.img");

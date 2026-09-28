@@ -595,6 +595,14 @@ The subsequent source fixes and full-suite results are recorded above.
   right scale; 320 is the density Android's own rule picks for that pixel
   density. A per-user `droidloomctl dpi` override still outranks the product
   default and persists in the Android data image.
+- **The cell never sees a physical input device.** Kernel hotplug uevents reach
+  every uevent listener, including the cell's ueventd, so a device attached to
+  the host was published as `/dev/input/event*` inside the cell and Android read
+  it directly, in parallel with Droidloom's routed input. The cell's private
+  `/dev/input` is now an empty read-only filesystem, so ueventd cannot publish
+  devices there; the cell's own ueventd logs an error for each host input
+  hotplug, which is expected. Mouse, keyboard, pen and tablet-pad input reach
+  Android only through the routed task-token path.
 - **The cell's synthetic sysfs exposes CPU topology but no frequency metadata.**
   `/sys/devices/system/cpu/{possible,present,online}` report the CPUs the cell
   actually inherits, which is what `get_nprocs()` and Java's

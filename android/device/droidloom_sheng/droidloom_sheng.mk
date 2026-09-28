@@ -100,15 +100,6 @@ PRODUCT_VENDOR_PROPERTIES += \
 # interpreter.
 PRODUCT_VENDOR_PROPERTIES += dalvik.vm.dex2oat64.enabled=true
 
-# The panel reports no EDID, so SurfaceFlinger has no physical size to derive a
-# density from and would fall back to the pixel count alone (213 dpi here),
-# which renders every tablet interface about a third smaller than the hardware
-# does. The 12.4-inch 3048x2032 panel is roughly 295 ppi, and Android's density
-# rule maps that to xhdpi; state it so the cell matches the display Android
-# would build for this panel. The per-user `droidloomctl dpi` override stays
-# available and outranks this default.
-PRODUCT_VENDOR_PROPERTIES += ro.sf.lcd_density=320
-
 # The Iris decoders pass the AVC/HEVC/VP9/AV1 qualifier matrix, but the vendor
 # HAL stays opt-in: it is the only hardware decode path here, and every
 # advertised format has to keep passing before it becomes unconditional.

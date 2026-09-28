@@ -1076,9 +1076,18 @@ public final class InputBridge {
             coordinates.setAxisValue(MotionEvent.AXIS_VSCROLL, -record.scrollY);
             coordinates.setAxisValue(MotionEvent.AXIS_HSCROLL, record.scrollX);
         }
-        final boolean down = state.buttonState != 0 || action == MotionEvent.ACTION_UP
-                || action == MotionEvent.ACTION_CANCEL;
-        final long downTimeMillis = down ? state.downTimeMillis : eventTimeMillis;
+        // Every event of a button gesture shares the press time. Android's
+        // input verifier rejects an event whose down time is older than the
+        // stream's last event time, so only a hover sample may use its own.
+        final boolean gesture = state.buttonState != 0
+                || action == MotionEvent.ACTION_DOWN
+                || action == MotionEvent.ACTION_MOVE
+                || action == MotionEvent.ACTION_UP
+                || action == MotionEvent.ACTION_CANCEL
+                || action == MotionEvent.ACTION_BUTTON_PRESS
+                || action == MotionEvent.ACTION_BUTTON_RELEASE;
+        final long downTimeMillis = gesture && state.downTimeMillis != 0
+                ? state.downTimeMillis : eventTimeMillis;
         final MotionEvent event = MotionEvent.obtain(
                 downTimeMillis,
                 Math.max(downTimeMillis, eventTimeMillis),
