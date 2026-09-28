@@ -27,6 +27,13 @@ pub const PORTABLE_WINDOWED_DEFAULT: LogicalSize = LogicalSize {
     width: 480,
     height: 800,
 };
+/// Smallest window the adaptive default will offer on a large work area.
+const ADAPTIVE_MINIMUM_DIMENSION: u32 = 320;
+/// Fractions of the work area an adaptive default window occupies.
+const ADAPTIVE_WIDTH_DIVISOR: u32 = 3;
+const ADAPTIVE_WIDTH_PARTS: u32 = 2;
+const ADAPTIVE_HEIGHT_DIVISOR: u32 = 4;
+const ADAPTIVE_HEIGHT_PARTS: u32 = 3;
 
 /// Explicit runtime form factor, selected when starting Droidloom.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -119,8 +126,12 @@ pub enum LaunchMode {
     /// output extent. This is the natural mobile policy.
     FitOutput,
     /// Use an application-like fixed logical preference, clamped to XDG
-    /// bounds. This is the natural desktop policy.
+    /// bounds.
     Windowed,
+    /// Use a large fraction of the work area, clamped to XDG bounds. This is
+    /// the natural desktop default on an unknown display: a tablet-class
+    /// window on a large panel, and a sensible one on a small screen.
+    Adaptive,
 }
 
 /// One persistent launch preference.
@@ -143,6 +154,14 @@ impl WindowPreference {
         }
     }
 
+    /// Prefer a large fraction of the compositor work area.
+    pub const fn adaptive() -> Self {
+        Self {
+            mode: LaunchMode::Adaptive,
+            size: None,
+        }
+    }
+
     /// Prefer one fixed logical size.
     pub const fn windowed(size: LogicalSize) -> Self {
         Self {
@@ -153,11 +172,11 @@ impl WindowPreference {
 
     fn validate(self) -> Result<(), WindowPolicyError> {
         match (self.mode, self.size) {
-            (LaunchMode::FitOutput, None) => Ok(()),
+            (LaunchMode::FitOutput | LaunchMode::Adaptive, None) => Ok(()),
             (LaunchMode::Windowed, Some(size)) => size.validate(),
-            (LaunchMode::FitOutput, Some(_)) => Err(WindowPolicyError::Invalid(
-                "fit_output preference must not contain a fixed size".into(),
-            )),
+            (LaunchMode::FitOutput | LaunchMode::Adaptive, Some(_)) => Err(
+                WindowPolicyError::Invalid("this preference must not contain a fixed size".into()),
+            ),
             (LaunchMode::Windowed, None) => Err(WindowPolicyError::Invalid(
                 "windowed preference requires a fixed size".into(),
             )),
@@ -167,7 +186,7 @@ impl WindowPreference {
 
 impl Default for WindowPreference {
     fn default() -> Self {
-        Self::windowed(PORTABLE_WINDOWED_DEFAULT)
+        Self::adaptive()
     }
 }
 
@@ -306,10 +325,14 @@ impl WindowPolicyStore {
         let base = self.policy.applications.get(package).copied().map_or_else(
             || match default.mode {
                 LaunchMode::FitOutput => resolve_preference(default, bounds, output_size),
-                LaunchMode::Windowed => self.state.applications.get(package).copied().map_or_else(
-                    || resolve_preference(default, bounds, output_size),
-                    |remembered| remembered.clamped_to(bounds),
-                ),
+                // An application's own last stable size outranks the default,
+                // whether that default is fixed or adaptive.
+                LaunchMode::Windowed | LaunchMode::Adaptive => {
+                    self.state.applications.get(package).copied().map_or_else(
+                        || resolve_preference(default, bounds, output_size),
+                        |remembered| remembered.clamped_to(bounds),
+                    )
+                }
             },
             |preference| resolve_preference(preference, bounds, output_size),
         );
@@ -480,6 +503,23 @@ fn resolve_preference(
             .size
             .unwrap_or(PORTABLE_WINDOWED_DEFAULT)
             .clamped_to(bounds),
+        LaunchMode::Adaptive => bounds
+            .or(output_size.filter(|size| size.validate().is_ok()))
+            .map_or(PORTABLE_WINDOWED_DEFAULT, adaptive_default),
+    }
+}
+
+/// Two thirds of the work area wide and three quarters tall: large enough for
+/// tablet-class layouts on a big panel, while leaving the desktop visible.
+fn adaptive_default(area: LogicalSize) -> LogicalSize {
+    let fraction = |extent: u32, parts: u32, divisor: u32| {
+        (extent / divisor * parts)
+            .max(ADAPTIVE_MINIMUM_DIMENSION)
+            .min(extent)
+    };
+    LogicalSize {
+        width: fraction(area.width, ADAPTIVE_WIDTH_PARTS, ADAPTIVE_WIDTH_DIVISOR),
+        height: fraction(area.height, ADAPTIVE_HEIGHT_PARTS, ADAPTIVE_HEIGHT_DIVISOR),
     }
 }
 
@@ -581,8 +621,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_default_is_moderate_and_respects_small_outputs() {
+    fn desktop_default_is_adaptive_and_respects_small_outputs() {
         let store = WindowPolicyStore::ephemeral();
+        // 2560x1440: two thirds wide and three quarters tall, leaving the
+        // desktop visible around a tablet-class window.
         assert_eq!(
             store.resolve_initial(
                 "com.android.settings",
@@ -591,8 +633,10 @@ mod tests {
                 Some(LogicalSize::new(2560, 1440).unwrap()),
                 None
             ),
-            PORTABLE_WINDOWED_DEFAULT
+            LogicalSize::new(1706, 1080).unwrap()
         );
+        // A small output still leaves a margin, and the floor keeps the
+        // window usable instead of collapsing it to the bare fraction.
         assert_eq!(
             store.resolve_initial(
                 "com.android.settings",
@@ -601,7 +645,16 @@ mod tests {
                 None,
                 Some(LogicalSize::new(400, 600).unwrap())
             ),
-            LogicalSize::new(400, 600).unwrap()
+            LogicalSize::new(320, 450).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_fixed_desktop_default_still_overrides_the_adaptive_size() {
+        let fixed = WindowPreference::windowed(PORTABLE_WINDOWED_DEFAULT);
+        assert_eq!(
+            resolve_preference(fixed, Some(LogicalSize::new(1524, 1016).unwrap()), None),
+            PORTABLE_WINDOWED_DEFAULT
         );
     }
 
@@ -638,6 +691,59 @@ mod tests {
                 Some(LogicalSize::new(1264, 2780).unwrap()),
             ),
             LogicalSize::new(1264, 2684).unwrap()
+        );
+    }
+
+    #[test]
+    fn adaptive_default_fills_a_tablet_sized_work_area() {
+        let store = WindowPolicyStore::ephemeral();
+        // A 1524x1016 logical desktop opens new applications at 1016x762: a
+        // tablet-class window that still leaves the desktop visible.
+        assert_eq!(
+            store.resolve_initial(
+                "com.example.reader",
+                None,
+                None,
+                Some(LogicalSize::new(1524, 1016).unwrap()),
+                None,
+            ),
+            LogicalSize::new(1016, 762).unwrap()
+        );
+    }
+
+    #[test]
+    fn adaptive_default_keeps_a_floor_and_the_portable_fallback() {
+        let store = WindowPolicyStore::ephemeral();
+        assert_eq!(
+            store.resolve_initial(
+                "com.example.reader",
+                None,
+                None,
+                None,
+                Some(LogicalSize::new(640, 480).unwrap()),
+            ),
+            LogicalSize::new(426, 360).unwrap()
+        );
+        assert_eq!(
+            store.resolve_initial("com.example.reader", None, None, None, None),
+            PORTABLE_WINDOWED_DEFAULT
+        );
+    }
+
+    #[test]
+    fn a_remembered_size_outranks_the_adaptive_default() {
+        let mut store = WindowPolicyStore::ephemeral();
+        let remembered = LogicalSize::new(700, 900).unwrap();
+        assert!(store.remember("com.example.reader", remembered).unwrap());
+        assert_eq!(
+            store.resolve_initial(
+                "com.example.reader",
+                None,
+                None,
+                Some(LogicalSize::new(1524, 1016).unwrap()),
+                None,
+            ),
+            remembered
         );
     }
 

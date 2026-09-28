@@ -7,11 +7,22 @@ is manual. The catalog exports Android launcher activities, labels and icons as
 XDG desktop applications. `droidloomctl applications` lists the catalog; launches
 require a running cell.
 
-Desktop mode starts with a 480×800 logical window, constrained to available space,
-and remembers app sizes. `droidloomctl start --mode mobile` fills current bounds.
-Compositor sizes take precedence; restart preserves the mode. `window-mode`
-supports per-app preferences. Android's privileged task-resize API updates task
-configuration and crop. See [insets and resizing](contracts/navigation-insets.md).
+Desktop mode opens new applications at a large fraction of the work area — two
+thirds wide and three quarters tall, never below 320 logical pixels — so a large
+tablet panel gets tablet-class windows instead of phone-sized ones. The portable
+480×800 fallback applies only when the compositor reports neither bounds nor an
+output extent. Compositor sizes take precedence, app sizes are remembered, and
+`droidloomctl start --mode mobile` fills current bounds. Restart preserves the
+mode. `window-mode` supports per-app preferences. Android's privileged
+task-resize API updates task configuration and crop. See [insets and
+resizing](contracts/navigation-insets.md).
+
+F11 toggles fullscreen for the focused window. Ctrl+Alt+M confines the pointer to
+the focused window and keeps the desktop's own shortcuts from firing, so
+remote-desktop and game clients receive them; the same chord releases it, as do
+losing the window's keyboard focus or closing it. A graphics tablet may drag,
+resize and close windows with the pen on the title bar, and tablet pad buttons
+arrive in Android as `KEYCODE_BUTTON_1` upwards.
 
 ## Clipboard
 

@@ -586,6 +586,15 @@ The subsequent source fixes and full-suite results are recorded above.
   A cgroup v2 backend that declares `cpuset` next to the existing `memory` and
   `freezer` controllers, creates Android's `apps`/`system` sub-hierarchies and
   expresses the same groups through the v2 controller is the follow-up.
+- **The tablet cell's density comes from the product, because the panel reports
+  no physical size.** SurfaceFlinger takes the density of an internal display
+  from `ro.sf.lcd_density` and falls back to its TV density (213 dpi) when the
+  property is unset, which is what sheng ran with until the tablet product
+  declared `ro.sf.lcd_density=320`. The panel is a 12.4-inch 3048x2032 display
+  (about 295 ppi) with no EDID, so nothing else in the stack can derive the
+  right scale; 320 is the density Android's own rule picks for that pixel
+  density. A per-user `droidloomctl dpi` override still outranks the product
+  default and persists in the Android data image.
 - **The cell's synthetic sysfs exposes CPU topology but no frequency metadata.**
   `/sys/devices/system/cpu/{possible,present,online}` report the CPUs the cell
   actually inherits, which is what `get_nprocs()` and Java's

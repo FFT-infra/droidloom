@@ -85,13 +85,15 @@ Droidloom upgrades and host restarts. The display's pixel canvas remains the
 host output's oriented physical resolution; DPI changes UI sizing, not render
 resolution.
 
-`droidloomctl window-mode fit-output` is the default mobile policy. For a
-size-less initial XDG configure, the presenter waits for the standard
-`xdg_toplevel.configure_bounds` event and creates Android's first target pool
-at that logical size. There is no small provisional window or visible resize.
-If the compositor does not advertise bounds, the current logical `wl_output`
-extent is used. The portable 480x800 fallback is used only when neither source
-exists, before any buffer is published.
+`droidloomctl window-mode fit-output` selects the mobile policy and fills the
+work area. The desktop default is adaptive: two thirds of the work area wide and
+three quarters tall, with a 320 logical pixel floor, so a tablet panel opens
+tablet-sized windows. For a size-less initial XDG configure, the presenter waits
+for the standard `xdg_toplevel.configure_bounds` event and creates Android's
+first target pool at that logical size. There is no small provisional window or
+visible resize. If the compositor does not advertise bounds, the current logical
+`wl_output` extent is used. The portable 480x800 fallback is used only when
+neither source exists, before any buffer is published.
 
 `droidloomctl window-mode windowed --width WIDTH --height HEIGHT` selects a
 persistent desktop-style default. Add `--package PACKAGE` to set an explicit
