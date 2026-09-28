@@ -544,10 +544,17 @@ pub fn assemble_artifacts(
         &images.join("system.img"),
         product,
     )?;
+    let pencilengine_jar = product.join("system/system_ext/framework/xiaomi-pencilengine-pad.jar");
+    let pencilengine_opt = if pencilengine_jar.is_file() {
+        Some(pencilengine_jar.as_path())
+    } else {
+        None
+    };
     crate::image_policy::stage(
         &base.join("system_ext.img"),
         &images.join("system_ext.img"),
         &product.join("vendor/build.prop"),
+        pencilengine_opt,
     )?;
     let vendor = product.join("vendor.img");
     let mut magic = [0; 4];

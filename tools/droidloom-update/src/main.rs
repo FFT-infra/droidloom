@@ -69,6 +69,8 @@ enum Action {
         destination: PathBuf,
         #[arg(long)]
         vendor_properties: PathBuf,
+        #[arg(long)]
+        pencilengine_jar: Option<PathBuf>,
     },
     #[command(hide = true)]
     DeclareTabletProductImage {
@@ -147,8 +149,14 @@ fn execute(args: Args) -> Result<()> {
             image,
             destination,
             vendor_properties,
+            pencilengine_jar,
         }) => {
-            return image_policy::prune(image, destination, vendor_properties);
+            return image_policy::prune(
+                image,
+                destination,
+                vendor_properties,
+                pencilengine_jar.as_deref(),
+            );
         }
         Some(Action::DeclareTabletProductImage { image, destination }) => {
             return image_policy::declare_tablet_product_image(image, destination);

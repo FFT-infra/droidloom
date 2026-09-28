@@ -57,7 +57,12 @@ fn desktop_vendor(properties: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Result<()> {
+pub fn stage(
+    source: &Path,
+    destination: &Path,
+    vendor_properties: &Path,
+    pencilengine_jar: Option<&Path>,
+) -> Result<()> {
     desktop_vendor(&fs::read_to_string(vendor_properties)?)?;
     fs::create_dir_all(destination.parent().ok_or("image has no parent")?)?;
     // A single fakeroot session preserves otherwise privileged ownership and
@@ -70,7 +75,8 @@ pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Res
     let executable = worker.path().join("droidloom-update");
     fs::copy("/proc/self/exe", &executable)?;
     crate::util::mode(&executable, 0o755)?;
-    run(Command::new("fakeroot")
+    let mut command = Command::new("fakeroot");
+    command
         .arg("--")
         .arg(&executable)
         .arg("prune-desktop-image")
@@ -79,7 +85,11 @@ pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Res
         .arg("--destination")
         .arg(destination)
         .arg("--vendor-properties")
-        .arg(vendor_properties))
+        .arg(vendor_properties);
+    if let Some(jar) = pencilengine_jar {
+        command.arg("--pencilengine-jar").arg(jar);
+    }
+    run(&mut command)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -155,7 +165,12 @@ pub(crate) fn extract(image: &Path, destination: &Path) -> Result<()> {
         .arg(image))
 }
 
-pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Result<()> {
+pub fn prune(
+    image: &Path,
+    destination: &Path,
+    vendor_properties: &Path,
+    pencilengine_jar: Option<&Path>,
+) -> Result<()> {
     if std::env::var_os("FAKEROOTKEY").is_none() {
         return fail("image derivation must run inside fakeroot to preserve Android metadata");
     }
@@ -186,9 +201,117 @@ pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Resu
         std::time::UNIX_EPOCH
             + std::time::Duration::new(apex.modified.0.try_into()?, apex.modified.1.try_into()?),
     )?;
+
+    if let Some(jar) = pencilengine_jar {
+        if jar.is_file() {
+            let fw_rel = Path::new("framework");
+            let fw_dir = tree.join(fw_rel);
+            let created_fw_dir = !expected.contains_key(fw_rel);
+            if created_fw_dir {
+                fs::create_dir_all(&fw_dir)?;
+                run(Command::new("chown").args(["-h", "0:0"]).arg(&fw_dir))?;
+                mode(&fw_dir, 0o755)?;
+                run(Command::new("setfattr")
+                    .args(["-h", "-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+                    .arg(&fw_dir))?;
+            }
+
+            let relative = Path::new("framework/xiaomi-pencilengine-pad.jar");
+            let target = tree.join(relative);
+            fs::copy(jar, &target)?;
+            run(Command::new("chown").args(["-h", "0:0"]).arg(&target))?;
+            mode(&target, 0o644)?;
+            run(Command::new("setfattr")
+                .args(["-h", "-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+                .arg(&target))?;
+            fs::File::open(&target)?.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::new(1230768000, 0),
+            )?;
+
+            if created_fw_dir {
+                fs::File::open(&fw_dir)?.set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::new(1230768000, 0),
+                )?;
+                let attributes = output(
+                    Command::new("getfattr")
+                        .args([
+                            "--absolute-names",
+                            "--dump",
+                            "--no-dereference",
+                            "--encoding=hex",
+                            "--match=-",
+                        ])
+                        .arg(&fw_dir),
+                )?
+                .lines()
+                .filter(|line| !line.starts_with("# file:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+                let meta = fs::symlink_metadata(&fw_dir)?;
+                expected.insert(
+                    fw_rel.to_path_buf(),
+                    Entry {
+                        uid: 0,
+                        gid: 0,
+                        mode: meta.mode(),
+                        modified: (1230768000, 0),
+                        content: String::new(),
+                        attributes,
+                    },
+                );
+            } else if let Some(framework) = expected.get(fw_rel) {
+                fs::File::open(&fw_dir)?.set_modified(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::new(
+                            framework.modified.0.try_into()?,
+                            framework.modified.1.try_into()?,
+                        ),
+                )?;
+            }
+
+            if let Some(root_entry) = expected.get(Path::new("")) {
+                fs::File::open(&tree)?.set_modified(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::new(
+                            root_entry.modified.0.try_into()?,
+                            root_entry.modified.1.try_into()?,
+                        ),
+                )?;
+            }
+
+            let attributes = output(
+                Command::new("getfattr")
+                    .args([
+                        "--absolute-names",
+                        "--dump",
+                        "--no-dereference",
+                        "--encoding=hex",
+                        "--match=-",
+                    ])
+                    .arg(&target),
+            )?
+            .lines()
+            .filter(|line| !line.starts_with("# file:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+            let meta = fs::symlink_metadata(&target)?;
+            expected.insert(
+                relative.to_path_buf(),
+                Entry {
+                    uid: 0,
+                    gid: 0,
+                    mode: meta.mode(),
+                    modified: (1230768000, 0),
+                    content: hash(&target)?,
+                    attributes,
+                },
+            );
+        }
+    }
+
     let rebuilt = rebake_verified(work.path(), image, &tree, &expected)?;
     eprintln!(
-        "Removed four legacy VNDK APEXes; system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
+        "Derived system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
         fs::metadata(image)?.len(),
         fs::metadata(&rebuilt)?.len()
     );
@@ -485,6 +608,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let root = work.path().join("input");
         fs::create_dir_all(root.join("apex")).unwrap();
+        fs::create_dir_all(root.join("framework")).unwrap();
         for file in LEGACY_VNDK
             .into_iter()
             .chain(["apex/com.android.adbd.apex"])
@@ -508,7 +632,7 @@ mod tests {
             .arg(&root))
         .unwrap();
         let destination = work.path().join("derived.img");
-        prune(&original, &destination, &properties).unwrap();
+        prune(&original, &destination, &properties, None).unwrap();
         let check = work.path().join("verify");
         extract(&destination, &check).unwrap();
         let retained = fs::metadata(check.join("apex/com.android.adbd.apex")).unwrap();
@@ -517,6 +641,18 @@ mod tests {
             (1000, 2000, 0o640)
         );
         assert!(LEGACY_VNDK.iter().all(|file| !check.join(file).exists()));
-        assert!(prune(&original, &destination, &properties).is_err());
+        assert!(prune(&original, &destination, &properties, None).is_err());
+
+        // Test with pencilengine_jar provided
+        let pencil_jar = work.path().join("pencil.jar");
+        fs::write(&pencil_jar, b"PK\x03\x04dummy-jar-content").unwrap();
+        let destination2 = work.path().join("derived2.img");
+        prune(&original, &destination2, &properties, Some(&pencil_jar)).unwrap();
+        let check2 = work.path().join("verify2");
+        extract(&destination2, &check2).unwrap();
+        assert_eq!(
+            fs::read(check2.join("framework/xiaomi-pencilengine-pad.jar")).unwrap(),
+            b"PK\x03\x04dummy-jar-content"
+        );
     }
 }
