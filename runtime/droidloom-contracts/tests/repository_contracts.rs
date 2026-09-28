@@ -334,8 +334,10 @@ fn stylus_buttons_keep_standard_motion_and_key_paths() {
     .expect("read Droidloom input bridge");
 
     for expected in [
-        "case 331: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;",
-        "case 332: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;",
+        "case 331: return KeyEvent.KEYCODE_BUTTON_7;",
+        "case 332: return KeyEvent.KEYCODE_BUTTON_8;",
+        "case 0x14b: return KeyEvent.KEYCODE_BUTTON_7;",
+        "case 0x14c: return KeyEvent.KEYCODE_BUTTON_8;",
         "case 0x14b: return MotionEvent.BUTTON_STYLUS_PRIMARY;",
         "case 0x14c: return MotionEvent.BUTTON_STYLUS_SECONDARY;",
     ] {

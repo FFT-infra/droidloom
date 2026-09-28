@@ -891,8 +891,8 @@ public final class InputBridge {
     /// the pen compatibility layer they ship relies on the same pair.
     private static int tabletButtonKeyCode(int button) {
         switch (button) {
-            case 0x14b: return KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY;
-            case 0x14c: return KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY;
+            case 0x14b: return KeyEvent.KEYCODE_BUTTON_7;
+            case 0x14c: return KeyEvent.KEYCODE_BUTTON_8;
             default: return KeyEvent.KEYCODE_UNKNOWN;
         }
     }
