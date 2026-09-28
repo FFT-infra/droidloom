@@ -43,6 +43,9 @@ android_app {
         "android/framework/droidloom-touchservice/src/**/*.java",
         "android/framework/droidloom-touchservice/src/**/*.aidl",
     ],
+    aidl: {
+        local_include_dirs: ["android/framework/droidloom-touchservice/src"],
+    },
     sdk_version: "37",
     min_sdk_version: "31",
     certificate: "platform",
