@@ -95,6 +95,8 @@ public final class InputBridge {
     private static final int MAX_EVDEV_KEYCODE = 0x2ff;
     // Registered by Droidloom's EventHub patch as Android's attached keyboard.
     private static final String HOST_KEYBOARD_NAME = "Droidloom Host Keyboard";
+    // Registered by Droidloom's EventHub patch as Android's attached mouse.
+    private static final String HOST_MOUSE_NAME = "Droidloom Host Mouse";
     // The same layout Android applies to a physical keyboard without a
     // vendor-specific file.
     private static final String GENERIC_KEY_LAYOUT = "/system/usr/keylayout/Generic.kl";
@@ -119,6 +121,7 @@ public final class InputBridge {
     private final Map<Long, MouseState> mMice = new HashMap<>();
     private final Map<Integer, Integer> mKeyLayout = loadKeyLayout();
     private int mHostKeyboardDeviceId = KeyCharacterMap.VIRTUAL_KEYBOARD;
+    private int mHostMouseDeviceId = 0;
     private final Map<Integer, ScheduledFuture<?>> mPendingTaskBounds = new HashMap<>();
     private final ScheduledExecutorService mTaskResizeExecutor =
             Executors.newSingleThreadScheduledExecutor();
@@ -997,6 +1000,22 @@ public final class InputBridge {
         return KeyCharacterMap.VIRTUAL_KEYBOARD;
     }
 
+    private int hostMouseDeviceId() {
+        if (mHostMouseDeviceId != 0) {
+            return mHostMouseDeviceId;
+        }
+        for (int id : InputDevice.getDeviceIds()) {
+            final InputDevice device = InputDevice.getDevice(id);
+            if (device != null && HOST_MOUSE_NAME.equals(device.getName())) {
+                mHostMouseDeviceId = id;
+                Log.i(TAG, "Routed mouse uses Android input device " + id + " (" + HOST_MOUSE_NAME
+                        + ")");
+                return id;
+            }
+        }
+        return 0;
+    }
+
     private void inject(MouseRecord record) {
         final long identity = taskIdentity(record.displayId, record.taskId);
         MouseState state = mMice.get(identity);
@@ -1129,9 +1148,9 @@ public final class InputBridge {
                 state.buttonState,
                 1.0f,
                 1.0f,
-                // The targeted InputDispatcher path assigns the reserved mouse
-                // device ID, separate from injected touch and stylus streams.
-                0,
+                // The targeted InputDispatcher path uses the registered host mouse device ID
+                // when available, matching host keyboard behavior.
+                hostMouseDeviceId(),
                 0,
                 InputDevice.SOURCE_MOUSE,
                 action == MotionEvent.ACTION_CANCEL ? MotionEvent.FLAG_CANCELED : 0);

@@ -393,6 +393,10 @@ pub fn assemble_artifacts(
             "ime/TouchService.apk",
         ),
         (
+            "system/system_ext/framework/xiaomi-pencilengine-pad.jar",
+            "framework/xiaomi-pencilengine-pad.jar",
+        ),
+        (
             "system/system_ext/priv-app/DroidloomSystemUI/DroidloomSystemUI.apk",
             "systemui/SystemUI.apk",
         ),

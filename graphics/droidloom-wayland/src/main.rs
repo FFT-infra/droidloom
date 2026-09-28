@@ -128,6 +128,14 @@ const PAD_BUTTON_COUNT: u32 = 4;
 static INPUT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 const KEY_F11: u32 = 87;
 const KEY_M: u32 = 50;
+const KEY_BACK: u32 = 158;
+const BACK_BUTTON_WIDTH: f64 = 48.0;
+const BACK_BUTTON_HEIGHT: f64 = 36.0;
+
+fn is_back_button_zone(x: f64, y: f64) -> bool {
+    x <= BACK_BUTTON_WIDTH && y <= BACK_BUTTON_HEIGHT
+}
+
 /// One scroll step for a continuous (touchpad or finger) Wayland scroll,
 /// measured in surface pixels, following common toolkit behaviour.
 const CONTINUOUS_SCROLL_PIXELS_PER_STEP: f64 = 10.0;
@@ -140,6 +148,19 @@ fn app_display_title(package: &str) -> String {
     match characters.next() {
         Some(first) => first.to_uppercase().chain(characters).collect(),
         None => package.to_owned(),
+    }
+}
+
+fn format_task_title(package: &str, is_immersed: bool, is_fullscreen: bool) -> String {
+    let title = app_display_title(package);
+    if is_immersed && is_fullscreen {
+        format!("◀  {title} [● 沉浸中 | Ctrl+Alt+M 释放] [全屏 | F11 退出]")
+    } else if is_immersed {
+        format!("◀  {title} [● 沉浸中 | Ctrl+Alt+M 释放]")
+    } else if is_fullscreen {
+        format!("◀  {title} [全屏 | F11 退出]")
+    } else {
+        format!("◀  {title}")
     }
 }
 
@@ -304,6 +325,7 @@ struct DecorationTouch {
     seat: wl_seat::WlSeat,
     down_serial: u32,
     acted_on_down: bool,
+    back_button: bool,
 }
 
 impl Contact {
@@ -341,6 +363,7 @@ struct TabletToolState {
     pending_actions: Vec<(TabletAction, u32)>,
     down_serial: u32,
     decoration_down: Option<TaskObjectId>,
+    decoration_back_button: bool,
 }
 
 impl TabletToolState {
@@ -365,6 +388,7 @@ impl TabletToolState {
             pending_actions: Vec::new(),
             down_serial: 0,
             decoration_down: None,
+            decoration_back_button: false,
         }
     }
 }
@@ -465,6 +489,7 @@ struct App {
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
     decoration_touch: Option<DecorationTouch>,
+    decoration_back_pressed: Option<TaskObjectId>,
     next_buffer_id: u64,
     next_input_serial: u64,
     socket_path: PathBuf,
@@ -660,7 +685,8 @@ impl App {
                 let window = self
                     .xdg_shell
                     .create_window(surface, WindowDecorations::RequestServer, qh);
-                window.set_title(app_display_title(package));
+                let title = format_task_title(package, false, false);
+                window.set_title(&title);
                 window.set_app_id(package.to_owned());
                 window.set_min_size(Some((1, 1)));
                 if let Some(manager) = &self.insets_manager {
@@ -756,7 +782,7 @@ impl App {
         if task.window_frame.is_none() {
             let window = task.window.as_ref()
                 .ok_or(PresenterError::Configuration("window frame has no parent"))?;
-            let mut frame = AdwaitaFrame::new(
+            let frame = AdwaitaFrame::new(
                 window,
                 &self.shm_state,
                 self.compositor.clone(),
@@ -765,10 +791,16 @@ impl App {
                 FrameConfig::auto(),
             )
             .map_err(|error| PresenterError::WindowDecoration(error.to_string()))?;
-            frame.set_title(app_display_title(&task.package));
             task.window_frame = Some(frame);
         }
+        let is_immersed = self.immersion.as_ref().is_some_and(|imm| imm.object == object);
+        let is_fullscreen = task.fullscreen;
+        let title = format_task_title(&task.package, is_immersed, is_fullscreen);
         let frame = task.window_frame.as_mut().expect("frame initialized above");
+        frame.set_title(&title);
+        if let Some(window) = task.window.as_ref() {
+            window.set_title(&title);
+        }
         frame.set_hidden(false);
         frame.update_state(configure.state);
         frame.update_wm_capabilities(configure.capabilities);
@@ -1782,12 +1814,57 @@ impl App {
             confined,
             inhibitor,
         });
+        self.update_task_title(object);
     }
 
     fn end_immersion(&mut self) {
         if let Some(immersion) = self.immersion.take() {
-            eprintln!("Droidloom mouse immersion ended object={}", immersion.object.0);
+            let object = immersion.object;
+            eprintln!("Droidloom mouse immersion ended object={}", object.0);
             immersion.release();
+            self.update_task_title(object);
+        }
+    }
+
+    fn send_back_key(&mut self, object: TaskObjectId) {
+        if let Err(error) = self.send_input(
+            object,
+            InputEvent::Key {
+                action: KeyAction::Down,
+                keycode: KEY_BACK,
+                repeat: 0,
+            },
+        ) {
+            self.fail(&error);
+            return;
+        }
+        if let Err(error) = self.send_input(
+            object,
+            InputEvent::Key {
+                action: KeyAction::Up,
+                keycode: KEY_BACK,
+                repeat: 0,
+            },
+        ) {
+            self.fail(&error);
+        }
+    }
+
+    fn update_task_title(&mut self, object: TaskObjectId) {
+        let is_immersed = self.immersion.as_ref().is_some_and(|imm| imm.object == object);
+        let Some(task) = self.tasks.get_mut(&object) else { return; };
+        let is_fullscreen = task.fullscreen;
+        let title = format_task_title(&task.package, is_immersed, is_fullscreen);
+        if let Some(window) = task.window.as_ref() {
+            window.set_title(&title);
+        }
+        if let Some(frame) = task.window_frame.as_mut() {
+            frame.set_title(&title);
+            if frame.is_dirty() && frame.draw() {
+                if let Some(window) = task.window.as_ref() {
+                    window.wl_surface().commit();
+                }
+            }
         }
     }
 
@@ -1922,6 +1999,11 @@ impl App {
                     return false;
                 };
                 self.tablet_tool_mut(tool_id).decoration_down = Some(object);
+                if is_back_button_zone(position.0, position.1) {
+                    self.tablet_tool_mut(tool_id).decoration_back_button = true;
+                    return true;
+                }
+                self.tablet_tool_mut(tool_id).decoration_back_button = false;
                 let frame_action = self
                     .tasks
                     .get_mut(&object)
@@ -1932,9 +2014,15 @@ impl App {
                 }
             }
             TabletAction::Up => {
+                let was_back = self.tablet_tool_mut(tool_id).decoration_back_button;
+                self.tablet_tool_mut(tool_id).decoration_back_button = false;
                 let Some(object) = self.tablet_tool_mut(tool_id).decoration_down.take() else {
                     return true;
                 };
+                if was_back {
+                    self.send_back_key(object);
+                    return true;
+                }
                 let frame_action = self
                     .tasks
                     .get_mut(&object)
@@ -1949,6 +2037,7 @@ impl App {
             }
             TabletAction::ProximityOut | TabletAction::Cancel => {
                 self.tablet_tool_mut(tool_id).decoration_down = None;
+                self.tablet_tool_mut(tool_id).decoration_back_button = false;
                 self.decoration_pointer_left();
             }
             _ => {
@@ -2031,6 +2120,11 @@ impl App {
                     window.wl_surface().commit();
                 }
             }
+            let cursor = if cursor == CursorIcon::Default && is_back_button_zone(x, y) {
+                CursorIcon::Pointer
+            } else {
+                cursor
+            };
             Some((*object, cursor))
         })
     }
@@ -3055,6 +3149,7 @@ impl PointerHandler for App {
                     ),
                     PointerEventKind::Leave { .. } => {
                         self.decoration_pointer_left();
+                        self.decoration_back_pressed = None;
                         None
                     }
                     PointerEventKind::Axis { .. } => None,
@@ -3077,14 +3172,16 @@ impl PointerHandler for App {
             }
             if let Some((object, _)) = decoration_object {
                 match event.kind {
-                    PointerEventKind::Press { button, serial, time }
-                    | PointerEventKind::Release { button, serial, time } => {
+                    PointerEventKind::Press { button, serial, time } => {
+                        if button == LEFT_BUTTON && is_back_button_zone(event.position.0, event.position.1) {
+                            self.decoration_back_pressed = Some(object);
+                            continue;
+                        }
                         let click = match button {
                             0x110 => FrameClick::Normal,
                             0x111 => FrameClick::Alternate,
                             _ => continue,
                         };
-                        let pressed = matches!(event.kind, PointerEventKind::Press { .. });
                         let action = self
                             .tasks
                             .get_mut(&object)
@@ -3093,13 +3190,44 @@ impl PointerHandler for App {
                                 frame.on_click(
                                     Duration::from_millis(time as u64),
                                     click,
-                                    pressed,
+                                    true,
+                                )
+                            });
+                        if let Some(action) = action
+                            && let Some(data) = pointer.data::<PointerData>()
+                        {
+                            self.frame_action(data.seat(), object, serial, action);
+                        }
+                    }
+                    PointerEventKind::Release { button, serial, time } => {
+                        if button == LEFT_BUTTON {
+                            if let Some(pressed_object) = self.decoration_back_pressed.take() {
+                                if pressed_object == object && is_back_button_zone(event.position.0, event.position.1) {
+                                    self.send_back_key(object);
+                                    continue;
+                                }
+                            }
+                        }
+                        let click = match button {
+                            0x110 => FrameClick::Normal,
+                            0x111 => FrameClick::Alternate,
+                            _ => continue,
+                        };
+                        let action = self
+                            .tasks
+                            .get_mut(&object)
+                            .and_then(|task| task.window_frame.as_mut())
+                            .and_then(|frame| {
+                                frame.on_click(
+                                    Duration::from_millis(time as u64),
+                                    click,
+                                    false,
                                 )
                             });
                         // AdwaitaFrame returns Resize for both press and release.
                         // xdg_toplevel.resize needs only the initiating press serial.
                         if let Some(action) = action
-                            && (pressed || !matches!(action, FrameAction::Resize(_)))
+                            && !matches!(action, FrameAction::Resize(_))
                             && let Some(data) = pointer.data::<PointerData>()
                         {
                             self.frame_action(data.seat(), object, serial, action);
@@ -3203,6 +3331,14 @@ impl TouchHandler for App {
         {
             if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
                 let seat = data.seat().clone();
+                if is_back_button_zone(position.0, position.1) {
+                    self.decoration_touch = Some(DecorationTouch {
+                        id, touch: _touch.clone(), object, surface,
+                        seat, down_serial: serial, acted_on_down: true,
+                        back_button: true,
+                    });
+                    return;
+                }
                 let action = self.tasks.get_mut(&object)
                     .and_then(|task| task.window_frame.as_mut())
                     .and_then(|frame| frame.on_click(
@@ -3212,6 +3348,7 @@ impl TouchHandler for App {
                 self.decoration_touch = Some(DecorationTouch {
                     id, touch: _touch.clone(), object, surface,
                     seat: seat.clone(), down_serial: serial, acted_on_down,
+                    back_button: false,
                 });
                 if let Some(action) = action {
                     self.frame_action(&seat, object, serial, action);
@@ -3255,6 +3392,10 @@ impl TouchHandler for App {
             .is_some_and(|touch| touch.id == id && touch.touch == *_touch)
         {
             let touch = self.decoration_touch.take().expect("matched decoration touch");
+            if touch.back_button {
+                self.send_back_key(touch.object);
+                return;
+            }
             let action = self.tasks.get_mut(&touch.object)
                 .and_then(|task| task.window_frame.as_mut())
                 .and_then(|frame| {
@@ -3330,6 +3471,7 @@ impl TouchHandler for App {
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
         if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)
             && let Some(touch) = self.decoration_touch.take()
+            && !touch.back_button
             && let Some(frame) = self.tasks.get_mut(&touch.object)
                 .and_then(|task| task.window_frame.as_mut())
         {
@@ -3883,6 +4025,7 @@ fn run() -> Result<(), PresenterError> {
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
         decoration_touch: None,
+        decoration_back_pressed: None,
         next_buffer_id: 0,
         next_input_serial: 0,
         socket_path,

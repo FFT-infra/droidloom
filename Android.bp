@@ -85,6 +85,18 @@ java_library {
     lint: { enabled: false },
 }
 
+java_library {
+    name: "xiaomi-pencilengine-pad",
+    srcs: ["android/framework/xiaomi-pencilengine-pad/src/**/*.java"],
+    installable: true,
+    system_ext_specific: true,
+    sdk_version: "37",
+    min_sdk_version: "31",
+    dex_preopt: { enabled: false },
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
 // Safe, Binder-independent state used by the Android Composer service. These
 // modules are vendor-only: Droidloom reuses the pinned AOSP system partitions
 // and builds its own vendor partition.

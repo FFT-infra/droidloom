@@ -155,7 +155,7 @@ diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/r
 index ca79fc5..0929f5c 100644
 --- a/services/inputflinger/reader/EventHub.cpp
 +++ b/services/inputflinger/reader/EventHub.cpp
-@@ -2967,6 +2967,26 @@ void EventHub::createVirtualKeyboardLocked() {
+@@ -2967,6 +2967,38 @@ void EventHub::createVirtualKeyboardLocked() {
              InputDeviceClass::DPAD | InputDeviceClass::VIRTUAL;
      device->loadKeyMapLocked();
      addDeviceLocked(std::move(device));
@@ -179,6 +179,18 @@ index ca79fc5..0929f5c 100644
 +            InputDeviceClass::DPAD | InputDeviceClass::EXTERNAL;
 +    hostKeyboard->loadKeyMapLocked();
 +    addDeviceLocked(std::move(hostKeyboard));
++
++    InputDeviceIdentifier hostMouseIdentifier;
++    hostMouseIdentifier.name = "Droidloom Host Mouse";
++    hostMouseIdentifier.location = "droidloom/host-mouse";
++    hostMouseIdentifier.uniqueId = "<droidloom-host-mouse>";
++    assignDescriptorLocked(hostMouseIdentifier);
++
++    auto hostMouse = std::make_unique<Device>(
++            -1, mNextDeviceId++, "<droidloom-host-mouse>", hostMouseIdentifier,
++            /*associatedDevice=*/nullptr);
++    hostMouse->classes = InputDeviceClass::CURSOR | InputDeviceClass::EXTERNAL;
++    addDeviceLocked(std::move(hostMouse));
  }
  
  void EventHub::addDeviceLocked(std::unique_ptr<Device> device) {

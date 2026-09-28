@@ -236,7 +236,7 @@ index 0d27a09..9333027 100644
      Result<void> eventValidation = validateInputEvent(*event);
      if (!eventValidation.ok()) {
          LOG(INFO) << "Injection failed: invalid event: " << eventValidation.error();
-@@ -4971,10 +5038,40 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
+@@ -4971,10 +5038,41 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
      DeviceId resolvedDeviceId = VIRTUAL_KEYBOARD_ID;
      if (policyFlags & POLICY_FLAG_FILTERED) {
          resolvedDeviceId = event->getDeviceId();
@@ -267,7 +267,8 @@ index 0d27a09..9333027 100644
 +            if (motion.getPointerCount() != 1) {
 +                return InputEventInjectionResult::FAILED;
 +            }
-+            resolvedDeviceId = DROIDLOOM_MOUSE_DEVICE_ID;
++            resolvedDeviceId =
++                    event->getDeviceId() > 0 ? event->getDeviceId() : DROIDLOOM_MOUSE_DEVICE_ID;
 +        }
      }
  
@@ -356,7 +357,7 @@ diff --git a/services/inputflinger/dispatcher/InputState.cpp b/services/inputfli
 index ccf564b..a3c0813 100644
 --- a/services/inputflinger/dispatcher/InputState.cpp
 +++ b/services/inputflinger/dispatcher/InputState.cpp
-@@ -25,6 +25,30 @@
+@@ -25,6 +25,31 @@
  
  namespace android::inputdispatcher {
  
@@ -373,7 +374,8 @@ index ccf564b..a3c0813 100644
 +                id >= DROIDLOOM_STYLUS_DEVICE_ID_BASE - MAX_POINTER_ID &&
 +                isFromSource(source, AINPUT_SOURCE_STYLUS);
 +        const bool mouse =
-+                id == DROIDLOOM_MOUSE_DEVICE_ID && isFromSource(source, AINPUT_SOURCE_MOUSE);
++                (id == DROIDLOOM_MOUSE_DEVICE_ID || id > 0) &&
++                isFromSource(source, AINPUT_SOURCE_MOUSE);
 +        const bool injectedTouch =
 +                id == VIRTUAL_KEYBOARD_ID && isFromSource(source, AINPUT_SOURCE_TOUCHSCREEN);
 +        return stylus || mouse || injectedTouch;
