@@ -151,12 +151,12 @@ fn detect_fullscreen_button_y() -> i32 {
     10
 }
 
-fn detect_fullscreen_button_x(kind: TitlebarButtonKind) -> i32 {
-    let index = match kind {
-        TitlebarButtonKind::Back => 0,
-        TitlebarButtonKind::Fullscreen => 1,
-    };
-    14 + index * 38
+fn detect_fullscreen_button_x(kind: TitlebarButtonKind, window_width: i32) -> i32 {
+    let center = window_width / 2;
+    match kind {
+        TitlebarButtonKind::Back => center - 33,
+        TitlebarButtonKind::Fullscreen => center + 5,
+    }
 }
 
 fn detect_back_button_x() -> i32 {
@@ -268,12 +268,13 @@ impl TitlebarButton {
         qh: &QueueHandle<App>,
         titlebar_height: i32,
         is_fullscreen: bool,
+        window_width: i32,
     ) -> Result<Self, PresenterError> {
         let surface = compositor.create_surface(qh);
         let subsurface = globals.subcompositor.get_subsurface(&surface, parent, qh, ());
         let (x, y) = if is_fullscreen {
             (
-                detect_fullscreen_button_x(kind),
+                detect_fullscreen_button_x(kind, window_width),
                 detect_fullscreen_button_y(),
             )
         } else {
@@ -345,10 +346,10 @@ impl TitlebarButton {
         }
     }
 
-    fn update_position(&mut self, titlebar_height: i32, is_fullscreen: bool) {
+    fn update_position(&mut self, titlebar_height: i32, is_fullscreen: bool, window_width: i32) {
         let (x, y) = if is_fullscreen {
             (
-                detect_fullscreen_button_x(self.kind),
+                detect_fullscreen_button_x(self.kind, window_width),
                 detect_fullscreen_button_y(),
             )
         } else {
@@ -514,6 +515,204 @@ fn render_titlebar_button_buffer(
     Ok(buffer)
 }
 
+const GESTURE_FEEDBACK_WIDTH: u32 = 48;
+const GESTURE_FEEDBACK_HEIGHT: u32 = 144;
+
+fn edge_gesture_shape_x(norm_y: f32) -> f32 {
+    let t = norm_y.clamp(0.0, 1.0);
+    let y = if t > 0.5 { 1.0 - t } else { t };
+    if y <= 0.167 {
+        let p = y / 0.167;
+        p * p * 0.115
+    } else if y <= 0.350 {
+        let p = (y - 0.167) / (0.350 - 0.167);
+        0.115 + (0.620 - 0.115) * (p * p * (3.0 - 2.0 * p))
+    } else {
+        let p = (y - 0.350) / (0.500 - 0.350);
+        0.620 + (1.000 - 0.620) * (p * (2.0 - p))
+    }
+}
+
+fn render_edge_gesture_buffer(
+    globals: &layers::Globals,
+    qh: &QueueHandle<App>,
+    is_left: bool,
+    stage: usize,
+) -> Result<wl_buffer::WlBuffer, PresenterError> {
+    let width = GESTURE_FEEDBACK_WIDTH;
+    let height = GESTURE_FEEDBACK_HEIGHT;
+    let mut pixels = vec![0u32; (width * height) as usize];
+
+    let depths = [8.0f32, 16.0f32, 24.0f32, 32.0f32, 40.0f32];
+    let depth = depths[stage.min(4)];
+    let show_arrow = stage >= 2;
+
+    let (r_bg, g_bg, b_bg, a_bg) = (0.12f32, 0.13f32, 0.15f32, 0.85f32);
+    let (r_fg, g_fg, b_fg) = (1.0f32, 1.0f32, 1.0f32);
+
+    for y in 0..height {
+        let norm_y = (y as f32 + 0.5) / (height as f32);
+        let factor = edge_gesture_shape_x(norm_y);
+        let bound = factor * depth;
+
+        for x in 0..width {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+
+            let dist_to_boundary = if is_left {
+                bound - px
+            } else {
+                bound - ((width as f32) - px)
+            };
+
+            let bg_alpha = dist_to_boundary.clamp(0.0, 1.0) * a_bg;
+            if bg_alpha <= 0.0 {
+                continue;
+            }
+
+            let mut arrow_alpha = 0.0f32;
+            if show_arrow {
+                let arrow_center_x = if is_left {
+                    depth * 0.52
+                } else {
+                    (width as f32) - depth * 0.52
+                };
+                let arrow_center_y = (height as f32) / 2.0;
+
+                // Back arrow pointing LEFT on both left and right edges
+                let v = (arrow_center_x - 3.5, arrow_center_y);
+                let top = (arrow_center_x + 3.0, arrow_center_y - 6.5);
+                let bot = (arrow_center_x + 3.0, arrow_center_y + 6.5);
+
+                let d1 = dist_to_segment(px, py, top.0, top.1, v.0, v.1);
+                let d2 = dist_to_segment(px, py, bot.0, bot.1, v.0, v.1);
+                let min_d = d1.min(d2);
+
+                let stroke_radius = 1.3f32;
+                arrow_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0);
+            }
+
+            let out_a = (bg_alpha + arrow_alpha * (1.0 - bg_alpha)).clamp(0.0, 1.0);
+            let out_r = arrow_alpha * r_fg + (1.0 - arrow_alpha) * bg_alpha * r_bg;
+            let out_g = arrow_alpha * g_fg + (1.0 - arrow_alpha) * bg_alpha * g_bg;
+            let out_b = arrow_alpha * b_fg + (1.0 - arrow_alpha) * bg_alpha * b_bg;
+
+            let a = (out_a * 255.0).round().min(255.0) as u32;
+            let r = (out_r * 255.0).round().min(255.0) as u32;
+            let g = (out_g * 255.0).round().min(255.0) as u32;
+            let b = (out_b * 255.0).round().min(255.0) as u32;
+
+            pixels[(y * width + x) as usize] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    let bytes = (width * height * 4) as usize;
+    let mut file = tempfile::tempfile()?;
+    let mut byte_data = Vec::with_capacity(bytes);
+    for pixel in pixels {
+        byte_data.extend_from_slice(&pixel.to_ne_bytes());
+    }
+    file.write_all(&byte_data)?;
+    let pool = globals.shm.create_pool(file.as_fd(), bytes as i32, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        (width * 4) as i32,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
+    pool.destroy();
+    Ok(buffer)
+}
+
+struct GestureFeedbackView {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    visible: bool,
+    buffers_left: [wl_buffer::WlBuffer; 5],
+    buffers_right: [wl_buffer::WlBuffer; 5],
+}
+
+impl Drop for GestureFeedbackView {
+    fn drop(&mut self) {
+        self.subsurface.destroy();
+        self.surface.destroy();
+        for b in &self.buffers_left {
+            b.destroy();
+        }
+        for b in &self.buffers_right {
+            b.destroy();
+        }
+    }
+}
+
+impl GestureFeedbackView {
+    fn new(
+        globals: &layers::Globals,
+        compositor: &smithay_client_toolkit::compositor::CompositorState,
+        parent: &wl_surface::WlSurface,
+        qh: &QueueHandle<App>,
+    ) -> Result<Self, PresenterError> {
+        let surface = compositor.create_surface(qh);
+        let subsurface = globals.subcompositor.get_subsurface(&surface, parent, qh, ());
+        subsurface.set_desync();
+
+        if let Ok(region) = smithay_client_toolkit::compositor::Region::new(compositor) {
+            surface.set_input_region(Some(region.wl_region()));
+        }
+
+        let mut buffers_left = Vec::with_capacity(5);
+        for stage in 0..5 {
+            buffers_left.push(render_edge_gesture_buffer(globals, qh, true, stage)?);
+        }
+        let mut buffers_right = Vec::with_capacity(5);
+        for stage in 0..5 {
+            buffers_right.push(render_edge_gesture_buffer(globals, qh, false, stage)?);
+        }
+
+        let buffers_left: [wl_buffer::WlBuffer; 5] = buffers_left
+            .try_into()
+            .map_err(|_| PresenterError::Wayland("failed to convert left buffers".into()))?;
+        let buffers_right: [wl_buffer::WlBuffer; 5] = buffers_right
+            .try_into()
+            .map_err(|_| PresenterError::Wayland("failed to convert right buffers".into()))?;
+
+        surface.attach(None, 0, 0);
+        surface.commit();
+
+        Ok(Self {
+            surface,
+            subsurface,
+            visible: false,
+            buffers_left,
+            buffers_right,
+        })
+    }
+
+    fn update(&mut self, is_left: bool, stage: usize, x: i32, y: i32) {
+        self.subsurface.set_position(x, y);
+        let buffer = if is_left {
+            &self.buffers_left[stage.min(4)]
+        } else {
+            &self.buffers_right[stage.min(4)]
+        };
+        self.surface.attach(Some(buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, GESTURE_FEEDBACK_WIDTH as i32, GESTURE_FEEDBACK_HEIGHT as i32);
+        self.surface.commit();
+        self.visible = true;
+    }
+
+    fn hide(&mut self) {
+        if self.visible {
+            self.surface.attach(None, 0, 0);
+            self.surface.commit();
+            self.visible = false;
+        }
+    }
+}
+
 /// One scroll step for a continuous (touchpad or finger) Wayland scroll,
 /// measured in surface pixels, following common toolkit behaviour.
 const CONTINUOUS_SCROLL_PIXELS_PER_STEP: f64 = 10.0;
@@ -676,6 +875,7 @@ struct TaskWindow {
     maximized: bool,
     floating_size: Option<LogicalSize>,
     fullscreen_controls_revealed_until: Option<Instant>,
+    gesture_feedback: Option<GestureFeedbackView>,
     unmap_requested: bool,
     closing: bool,
 }
@@ -962,9 +1162,10 @@ impl App {
         let Some(task) = self.tasks.get_mut(&object) else { return };
         let is_fullscreen = task.fullscreen || task.decorations_hidden;
         let should_be_visible = !is_fullscreen || task.fullscreen_controls_revealed_until.is_some();
+        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
         if !task.titlebar_buttons.is_empty() {
             for btn in &mut task.titlebar_buttons {
-                btn.update_position(titlebar_height, is_fullscreen);
+                btn.update_position(titlebar_height, is_fullscreen, window_width);
                 btn.set_visible(should_be_visible);
             }
             return;
@@ -979,6 +1180,7 @@ impl App {
             qh,
             titlebar_height,
             is_fullscreen,
+            window_width,
         ) {
             back.set_visible(should_be_visible);
             task.titlebar_buttons.push(back);
@@ -991,16 +1193,37 @@ impl App {
             qh,
             titlebar_height,
             is_fullscreen,
+            window_width,
         ) {
             fs.set_visible(should_be_visible);
             task.titlebar_buttons.push(fs);
         }
     }
 
+    fn ensure_gesture_feedback(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
+        let Some(task) = self.tasks.get_mut(&object) else { return };
+        if task.gesture_feedback.is_some() {
+            return;
+        }
+        let Some(window) = task.window.as_ref() else { return };
+        let surface = window.wl_surface();
+        if let Ok(feedback) = GestureFeedbackView::new(
+            &self.layer_globals,
+            &self.compositor,
+            surface,
+            qh,
+        ) {
+            task.gesture_feedback = Some(feedback);
+        }
+    }
+
     fn reveal_fullscreen_controls(&mut self, object: TaskObjectId, duration: Duration) {
         let Some(task) = self.tasks.get_mut(&object) else { return };
         task.fullscreen_controls_revealed_until = Some(Instant::now() + duration);
+        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
+        let is_fullscreen = task.fullscreen || task.decorations_hidden;
         for btn in &mut task.titlebar_buttons {
+            btn.update_position(0, is_fullscreen, window_width);
             btn.set_visible(true);
         }
     }
@@ -1312,6 +1535,7 @@ impl App {
                 maximized: false,
                 floating_size: None,
                 fullscreen_controls_revealed_until: None,
+                gesture_feedback: None,
                 unmap_requested: false,
                 closing: false,
             },
@@ -1500,6 +1724,10 @@ impl App {
                 .get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.logical_size = Some((width, height));
+            let is_fullscreen = task.fullscreen || task.decorations_hidden;
+            for btn in &mut task.titlebar_buttons {
+                btn.update_position(0, is_fullscreen, width as i32);
+            }
             task.applied_opaque = None;
             task.buffer_size = (buffer_width, buffer_height);
             task.configure_serial = serial;
@@ -1981,6 +2209,7 @@ impl App {
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             task.titlebar_buttons.clear();
+            task.gesture_feedback.take();
             if let Some(surface) = task.surface() {
                 for tool in &mut self.tablet_tools {
                     if tool.surface.as_ref() == Some(surface) {
@@ -2063,6 +2292,7 @@ impl App {
             sync_surface.destroy();
         }
         task.titlebar_buttons.clear();
+        task.gesture_feedback.take();
         if let Some((obj, _)) = self.titlebar_button_pointer && obj == object {
             self.titlebar_button_pointer = None;
         }
@@ -4122,6 +4352,9 @@ impl TouchHandler for App {
         if let Some(candidate) = gesture::EdgeGestureTracker::new_candidate(
             id, object, serial, pointer_id, position, logical_size, is_fullscreen,
         ) {
+            if matches!(candidate.kind, gesture::EdgeGestureKind::Back { .. }) {
+                self.ensure_gesture_feedback(_qh, object);
+            }
             self.edge_gestures.insert(id, candidate);
             return;
         }
@@ -4176,6 +4409,11 @@ impl TouchHandler for App {
         }
 
         if let Some(tracker) = self.edge_gestures.remove(&id) {
+            if let Some(task) = self.tasks.get_mut(&tracker.object) {
+                if let Some(feedback) = task.gesture_feedback.as_mut() {
+                    feedback.hide();
+                }
+            }
             match tracker.on_up() {
                 gesture::EdgeUpResult::TriggerBack => {
                     self.send_back_key(tracker.object);
@@ -4230,11 +4468,42 @@ impl TouchHandler for App {
         }
 
         let gesture_update = self.edge_gestures.get_mut(&id).map(|tracker| {
-            (tracker.on_motion(position), tracker.object)
+            let res = tracker.on_motion(position);
+            (res, tracker.object, tracker.kind, tracker.start_pos)
         });
-        if let Some((res, object)) = gesture_update {
+        if let Some((res, object, kind, start_pos)) = gesture_update {
             match res {
                 gesture::EdgeMotionResult::StayPending | gesture::EdgeMotionResult::ConfirmedBack => {
+                    if let gesture::EdgeGestureKind::Back { is_left } = kind {
+                        let inward_dx = if is_left {
+                            position.0 - start_pos.0
+                        } else {
+                            start_pos.0 - position.0
+                        };
+                        if let Some(task) = self.tasks.get_mut(&object) {
+                            if let Some(feedback) = task.gesture_feedback.as_mut() {
+                                if inward_dx < 6.0 {
+                                    feedback.hide();
+                                } else {
+                                    let stage = if inward_dx < 14.0 {
+                                        0
+                                    } else if inward_dx < 22.0 {
+                                        1
+                                    } else if inward_dx < 30.0 {
+                                        2
+                                    } else if inward_dx < 38.0 {
+                                        3
+                                    } else {
+                                        4
+                                    };
+                                    let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
+                                    let x = if is_left { 0 } else { window_width - GESTURE_FEEDBACK_WIDTH as i32 };
+                                    let y = (position.1 - (GESTURE_FEEDBACK_HEIGHT as f64 / 2.0)).round() as i32;
+                                    feedback.update(is_left, stage, x, y);
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
                 gesture::EdgeMotionResult::ConfirmedTopReveal => {
@@ -4242,6 +4511,11 @@ impl TouchHandler for App {
                     return;
                 }
                 gesture::EdgeMotionResult::CancelScroll => {
+                    if let Some(task) = self.tasks.get_mut(&object) {
+                        if let Some(feedback) = task.gesture_feedback.as_mut() {
+                            feedback.hide();
+                        }
+                    }
                     let trk = self.edge_gestures.remove(&id).unwrap();
                     let (start_xf, start_yf) = self.fixed_position(trk.object, trk.start_pos);
                     let (cur_xf, cur_yf) = self.fixed_position(trk.object, position);
@@ -4323,7 +4597,14 @@ impl TouchHandler for App {
         {
             frame.click_point_left();
         }
-        self.edge_gestures.clear();
+        let gestures = std::mem::take(&mut self.edge_gestures);
+        for (_, tracker) in gestures {
+            if let Some(task) = self.tasks.get_mut(&tracker.object) {
+                if let Some(feedback) = task.gesture_feedback.as_mut() {
+                    feedback.hide();
+                }
+            }
+        }
         let contacts = std::mem::take(&mut self.touch_contacts);
         for (_, contact) in contacts {
             if let Err(error) = self.send_input(
