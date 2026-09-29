@@ -871,11 +871,23 @@ where
 
     fn getColorModes(&self, display: i64) -> binder::Result<Vec<ColorMode>> {
         require_display(&self.session, display)?;
-        Ok(vec![ColorMode::NATIVE])
+        Ok(vec![
+            ColorMode::NATIVE,
+            ColorMode::SRGB,
+            ColorMode::DISPLAY_P3,
+        ])
     }
 
-    fn getDataspaceSaturationMatrix(&self, _dataspace: Dataspace) -> binder::Result<Vec<f32>> {
-        unsupported()
+    fn getDataspaceSaturationMatrix(&self, dataspace: Dataspace) -> binder::Result<Vec<f32>> {
+        if dataspace != Dataspace::SRGB_LINEAR {
+            return Err(service_error(ErrorCode::BadParameter));
+        }
+        Ok(vec![
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
     }
 
     fn getDisplayAttribute(
@@ -996,10 +1008,12 @@ where
 
     fn getRenderIntents(&self, display: i64, mode: ColorMode) -> binder::Result<Vec<RenderIntent>> {
         require_display(&self.session, display)?;
-        if mode != ColorMode::NATIVE {
-            return Err(service_error(ErrorCode::BadParameter));
+        match mode {
+            ColorMode::NATIVE | ColorMode::SRGB | ColorMode::DISPLAY_P3 => {
+                Ok(vec![RenderIntent::COLORIMETRIC])
+            }
+            _ => Err(service_error(ErrorCode::BadParameter)),
         }
-        Ok(vec![RenderIntent::COLORIMETRIC])
     }
 
     fn getSupportedContentTypes(&self, display: i64) -> binder::Result<Vec<ContentType>> {
@@ -1088,10 +1102,13 @@ where
         intent: RenderIntent,
     ) -> binder::Result<()> {
         require_display(&self.session, display)?;
-        if mode == ColorMode::NATIVE && intent == RenderIntent::COLORIMETRIC {
-            Ok(())
-        } else {
-            Err(service_error(ErrorCode::BadParameter))
+        match mode {
+            ColorMode::NATIVE | ColorMode::SRGB | ColorMode::DISPLAY_P3
+                if intent == RenderIntent::COLORIMETRIC =>
+            {
+                Ok(())
+            }
+            _ => Err(service_error(ErrorCode::BadParameter)),
         }
     }
 

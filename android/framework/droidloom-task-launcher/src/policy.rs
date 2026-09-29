@@ -99,7 +99,7 @@ impl PolicyCache {
         // /dev is private tmpfs for this Android cell. Bump the version when
         // changing policy; Android user IDs and framework restarts never share
         // successful setup, including when a PID is recycled.
-        let path = directory.join(format!("v2-user-{user}"));
+        let path = directory.join(format!("v3-user-{user}"));
         let cached = fs::read_to_string(&path)
             .ok()
             .and_then(|record| FrameworkIdentity::decode(&record))
@@ -179,7 +179,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            6
+            9
         );
         assert!(!configure_once(&command, 10, &cache, &proc_directory).unwrap());
         assert!(configure_once(&command, 0, &cache, &proc_directory).unwrap());
@@ -191,7 +191,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            18
+            27
         );
     }
 
@@ -204,7 +204,7 @@ mod tests {
         let command = command(directory.path());
         fs::write(command.with_extension("fail"), "").unwrap();
         assert!(configure_once(&command, 0, &cache, &proc_directory).is_err());
-        assert!(!cache.join("v2-user-0").exists());
+        assert!(!cache.join("v3-user-0").exists());
         fs::remove_file(command.with_extension("fail")).unwrap();
         assert!(!configure_once(&command, 0, &cache, &proc_directory).unwrap());
         assert!(configure_once(&command, 0, &cache, &proc_directory).unwrap());
@@ -232,7 +232,7 @@ mod tests {
         fs::create_dir(&cache).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!configure_once(&command, 0, &cache, &proc_directory).unwrap());
-        assert!(!cache.join("v2-user-0").exists());
+        assert!(!cache.join("v3-user-0").exists());
         let linked = directory.path().join("linked-cache");
         symlink(&cache, &linked).unwrap();
         assert!(!configure_once(&command, 0, &linked, &proc_directory).unwrap());
@@ -250,7 +250,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            18
+            27
         );
     }
 
@@ -262,7 +262,7 @@ mod tests {
         framework(&proc_directory, 123, 456);
         let command = command(directory.path());
         assert!(!configure_once(&command, 0, &cache, &proc_directory).unwrap());
-        fs::write(cache.join("v2-user-0"), "123 456 extra").unwrap();
+        fs::write(cache.join("v3-user-0"), "123 456 extra").unwrap();
         assert!(!configure_once(&command, 0, &cache, &proc_directory).unwrap());
         fs::remove_file(proc_directory.join("123/stat")).unwrap();
         assert!(!configure_once(&command, 0, &cache, &proc_directory).unwrap());

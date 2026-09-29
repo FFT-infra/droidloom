@@ -103,7 +103,10 @@ PRODUCT_VENDOR_PROPERTIES += \
     dalvik.vm.heaptargetutilization=0.75 \
     dalvik.vm.heapminfree=512k \
     dalvik.vm.heapmaxfree=8m \
-    media.c2.hal.selection=aidl
+    media.c2.hal.selection=aidl \
+    ro.surface_flinger.has_wide_color_display=true \
+    ro.surface_flinger.use_color_management=true \
+    ro.surface_flinger.has_HDR_display=false
 
 # The pen relay publishes a barrel-button device and a gesture device for an
 # Android reader. The supervisor hands exactly those two to the cell; these are

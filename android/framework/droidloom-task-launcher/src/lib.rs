@@ -457,6 +457,45 @@ fn configure_cell_display_policy(
         .output()?;
     checked_activity_output(&output, "enable legacy app window compatibility")?;
 
+    // Enable stock Android freeform window management support.
+    let output = command_as_android_shell(android_command)
+        .args([
+            "settings",
+            "put",
+            "global",
+            "enable_freeform_support",
+            "1",
+        ])
+        .output()?;
+    checked_activity_output(&output, "enable freeform support")?;
+
+    // Allow non-resizable apps in multi-window and bypass activity minimum dimensions
+    // so windows can be resized smoothly without constraint.
+    let output = command_as_android_shell(android_command)
+        .args([
+            "window",
+            "set-multi-window-config",
+            "--supportsNonResizable",
+            "1",
+            "--respectsActivityMinWidthHeight",
+            "-1",
+        ])
+        .output()?;
+    checked_activity_output(&output, "configure multi-window resizing")?;
+
+    // Enable user app aspect ratio fullscreen overrides to prevent letterbox distortion on tablets.
+    let output = command_as_android_shell(android_command)
+        .args([
+            "window",
+            "set-letterbox-style",
+            "--isUserAppAspectRatioSettingsEnabled",
+            "1",
+            "--isUserAppAspectRatioFullscreenEnabled",
+            "1",
+        ])
+        .output()?;
+    checked_activity_output(&output, "configure letterbox style aspect ratio")?;
+
     // Denial owns the real user session and its lock boundary. Android's
     // keyguard has no physical panel to protect inside the cell and otherwise
     // imposes a separate ten-second WindowManager timeout while it is shown.
