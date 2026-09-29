@@ -387,44 +387,13 @@ pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<
     // and a per-user `droidloomctl dpi` override still outranks it.
     const DENSITY_PREFIX: &str = "ro.sf.lcd_density=";
     const DENSITY: &str = "ro.sf.lcd_density=360";
-    let mut declared = match declared
+    let declared = match declared
         .lines()
         .find(|line| line.starts_with(DENSITY_PREFIX))
     {
         Some(existing) => declared.replace(existing, DENSITY),
         None => format!("{declared}{DENSITY}\n"),
     };
-    // State the truthful Xiaomi Pad 6S Pro tablet identity on tablet products.
-    // Pinned base images declare Cuttlefish phone defaults; applications gate
-    // their tablet UI on product brand/model and reject generic "phone" devices.
-    const REPLACEMENTS: &[(&str, &str)] = &[
-        ("ro.product.product.brand=generic", "ro.product.product.brand=Xiaomi"),
-        ("ro.product.product.device=vsoc_arm64_only", "ro.product.product.device=sheng"),
-        ("ro.product.product.manufacturer=Google", "ro.product.product.manufacturer=Xiaomi"),
-        ("ro.product.product.model=Cuttlefish arm64 phone 64-bit only", "ro.product.product.model=24018RPACC"),
-        ("ro.product.product.name=aosp_cf_arm64_only_phone", "ro.product.product.name=sheng"),
-        ("bluetooth.device.class_of_device=90,2,12", "bluetooth.device.class_of_device=90,1,28"),
-    ];
-    for (from, to) in REPLACEMENTS {
-        declared = declared.replace(from, to);
-    }
-    const SUPPLEMENTAL: &[&str] = &[
-        "ro.product.brand=Xiaomi",
-        "ro.product.device=sheng",
-        "ro.product.manufacturer=Xiaomi",
-        "ro.product.model=24018RPACC",
-        "ro.product.name=sheng",
-        "ro.miui.ui.version.name=V816",
-        "ro.miui.ui.version.code=1",
-        "persist.sys.miui_feature_tablet=true",
-    ];
-    for prop in SUPPLEMENTAL {
-        let prefix = prop.split('=').next().unwrap();
-        if !declared.lines().any(|l| l.starts_with(prefix)) {
-            declared.push_str(prop);
-            declared.push('\n');
-        }
-    }
     // Rewriting the file in place keeps its owner, mode and security label; the
     // original modification time is restored so a derived image stays
     // reproducible from its base.
