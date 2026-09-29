@@ -8,13 +8,13 @@ use droidloom_denial_protocol::TaskObjectId;
 pub const EDGE_SWIPE_MARGIN: f64 = 28.0;
 
 /// Margin in surface-local pixels from the top edge in fullscreen to intercept reveal gestures.
-pub const TOP_EDGE_MARGIN: f64 = 24.0;
+pub const TOP_EDGE_MARGIN: f64 = 28.0;
 
 /// Distance in pixels required to confirm a horizontal back swipe.
 pub const BACK_CONFIRM_DISPLACEMENT: f64 = 36.0;
 
 /// Distance in pixels required to confirm a top-edge pull-down.
-pub const TOP_CONFIRM_DISPLACEMENT: f64 = 24.0;
+pub const TOP_CONFIRM_DISPLACEMENT: f64 = 32.0;
 
 /// Vertical distance in pixels after which an edge touch is classified as vertical scrolling.
 pub const SCROLL_DISAMBIGUATION_SLOP: f64 = 8.0;

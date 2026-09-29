@@ -426,38 +426,34 @@ fn render_titlebar_button_buffer(
 
     let segments: &[((f32, f32), (f32, f32))] = match kind {
         TitlebarButtonKind::Back => &[
-            ((16.0, 9.5), (11.5, 14.0)),
-            ((11.5, 14.0), (16.0, 18.5)),
+            ((16.0, 9.0), (11.0, 14.0)),
+            ((11.0, 14.0), (16.0, 19.0)),
         ],
         TitlebarButtonKind::Fullscreen => {
             if is_fullscreen {
                 &[
-                    ((12.5, 9.5), (12.5, 12.5)),
-                    ((9.5, 12.5), (12.5, 12.5)),
-                    ((15.5, 9.5), (15.5, 12.5)),
-                    ((18.5, 12.5), (15.5, 12.5)),
-                    ((12.5, 18.5), (12.5, 15.5)),
-                    ((9.5, 15.5), (12.5, 15.5)),
-                    ((15.5, 18.5), (15.5, 15.5)),
-                    ((18.5, 15.5), (15.5, 15.5)),
+                    ((18.0, 13.5), (14.5, 13.5)),
+                    ((14.5, 13.5), (14.5, 10.0)),
+                    ((14.5, 13.5), (18.5, 9.5)),
+                    ((10.0, 14.5), (13.5, 14.5)),
+                    ((13.5, 14.5), (13.5, 18.0)),
+                    ((13.5, 14.5), (9.5, 18.5)),
                 ]
             } else {
                 &[
-                    ((9.5, 9.5), (12.5, 9.5)),
-                    ((9.5, 9.5), (9.5, 12.5)),
-                    ((15.5, 9.5), (18.5, 9.5)),
-                    ((18.5, 9.5), (18.5, 12.5)),
-                    ((9.5, 18.5), (12.5, 18.5)),
-                    ((9.5, 18.5), (9.5, 15.5)),
-                    ((18.5, 18.5), (15.5, 18.5)),
-                    ((18.5, 18.5), (18.5, 15.5)),
+                    ((14.5, 9.5), (18.5, 9.5)),
+                    ((18.5, 9.5), (18.5, 13.5)),
+                    ((18.5, 9.5), (14.0, 14.0)),
+                    ((13.5, 18.5), (9.5, 18.5)),
+                    ((9.5, 18.5), (9.5, 14.5)),
+                    ((9.5, 18.5), (14.0, 14.0)),
                 ]
             }
         }
     };
     let stroke_radius = match kind {
-        TitlebarButtonKind::Back => 1.15f32,
-        TitlebarButtonKind::Fullscreen => 1.0f32,
+        TitlebarButtonKind::Back => 1.35f32,
+        TitlebarButtonKind::Fullscreen => 1.15f32,
     };
 
     for y in 0..size {
@@ -480,10 +476,17 @@ fn render_titlebar_button_buffer(
 
             let eff_stroke_a = stroke_alpha.min(base_circle_alpha);
 
-            let out_a = (eff_stroke_a + circle_alpha * (1.0 - eff_stroke_a)).min(1.0);
-            let out_r = eff_stroke_a * r_icon + circle_alpha * (1.0 - eff_stroke_a) * r_bg;
-            let out_g = eff_stroke_a * g_icon + circle_alpha * (1.0 - eff_stroke_a) * g_bg;
-            let out_b = eff_stroke_a * b_icon + circle_alpha * (1.0 - eff_stroke_a) * b_bg;
+            let border_dist = (dist_center - 11.5).abs();
+            let border_alpha = if is_fullscreen {
+                (0.75 - border_dist).clamp(0.0, 1.0) * 0.28
+            } else {
+                0.0
+            };
+
+            let out_a = (circle_alpha + eff_stroke_a * (1.0 - circle_alpha) + border_alpha).min(1.0);
+            let out_r = eff_stroke_a * r_icon + circle_alpha * (1.0 - eff_stroke_a) * r_bg + border_alpha * 0.9;
+            let out_g = eff_stroke_a * g_icon + circle_alpha * (1.0 - eff_stroke_a) * g_bg + border_alpha * 0.9;
+            let out_b = eff_stroke_a * b_icon + circle_alpha * (1.0 - eff_stroke_a) * b_bg + border_alpha * 0.9;
 
             let a = (out_a * 255.0).round().min(255.0) as u32;
             let r = (out_r * 255.0).round().min(255.0) as u32;
@@ -515,8 +518,13 @@ fn render_titlebar_button_buffer(
     Ok(buffer)
 }
 
-const GESTURE_FEEDBACK_WIDTH: u32 = 48;
-const GESTURE_FEEDBACK_HEIGHT: u32 = 144;
+const GESTURE_FEEDBACK_SIDE_WIDTH: u32 = 48;
+const GESTURE_FEEDBACK_SIDE_HEIGHT: u32 = 144;
+const GESTURE_FEEDBACK_SIDE_STAGES: usize = 20;
+
+const GESTURE_FEEDBACK_TOP_WIDTH: u32 = 72;
+const GESTURE_FEEDBACK_TOP_HEIGHT: u32 = 32;
+const GESTURE_FEEDBACK_TOP_STAGES: usize = 12;
 
 fn edge_gesture_shape_x(norm_y: f32) -> f32 {
     let t = norm_y.clamp(0.0, 1.0);
@@ -533,21 +541,26 @@ fn edge_gesture_shape_x(norm_y: f32) -> f32 {
     }
 }
 
-fn render_edge_gesture_buffer(
+fn render_side_gesture_buffer(
     globals: &layers::Globals,
     qh: &QueueHandle<App>,
     is_left: bool,
     stage: usize,
 ) -> Result<wl_buffer::WlBuffer, PresenterError> {
-    let width = GESTURE_FEEDBACK_WIDTH;
-    let height = GESTURE_FEEDBACK_HEIGHT;
+    let width = GESTURE_FEEDBACK_SIDE_WIDTH;
+    let height = GESTURE_FEEDBACK_SIDE_HEIGHT;
     let mut pixels = vec![0u32; (width * height) as usize];
 
-    let depths = [8.0f32, 16.0f32, 24.0f32, 32.0f32, 40.0f32];
-    let depth = depths[stage.min(4)];
-    let show_arrow = stage >= 2;
+    let depth = 2.0f32 + (stage.min(19) as f32) * 2.0f32;
+    let arrow_intensity = if stage < 7 {
+        0.0f32
+    } else if stage < 14 {
+        ((stage - 7) as f32 / 7.0f32).clamp(0.0, 1.0)
+    } else {
+        1.0f32
+    };
 
-    let (r_bg, g_bg, b_bg, a_bg) = (0.12f32, 0.13f32, 0.15f32, 0.85f32);
+    let (r_bg, g_bg, b_bg, a_bg) = (0.10f32, 0.11f32, 0.13f32, 0.88f32);
     let (r_fg, g_fg, b_fg) = (1.0f32, 1.0f32, 1.0f32);
 
     for y in 0..height {
@@ -571,7 +584,7 @@ fn render_edge_gesture_buffer(
             }
 
             let mut arrow_alpha = 0.0f32;
-            if show_arrow {
+            if arrow_intensity > 0.0 {
                 let arrow_center_x = if is_left {
                     depth * 0.52
                 } else {
@@ -581,15 +594,119 @@ fn render_edge_gesture_buffer(
 
                 // Back arrow pointing LEFT on both left and right edges
                 let v = (arrow_center_x - 3.5, arrow_center_y);
-                let top = (arrow_center_x + 3.0, arrow_center_y - 6.5);
-                let bot = (arrow_center_x + 3.0, arrow_center_y + 6.5);
+                let top = (arrow_center_x + 2.5, arrow_center_y - 6.0);
+                let bot = (arrow_center_x + 2.5, arrow_center_y + 6.0);
 
                 let d1 = dist_to_segment(px, py, top.0, top.1, v.0, v.1);
                 let d2 = dist_to_segment(px, py, bot.0, bot.1, v.0, v.1);
                 let min_d = d1.min(d2);
 
-                let stroke_radius = 1.3f32;
-                arrow_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0);
+                let stroke_radius = 1.35f32;
+                arrow_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0) * arrow_intensity;
+            }
+
+            let out_a = (bg_alpha + arrow_alpha * (1.0 - bg_alpha)).clamp(0.0, 1.0);
+            let out_r = arrow_alpha * r_fg + (1.0 - arrow_alpha) * bg_alpha * r_bg;
+            let out_g = arrow_alpha * g_fg + (1.0 - arrow_alpha) * bg_alpha * g_bg;
+            let out_b = arrow_alpha * b_fg + (1.0 - arrow_alpha) * bg_alpha * b_bg;
+
+            let a = (out_a * 255.0).round().min(255.0) as u32;
+            let r = (out_r * 255.0).round().min(255.0) as u32;
+            let g = (out_g * 255.0).round().min(255.0) as u32;
+            let b = (out_b * 255.0).round().min(255.0) as u32;
+
+            pixels[(y * width + x) as usize] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    let bytes = (width * height * 4) as usize;
+    let mut file = tempfile::tempfile()?;
+    let mut byte_data = Vec::with_capacity(bytes);
+    for pixel in pixels {
+        byte_data.extend_from_slice(&pixel.to_ne_bytes());
+    }
+    file.write_all(&byte_data)?;
+    let pool = globals.shm.create_pool(file.as_fd(), bytes as i32, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        (width * 4) as i32,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
+    pool.destroy();
+    Ok(buffer)
+}
+
+fn render_top_gesture_buffer(
+    globals: &layers::Globals,
+    qh: &QueueHandle<App>,
+    stage: usize,
+) -> Result<wl_buffer::WlBuffer, PresenterError> {
+    let width = GESTURE_FEEDBACK_TOP_WIDTH;
+    let height = GESTURE_FEEDBACK_TOP_HEIGHT;
+    let mut pixels = vec![0u32; (width * height) as usize];
+
+    let depth = 4.0f32 + (stage.min(11) as f32) * 2.0f32;
+    let arrow_intensity = if stage < 4 {
+        0.0f32
+    } else if stage < 8 {
+        ((stage - 4) as f32 / 4.0f32).clamp(0.0, 1.0)
+    } else {
+        1.0f32
+    };
+
+    let (r_bg, g_bg, b_bg, a_bg) = (0.10f32, 0.11f32, 0.13f32, 0.88f32);
+    let (r_fg, g_fg, b_fg) = (1.0f32, 1.0f32, 1.0f32);
+
+    let center_x = (width as f32) / 2.0;
+
+    for y in 0..height {
+        let py = y as f32 + 0.5;
+        if py > depth + 1.0 {
+            continue;
+        }
+
+        for x in 0..width {
+            let px = x as f32 + 0.5;
+            let half_w = 26.0f32;
+            let dist_x = (px - center_x).abs();
+            if dist_x > half_w + 1.0 {
+                continue;
+            }
+
+            let dist_y = depth - py;
+            let dist_side = half_w - dist_x;
+            let corner_r = 10.0f32.min(depth / 2.0);
+
+            let dist_boundary = if dist_side < corner_r && dist_y < corner_r {
+                let dx = corner_r - dist_side;
+                let dy = corner_r - dist_y;
+                corner_r - (dx * dx + dy * dy).sqrt()
+            } else {
+                dist_y.min(dist_side)
+            };
+
+            let bg_alpha = dist_boundary.clamp(0.0, 1.0) * a_bg;
+            if bg_alpha <= 0.0 {
+                continue;
+            }
+
+            let mut arrow_alpha = 0.0f32;
+            if arrow_intensity > 0.0 {
+                let chevron_y = (depth * 0.6).max(8.0);
+                let v = (center_x, chevron_y + 3.0);
+                let left = (center_x - 5.5, chevron_y - 2.5);
+                let right = (center_x + 5.5, chevron_y - 2.5);
+
+                let d1 = dist_to_segment(px, py, left.0, left.1, v.0, v.1);
+                let d2 = dist_to_segment(px, py, right.0, right.1, v.0, v.1);
+                let min_d = d1.min(d2);
+
+                let stroke_radius = 1.25f32;
+                arrow_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0) * arrow_intensity;
             }
 
             let out_a = (bg_alpha + arrow_alpha * (1.0 - bg_alpha)).clamp(0.0, 1.0);
@@ -631,8 +748,9 @@ struct GestureFeedbackView {
     surface: wl_surface::WlSurface,
     subsurface: wl_subsurface::WlSubsurface,
     visible: bool,
-    buffers_left: [wl_buffer::WlBuffer; 5],
-    buffers_right: [wl_buffer::WlBuffer; 5],
+    buffers_left: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES],
+    buffers_right: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES],
+    buffers_top: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_TOP_STAGES],
 }
 
 impl Drop for GestureFeedbackView {
@@ -643,6 +761,9 @@ impl Drop for GestureFeedbackView {
             b.destroy();
         }
         for b in &self.buffers_right {
+            b.destroy();
+        }
+        for b in &self.buffers_top {
             b.destroy();
         }
     }
@@ -663,21 +784,28 @@ impl GestureFeedbackView {
             surface.set_input_region(Some(region.wl_region()));
         }
 
-        let mut buffers_left = Vec::with_capacity(5);
-        for stage in 0..5 {
-            buffers_left.push(render_edge_gesture_buffer(globals, qh, true, stage)?);
+        let mut buffers_left = Vec::with_capacity(GESTURE_FEEDBACK_SIDE_STAGES);
+        for stage in 0..GESTURE_FEEDBACK_SIDE_STAGES {
+            buffers_left.push(render_side_gesture_buffer(globals, qh, true, stage)?);
         }
-        let mut buffers_right = Vec::with_capacity(5);
-        for stage in 0..5 {
-            buffers_right.push(render_edge_gesture_buffer(globals, qh, false, stage)?);
+        let mut buffers_right = Vec::with_capacity(GESTURE_FEEDBACK_SIDE_STAGES);
+        for stage in 0..GESTURE_FEEDBACK_SIDE_STAGES {
+            buffers_right.push(render_side_gesture_buffer(globals, qh, false, stage)?);
+        }
+        let mut buffers_top = Vec::with_capacity(GESTURE_FEEDBACK_TOP_STAGES);
+        for stage in 0..GESTURE_FEEDBACK_TOP_STAGES {
+            buffers_top.push(render_top_gesture_buffer(globals, qh, stage)?);
         }
 
-        let buffers_left: [wl_buffer::WlBuffer; 5] = buffers_left
+        let buffers_left: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES] = buffers_left
             .try_into()
             .map_err(|_| PresenterError::Wayland("failed to convert left buffers".into()))?;
-        let buffers_right: [wl_buffer::WlBuffer; 5] = buffers_right
+        let buffers_right: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES] = buffers_right
             .try_into()
             .map_err(|_| PresenterError::Wayland("failed to convert right buffers".into()))?;
+        let buffers_top: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_TOP_STAGES] = buffers_top
+            .try_into()
+            .map_err(|_| PresenterError::Wayland("failed to convert top buffers".into()))?;
 
         surface.attach(None, 0, 0);
         surface.commit();
@@ -688,18 +816,28 @@ impl GestureFeedbackView {
             visible: false,
             buffers_left,
             buffers_right,
+            buffers_top,
         })
     }
 
-    fn update(&mut self, is_left: bool, stage: usize, x: i32, y: i32) {
+    fn update_side(&mut self, is_left: bool, stage: usize, x: i32, y: i32) {
         self.subsurface.set_position(x, y);
         let buffer = if is_left {
-            &self.buffers_left[stage.min(4)]
+            &self.buffers_left[stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1)]
         } else {
-            &self.buffers_right[stage.min(4)]
+            &self.buffers_right[stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1)]
         };
         self.surface.attach(Some(buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, GESTURE_FEEDBACK_WIDTH as i32, GESTURE_FEEDBACK_HEIGHT as i32);
+        self.surface.damage_buffer(0, 0, GESTURE_FEEDBACK_SIDE_WIDTH as i32, GESTURE_FEEDBACK_SIDE_HEIGHT as i32);
+        self.surface.commit();
+        self.visible = true;
+    }
+
+    fn update_top(&mut self, stage: usize, x: i32, y: i32) {
+        self.subsurface.set_position(x, y);
+        let buffer = &self.buffers_top[stage.min(GESTURE_FEEDBACK_TOP_STAGES - 1)];
+        self.surface.attach(Some(buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, GESTURE_FEEDBACK_TOP_WIDTH as i32, GESTURE_FEEDBACK_TOP_HEIGHT as i32);
         self.surface.commit();
         self.visible = true;
     }
@@ -1163,9 +1301,10 @@ impl App {
         let is_fullscreen = task.fullscreen || task.decorations_hidden;
         let should_be_visible = !is_fullscreen || task.fullscreen_controls_revealed_until.is_some();
         let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
+        let titlebar_h = if is_fullscreen { 0 } else { titlebar_height.max(DEFAULT_TITLEBAR_HEIGHT) };
         if !task.titlebar_buttons.is_empty() {
             for btn in &mut task.titlebar_buttons {
-                btn.update_position(titlebar_height, is_fullscreen, window_width);
+                btn.update_position(titlebar_h, is_fullscreen, window_width);
                 btn.set_visible(should_be_visible);
             }
             return;
@@ -1178,7 +1317,7 @@ impl App {
             &self.compositor,
             surface,
             qh,
-            titlebar_height,
+            titlebar_h,
             is_fullscreen,
             window_width,
         ) {
@@ -1191,7 +1330,7 @@ impl App {
             &self.compositor,
             surface,
             qh,
-            titlebar_height,
+            titlebar_h,
             is_fullscreen,
             window_width,
         ) {
@@ -1725,8 +1864,13 @@ impl App {
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.logical_size = Some((width, height));
             let is_fullscreen = task.fullscreen || task.decorations_hidden;
+            let titlebar_h = if is_fullscreen {
+                0
+            } else {
+                task.window_frame.as_ref().map_or(DEFAULT_TITLEBAR_HEIGHT, |f| (-f.location().1).max(DEFAULT_TITLEBAR_HEIGHT))
+            };
             for btn in &mut task.titlebar_buttons {
-                btn.update_position(0, is_fullscreen, width as i32);
+                btn.update_position(titlebar_h, is_fullscreen, width as i32);
             }
             task.applied_opaque = None;
             task.buffer_size = (buffer_width, buffer_height);
@@ -4352,9 +4496,7 @@ impl TouchHandler for App {
         if let Some(candidate) = gesture::EdgeGestureTracker::new_candidate(
             id, object, serial, pointer_id, position, logical_size, is_fullscreen,
         ) {
-            if matches!(candidate.kind, gesture::EdgeGestureKind::Back { .. }) {
-                self.ensure_gesture_feedback(_qh, object);
-            }
+            self.ensure_gesture_feedback(_qh, object);
             self.edge_gestures.insert(id, candidate);
             return;
         }
@@ -4473,41 +4615,52 @@ impl TouchHandler for App {
         });
         if let Some((res, object, kind, start_pos)) = gesture_update {
             match res {
-                gesture::EdgeMotionResult::StayPending | gesture::EdgeMotionResult::ConfirmedBack => {
-                    if let gesture::EdgeGestureKind::Back { is_left } = kind {
-                        let inward_dx = if is_left {
-                            position.0 - start_pos.0
-                        } else {
-                            start_pos.0 - position.0
-                        };
-                        if let Some(task) = self.tasks.get_mut(&object) {
-                            if let Some(feedback) = task.gesture_feedback.as_mut() {
-                                if inward_dx < 6.0 {
-                                    feedback.hide();
-                                } else {
-                                    let stage = if inward_dx < 14.0 {
-                                        0
-                                    } else if inward_dx < 22.0 {
-                                        1
-                                    } else if inward_dx < 30.0 {
-                                        2
-                                    } else if inward_dx < 38.0 {
-                                        3
+                gesture::EdgeMotionResult::StayPending
+                | gesture::EdgeMotionResult::ConfirmedBack
+                | gesture::EdgeMotionResult::ConfirmedTopReveal => {
+                    match kind {
+                        gesture::EdgeGestureKind::Back { is_left } => {
+                            let inward_dx = if is_left {
+                                position.0 - start_pos.0
+                            } else {
+                                start_pos.0 - position.0
+                            };
+                            if let Some(task) = self.tasks.get_mut(&object) {
+                                if let Some(feedback) = task.gesture_feedback.as_mut() {
+                                    if inward_dx < 4.0 {
+                                        feedback.hide();
                                     } else {
-                                        4
-                                    };
-                                    let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
-                                    let x = if is_left { 0 } else { window_width - GESTURE_FEEDBACK_WIDTH as i32 };
-                                    let y = (position.1 - (GESTURE_FEEDBACK_HEIGHT as f64 / 2.0)).round() as i32;
-                                    feedback.update(is_left, stage, x, y);
+                                        let stage = ((inward_dx - 4.0) / 1.8).floor().max(0.0) as usize;
+                                        let stage = stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1);
+                                        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
+                                        let x = if is_left {
+                                            0
+                                        } else {
+                                            window_width - GESTURE_FEEDBACK_SIDE_WIDTH as i32
+                                        };
+                                        let y = (position.1 - (GESTURE_FEEDBACK_SIDE_HEIGHT as f64 / 2.0)).round() as i32;
+                                        feedback.update_side(is_left, stage, x, y);
+                                    }
+                                }
+                            }
+                        }
+                        gesture::EdgeGestureKind::TopReveal => {
+                            let dy = position.1 - start_pos.1;
+                            if let Some(task) = self.tasks.get_mut(&object) {
+                                if let Some(feedback) = task.gesture_feedback.as_mut() {
+                                    if dy < 3.0 {
+                                        feedback.hide();
+                                    } else {
+                                        let stage = ((dy - 3.0) / 2.5).floor().max(0.0) as usize;
+                                        let stage = stage.min(GESTURE_FEEDBACK_TOP_STAGES - 1);
+                                        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
+                                        let x = (window_width - GESTURE_FEEDBACK_TOP_WIDTH as i32) / 2;
+                                        feedback.update_top(stage, x, 0);
+                                    }
                                 }
                             }
                         }
                     }
-                    return;
-                }
-                gesture::EdgeMotionResult::ConfirmedTopReveal => {
-                    self.reveal_fullscreen_controls(object, gesture::FULLSCREEN_REVEAL_DURATION);
                     return;
                 }
                 gesture::EdgeMotionResult::CancelScroll => {
