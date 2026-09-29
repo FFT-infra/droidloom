@@ -120,13 +120,10 @@ PRODUCT_COPY_FILES += \
 # interpreter.
 PRODUCT_VENDOR_PROPERTIES += dalvik.vm.dex2oat64.enabled=true
 
-# The Iris decoders pass the AVC/HEVC/VP9/AV1 qualifier matrix, but the vendor
-# HAL stays opt-in: it is the only hardware decode path here, and every
-# advertised format has to keep passing before it becomes unconditional.
-ifeq ($(DROIDLOOM_ENABLE_EXPERIMENTAL_IRIS_CODEC2),true)
+# The Iris decoders pass the AVC/HEVC/VP9/AV1 qualifier matrix. It is the
+# standard hardware decode path on sheng.
 PRODUCT_PACKAGES += droidloom-v4l2-codec2-service
 PRODUCT_COPY_FILES += \
     vendor/droidloom/android/device/droidloom_sheng/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml
 # Must stay equal to concurrent-instances in media_codecs_c2.xml.
 PRODUCT_VENDOR_PROPERTIES += ro.vendor.v4l2_codec2.decode_concurrent_instances=4
-endif

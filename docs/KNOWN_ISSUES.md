@@ -6,12 +6,11 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 
 ## Video decode
 
-- **Sheng Iris hardware decode is opt-in, and preferred once enabled.** The path
+- **Sheng Iris hardware decode is standard and enabled by default.** The path
   is Android `MediaCodec` → Codec2 AIDL → AOSP `v4l2_codec2` → the host's
-  Qualcomm Iris stateful V4L2 decoder, with DMA-BUF buffers. Only builds made
-  with `DROIDLOOM_ENABLE_EXPERIMENTAL_IRIS_CODEC2=true` include the Codec2
-  service and capability XML, and a cell exposes the decoder only when its
-  `cell.json` sets `"video_decoder": "iris"`. Codec2 sizes input buffers from
+  Qualcomm Iris stateful V4L2 decoder, with DMA-BUF buffers. Sheng builds
+  include the Codec2 service and capability XML by default, and a cell exposes
+  the decoder when its `cell.json` sets `"video_decoder": "iris"`. Codec2 sizes input buffers from
   the OUTPUT `sizeimage` that Iris reports when the service starts: 7,077,888
   bytes for H.264, HEVC and AV1 and 14,155,776 bytes for VP9 on sheng. That
   size is a floor. A client `max-input-size` can raise the buffers but never

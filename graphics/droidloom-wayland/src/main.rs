@@ -4453,6 +4453,9 @@ fn run() -> Result<(), PresenterError> {
     validate_render_node(&render_node)?;
     let identity = fs::metadata("/proc/self")?;
     prepare_socket_path(&socket_path, &runtime_root, identity.uid())?;
+    if let Some(parent) = socket_path.parent() {
+        prepare_dbus_send_shim(parent);
+    }
     // The async reactor may be created synchronously by Bridge::start.
     droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Background);
     let notifications = notifications::Bridge::start(socket_path.with_file_name("notifications.sock"));
@@ -4939,6 +4942,84 @@ fn prepare_socket_path(
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn prepare_dbus_send_shim(runtime_dir: &Path) {
+    let shim_dir = runtime_dir.join("shims");
+    if let Err(error) = fs::create_dir_all(&shim_dir) {
+        eprintln!("droidloom-wayland: failed to create shim directory: {error}");
+        return;
+    }
+    let shim_path = shim_dir.join("dbus-send");
+    let script = r#"#!/bin/sh
+CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}/droidloom"
+mkdir -p "$CACHE_DIR" 2>/dev/null
+
+REAL_DBUS=$(which -a dbus-send 2>/dev/null | grep -v "/droidloom/shims" | head -n1)
+[ -z "$REAL_DBUS" ] && REAL_DBUS="/usr/bin/dbus-send"
+
+case "$*" in
+  *"string:org.gnome.desktop.wm.preferences"*"string:button-layout"*)
+    CACHE_FILE="$CACHE_DIR/button-layout.cache"
+    OUT=$("$REAL_DBUS" --reply-timeout=2000 "$@" 2>/dev/null)
+    if [ -n "$OUT" ]; then
+      printf '%s\n' "$OUT" > "$CACHE_FILE"
+      printf '%s\n' "$OUT"
+      exit 0
+    fi
+    GSET=$(gsettings get org.gnome.desktop.wm.preferences button-layout 2>/dev/null)
+    if [ -n "$GSET" ]; then
+      CLEAN=$(printf '%s' "$GSET" | tr -d "'\"")
+      OUT="   variant       variant          $CLEAN"
+      printf '%s\n' "$OUT" > "$CACHE_FILE"
+      printf '%s\n' "$OUT"
+      exit 0
+    fi
+    if [ -s "$CACHE_FILE" ]; then
+      cat "$CACHE_FILE"
+      exit 0
+    fi
+    printf '   variant       variant          close,minimize,maximize:appmenu\n'
+    exit 0
+    ;;
+  *"string:org.freedesktop.appearance"*"string:color-scheme"*)
+    CACHE_FILE="$CACHE_DIR/color-scheme.cache"
+    OUT=$("$REAL_DBUS" --reply-timeout=2000 "$@" 2>/dev/null)
+    if [ -n "$OUT" ]; then
+      printf '%s\n' "$OUT" > "$CACHE_FILE"
+      printf '%s\n' "$OUT"
+      exit 0
+    fi
+    GSET=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)
+    case "$GSET" in
+      *dark*)
+        OUT="   variant       variant          uint32 1"
+        ;;
+      *)
+        OUT="   variant       variant          uint32 0"
+        ;;
+    esac
+    printf '%s\n' "$OUT" > "$CACHE_FILE"
+    printf '%s\n' "$OUT"
+    exit 0
+    ;;
+  *)
+    exec "$REAL_DBUS" "$@"
+    ;;
+esac
+"#;
+    if let Ok(()) = fs::write(&shim_path, script) {
+        let _ = fs::set_permissions(&shim_path, fs::Permissions::from_mode(0o755));
+        if let Some(old_path) = env::var_os("PATH") {
+            let mut new_path = shim_dir.into_os_string();
+            new_path.push(":");
+            new_path.push(old_path);
+            // SAFETY: this process is still in its single-threaded initialization phase.
+            unsafe {
+                env::set_var("PATH", new_path);
+            }
+        }
+    }
 }
 
 fn remove_owned_socket(socket: &Path) {

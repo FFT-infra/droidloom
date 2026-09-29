@@ -304,25 +304,22 @@ fn native_targeted_input_keeps_the_boot_framework_abi_untouched() {
 }
 
 #[test]
-fn unvalidated_sheng_iris_codecs_are_not_advertised_by_default() {
+fn sheng_iris_codecs_are_advertised_by_default() {
     let root = repository_root();
     let product = fs::read_to_string(root.join("android/device/droidloom_sheng/droidloom_sheng.mk"))
         .expect("read sheng product makefile");
-    let experimental_gate = "ifeq ($(DROIDLOOM_ENABLE_EXPERIMENTAL_IRIS_CODEC2),true)";
-    let (default_product, experimental_product) = product
-        .split_once(experimental_gate)
-        .expect("Iris codec opt-in gate must be explicit");
     assert!(
-        !default_product.contains("droidloom-v4l2-codec2-service"),
-        "release builds must not install the unvalidated Iris service"
+        product.contains("PRODUCT_PACKAGES += droidloom-v4l2-codec2-service"),
+        "sheng product must install the Iris hardware decode service"
     );
     assert!(
-        !default_product.contains("media_codecs_c2.xml"),
-        "release builds must not advertise unvalidated hardware decoders"
+        product.contains("media_codecs_c2.xml"),
+        "sheng product must advertise hardware decoders"
     );
-    assert!(experimental_product.contains("PRODUCT_PACKAGES += droidloom-v4l2-codec2-service"));
-    assert!(experimental_product.contains("media_codecs_c2.xml"));
-    assert!(experimental_product.contains("endif"));
+    assert!(
+        product.contains("ro.vendor.v4l2_codec2.decode_concurrent_instances=4"),
+        "sheng product must configure concurrent decoder instances"
+    );
 }
 
 #[test]
