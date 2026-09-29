@@ -2,7 +2,7 @@
 // Provides edge-swipe back navigation and top-edge fullscreen controls reveal.
 
 use std::time::Duration;
-use crate::TaskObjectId;
+use droidloom_denial_protocol::TaskObjectId;
 
 /// Margin in surface-local pixels from the left or right edge to intercept back gestures.
 pub const EDGE_SWIPE_MARGIN: f64 = 28.0;
