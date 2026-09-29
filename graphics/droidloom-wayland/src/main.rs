@@ -4228,13 +4228,16 @@ impl TouchHandler for App {
             return;
         }
 
-        if let Some(tracker) = self.edge_gestures.get_mut(&id) {
-            match tracker.on_motion(position) {
+        let gesture_update = self.edge_gestures.get_mut(&id).map(|tracker| {
+            (tracker.on_motion(position), tracker.object)
+        });
+        if let Some((res, object)) = gesture_update {
+            match res {
                 gesture::EdgeMotionResult::StayPending | gesture::EdgeMotionResult::ConfirmedBack => {
                     return;
                 }
                 gesture::EdgeMotionResult::ConfirmedTopReveal => {
-                    self.reveal_fullscreen_controls(tracker.object, gesture::FULLSCREEN_REVEAL_DURATION);
+                    self.reveal_fullscreen_controls(object, gesture::FULLSCREEN_REVEAL_DURATION);
                     return;
                 }
                 gesture::EdgeMotionResult::CancelScroll => {
