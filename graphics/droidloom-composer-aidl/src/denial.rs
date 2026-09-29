@@ -148,6 +148,11 @@ impl DenialPresentationSink {
         Ok(())
     }
 
+    /// Check whether a Composer display channel is currently registered in the sink.
+    pub fn is_display_registered(&self, display: DisplayId) -> bool {
+        self.lock_tasks().map(|tasks| tasks.contains_key(&display)).unwrap_or(false)
+    }
+
     /// Borrow the connected socket for a single-owner protocol event pump.
     pub fn socket(&self) -> &ProtocolSocket {
         &self.socket

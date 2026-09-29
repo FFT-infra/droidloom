@@ -175,25 +175,30 @@ impl TaskCoordinator {
         {
             // Keep one guard for both lookups. An if-let scrutinee guard
             // lives through its body; locking again there deadlocks on reopen.
-            let state = self
+            let mut state = self
                 .state
                 .0
                 .lock()
                 .map_err(|_| "task-control state lock is poisoned".to_owned())?;
             if let Some(existing) = state.direct_tasks.get(&task).copied() {
-                let registration = state
-                    .registry
-                    .get(existing)
-                    .map_err(|error| error.to_string())?;
-                if registration.reservation.package != package
-                    || registration.android_display != Some(android_display)
-                {
-                    return Err(format!(
-                        "Android task {} is already registered with different ownership",
-                        task.0
-                    ));
+                if let Ok(registration) = state.registry.get(existing) {
+                    if self.sink.is_display_registered(registration.reservation.display) {
+                        if registration.reservation.package != package
+                            || registration.android_display != Some(android_display)
+                        {
+                            return Err(format!(
+                                "Android task {} is already registered with different ownership",
+                                task.0
+                            ));
+                        }
+                        return Ok((existing, registration.reservation.display));
+                    }
                 }
-                return Ok((existing, registration.reservation.display));
+                // Previous display is no longer active in sink; prune stale mapping so
+                // a fresh display can be reserved without conflict.
+                state.direct_tasks.remove(&task);
+                state.direct_android_displays.remove(&existing);
+                let _ = state.registry.cancel_reservation(existing);
             }
         }
 
@@ -251,6 +256,9 @@ impl TaskCoordinator {
             .map_err(|error| error.to_string())?;
         if registration.phase != TaskRegistrationPhase::Bound {
             return Err(format!("Android task {} export is not ready", task.0));
+        }
+        if !self.sink.is_display_registered(registration.reservation.display) {
+            return Err(format!("Android task {} display is no longer active", task.0));
         }
         Ok(registration.reservation.display)
     }
