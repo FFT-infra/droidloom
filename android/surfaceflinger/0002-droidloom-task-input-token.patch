@@ -22,19 +22,17 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
              Rect bounds{snapshot->transformedBounds};
              Rect clipped;
              if (!displayBounds.isEmpty() && bounds.intersect(displayBounds, &clipped)) {
-@@ -3514,4 +3519,15 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+@@ -3514,4 +3519,13 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
              frame.layers.emplace_back(owner, std::move(copy));
          }
  
-+        std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
-+        for (const auto& [task, frame] : taskFrames) {
-+            if (frame.applicationToken != nullptr) {
-+                taskInputTokens.emplace(task, frame.applicationToken);
-+            }
-+        }
 +        {
 +            std::lock_guard lock(mDroidloomTaskInputMutex);
-+            mDroidloomTaskInputTokens = std::move(taskInputTokens);
++            for (const auto& [task, frame] : taskFrames) {
++                if (frame.applicationToken != nullptr) {
++                    mDroidloomTaskInputTokens[task] = frame.applicationToken;
++                }
++            }
 +        }
 +
          // A task output owns exactly one Denial window. Keep it across short

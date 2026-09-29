@@ -110,7 +110,8 @@ impl LogicalSize {
         Ok(())
     }
 
-    fn clamped_to(self, bounds: Option<Self>) -> Self {
+    /// Return a copy clamped to explicit bounds when present.
+    pub fn clamped_to(self, bounds: Option<Self>) -> Self {
         bounds.map_or(self, |bounds| Self {
             width: self.width.min(bounds.width),
             height: self.height.min(bounds.height),

@@ -176,7 +176,7 @@ index ca79fc5..0929f5c 100644
 +            -1, mNextDeviceId++, "<droidloom-host-keyboard>", hostKeyboardIdentifier,
 +            /*associatedDevice=*/nullptr);
 +    hostKeyboard->classes = InputDeviceClass::KEYBOARD | InputDeviceClass::ALPHAKEY |
-+            InputDeviceClass::DPAD | InputDeviceClass::EXTERNAL;
++            InputDeviceClass::EXTERNAL;
 +    hostKeyboard->loadKeyMapLocked();
 +    addDeviceLocked(std::move(hostKeyboard));
 +

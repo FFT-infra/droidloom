@@ -254,7 +254,7 @@ index 56a1ff4..e53c912 100644
 +            frame.layers.emplace_back(owner, copy);
          }
  
-         std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
+         {
 @@ -3541,6 +3561,9 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
          // ordinary Denial window through its normal lifecycle.
          const nsecs_t taskNow = systemTime();

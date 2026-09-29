@@ -120,6 +120,7 @@ public final class InputBridge {
     private final Map<Long, Integer> mMetaStates = new HashMap<>();
     private final Map<Long, MouseState> mMice = new HashMap<>();
     private final Map<Integer, Integer> mKeyLayout = loadKeyLayout();
+    private final Map<Integer, IBinder> mTaskInputTokens = new HashMap<>();
     private int mHostKeyboardDeviceId = KeyCharacterMap.VIRTUAL_KEYBOARD;
     private int mHostMouseDeviceId = 0;
     private final Map<Integer, ScheduledFuture<?>> mPendingTaskBounds = new HashMap<>();
@@ -245,8 +246,6 @@ public final class InputBridge {
                 return;
             } catch (RuntimeException error) {
                 Log.w(TAG, "Rejected routed input record", error);
-                resetTransientInputState();
-                return;
             }
         }
     }
@@ -478,6 +477,7 @@ public final class InputBridge {
     }
 
     private void closeTask(TaskCloseRecord record) {
+        mTaskInputTokens.remove(record.taskId);
         try {
             final Object activityTaskManager = activityTaskManager();
             final boolean removed = (Boolean) mRemoveTask.invoke(
@@ -680,17 +680,34 @@ public final class InputBridge {
         switch (record.action) {
             case TABLET_ACTION_PROXIMITY_IN:
                 if (state != null) {
-                    throw new IllegalStateException("duplicate tablet proximity-in");
+                    injectTabletEvent(record, state, MotionEvent.ACTION_HOVER_EXIT, 0);
+                    mTablets.remove(identity);
+                }
+                final IBinder tabletToken = taskInputApplicationToken(record.taskId);
+                if (tabletToken == null) {
+                    Log.w(TAG, "Dropping tablet proximity-in for task " + record.taskId + ": no application token");
+                    return;
                 }
                 state = new TabletState(
                         record.timestampNanos / 1_000_000L,
-                        taskInputApplicationToken(record.taskId),
+                        tabletToken,
                         record);
                 mTablets.put(identity, state);
                 injectTabletEvent(record, state, MotionEvent.ACTION_HOVER_ENTER, 0);
                 return;
             case TABLET_ACTION_MOTION:
-                requireTabletState(state, "tablet motion");
+                if (state == null) {
+                    final IBinder token = taskInputApplicationToken(record.taskId);
+                    if (token == null) {
+                        return;
+                    }
+                    state = new TabletState(
+                            record.timestampNanos / 1_000_000L,
+                            token,
+                            record);
+                    mTablets.put(identity, state);
+                    injectTabletEvent(record, state, MotionEvent.ACTION_HOVER_ENTER, 0);
+                }
                 state.update(record);
                 injectTabletEvent(
                         record,
@@ -699,7 +716,18 @@ public final class InputBridge {
                         0);
                 return;
             case TABLET_ACTION_DOWN:
-                requireTabletState(state, "tablet down");
+                if (state == null) {
+                    final IBinder token = taskInputApplicationToken(record.taskId);
+                    if (token == null) {
+                        return;
+                    }
+                    state = new TabletState(
+                            record.timestampNanos / 1_000_000L,
+                            token,
+                            record);
+                    mTablets.put(identity, state);
+                    injectTabletEvent(record, state, MotionEvent.ACTION_HOVER_ENTER, 0);
+                }
                 if (state.down) {
                     throw new IllegalStateException("duplicate tablet down");
                 }
@@ -718,7 +746,9 @@ public final class InputBridge {
                 state.down = false;
                 return;
             case TABLET_ACTION_PROXIMITY_OUT:
-                requireTabletState(state, "tablet proximity-out");
+                if (state == null) {
+                    return;
+                }
                 if (state.down) {
                     throw new IllegalStateException("tablet left proximity while down");
                 }
@@ -728,32 +758,46 @@ public final class InputBridge {
                 return;
             case TABLET_ACTION_BUTTON_PRESS:
             case TABLET_ACTION_BUTTON_RELEASE:
-                requireTabletState(state, "tablet button");
-                state.update(record);
+                if (state == null) {
+                    final IBinder token = taskInputApplicationToken(record.taskId);
+                    if (token != null) {
+                        state = new TabletState(
+                                record.timestampNanos / 1_000_000L,
+                                token,
+                                record);
+                        mTablets.put(identity, state);
+                    }
+                }
+                if (state != null) {
+                    state.update(record);
+                }
                 final int button = androidTabletButton(record.button);
-                if (button == 0) return;
-                // A pen button reaches an application as a key on a tablet
-                // that passes the pen devices through, so send the same key
-                // alongside the motion button state.
-                final int buttonKey = tabletButtonKeyCode(record.button);
-                if (buttonKey != KeyEvent.KEYCODE_UNKNOWN) {
-                    injectKey(record.displayId, state.applicationToken,
-                            record.timestampNanos / 1_000_000L,
-                            record.timestampNanos / 1_000_000L,
-                            record.action == TABLET_ACTION_BUTTON_PRESS, buttonKey,
-                            record.button, 0, metaState(record.displayId, record.taskId),
-                            InputDevice.SOURCE_STYLUS);
+                if (button != 0) {
+                    final int buttonKey = tabletButtonKeyCode(record.button);
+                    if (buttonKey != KeyEvent.KEYCODE_UNKNOWN) {
+                        final IBinder keyToken = state != null ? state.applicationToken : taskInputApplicationToken(record.taskId);
+                        if (keyToken != null) {
+                            injectKey(record.displayId, keyToken,
+                                    record.timestampNanos / 1_000_000L,
+                                    record.timestampNanos / 1_000_000L,
+                                    record.action == TABLET_ACTION_BUTTON_PRESS, buttonKey,
+                                    record.button, 0, metaState(record.displayId, record.taskId),
+                                    InputDevice.SOURCE_STYLUS);
+                        }
+                    }
+                    if (state != null) {
+                        if (record.action == TABLET_ACTION_BUTTON_PRESS) {
+                            state.buttonState |= button;
+                        } else {
+                            state.buttonState &= ~button;
+                        }
+                        injectTabletEvent(record, state,
+                                record.action == TABLET_ACTION_BUTTON_PRESS
+                                        ? MotionEvent.ACTION_BUTTON_PRESS
+                                        : MotionEvent.ACTION_BUTTON_RELEASE,
+                                button);
+                    }
                 }
-                if (record.action == TABLET_ACTION_BUTTON_PRESS) {
-                    state.buttonState |= button;
-                } else {
-                    state.buttonState &= ~button;
-                }
-                injectTabletEvent(record, state,
-                        record.action == TABLET_ACTION_BUTTON_PRESS
-                                ? MotionEvent.ACTION_BUTTON_PRESS
-                                : MotionEvent.ACTION_BUTTON_RELEASE,
-                        button);
                 return;
             case TABLET_ACTION_CANCEL:
                 requireTabletState(state, "tablet cancel");
@@ -920,6 +964,10 @@ public final class InputBridge {
             applicationToken = continued
                     ? existing.applicationToken
                     : taskInputApplicationToken(record.taskId);
+            if (applicationToken == null) {
+                Log.w(TAG, "Dropping key press for task " + record.taskId + ": no application token");
+                return;
+            }
             mKeys.put(identity, new KeyState(downTimeMillis, applicationToken));
         } else {
             if (existing == null) {
@@ -1023,7 +1071,12 @@ public final class InputBridge {
             if (record.action == MOUSE_ACTION_LEAVE || record.action == MOUSE_ACTION_CANCEL) {
                 return;
             }
-            state = new MouseState(taskInputApplicationToken(record.taskId));
+            final IBinder token = taskInputApplicationToken(record.taskId);
+            if (token == null) {
+                Log.w(TAG, "Dropping mouse event for task " + record.taskId + ": no application token");
+                return;
+            }
+            state = new MouseState(token);
             mMice.put(identity, state);
         }
         state.x = record.x;
@@ -1255,28 +1308,32 @@ public final class InputBridge {
         final Parcel reply = Parcel.obtain();
         try {
             final IBinder surfaceFlinger = systemService(SURFACE_FLINGER_SERVICE);
-            if (surfaceFlinger == null) {
-                throw new IllegalStateException("SurfaceFlinger is not ready");
+            if (surfaceFlinger != null) {
+                data.writeInterfaceToken(SURFACE_FLINGER_DESCRIPTOR);
+                data.writeInt(taskId);
+                if (surfaceFlinger.transact(
+                        GET_TASK_INPUT_TOKEN_TRANSACTION, data, reply, 0)) {
+                    reply.readException();
+                    final IBinder token = reply.readStrongBinder();
+                    if (token != null) {
+                        mTaskInputTokens.put(taskId, token);
+                        return token;
+                    }
+                }
             }
-            data.writeInterfaceToken(SURFACE_FLINGER_DESCRIPTOR);
-            data.writeInt(taskId);
-            if (!surfaceFlinger.transact(
-                    GET_TASK_INPUT_TOKEN_TRANSACTION, data, reply, 0)) {
-                throw new IllegalStateException("Android rejected the task input-token query");
-            }
-            reply.readException();
-            final IBinder token = reply.readStrongBinder();
-            if (token == null) {
-                throw new IllegalStateException(
-                        "Android task " + taskId + " has no input application token");
-            }
-            return token;
-        } catch (ReflectiveOperationException | RemoteException error) {
-            throw new IllegalStateException("Android task input-token query failed", error);
+        } catch (ReflectiveOperationException | RemoteException | RuntimeException error) {
+            Log.w(TAG, "Android task input-token query failed for task " + taskId, error);
         } finally {
             reply.recycle();
             data.recycle();
         }
+
+        final IBinder cached = mTaskInputTokens.get(taskId);
+        if (cached != null) {
+            return cached;
+        }
+        Log.w(TAG, "Android task " + taskId + " has no input application token");
+        return null;
     }
 
     private boolean injectInputEventToApplication(InputEvent event, IBinder applicationToken)
