@@ -141,10 +141,10 @@ const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const TITLEBAR_BUTTON_SIZE: u32 = 28;
-const DEFAULT_TITLEBAR_HEIGHT: i32 = 36;
+const DEFAULT_TITLEBAR_HEIGHT: i32 = 35;
 
 fn detect_titlebar_button_y(titlebar_height: i32) -> i32 {
-    -(titlebar_height + TITLEBAR_BUTTON_SIZE as i32) / 2
+    -titlebar_height + 3
 }
 
 fn detect_fullscreen_button_y() -> i32 {
@@ -1210,7 +1210,7 @@ struct App {
     edge_gestures: BTreeMap<i32, gesture::EdgeGestureTracker>,
     decoration_touch: Option<DecorationTouch>,
     titlebar_button_pointer: Option<(TaskObjectId, TitlebarButtonKind)>,
-    titlebar_button_touch: Option<(i32, TaskObjectId, TitlebarButtonKind)>,
+    titlebar_button_touch: Option<(i32, TaskObjectId, TitlebarButtonKind, (f64, f64))>,
     titlebar_button_tablet: Option<(TaskObjectId, TitlebarButtonKind)>,
     next_buffer_id: u64,
     next_input_serial: u64,
@@ -1288,7 +1288,7 @@ impl App {
         if self.titlebar_button_pointer.is_some_and(|(obj, _)| obj == object) {
             self.titlebar_button_pointer = None;
         }
-        if self.titlebar_button_touch.is_some_and(|(_, obj, _)| obj == object) {
+        if self.titlebar_button_touch.is_some_and(|(_, obj, _, _)| obj == object) {
             self.titlebar_button_touch = None;
         }
         if self.titlebar_button_tablet.is_some_and(|(obj, _)| obj == object) {
@@ -2387,7 +2387,7 @@ impl App {
         if let Some((obj, _)) = self.titlebar_button_pointer && obj == object {
             self.titlebar_button_pointer = None;
         }
-        if let Some((_, obj, _)) = self.titlebar_button_touch && obj == object {
+        if let Some((_, obj, _, _)) = self.titlebar_button_touch && obj == object {
             self.titlebar_button_touch = None;
         }
         if let Some((obj, _)) = self.titlebar_button_tablet && obj == object {
@@ -2440,7 +2440,7 @@ impl App {
         if let Some((obj, _)) = self.titlebar_button_pointer && obj == object {
             self.titlebar_button_pointer = None;
         }
-        if let Some((_, obj, _)) = self.titlebar_button_touch && obj == object {
+        if let Some((_, obj, _, _)) = self.titlebar_button_touch && obj == object {
             self.titlebar_button_touch = None;
         }
         if let Some((obj, _)) = self.titlebar_button_tablet && obj == object {
@@ -3615,6 +3615,9 @@ impl WindowHandler for App {
         }
 
         if was_fullscreen != is_fullscreen {
+            if let Some(task) = self.tasks.get_mut(&object) {
+                task.fullscreen_controls_revealed_until = None;
+            }
             self.clear_titlebar_buttons(object);
         }
 
@@ -4451,7 +4454,7 @@ impl TouchHandler for App {
         position: (f64, f64),
     ) {
         if let Some((object, kind)) = self.task_and_button_for_surface(&surface) {
-            self.titlebar_button_touch = Some((id, object, kind));
+            self.titlebar_button_touch = Some((id, object, kind, position));
             self.update_titlebar_button_state(object, kind, TitlebarButtonState::Pressed);
             return;
         }
@@ -4493,12 +4496,14 @@ impl TouchHandler for App {
             |t| (t.logical_size.unwrap_or((1920, 1080)), t.fullscreen || t.decorations_hidden),
         );
 
-        if let Some(candidate) = gesture::EdgeGestureTracker::new_candidate(
-            id, object, serial, pointer_id, position, logical_size, is_fullscreen,
-        ) {
-            self.ensure_gesture_feedback(_qh, object);
-            self.edge_gestures.insert(id, candidate);
-            return;
+        if self.edge_gestures.is_empty() {
+            if let Some(candidate) = gesture::EdgeGestureTracker::new_candidate(
+                id, object, serial, pointer_id, position, logical_size, is_fullscreen,
+            ) {
+                self.ensure_gesture_feedback(_qh, object);
+                self.edge_gestures.insert(id, candidate);
+                return;
+            }
         }
 
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
@@ -4523,7 +4528,7 @@ impl TouchHandler for App {
         time: u32,
         id: i32,
     ) {
-        if let Some((touch_id, object, kind)) = self.titlebar_button_touch {
+        if let Some((touch_id, object, kind, _)) = self.titlebar_button_touch {
             if touch_id == id {
                 self.titlebar_button_touch = None;
                 self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
@@ -4601,6 +4606,17 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if let Some((touch_id, object, kind, start_pos)) = self.titlebar_button_touch {
+            if touch_id == id {
+                let dx = position.0 - start_pos.0;
+                let dy = position.1 - start_pos.1;
+                if dx * dx + dy * dy > 144.0 {
+                    self.titlebar_button_touch = None;
+                    self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
+                }
+            }
+        }
+
         if let Some(surface) = self.decoration_touch.as_ref()
             .filter(|touch| touch.id == id && touch.touch == *_touch)
             .map(|touch| touch.surface.clone())
@@ -4633,12 +4649,14 @@ impl TouchHandler for App {
                                         let stage = ((inward_dx - 4.0) / 1.8).floor().max(0.0) as usize;
                                         let stage = stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1);
                                         let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
+                                        let window_height = task.logical_size.map_or(1080, |s| s.1 as i32);
                                         let x = if is_left {
                                             0
                                         } else {
                                             window_width - GESTURE_FEEDBACK_SIDE_WIDTH as i32
                                         };
-                                        let y = (position.1 - (GESTURE_FEEDBACK_SIDE_HEIGHT as f64 / 2.0)).round() as i32;
+                                        let y = (start_pos.1 - (GESTURE_FEEDBACK_SIDE_HEIGHT as f64 / 2.0)).round() as i32;
+                                        let y = y.clamp(0, (window_height - GESTURE_FEEDBACK_SIDE_HEIGHT as i32).max(0));
                                         feedback.update_side(is_left, stage, x, y);
                                     }
                                 }
@@ -4740,7 +4758,7 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        if let Some((_, object, kind)) = self.titlebar_button_touch.take() {
+        if let Some((_, object, kind, _)) = self.titlebar_button_touch.take() {
             self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
         }
         if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)

@@ -5,10 +5,10 @@ use std::time::Duration;
 use droidloom_denial_protocol::TaskObjectId;
 
 /// Margin in surface-local pixels from the left or right edge to intercept back gestures.
-pub const EDGE_SWIPE_MARGIN: f64 = 28.0;
+pub const EDGE_SWIPE_MARGIN: f64 = 36.0;
 
 /// Margin in surface-local pixels from the top edge in fullscreen to intercept reveal gestures.
-pub const TOP_EDGE_MARGIN: f64 = 28.0;
+pub const TOP_EDGE_MARGIN: f64 = 48.0;
 
 /// Distance in pixels required to confirm a horizontal back swipe.
 pub const BACK_CONFIRM_DISPLACEMENT: f64 = 36.0;
@@ -17,7 +17,7 @@ pub const BACK_CONFIRM_DISPLACEMENT: f64 = 36.0;
 pub const TOP_CONFIRM_DISPLACEMENT: f64 = 32.0;
 
 /// Vertical distance in pixels after which an edge touch is classified as vertical scrolling.
-pub const SCROLL_DISAMBIGUATION_SLOP: f64 = 8.0;
+pub const SCROLL_DISAMBIGUATION_SLOP: f64 = 20.0;
 
 /// Tap threshold: movements below this are treated as taps if released without confirming.
 pub const TAP_THRESHOLD: f64 = 15.0;
@@ -50,6 +50,7 @@ pub struct EdgeGestureTracker {
     #[allow(dead_code)]
     pub serial: u32,
     pub pointer_id: u32,
+    pub start_time: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,8 +80,9 @@ impl EdgeGestureTracker {
         window_size: (u32, u32),
         is_fullscreen: bool,
     ) -> Option<Self> {
-        let (width, _height) = window_size;
+        let (width, height) = window_size;
         let width_f = width as f64;
+        let height_f = height as f64;
 
         if is_fullscreen && pos.1 <= TOP_EDGE_MARGIN {
             return Some(Self {
@@ -92,7 +94,14 @@ impl EdgeGestureTracker {
                 current_pos: pos,
                 serial,
                 pointer_id,
+                start_time: std::time::Instant::now(),
             });
+        }
+
+        // Top/bottom edge exclusion for side back gestures:
+        // Avoid interfering with top panel / status bar or bottom bar / IME
+        if pos.1 < 36.0 || (height_f > 72.0 && pos.1 > height_f - 36.0) {
+            return None;
         }
 
         if pos.0 <= EDGE_SWIPE_MARGIN {
@@ -105,6 +114,7 @@ impl EdgeGestureTracker {
                 current_pos: pos,
                 serial,
                 pointer_id,
+                start_time: std::time::Instant::now(),
             });
         }
 
@@ -118,6 +128,7 @@ impl EdgeGestureTracker {
                 current_pos: pos,
                 serial,
                 pointer_id,
+                start_time: std::time::Instant::now(),
             });
         }
 
@@ -134,23 +145,44 @@ impl EdgeGestureTracker {
 
         match self.kind {
             EdgeGestureKind::Back { is_left } => {
-                if self.phase == EdgeGesturePhase::Confirmed {
-                    return EdgeMotionResult::ConfirmedBack;
-                }
                 if self.phase == EdgeGesturePhase::Cancelled {
                     return EdgeMotionResult::CancelScroll;
                 }
 
-                // Vertical dominance check: if vertical movement exceeds slop and is greater
-                // than or equal to horizontal movement, user is scrolling a list near edge.
-                if abs_dy >= SCROLL_DISAMBIGUATION_SLOP && abs_dy >= abs_dx {
+                let inward_dx = if is_left { dx } else { -dx };
+
+                // If previously confirmed, check if user aborted by sliding back towards the edge
+                if self.phase == EdgeGesturePhase::Confirmed {
+                    if inward_dx < 16.0 {
+                        self.phase = EdgeGesturePhase::Pending;
+                        return EdgeMotionResult::StayPending;
+                    }
+                    return EdgeMotionResult::ConfirmedBack;
+                }
+
+                // Vertical scroll disambiguation check:
+                // Only cancel if vertical movement is dominant (dy > 1.6 * dx)
+                // AND exceeds the slop threshold (20px).
+                if abs_dy >= SCROLL_DISAMBIGUATION_SLOP && abs_dy > 1.6 * abs_dx {
                     self.phase = EdgeGesturePhase::Cancelled;
                     return EdgeMotionResult::CancelScroll;
                 }
 
-                // Inward travel check: must move towards window center.
-                let inward_dx = if is_left { dx } else { -dx };
-                if inward_dx >= BACK_CONFIRM_DISPLACEMENT && abs_dx > 1.4 * abs_dy {
+                // Outward drag into bezel cancel
+                if inward_dx < -12.0 {
+                    self.phase = EdgeGesturePhase::Cancelled;
+                    return EdgeMotionResult::CancelScroll;
+                }
+
+                // Inward travel check: natural thumb arc allows up to ~50 degree diagonal
+                if inward_dx >= BACK_CONFIRM_DISPLACEMENT && abs_dx > 0.85 * abs_dy {
+                    self.phase = EdgeGesturePhase::Confirmed;
+                    return EdgeMotionResult::ConfirmedBack;
+                }
+
+                // Rapid swipe / fling check:
+                let elapsed = self.start_time.elapsed().as_millis();
+                if inward_dx >= 20.0 && elapsed < 200 && abs_dx > abs_dy {
                     self.phase = EdgeGesturePhase::Confirmed;
                     return EdgeMotionResult::ConfirmedBack;
                 }
@@ -165,12 +197,18 @@ impl EdgeGestureTracker {
                     return EdgeMotionResult::CancelScroll;
                 }
 
-                if abs_dx >= 15.0 && abs_dx > dy {
+                if abs_dx >= 20.0 && abs_dx > dy * 1.5 {
                     self.phase = EdgeGesturePhase::Cancelled;
                     return EdgeMotionResult::CancelScroll;
                 }
 
                 if dy >= TOP_CONFIRM_DISPLACEMENT && dy > abs_dx {
+                    self.phase = EdgeGesturePhase::Confirmed;
+                    return EdgeMotionResult::ConfirmedTopReveal;
+                }
+
+                let elapsed = self.start_time.elapsed().as_millis();
+                if dy >= 20.0 && elapsed < 200 && dy > abs_dx {
                     self.phase = EdgeGesturePhase::Confirmed;
                     return EdgeMotionResult::ConfirmedTopReveal;
                 }
@@ -188,9 +226,27 @@ impl EdgeGestureTracker {
                 EdgeGestureKind::TopReveal => EdgeUpResult::TriggerTopReveal,
             },
             EdgeGesturePhase::Pending => {
-                let dx = (self.current_pos.0 - self.start_pos.0).abs();
-                let dy = (self.current_pos.1 - self.start_pos.1).abs();
-                if dx < TAP_THRESHOLD && dy < TAP_THRESHOLD {
+                let dx = self.current_pos.0 - self.start_pos.0;
+                let dy = self.current_pos.1 - self.start_pos.1;
+                let abs_dx = dx.abs();
+                let abs_dy = dy.abs();
+                let elapsed = self.start_time.elapsed().as_millis();
+
+                match self.kind {
+                    EdgeGestureKind::Back { is_left } => {
+                        let inward_dx = if is_left { dx } else { -dx };
+                        if inward_dx >= 18.0 && elapsed < 250 && abs_dx > 0.85 * abs_dy {
+                            return EdgeUpResult::TriggerBack;
+                        }
+                    }
+                    EdgeGestureKind::TopReveal => {
+                        if dy >= 18.0 && elapsed < 250 && dy > abs_dx {
+                            return EdgeUpResult::TriggerTopReveal;
+                        }
+                    }
+                }
+
+                if abs_dx < TAP_THRESHOLD && abs_dy < TAP_THRESHOLD {
                     EdgeUpResult::TapAtEdge { pos: self.start_pos }
                 } else {
                     EdgeUpResult::None
@@ -231,8 +287,20 @@ mod tests {
         let mut tracker = EdgeGestureTracker::new_candidate(
             1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
         ).expect("should be candidate");
-        assert_eq!(tracker.on_motion((12.0, 485.0)), EdgeMotionResult::CancelScroll);
+        assert_eq!(tracker.on_motion((12.0, 470.0)), EdgeMotionResult::CancelScroll);
         assert_eq!(tracker.on_up(), EdgeUpResult::None);
+    }
+
+    #[test]
+    fn test_edge_swipe_back_abort_by_sliding_back() {
+        let mut tracker = EdgeGestureTracker::new_candidate(
+            1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
+        ).expect("should be candidate");
+        assert_eq!(tracker.on_motion((52.0, 505.0)), EdgeMotionResult::ConfirmedBack);
+        // Slide back to edge (inward_dx = 12.0 - 10.0 = 2.0 < 16.0)
+        assert_eq!(tracker.on_motion((12.0, 505.0)), EdgeMotionResult::StayPending);
+        // Aborted back to edge, user releases -> tap at edge or none
+        assert_ne!(tracker.on_up(), EdgeUpResult::TriggerBack);
     }
 
     #[test]
