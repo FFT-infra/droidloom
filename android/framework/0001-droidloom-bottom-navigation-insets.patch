@@ -292,30 +292,3 @@ new file mode 100644
 +        assertEquals(0, policy.adjustInsetsForWindow(imeWindow, empty).sourceSize());
 +    }
 +}
-
-diff --git a/services/core/java/com/android/server/wm/ConfigurationContainer.java b/services/core/java/com/android/server/wm/ConfigurationContainer.java
-index 448ed66c..8562dba8 100644
---- a/services/core/java/com/android/server/wm/ConfigurationContainer.java
-+++ b/services/core/java/com/android/server/wm/ConfigurationContainer.java
-@@ -435,6 +435,10 @@ public abstract class ConfigurationContainer<E extends ConfigurationContainer> {
-         } else {
-             mMergedOverrideConfiguration.setTo(mResolvedOverrideConfiguration);
-         }
-+        if (mMergedOverrideConfiguration.windowConfiguration.getWindowingMode() == WINDOWING_MODE_FREEFORM
-+                && android.os.SystemProperties.getBoolean("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
-+            mMergedOverrideConfiguration.windowConfiguration.setWindowingMode(WINDOWING_MODE_FULLSCREEN);
-+        }
-     }
- 
-     /**
-@@ -678,6 +682,10 @@ public abstract class ConfigurationContainer<E extends ConfigurationContainer> {
-     public boolean inMultiWindowMode() {
-         @WindowConfiguration.WindowingMode int windowingMode =
-                 mFullConfiguration.windowConfiguration.getWindowingMode();
-+        if (windowingMode == WINDOWING_MODE_FREEFORM
-+                && android.os.SystemProperties.getBoolean("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
-+            return false;
-+        }
-         return WindowConfiguration.inMultiWindowMode(windowingMode);
-     }
- 
