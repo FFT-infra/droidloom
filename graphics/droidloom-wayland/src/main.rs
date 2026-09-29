@@ -127,6 +127,7 @@ const PAD_BUTTON_COUNT: u32 = 4;
 /// Set once from the environment to trace routed keys and mouse events.
 static INPUT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 const KEY_F11: u32 = 87;
+const KEY_ESC: u32 = 1;
 const KEY_M: u32 = 50;
 const KEY_B: u32 = 48;
 const KEY_BACK: u32 = 158;
@@ -143,6 +144,18 @@ const DEFAULT_TITLEBAR_HEIGHT: i32 = 36;
 
 fn detect_titlebar_button_y(titlebar_height: i32) -> i32 {
     -(titlebar_height + TITLEBAR_BUTTON_SIZE as i32) / 2
+}
+
+fn detect_fullscreen_button_y() -> i32 {
+    10
+}
+
+fn detect_fullscreen_button_x(kind: TitlebarButtonKind) -> i32 {
+    let index = match kind {
+        TitlebarButtonKind::Back => 0,
+        TitlebarButtonKind::Fullscreen => 1,
+    };
+    14 + index * 38
 }
 
 fn detect_back_button_x() -> i32 {
@@ -252,15 +265,27 @@ impl TitlebarButton {
         parent: &wl_surface::WlSurface,
         qh: &QueueHandle<App>,
         titlebar_height: i32,
+        is_fullscreen: bool,
     ) -> Result<Self, PresenterError> {
         let surface = compositor.create_surface(qh);
         let subsurface = globals.subcompositor.get_subsurface(&surface, parent, qh, ());
-        subsurface.set_position(detect_titlebar_button_x(kind), detect_titlebar_button_y(titlebar_height));
+        let (x, y) = if is_fullscreen {
+            (
+                detect_fullscreen_button_x(kind),
+                detect_fullscreen_button_y(),
+            )
+        } else {
+            (
+                detect_titlebar_button_x(kind),
+                detect_titlebar_button_y(titlebar_height),
+            )
+        };
+        subsurface.set_position(x, y);
         subsurface.set_desync();
 
-        let buffer_normal = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Normal)?;
-        let buffer_hover = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Hover)?;
-        let buffer_pressed = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Pressed)?;
+        let buffer_normal = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Normal, is_fullscreen)?;
+        let buffer_hover = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Hover, is_fullscreen)?;
+        let buffer_pressed = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Pressed, is_fullscreen)?;
 
         surface.attach(Some(&buffer_normal), 0, 0);
         surface.commit();
@@ -291,11 +316,19 @@ impl TitlebarButton {
         self.surface.commit();
     }
 
-    fn update_position(&mut self, titlebar_height: i32) {
-        self.subsurface.set_position(
-            detect_titlebar_button_x(self.kind),
-            detect_titlebar_button_y(titlebar_height),
-        );
+    fn update_position(&mut self, titlebar_height: i32, is_fullscreen: bool) {
+        let (x, y) = if is_fullscreen {
+            (
+                detect_fullscreen_button_x(self.kind),
+                detect_fullscreen_button_y(),
+            )
+        } else {
+            (
+                detect_titlebar_button_x(self.kind),
+                detect_titlebar_button_y(titlebar_height),
+            )
+        };
+        self.subsurface.set_position(x, y);
         self.surface.commit();
     }
 }
@@ -318,6 +351,7 @@ fn render_titlebar_button_buffer(
     qh: &QueueHandle<App>,
     kind: TitlebarButtonKind,
     state: TitlebarButtonState,
+    is_fullscreen: bool,
 ) -> Result<wl_buffer::WlBuffer, PresenterError> {
     let size = TITLEBAR_BUTTON_SIZE;
     let mut pixels = vec![0u32; (size * size) as usize];
@@ -325,27 +359,38 @@ fn render_titlebar_button_buffer(
     let center = (size as f32) / 2.0;
     let radius = 12.0f32;
 
-    let theme = sctk_adwaita::theme::ColorTheme::auto();
-    let colors = theme.active;
-
-    let (r_bg, g_bg, b_bg) = match state {
-        TitlebarButtonState::Normal => {
-            let c = colors.button_idle;
-            (c.red(), c.green(), c.blue())
+    let (r_bg, g_bg, b_bg, bg_alpha_factor) = if is_fullscreen {
+        match state {
+            TitlebarButtonState::Normal => (0.15f32, 0.16f32, 0.18f32, 0.70f32),
+            TitlebarButtonState::Hover => (0.25f32, 0.27f32, 0.30f32, 0.85f32),
+            TitlebarButtonState::Pressed => (0.35f32, 0.38f32, 0.42f32, 0.95f32),
         }
-        TitlebarButtonState::Hover => {
-            let c = colors.button_hover;
-            (c.red(), c.green(), c.blue())
-        }
-        TitlebarButtonState::Pressed => {
-            let c = colors.button_hover;
-            let factor = if colors.button_icon.red() > 0.5 { 1.25f32 } else { 0.85f32 };
-            ((c.red() * factor).min(1.0), (c.green() * factor).min(1.0), (c.blue() * factor).min(1.0))
-        }
+    } else {
+        let theme = sctk_adwaita::theme::ColorTheme::auto();
+        let colors = theme.active;
+        let (r, g, b) = match state {
+            TitlebarButtonState::Normal => {
+                let c = colors.button_idle;
+                (c.red(), c.green(), c.blue())
+            }
+            TitlebarButtonState::Hover => {
+                let c = colors.button_hover;
+                (c.red(), c.green(), c.blue())
+            }
+            TitlebarButtonState::Pressed => {
+                let c = colors.button_hover;
+                let factor = if colors.button_icon.red() > 0.5 { 1.25f32 } else { 0.85f32 };
+                ((c.red() * factor).min(1.0), (c.green() * factor).min(1.0), (c.blue() * factor).min(1.0))
+            }
+        };
+        (r, g, b, 1.0f32)
     };
 
-    let (r_icon, g_icon, b_icon) = {
-        let c = colors.button_icon;
+    let (r_icon, g_icon, b_icon) = if is_fullscreen {
+        (0.95f32, 0.95f32, 0.95f32)
+    } else {
+        let theme = sctk_adwaita::theme::ColorTheme::auto();
+        let c = theme.active.button_icon;
         (c.red(), c.green(), c.blue())
     };
 
@@ -354,16 +399,31 @@ fn render_titlebar_button_buffer(
             ((16.0, 9.5), (11.5, 14.0)),
             ((11.5, 14.0), (16.0, 18.5)),
         ],
-        TitlebarButtonKind::Fullscreen => &[
-            ((9.5, 9.5), (12.5, 9.5)),
-            ((9.5, 9.5), (9.5, 12.5)),
-            ((15.5, 9.5), (18.5, 9.5)),
-            ((18.5, 9.5), (18.5, 12.5)),
-            ((9.5, 18.5), (12.5, 18.5)),
-            ((9.5, 15.5), (9.5, 18.5)),
-            ((15.5, 18.5), (18.5, 18.5)),
-            ((18.5, 15.5), (18.5, 18.5)),
-        ],
+        TitlebarButtonKind::Fullscreen => {
+            if is_fullscreen {
+                &[
+                    ((12.5, 9.5), (12.5, 12.5)),
+                    ((9.5, 12.5), (12.5, 12.5)),
+                    ((15.5, 9.5), (15.5, 12.5)),
+                    ((18.5, 12.5), (15.5, 12.5)),
+                    ((12.5, 18.5), (12.5, 15.5)),
+                    ((9.5, 15.5), (12.5, 15.5)),
+                    ((15.5, 18.5), (15.5, 15.5)),
+                    ((18.5, 15.5), (15.5, 15.5)),
+                ]
+            } else {
+                &[
+                    ((9.5, 9.5), (12.5, 9.5)),
+                    ((9.5, 9.5), (9.5, 12.5)),
+                    ((15.5, 9.5), (18.5, 9.5)),
+                    ((18.5, 9.5), (18.5, 12.5)),
+                    ((9.5, 18.5), (12.5, 18.5)),
+                    ((9.5, 18.5), (9.5, 15.5)),
+                    ((18.5, 18.5), (15.5, 18.5)),
+                    ((18.5, 18.5), (18.5, 15.5)),
+                ]
+            }
+        }
     };
     let stroke_radius = match kind {
         TitlebarButtonKind::Back => 1.15f32,
@@ -376,7 +436,8 @@ fn render_titlebar_button_buffer(
             let py = y as f32 + 0.5;
 
             let dist_center = ((px - center).powi(2) + (py - center).powi(2)).sqrt();
-            let circle_alpha = (radius + 0.5 - dist_center).clamp(0.0, 1.0);
+            let base_circle_alpha = (radius + 0.5 - dist_center).clamp(0.0, 1.0);
+            let circle_alpha = base_circle_alpha * bg_alpha_factor;
 
             let mut min_d = f32::MAX;
             for &((x1, y1), (x2, y2)) in segments {
@@ -387,9 +448,9 @@ fn render_titlebar_button_buffer(
             }
             let stroke_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0);
 
-            let eff_stroke_a = stroke_alpha.min(circle_alpha);
+            let eff_stroke_a = stroke_alpha.min(base_circle_alpha);
 
-            let out_a = eff_stroke_a + circle_alpha * (1.0 - eff_stroke_a);
+            let out_a = (eff_stroke_a + circle_alpha * (1.0 - eff_stroke_a)).min(1.0);
             let out_r = eff_stroke_a * r_icon + circle_alpha * (1.0 - eff_stroke_a) * r_bg;
             let out_g = eff_stroke_a * g_icon + circle_alpha * (1.0 - eff_stroke_a) * g_bg;
             let out_b = eff_stroke_a * b_icon + circle_alpha * (1.0 - eff_stroke_a) * b_bg;
@@ -442,11 +503,11 @@ fn app_display_title(package: &str) -> String {
 fn format_task_title(package: &str, is_immersed: bool, is_fullscreen: bool) -> String {
     let title = app_display_title(package);
     if is_immersed && is_fullscreen {
-        format!("{title} [Immersed: Ctrl+Alt+M] [Fullscreen: F11]")
+        format!("{title} [Immersed: Ctrl+Alt+M] [Fullscreen: F11/Esc]")
     } else if is_immersed {
         format!("{title} [Immersed: Ctrl+Alt+M]")
     } else if is_fullscreen {
-        format!("{title} [Fullscreen: F11]")
+        format!("{title} [Fullscreen: F11/Esc]")
     } else {
         title
     }
@@ -868,9 +929,10 @@ impl App {
 
     fn ensure_titlebar_buttons(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId, titlebar_height: i32) {
         let Some(task) = self.tasks.get_mut(&object) else { return };
+        let is_fullscreen = task.fullscreen || task.decorations_hidden;
         if !task.titlebar_buttons.is_empty() {
             for btn in &mut task.titlebar_buttons {
-                btn.update_position(titlebar_height);
+                btn.update_position(titlebar_height, is_fullscreen);
             }
             return;
         }
@@ -883,6 +945,7 @@ impl App {
             surface,
             qh,
             titlebar_height,
+            is_fullscreen,
         ) {
             task.titlebar_buttons.push(back);
         }
@@ -893,6 +956,7 @@ impl App {
             surface,
             qh,
             titlebar_height,
+            is_fullscreen,
         ) {
             task.titlebar_buttons.push(fs);
         }
@@ -908,14 +972,8 @@ impl App {
         if let Some(frame) = task.window_frame.as_mut() {
             frame.set_hidden(is_hidden);
         }
-        if is_hidden {
-            self.clear_titlebar_buttons(object);
-        } else {
-            let titlebar_height = task.window_frame.as_ref()
-                .map(|f| (-f.location().1).max(DEFAULT_TITLEBAR_HEIGHT))
-                .unwrap_or(DEFAULT_TITLEBAR_HEIGHT);
-            self.ensure_titlebar_buttons(qh, object, titlebar_height);
-        }
+        self.clear_titlebar_buttons(object);
+        self.ensure_titlebar_buttons(qh, object, if is_hidden { 0 } else { DEFAULT_TITLEBAR_HEIGHT });
         let Some(task) = self.tasks.get_mut(&object) else { return };
         let Some((width, height)) = task.logical_size else { return };
         let scale_120 = task.preferred_scale_120;
@@ -1210,7 +1268,11 @@ impl App {
             if let Some(frame) = task.window_frame.as_mut() {
                 frame.set_hidden(true);
             }
-            self.clear_titlebar_buttons(object);
+            if is_fullscreen || task.decorations_hidden {
+                self.ensure_titlebar_buttons(qh, object, 0);
+            } else {
+                self.clear_titlebar_buttons(object);
+            }
             return Ok(requested);
         }
         if task.window_frame.is_none() {
@@ -2236,6 +2298,13 @@ impl App {
             self.toggle_fullscreen(object);
             return true;
         }
+        if keycode == KEY_ESC && !modifiers.logo && !modifiers.ctrl && !modifiers.alt {
+            let is_fullscreen = self.tasks.get(&object).is_some_and(|t| t.fullscreen);
+            if is_fullscreen {
+                self.toggle_fullscreen(object);
+                return true;
+            }
+        }
         if keycode == KEY_B && modifiers.ctrl && modifiers.alt && !modifiers.logo {
             self.toggle_decorations(qh, object);
             return true;
@@ -3075,6 +3144,10 @@ impl WindowHandler for App {
             task.fullscreen = is_fullscreen;
             task.maximized = is_maximized;
             task.floating_size = floating_size;
+        }
+
+        if was_fullscreen != is_fullscreen {
+            self.clear_titlebar_buttons(object);
         }
 
         let (requested_width, requested_height) =

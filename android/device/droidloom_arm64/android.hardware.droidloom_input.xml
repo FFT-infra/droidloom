@@ -19,4 +19,8 @@
          it stop crashing; Bilibili's device-id library is the measured case.
          The x86_64 product copies this file, so both products share it. -->
     <feature name="android.hardware.wifi" />
+    <!-- Droidloom audio bridge streams playback and capture PCM via host PipeWire. -->
+    <feature name="android.hardware.audio.output" />
+    <feature name="android.hardware.audio.low_latency" />
+    <feature name="android.hardware.microphone" />
 </permissions>

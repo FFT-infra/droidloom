@@ -18,4 +18,8 @@
          still fail, but apps that dereference the manager instead of checking
          it stop crashing; Bilibili's device-id library is the measured case. -->
     <feature name="android.hardware.wifi" />
+    <!-- Droidloom audio bridge streams playback and capture PCM via host PipeWire. -->
+    <feature name="android.hardware.audio.output" />
+    <feature name="android.hardware.audio.low_latency" />
+    <feature name="android.hardware.microphone" />
 </permissions>
