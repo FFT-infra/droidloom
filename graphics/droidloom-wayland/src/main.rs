@@ -130,6 +130,14 @@ const KEY_F11: u32 = 87;
 const KEY_M: u32 = 50;
 const KEY_B: u32 = 48;
 const KEY_BACK: u32 = 158;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_RIGHTCTRL: u32 = 97;
+const KEY_LEFTALT: u32 = 56;
+const KEY_RIGHTALT: u32 = 100;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTSHIFT: u32 = 54;
+const KEY_LEFTMETA: u32 = 125;
+const KEY_RIGHTMETA: u32 = 126;
 const TITLEBAR_BUTTON_SIZE: u32 = 28;
 const DEFAULT_TITLEBAR_HEIGHT: i32 = 36;
 
@@ -434,11 +442,11 @@ fn app_display_title(package: &str) -> String {
 fn format_task_title(package: &str, is_immersed: bool, is_fullscreen: bool) -> String {
     let title = app_display_title(package);
     if is_immersed && is_fullscreen {
-        format!("{title} [● 沉浸中 | Ctrl+Alt+M 释放] [全屏 | F11 退出]")
+        format!("{title} [Immersed: Ctrl+Alt+M] [Fullscreen: F11]")
     } else if is_immersed {
-        format!("{title} [● 沉浸中 | Ctrl+Alt+M 释放]")
+        format!("{title} [Immersed: Ctrl+Alt+M]")
     } else if is_fullscreen {
-        format!("{title} [全屏 | F11 退出]")
+        format!("{title} [Fullscreen: F11]")
     } else {
         title
     }
@@ -2224,8 +2232,7 @@ impl App {
     fn window_shortcut(&mut self, qh: &QueueHandle<Self>, keycode: u32) -> bool {
         let Some(object) = self.focused else { return false };
         let modifiers = self.modifiers;
-        let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.logo && !modifiers.shift;
-        if keycode == KEY_F11 && plain {
+        if keycode == KEY_F11 && !modifiers.logo {
             self.toggle_fullscreen(object);
             return true;
         }
@@ -3625,13 +3632,39 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
-        if self.consumed_keys.remove(&event.raw_code) {
+        let consumed = self.consumed_keys.remove(&event.raw_code);
+        let previous = self.pressed_keys.remove(&event.raw_code);
+        if matches!(event.raw_code, KEY_LEFTCTRL | KEY_RIGHTCTRL)
+            && !self.pressed_keys.contains_key(&KEY_LEFTCTRL)
+            && !self.pressed_keys.contains_key(&KEY_RIGHTCTRL)
+        {
+            self.modifiers.ctrl = false;
+        }
+        if matches!(event.raw_code, KEY_LEFTALT | KEY_RIGHTALT)
+            && !self.pressed_keys.contains_key(&KEY_LEFTALT)
+            && !self.pressed_keys.contains_key(&KEY_RIGHTALT)
+        {
+            self.modifiers.alt = false;
+        }
+        if matches!(event.raw_code, KEY_LEFTSHIFT | KEY_RIGHTSHIFT)
+            && !self.pressed_keys.contains_key(&KEY_LEFTSHIFT)
+            && !self.pressed_keys.contains_key(&KEY_RIGHTSHIFT)
+        {
+            self.modifiers.shift = false;
+        }
+        if matches!(event.raw_code, KEY_LEFTMETA | KEY_RIGHTMETA)
+            && !self.pressed_keys.contains_key(&KEY_LEFTMETA)
+            && !self.pressed_keys.contains_key(&KEY_RIGHTMETA)
+        {
+            self.modifiers.logo = false;
+        }
+        if consumed {
             return;
         }
         // The release goes to the task that received the press, even if the
         // routed focus moved in between; a release without a routed press is
         // not forwarded.
-        if let Some(object) = self.pressed_keys.remove(&event.raw_code)
+        if let Some(object) = previous
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
