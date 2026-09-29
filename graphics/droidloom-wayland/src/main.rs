@@ -1005,6 +1005,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn hide_fullscreen_controls(&mut self, object: TaskObjectId) {
         let Some(task) = self.tasks.get_mut(&object) else { return };
         task.fullscreen_controls_revealed_until = None;

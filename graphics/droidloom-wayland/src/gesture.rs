@@ -40,12 +40,14 @@ pub enum EdgeGesturePhase {
 
 #[derive(Clone, Copy, Debug)]
 pub struct EdgeGestureTracker {
+    #[allow(dead_code)]
     pub id: i32,
     pub object: TaskObjectId,
     pub kind: EdgeGestureKind,
     pub phase: EdgeGesturePhase,
     pub start_pos: (f64, f64),
     pub current_pos: (f64, f64),
+    #[allow(dead_code)]
     pub serial: u32,
     pub pointer_id: u32,
 }
@@ -206,7 +208,7 @@ mod tests {
     #[test]
     fn test_edge_swipe_back_left_confirmed() {
         let mut tracker = EdgeGestureTracker::new_candidate(
-            1, 100, 1, 0, (10.0, 500.0), (1920, 1080), false,
+            1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
         ).expect("should be candidate");
         assert_eq!(tracker.kind, EdgeGestureKind::Back { is_left: true });
         assert_eq!(tracker.on_motion((20.0, 502.0)), EdgeMotionResult::StayPending);
@@ -217,7 +219,7 @@ mod tests {
     #[test]
     fn test_edge_swipe_back_right_confirmed() {
         let mut tracker = EdgeGestureTracker::new_candidate(
-            1, 100, 1, 0, (1910.0, 500.0), (1920, 1080), false,
+            1, TaskObjectId(100), 1, 0, (1910.0, 500.0), (1920, 1080), false,
         ).expect("should be candidate");
         assert_eq!(tracker.kind, EdgeGestureKind::Back { is_left: false });
         assert_eq!(tracker.on_motion((1860.0, 503.0)), EdgeMotionResult::ConfirmedBack);
@@ -227,7 +229,7 @@ mod tests {
     #[test]
     fn test_vertical_scroll_cancelled_to_app() {
         let mut tracker = EdgeGestureTracker::new_candidate(
-            1, 100, 1, 0, (10.0, 500.0), (1920, 1080), false,
+            1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
         ).expect("should be candidate");
         assert_eq!(tracker.on_motion((12.0, 485.0)), EdgeMotionResult::CancelScroll);
         assert_eq!(tracker.on_up(), EdgeUpResult::None);
@@ -236,7 +238,7 @@ mod tests {
     #[test]
     fn test_tap_at_edge_triggers_tap() {
         let tracker = EdgeGestureTracker::new_candidate(
-            1, 100, 1, 0, (8.0, 300.0), (1920, 1080), false,
+            1, TaskObjectId(100), 1, 0, (8.0, 300.0), (1920, 1080), false,
         ).expect("should be candidate");
         assert_eq!(tracker.on_up(), EdgeUpResult::TapAtEdge { pos: (8.0, 300.0) });
     }
@@ -244,7 +246,7 @@ mod tests {
     #[test]
     fn test_fullscreen_top_reveal() {
         let mut tracker = EdgeGestureTracker::new_candidate(
-            1, 100, 1, 0, (500.0, 10.0), (1920, 1080), true,
+            1, TaskObjectId(100), 1, 0, (500.0, 10.0), (1920, 1080), true,
         ).expect("should be candidate in fullscreen");
         assert_eq!(tracker.kind, EdgeGestureKind::TopReveal);
         assert_eq!(tracker.on_motion((502.0, 42.0)), EdgeMotionResult::ConfirmedTopReveal);
@@ -254,7 +256,7 @@ mod tests {
     #[test]
     fn test_content_touch_not_candidate() {
         assert!(EdgeGestureTracker::new_candidate(
-            1, 100, 1, 0, (200.0, 300.0), (1920, 1080), false,
+            1, TaskObjectId(100), 1, 0, (200.0, 300.0), (1920, 1080), false,
         ).is_none());
     }
 }
