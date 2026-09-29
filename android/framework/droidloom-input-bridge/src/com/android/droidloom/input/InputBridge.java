@@ -1077,8 +1077,12 @@ public final class InputBridge {
                 return;
             }
             state = new MouseState(token);
+            state.x = record.x;
+            state.y = record.y;
             mMice.put(identity, state);
         }
+        state.deltaX = record.x - state.x;
+        state.deltaY = record.y - state.y;
         state.x = record.x;
         state.y = record.y;
         final long eventTimeMillis = record.timestampNanos / 1_000_000L;
@@ -1172,6 +1176,8 @@ public final class InputBridge {
         coordinates.y = state.y + taskBounds.top;
         coordinates.pressure = state.buttonState != 0 ? 1.0f : 0.0f;
         coordinates.size = 1.0f;
+        coordinates.setAxisValue(MotionEvent.AXIS_RELATIVE_X, state.deltaX);
+        coordinates.setAxisValue(MotionEvent.AXIS_RELATIVE_Y, state.deltaY);
         if (action == MotionEvent.ACTION_SCROLL) {
             // Wayland scrolls down and right for positive values; Android's
             // vertical scroll axis is positive upward.
@@ -1862,6 +1868,8 @@ public final class InputBridge {
         boolean hovering;
         float x;
         float y;
+        float deltaX;
+        float deltaY;
 
         MouseState(IBinder applicationToken) {
             this.applicationToken = applicationToken;

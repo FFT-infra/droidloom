@@ -538,6 +538,66 @@ fn configure_cell_display_policy(
             .output()?;
         checked_activity_output(&output, "match cell refresh rate to host")?;
     }
+    configure_companion_accessibility_services(android_command, &user)?;
+    Ok(())
+}
+
+fn configure_companion_accessibility_services(
+    android_command: &Path,
+    user: &str,
+) -> Result<(), LaunchError> {
+    let output = command_as_android_shell(android_command)
+        .args([
+            "pm",
+            "query-services",
+            "-a",
+            "android.accessibilityservice.AccessibilityService",
+        ])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut services_to_enable = Vec::new();
+    let mut current_pkg: Option<String> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(pkg) = trimmed.strip_prefix("packageName=") {
+            current_pkg = Some(pkg.trim().to_string());
+        } else if let Some(name) = trimmed.strip_prefix("name=") {
+            if let Some(pkg) = &current_pkg {
+                let s_name = name.trim();
+                if s_name.contains("UURemote")
+                    || s_name.contains("uuremote")
+                    || pkg == "com.netease.uuremote"
+                {
+                    services_to_enable.push(format!("{pkg}/{s_name}"));
+                }
+            }
+        }
+    }
+    if !services_to_enable.is_empty() {
+        let joined = services_to_enable.join(":");
+        let _ = command_as_android_shell(android_command)
+            .args([
+                "settings",
+                "--user",
+                user,
+                "put",
+                "secure",
+                "enabled_accessibility_services",
+                &joined,
+            ])
+            .output();
+        let _ = command_as_android_shell(android_command)
+            .args([
+                "settings",
+                "--user",
+                user,
+                "put",
+                "secure",
+                "accessibility_enabled",
+                "1",
+            ])
+            .output();
+    }
     Ok(())
 }
 

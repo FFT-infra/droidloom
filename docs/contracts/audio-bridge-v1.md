@@ -39,8 +39,9 @@ effect when the runtime restarts, which is what `Restart=on-failure` and the
 
 Android's volume keys scale the mix before it leaves the cell, so they keep
 working; the host sink keeps its own level and mute state, and the two are not
-yet synchronized. Microphone capture is not part of this version, and neither is
-per-stream control (multiple simultaneous Android outputs are mixed inside the
+yet synchronized. Microphone capture is served through `<XDG_RUNTIME_DIR>/droidloom/audio_in.sock`
+(raw signed 16-bit LE PCM, 48 000 Hz, mono), piped from `pw-cat --record`. Neither side
+requires per-stream control (simultaneous Android outputs are mixed inside the
 cell by the audio policy, not by the host).
 
 A cell that fills the pipe faster than the sink drains it blocks in `write`,

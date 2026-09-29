@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..f1de1a1
 --- /dev/null
 +++ b/audio/aidl/default/include/core-impl/DriverSocketImpl.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,79 @@
 +/*
 + * Copyright (C) 2026 The Android Open Source Project
 + *
@@ -43,17 +43,17 @@ index 0000000..f1de1a1
 +
 +namespace aidl::android::hardware::audio::core {
 +
-+// Sends the primary output mix to Droidloom's host audio bridge.
++// Sends and receives audio streams with Droidloom's host audio bridge.
 +//
-+// The supervisor mounts the host endpoint into the cell, and the host end
-+// renders the bytes on the session sound server. The endpoint carries the mix
-+// port's own samples with no header and no conversion, so transfer() writes
++// The supervisor mounts the host endpoints into the cell, and the host end
++// renders or captures the bytes on the session sound server. The endpoint carries
++// the samples with no header and no conversion, so transfer() writes or reads
 +// exactly the buffer it is given.
 +//
-+// Timing stays DriverStubImpl's: a write that waits for the sink is the pacing,
-+// and a sink that cannot take the data within the send timeout costs those
++// Timing stays DriverStubImpl's: a transfer that waits is the pacing,
++// and a sink/source that cannot take or supply the data within the timeout costs those
 +// frames instead of stalling Android's audio worker. With no endpoint present
-+// the driver is the stub, so a cell without the bridge keeps its current silent
++// the driver is the stub, so a cell without the bridge keeps its silent
 +// but correctly paced behavior.
 +class DriverSocketImpl : public DriverStubImpl {
 +  public:
@@ -67,20 +67,23 @@ index 0000000..f1de1a1
 +    void shutdown() override;
 +
 +  private:
-+    // Longest one transfer may wait for the sink. The primary mix port's buffers
-+    // are milliseconds long, so this only expires once the sink has stalled.
++    // Longest one transfer may wait for the endpoint.
 +    static constexpr int64_t kSendTimeoutUs = 100000;
 +    // Endpoint exposed inside the cell unless a property overrides it.
 +    static constexpr const char* kDefaultPath = "/dev/socket/droidloom/audio";
 +    static constexpr const char* kPathProperty = "persist.vendor.droidloom.audio.socket";
++    static constexpr const char* kDefaultInPath = "/dev/socket/droidloom/audio_in";
++    static constexpr const char* kInPathProperty = "persist.vendor.droidloom.audio_in.socket";
 +
-+    static std::string defaultPath();
++    static std::string defaultPath(bool isInput);
 +
 +    bool connect();
 +    void disconnect();
 +    // Writes as much of one buffer as the endpoint takes within the timeout and
 +    // returns the bytes accepted from it.
 +    size_t sendBuffer(const void* buffer, size_t byteCount);
++    // Reads as much of one buffer as the endpoint supplies within the timeout.
++    size_t receiveBuffer(void* buffer, size_t byteCount);
 +
 +    const std::string mPath;
 +    int mFd = -1;
@@ -189,7 +192,7 @@ new file mode 100644
 index 0000000..2382588
 --- /dev/null
 +++ b/audio/aidl/default/socket/DriverSocketImpl.cpp
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,208 @@
 +/*
 + * Copyright (C) 2026 The Android Open Source Project
 + *
@@ -223,21 +226,20 @@ index 0000000..2382588
 +namespace aidl::android::hardware::audio::core {
 +
 +// static
-+std::string DriverSocketImpl::defaultPath() {
++std::string DriverSocketImpl::defaultPath(bool isInput) {
++    if (isInput) {
++        return ::android::base::GetProperty(kInPathProperty, kDefaultInPath);
++    }
 +    return ::android::base::GetProperty(kPathProperty, kDefaultPath);
 +}
 +
 +DriverSocketImpl::DriverSocketImpl(const StreamContext& context)
-+    : DriverSocketImpl(context, defaultPath()) {}
++    : DriverSocketImpl(context, defaultPath(context.isInput())) {}
 +
 +DriverSocketImpl::DriverSocketImpl(const StreamContext& context, std::string path)
 +    : DriverStubImpl(context), mPath(std::move(path)) {}
 +
 +bool DriverSocketImpl::connect() {
-+    if (mIsInput) {
-+        // Capture is not part of the bridge; the stub keeps its place.
-+        return false;
-+    }
 +    if (mFd >= 0) {
 +        return true;
 +    }
@@ -263,13 +265,15 @@ index 0000000..2382588
 +    timeval timeout;
 +    timeout.tv_sec = kSendTimeoutUs / 1000000;
 +    timeout.tv_usec = kSendTimeoutUs % 1000000;
-+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
-+        LOG(WARNING) << __func__ << ": cannot bound the send timeout: " << strerror(errno);
++    const int opt = mIsInput ? SO_RCVTIMEO : SO_SNDTIMEO;
++    if (::setsockopt(fd, SOL_SOCKET, opt, &timeout, sizeof(timeout)) < 0) {
++        LOG(WARNING) << __func__ << ": cannot bound the timeout: " << strerror(errno);
 +    }
 +    mFd = fd;
 +    mLoggedStall = false;
-+    LOG(INFO) << __func__ << ": sending " << mSampleRate << " Hz, " << mFrameSizeBytes
-+              << "-byte frames to " << mPath;
++    LOG(INFO) << __func__ << ": " << (mIsInput ? "capturing " : "sending ") << mSampleRate
++              << " Hz, " << mFrameSizeBytes << "-byte frames "
++              << (mIsInput ? "from " : "to ") << mPath;
 +    return true;
 +}
 +
@@ -332,6 +336,31 @@ index 0000000..2382588
 +    return offset;
 +}
 +
++size_t DriverSocketImpl::receiveBuffer(void* buffer, size_t byteCount) {
++    auto* bytes = static_cast<uint8_t*>(buffer);
++    size_t offset = 0;
++    while (offset < byteCount && mFd >= 0) {
++        const ssize_t count = ::read(mFd, bytes + offset, byteCount - offset);
++        if (count > 0) {
++            offset += static_cast<size_t>(count);
++            continue;
++        }
++        if (count < 0 && errno == EINTR) {
++            continue;
++        }
++        const int error = count < 0 ? errno : 0;
++        if (error != 0 && error != EAGAIN && error != EWOULDBLOCK) {
++            LOG(WARNING) << __func__ << ": " << mPath << " failed: " << strerror(error);
++            disconnect();
++        }
++        break;
++    }
++    if (offset < byteCount) {
++        std::memset(bytes + offset, 0, byteCount - offset);
++    }
++    return offset;
++}
++
 +::android::status_t DriverSocketImpl::start() {
 +    connect();
 +    return DriverStubImpl::start();
@@ -346,8 +375,19 @@ index 0000000..2382588
 +
 +::android::status_t DriverSocketImpl::transfer(void* buffer, size_t frameCount,
 +                                               size_t* actualFrameCount, int32_t* latencyMs) {
-+    if (mFd >= 0 && !mIsInput) {
-+        sendBuffer(buffer, frameCount * mFrameSizeBytes);
++    if (mFd >= 0) {
++        if (!mIsInput) {
++            sendBuffer(buffer, frameCount * mFrameSizeBytes);
++        } else {
++            receiveBuffer(buffer, frameCount * mFrameSizeBytes);
++            if (actualFrameCount != nullptr) {
++                *actualFrameCount = frameCount;
++            }
++            if (latencyMs != nullptr) {
++                *latencyMs = 0;
++            }
++            return ::android::OK;
++        }
 +    }
 +    // A write that waited for the sink has already consumed the buffer's
 +    // duration, and the stub's own accounting notices that and adds nothing.

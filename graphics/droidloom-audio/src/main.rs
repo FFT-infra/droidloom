@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod sink;
+mod source;
 
 use std::env;
 use std::fs;
@@ -31,6 +32,8 @@ use std::time::Instant;
 const ENDPOINT_MODE: u32 = 0o666;
 /// Endpoint location below `XDG_RUNTIME_DIR`, next to the other cell endpoints.
 const ENDPOINT_NAME: &str = "droidloom/audio.sock";
+/// Capture endpoint location below `XDG_RUNTIME_DIR`.
+const IN_ENDPOINT_NAME: &str = "droidloom/audio_in.sock";
 
 /// Failures that stop the bridge before it serves the cell.
 #[derive(Debug, thiserror::Error)]
@@ -59,16 +62,36 @@ fn run() -> Result<(), AudioError> {
         .ok_or(AudioError::Configuration("XDG_RUNTIME_DIR is not set"))?;
     let endpoint = env::var_os("DROIDLOOM_AUDIO_SOCKET")
         .map_or_else(|| runtime_root.join(ENDPOINT_NAME), PathBuf::from);
+    let in_endpoint = env::var_os("DROIDLOOM_AUDIO_IN_SOCKET")
+        .map_or_else(|| runtime_root.join(IN_ENDPOINT_NAME), PathBuf::from);
     let effective_uid = fs::metadata("/proc/self")?.uid();
     prepare_endpoint(&endpoint, &runtime_root, effective_uid)?;
+    prepare_endpoint(&in_endpoint, &runtime_root, effective_uid)?;
     let listener = UnixListener::bind(&endpoint)?;
+    let in_listener = UnixListener::bind(&in_endpoint)?;
     fs::set_permissions(&endpoint, fs::Permissions::from_mode(ENDPOINT_MODE))?;
+    fs::set_permissions(&in_endpoint, fs::Permissions::from_mode(ENDPOINT_MODE))?;
     notify_ready()?;
     eprintln!(
-        "droidloom-audio: {} listening for {} PCM from the cell",
+        "droidloom-audio: {} listening for {} playback PCM from the cell",
         endpoint.display(),
         sink::FORMAT
     );
+    eprintln!(
+        "droidloom-audio: {} listening for {} capture PCM for the cell",
+        in_endpoint.display(),
+        source::FORMAT
+    );
+
+    std::thread::spawn(move || {
+        for connection in in_listener.incoming() {
+            match connection {
+                Ok(stream) => serve_input(stream),
+                Err(error) => eprintln!("droidloom-audio: in_accept failed: {error}"),
+            }
+        }
+    });
+
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => serve(stream),
@@ -83,14 +106,28 @@ fn run() -> Result<(), AudioError> {
 /// Play one cell stream to completion, reporting the bytes that were forwarded.
 fn serve(stream: UnixStream) {
     let opened = Instant::now();
-    eprintln!("droidloom-audio: cell stream opened");
+    eprintln!("droidloom-audio: cell playback stream opened");
     match sink::play(stream) {
         Ok(bytes) => eprintln!(
-            "droidloom-audio: cell stream ended after {bytes} bytes ({:?} of audio in {:?})",
+            "droidloom-audio: cell playback stream ended after {bytes} bytes ({:?} of audio in {:?})",
             sink::duration_of(bytes),
             opened.elapsed()
         ),
-        Err(error) => eprintln!("droidloom-audio: cell stream failed: {error}"),
+        Err(error) => eprintln!("droidloom-audio: cell playback stream failed: {error}"),
+    }
+}
+
+/// Record from the host session sound server into one cell stream to completion.
+fn serve_input(stream: UnixStream) {
+    let opened = Instant::now();
+    eprintln!("droidloom-audio: cell capture stream opened");
+    match source::record(stream) {
+        Ok(bytes) => eprintln!(
+            "droidloom-audio: cell capture stream ended after {bytes} bytes ({:?} of audio in {:?})",
+            source::duration_of(bytes),
+            opened.elapsed()
+        ),
+        Err(error) => eprintln!("droidloom-audio: cell capture stream failed: {error}"),
     }
 }
 

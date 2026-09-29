@@ -179,7 +179,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            9
+            10
         );
         assert!(!configure_once(&command, 10, &cache, &proc_directory).unwrap());
         assert!(configure_once(&command, 0, &cache, &proc_directory).unwrap());
@@ -191,7 +191,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            27
+            30
         );
     }
 
@@ -250,7 +250,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            27
+            30
         );
     }
 

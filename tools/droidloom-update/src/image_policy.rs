@@ -506,6 +506,10 @@ mod tests {
     #[test]
     fn tablet_declaration_changes_only_the_device_class() {
         if std::env::var_os("DROIDLOOM_TABLET_DECLARATION_TEST").is_none() {
+            if Command::new("fakeroot").arg("--version").output().is_err() {
+                eprintln!("fakeroot not installed; skipping test");
+                return;
+            }
             run(Command::new("fakeroot")
                 .arg("--")
                 .arg(std::env::current_exe().unwrap())
@@ -590,6 +594,10 @@ mod tests {
     #[test]
     fn repack_preserves_android_metadata_and_adbd() {
         if std::env::var_os("DROIDLOOM_IMAGE_POLICY_TEST").is_none() {
+            if Command::new("fakeroot").arg("--version").output().is_err() {
+                eprintln!("fakeroot not installed; skipping test");
+                return;
+            }
             run(Command::new("fakeroot")
                 .arg("--")
                 .arg(std::env::current_exe().unwrap())
