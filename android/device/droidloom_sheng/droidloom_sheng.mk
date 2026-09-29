@@ -3,9 +3,9 @@
 # Android CI artifact and are never rebuilt implicitly by this target.
 PRODUCT_NAME := droidloom_sheng
 PRODUCT_DEVICE := droidloom_sheng
-PRODUCT_BRAND := Droidloom
-PRODUCT_MODEL := Droidloom sheng cell
-PRODUCT_MANUFACTURER := Droidloom
+PRODUCT_BRAND := Xiaomi
+PRODUCT_MODEL := 24018RPACC
+PRODUCT_MANUFACTURER := Xiaomi
 
 PRODUCT_SOONG_NAMESPACES += \
     vendor/droidloom \
@@ -87,6 +87,15 @@ PRODUCT_VENDOR_PROPERTIES += \
     ro.hardware.egl=mesa \
     ro.hardware.vulkan=freedreno \
     ro.opengles.version=196610 \
+    ro.sf.lcd_density=360 \
+    ro.product.model=24018RPACC \
+    ro.product.brand=Xiaomi \
+    ro.product.manufacturer=Xiaomi \
+    ro.product.device=sheng \
+    ro.product.name=sheng \
+    ro.miui.ui.version.name=V816 \
+    ro.miui.ui.version.code=1 \
+    persist.sys.miui_feature_tablet=true \
     dalvik.vm.heapstartsize=16m \
     dalvik.vm.heapgrowthlimit=256m \
     dalvik.vm.heapsize=512m \
