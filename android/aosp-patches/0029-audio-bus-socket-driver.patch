@@ -192,7 +192,7 @@ new file mode 100644
 index 0000000..2382588
 --- /dev/null
 +++ b/audio/aidl/default/socket/DriverSocketImpl.cpp
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,207 @@
 +/*
 + * Copyright (C) 2026 The Android Open Source Project
 + *
