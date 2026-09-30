@@ -85,6 +85,7 @@ final class TaskObserver extends TaskStackListener {
 
     private void reconcile() {
         try {
+            if (manager == null) return;
             List<RunningTaskInfo> tasks = manager.getTasks(MAX_TASKS, false, false, 0);
             // The focused task first: a normal app switch keeps its binding.
             // Then every other eligible task on the shared display, because a
@@ -146,59 +147,4 @@ final class TaskObserver extends TaskStackListener {
         }
     }
 
-    private void schedule() {
-        handler.removeCallbacks(reconcile);
-        handler.postDelayed(reconcile, 50);
-    }
-
-    private void reconcile() {
-        try {
-            TaskRegistration.Task foreground = null;
-            if (manager == null) return;
-            for (RunningTaskInfo info : manager.getTasks(MAX_TASKS, false, false, 0)) {
-                if (!info.isFocused) continue;
-                foreground = new TaskRegistration.Task(info.taskId, info.userId, info.displayId,
-                        info.getActivityType() == WindowConfiguration.ACTIVITY_TYPE_STANDARD,
-                        info.isVisible, info.numActivities > 0 && info.topActivity != null,
-                        info.baseActivity == null ? null : info.baseActivity.getPackageName());
-                break;
-            }
-            if (!state.needsRegistration(foreground)) {
-                // Distinguish "the registered binding still holds" from "the
-                // focused task is refused": both return false, and without
-                // this line a refused window is invisible in the journal.
-                if (foreground != null && !foreground.eligible()) {
-                    Log.i(TAG, "Task " + foreground.id + " (" + foreground.owner
-                            + ") is not eligible: " + foreground.rejection());
-                } else if (state.lastRejection() != null) {
-                    Log.i(TAG, "Waiting: " + state.lastRejection()
-                            + "; the current host window keeps its binding");
-                }
-                failures = 0;
-                return;
-            }
-            final TaskRegistration.Task target = foreground;
-            Process child = new ProcessBuilder("/vendor/bin/droidloom-task-launcher",
-                    "--bind-task", Integer.toString(target.id),
-                    "--user", Integer.toString(target.user), target.owner)
-                    .redirectErrorStream(true)
-                    .redirectOutput(ProcessBuilder.Redirect.INHERIT).start();
-            if (!child.waitFor(10, TimeUnit.SECONDS)) {
-                child.destroyForcibly();
-                child.waitFor();
-                throw new IllegalStateException("Task registration timed out");
-            }
-            if (child.exitValue() != 0) {
-                throw new IllegalStateException("Task registration exited " + child.exitValue());
-            }
-            state.registered(target);
-            failures = 0;
-            Log.i(TAG, "Published foreground task=" + target.id + " package=" + target.owner);
-        } catch (Exception error) {
-            Log.w(TAG, "Could not publish foreground task", error);
-            // Bound retries to the current transition; another task event can
-            // try again after a backend reconnect. Never launch the app again.
-            if (++failures <= 5) handler.postDelayed(reconcile, 500);
-        }
-    }
 }
