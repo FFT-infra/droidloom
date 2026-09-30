@@ -243,7 +243,12 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
     let id = manifest.build_id.clone();
     let release = base.join("releases").join(&id);
     if release.exists() {
-        bundle::verify(&release)?;
+        // The same build identity must mean the same verified bytes; never
+        // silently reuse a named release for different content.
+        let existing = bundle::verify(&release)?;
+        if existing != manifest {
+            return fail("a release with this build identity already exists with different contents");
+        }
     } else {
         sync_tree(private.path())?;
         fs::rename(private.path(), &release)?;
@@ -262,6 +267,16 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return fail("Android data must remain below /var/lib/droidloom");
+    }
+    // An update must not silently start a second, empty cell: the declared
+    // data directory has to match the currently active release.
+    if let Ok(active) = fs::read_link(base.join("active"))
+        && let Ok(previous) = fs::read(active.join("etc/droidloom/cell.json"))
+        && let Ok(previous) = serde_json::from_slice::<serde_json::Value>(&previous)
+        && let Some(previous) = previous["data_dir"].as_str()
+        && Path::new(previous) != data.as_path()
+    {
+        return fail("bundle data directory differs from the installed cell; refusing to start with new Android data");
     }
     fs::create_dir_all(&data)?;
     mode(&data, 0o700)?;

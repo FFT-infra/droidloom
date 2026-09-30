@@ -416,11 +416,14 @@ fn execute(args: Args) -> Result<()> {
         uid,
         target_arch,
     )?;
-    let id = bundle::seal(staging.path(), identity)?;
-    bundle::verify(staging.path())?;
+    provenance.check_unchanged(&repo)?;
+    let id = bundle::seal(staging.path(), &provenance)?;
+    let sealed = bundle::verify(staging.path())?;
     let payload = work.join(format!("release-{id}"));
     if payload.exists() {
-        bundle::verify(&payload)?;
+        if bundle::verify(&payload)? != sealed {
+            return fail("a release with this build identity already exists with different contents");
+        }
     } else {
         fs::rename(staging.path(), &payload)?;
     }

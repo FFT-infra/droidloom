@@ -142,18 +142,6 @@ pub fn open_beneath(root: &fs::File, relative: &Path) -> Result<fs::File> {
     fail("staging path has no file")
 }
 
-pub fn hash_beneath(root: &fs::File, relative: &Path) -> Result<String> {
-    let mut file = open_beneath(root, relative)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 131072];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
-        digest.update(&buffer[..n]);
-    }
-    Ok(hex::encode(digest.finalize()))
-}
-
 pub fn copy_beneath(root: &fs::File, relative: &Path, destination: &Path) -> Result<u32> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;

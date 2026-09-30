@@ -2,7 +2,7 @@
 
 use crate::{bundle::{self, BuildProvenance, BundleKind, Manifest}, util::*};
 use serde::{Deserialize, Serialize};
-use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::Command};
+use std::{fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}, process::Command};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

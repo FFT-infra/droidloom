@@ -563,9 +563,18 @@ mod tests {
 }
 
 #[cfg(test)]
-mod artifact_tests {
+pub(crate) mod artifact_tests {
     use super::*;
-    fn fixture(root: &Path, composer: u16, java: u16) {
+    fn test_provenance(arch: &str) -> BuildProvenance {
+        BuildProvenance {
+            source_commit: "a".repeat(40),
+            cargo_lock_sha256: "b".repeat(64),
+            source_lock_sha256: "c".repeat(64),
+            toolchain: "rustc test".into(),
+            target: host_target(arch).unwrap().into(),
+        }
+    }
+    pub(crate) fn fixture(root: &Path, composer: u16, java: u16) {
         let launcher = root.join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge");
         write(&launcher, b"#!/system/bin/sh\nexec app_process\n").unwrap();
         mode(&launcher, 0o755).unwrap();
@@ -602,38 +611,40 @@ mod artifact_tests {
     }
     #[test]
     fn refuses_bundle_without_minimal_system_apps() {
+        let provenance = test_provenance("x86_64");
         for relative in ["ime/DroidloomHome.apk", "ime/home-setup", "systemui/SystemUI.apk"] {
             let d = tempfile::tempdir().unwrap();
             fixture(d.path(), 5, 5);
             fs::remove_file(d.path().join("usr/lib/droidloom/runtime").join(relative)).unwrap();
-            assert!(seal(d.path(), "fixture".into()).is_err());
+            assert!(seal(d.path(), &provenance).is_err());
         }
     }
     #[test]
     fn refuses_nonexecutable_input_launcher_even_when_recorded_that_way() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);
-        seal(d.path(), "fixture".into()).unwrap();
+        let provenance = test_provenance("x86_64");
+        seal(d.path(), &provenance).unwrap();
         let launcher = d
             .path()
             .join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge");
         mode(&launcher, 0o644).unwrap();
         assert!(verify(d.path()).is_err());
         // A manifest made from a bad installation must not legitimize the mode.
-        assert!(seal(d.path(), "fixture".into()).is_err());
+        assert!(seal(d.path(), &provenance).is_err());
     }
     #[test]
     fn refuses_mixed_native_java_bundle() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 4, 5);
-        assert!(seal(d.path(), "fixture".into()).is_err());
+        assert!(seal(d.path(), &test_provenance("x86_64")).is_err());
         assert!(!d.path().join(MANIFEST).exists());
     }
     #[test]
-    fn checks_required_components_without_requiring_identical_bytes() {
+    fn verifies_exact_content_instead_of_compatibility_only() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);
-        seal(d.path(), "fixture".into()).unwrap();
+        seal(d.path(), &test_provenance("x86_64")).unwrap();
         verify(d.path()).unwrap();
         let file = d.path().join(
             "usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom",
@@ -644,14 +655,27 @@ mod artifact_tests {
         let mut compatible = original.clone();
         compatible.extend_from_slice(b"different build metadata");
         write(&file, &compatible).unwrap();
-        verify(d.path()).unwrap();
+        assert!(verify(d.path()).is_err(), "different bytes at the same path must fail schema 3");
         fs::remove_file(&file).unwrap();
         assert!(verify(d.path()).is_err());
         write(&file, &original).unwrap();
         write(&d.path().join("unexpected"), b"old component").unwrap();
+        assert!(verify(d.path()).is_err(), "unrecorded payload files must fail the exact inventory");
+        fs::remove_file(d.path().join("unexpected")).unwrap();
         verify(d.path()).unwrap();
     }
     #[test]
+    fn rejects_same_mode_content_tampering() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 5, 5);
+        seal(d.path(), &test_provenance("x86_64")).unwrap();
+        let file = d.path().join("usr/lib/droidloom/runtime/ime/home-setup");
+        let mut bytes = fs::read(&file).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        write(&file, &bytes).unwrap();
+        assert!(verify(d.path()).is_err(), "same size and mode with different bytes must fail");
+    }
     fn rejects_foreign_architecture_in_other_component() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);
@@ -661,6 +685,6 @@ mod artifact_tests {
         elf[5] = 1;
         elf[18] = 183;
         write(&d.path().join("wrong-library.so"), elf).unwrap();
-        assert!(seal(d.path(), "fixture".into()).is_err());
+        assert!(seal(d.path(), &test_provenance("x86_64")).is_err());
     }
 }
