@@ -48,7 +48,8 @@ final class TaskObserver extends TaskStackListener {
                 connect();
             }), 0);
             manager = service;
-            Log.i(TAG, "Observing Android foreground task launches");
+            Log.i(TAG, "Observing Android foreground task launches; ineligible focus is"
+                    + " reported by reason and never clears the registered binding");
             schedule();
         } catch (Exception error) {
             Log.w(TAG, "ActivityTaskManager not ready", error);
@@ -92,7 +93,20 @@ final class TaskObserver extends TaskStackListener {
                         info.baseActivity == null ? null : info.baseActivity.getPackageName());
                 break;
             }
-            if (!state.needsRegistration(foreground)) { failures = 0; return; }
+            if (!state.needsRegistration(foreground)) {
+                // Distinguish "the registered binding still holds" from "the
+                // focused task is refused": both return false, and without
+                // this line a refused window is invisible in the journal.
+                if (foreground != null && !foreground.eligible()) {
+                    Log.i(TAG, "Task " + foreground.id + " (" + foreground.owner
+                            + ") is not eligible: " + foreground.rejection());
+                } else if (state.lastRejection() != null) {
+                    Log.i(TAG, "Waiting: " + state.lastRejection()
+                            + "; the current host window keeps its binding");
+                }
+                failures = 0;
+                return;
+            }
             final TaskRegistration.Task target = foreground;
             Process child = new ProcessBuilder("/vendor/bin/droidloom-task-launcher",
                     "--bind-task", Integer.toString(target.id),

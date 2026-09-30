@@ -81,7 +81,11 @@ PendingIntents without starting another launcher activity. Android retains the
 original intent, extras, URI grants, task flags and activity-result relationship.
 HOME, recents, organizer containers, background tasks and other users/displays
 are excluded. Activities from another package within the same task retain that
-task's base owner, including authentication and permission screens.
+task's base owner, including authentication and permission screens. A focused
+task that fails the eligibility checks is reported in the journal with the
+reason it was refused and leaves the registered binding alone: the host window
+stays bound to the task it already holds, and a task that becomes eligible
+again registers as the ordinary new activation it is.
 
 Task callbacks are coalesced on a worker thread, with bounded retries for failed
 registration and no idle task polling. Concurrent explicit launches and observer

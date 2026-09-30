@@ -8,6 +8,9 @@ public final class TaskRegistrationTest {
     private static void check(boolean value) {
         if (!value) throw new AssertionError();
     }
+    private static void checkReason(String value) {
+        if (value == null || value.isEmpty()) throw new AssertionError("missing reason");
+    }
     public static void main(String[] args) {
         TaskRegistration state = new TaskRegistration();
         TaskRegistration.Task store = app(25, "com.android.vending");
@@ -23,7 +26,14 @@ public final class TaskRegistrationTest {
         state.registered(store);
         check(state.needsRegistration(tiktok)); // Open an already running app again.
         state.registered(tiktok);
-        check(state.needsRegistration(app(26, "org.example.changed"))); // ID reuse/owner change.
+        // A focused task that is momentarily ineligible — a window briefly
+        // hidden behind another — reports why but leaves the binding intact;
+        // the retry budget is not spent and no window is torn down.
+        TaskRegistration.Task hidden =
+                new TaskRegistration.Task(26, 0, 0, true, false, true, tiktok.owner);
+        check(!state.needsRegistration(hidden));
+        checkReason(hidden.rejection());
+        checkReason(state.lastRejection());
         for (TaskRegistration.Task rejected : new TaskRegistration.Task[] {
                 null,
                 new TaskRegistration.Task(1, 0, 0, false, true, true, "com.android.droidloom.home"),
@@ -35,6 +45,11 @@ public final class TaskRegistrationTest {
                 app(0, "org.example.invalid"), app(-1, "org.example.invalid") }) {
             check(!state.needsRegistration(rejected));
         }
+        check(!state.needsRegistration(tiktok)); // Still hidden: the binding survived.
+        check(state.needsRegistration(app(26, "org.example.changed"))); // ID reuse/owner change.
+        // The caller registers on a positive answer, so the changed task now
+        // holds the binding and returning to tiktok is a new activation.
+        state.registered(app(26, "org.example.changed"));
         check(state.needsRegistration(tiktok)); // Returning from HOME must activate again.
         state.registered(tiktok);
         state.clear();
