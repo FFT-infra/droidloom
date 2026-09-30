@@ -281,15 +281,8 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
 /// The symlink is created dangling when the tree has no APEX copy; it publishes
 /// the path the resolver checks, and the target appears with the APEX mount.
 fn link_apex_debuggerd(tree: &Path) -> Result<()> {
-    let runtime = tree.join("apex/com.android.runtime");
-    if !runtime.is_dir() {
-        return fail("system tree has no runtime APEX");
-    }
     let bin = tree.join("system/bin");
     for name in ["crash_dump64", "crash_dump32"] {
-        if !runtime.join("bin").join(name).exists() {
-            continue;
-        }
         let link = bin.join(name);
         if fs::symlink_metadata(&link).is_ok() {
             continue;
@@ -564,29 +557,27 @@ mod tests {
         unsafe { std::env::set_var("PATH", &path) };
 
         let tree = tempfile::tempdir().unwrap();
-        let runtime = tree.path().join("apex/com.android.runtime/bin");
-        fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(tree.path().join("system/bin")).unwrap();
-        fs::write(runtime.join("crash_dump64"), b"elf").unwrap();
         link_apex_debuggerd(tree.path()).unwrap();
 
+        // The APEX mount is what makes the target appear, so the derivation
+        // states the path for each architecture the runtime can dump.
+        for name in ["crash_dump64", "crash_dump32"] {
+            assert_eq!(
+                fs::read_link(tree.path().join("system/bin").join(name)).unwrap(),
+                Path::new("/apex/com.android.runtime/bin").join(name)
+            );
+        }
+        // An existing entry stays untouched, and the step is idempotent.
         let link = tree.path().join("system/bin/crash_dump64");
-        assert_eq!(
-            fs::read_link(&link).unwrap(),
-            Path::new("/apex/com.android.runtime/bin/crash_dump64")
-        );
-        // Only binaries the APEX actually carries are published, and an
-        // existing entry stays untouched.
-        assert!(fs::symlink_metadata(tree.path().join("system/bin/crash_dump32")).is_err());
         fs::remove_file(&link).unwrap();
         fs::write(&link, b"existing").unwrap();
         link_apex_debuggerd(tree.path()).unwrap();
         assert_eq!(fs::read(&link).unwrap(), b"existing");
-
-        // A tree without the runtime APEX is rejected rather than silently skipped.
-        let bare = tempfile::tempdir().unwrap();
-        fs::create_dir_all(bare.path().join("system/bin")).unwrap();
-        assert!(link_apex_debuggerd(bare.path()).is_err());
+        assert!(fs::symlink_metadata(tree.path().join("system/bin/crash_dump32"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         // SAFETY: restoring the value this test replaced.
         unsafe { std::env::set_var("PATH", original) };
