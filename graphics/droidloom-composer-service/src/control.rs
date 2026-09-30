@@ -183,12 +183,17 @@ impl TaskCoordinator {
             if let Some(existing) = state.direct_tasks.get(&task).copied() {
                 if let Ok(registration) = state.registry.get(existing) {
                     if self.sink.is_display_registered(registration.reservation.display) {
-                        if registration.reservation.package != package
-                            || registration.android_display != Some(android_display)
-                        {
+                        // The package is a label, not identity: the observer
+                        // names a task by its current base activity, and the
+                        // explicit-launch path names it by the package it was
+                        // asked for, so the two can disagree about the same
+                        // task without either being wrong. The Android display
+                        // is different — it decides where input goes.
+                        if registration.android_display != Some(android_display) {
                             return Err(format!(
-                                "Android task {} is already registered with different ownership",
-                                task.0
+                                "Android task {} is already registered on Android display {}",
+                                task.0,
+                                android_display
                             ));
                         }
                         return Ok((existing, registration.reservation.display));

@@ -41,9 +41,18 @@ final class TaskRegistration {
         /** Why {@link #eligible()} refused this task, or null when it did not. */
         String rejection() { return rejection; }
     }
-    /** Identity of a registered binding; a task that changes shape is new. */
+    /**
+     * Identity of a registered binding.
+     *
+     * The task id carries it, with the user and display that scope it. The
+     * owning package is deliberately not part of the key: Android recomputes
+     * a task's base activity as its bottom-most non-finishing activity, so
+     * when that activity finishes the package legitimately changes and the
+     * task would look like a new binding — the launcher would re-run and the
+     * composer would refuse it as "different ownership" forever.
+     */
     private static String key(Task task) {
-        return task.id + ":" + task.user + ":" + task.display + ":" + task.owner;
+        return task.id + ":" + task.user + ":" + task.display;
     }
     /**
      * Bindings the host currently holds, by identity.

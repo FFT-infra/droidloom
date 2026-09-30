@@ -51,15 +51,15 @@ public final class TaskRegistrationTest {
             check(!state.needsRegistration(rejected));
         }
         check(!state.needsRegistration(tiktok)); // Still hidden: the binding survived.
-        check(state.needsRegistration(app(26, "org.example.changed"))); // ID reuse/owner change.
-        // The caller registers on a positive answer. The changed task is a
-        // second binding; tiktok's is still held, so switching back to it is
-        // not a new activation.
-        state.registered(app(26, "org.example.changed"));
-        check(!state.needsRegistration(tiktok)); // Its binding was never dropped.
-        // Only when Android stops listing it does the binding go.
+        // The owning package is a label, not identity. Android recomputes a
+        // task's base activity as its bottom-most non-finishing activity, so
+        // when that one finishes the package changes while the task does not:
+        // same id, same binding, no re-registration.
+        check(!state.needsRegistration(app(26, "org.example.changed")));
+        check(!state.needsRegistration(tiktok)); // Still the same task either way.
+        // Only when Android stops listing the task does the binding go.
         state.retain(java.util.List.of(tiktok));
-        check(state.needsRegistration(app(26, "org.example.changed")));
+        check(state.needsRegistration(app(27, "org.example.other"))); // A different task is new.
         state.clear();
         check(state.needsRegistration(tiktok)); // System-server reconnection rebuilds bindings.
         // Foreign activities inside an existing app task retain its base owner;
