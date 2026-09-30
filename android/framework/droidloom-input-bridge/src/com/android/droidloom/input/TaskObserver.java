@@ -84,6 +84,20 @@ final class TaskObserver extends TaskStackListener {
     }
 
     /**
+     * The package whose window this task is showing.
+     *
+     * The base activity is the task's origin, which for a system-hosted task
+     * is the framework itself: the package installer that Android starts
+     * behind "download finished" lives in a task owned by `android`, and the
+     * launcher refuses that name. The top activity is what is actually on
+     * screen, and it is the package the window belongs to.
+     */
+    private static String owner(RunningTaskInfo info) {
+        if (info.topActivity != null) return info.topActivity.getPackageName();
+        return info.baseActivity == null ? null : info.baseActivity.getPackageName();
+    }
+
+    /**
      * Ask the launcher to publish one task as a host window. Returns null on
      * success, or the launcher's own words when it refuses, which is the only
      * description of the refusal anyone gets.
@@ -134,7 +148,7 @@ final class TaskObserver extends TaskStackListener {
                         info.displayId,
                         info.getActivityType() == WindowConfiguration.ACTIVITY_TYPE_STANDARD,
                         info.isVisible, info.numActivities > 0 && info.topActivity != null,
-                        info.baseActivity == null ? null : info.baseActivity.getPackageName());
+                        owner(info));
                 if (!task.eligible()) {
                     if (info.isFocused) {
                         Log.i(TAG, "Task " + task.id + " (" + task.owner + ") is not eligible: "
