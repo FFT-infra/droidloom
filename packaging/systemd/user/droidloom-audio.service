@@ -9,6 +9,8 @@ After=pipewire.service wireplumber.service
 [Service]
 Type=notify
 NotifyAccess=main
+Environment=WAYLAND_DISPLAY= DISPLAY= XDG_CURRENT_DESKTOP= XDG_SESSION_ID=
+EnvironmentFile=-%t/droidloom/session.env
 ExecStart=/usr/bin/droidloom-audio
 Restart=on-failure
 RestartSec=2

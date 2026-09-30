@@ -9,7 +9,9 @@ ConditionPathExists=/etc/droidloom/cell.json
 Type=notify
 NotifyAccess=main
 EnvironmentFile=/usr/lib/environment.d/60-droidloom.conf
-Environment=DROIDLOOM_MODE=desktop
+Environment=DROIDLOOM_MODE=desktop DROIDLOOM_HOST_NAVIGATION=0
+Environment=WAYLAND_DISPLAY= DISPLAY= XDG_CURRENT_DESKTOP= XDG_SESSION_ID=
+Environment=DROIDLOOM_COMPOSITOR_PID= DROIDLOOM_COMPOSITOR_START_TICKS=
 EnvironmentFile=-%t/droidloom/session.env
 ExecStartPre=/usr/bin/systemctl start droidloomd.service
 ExecStart=/usr/bin/droidloom-wayland

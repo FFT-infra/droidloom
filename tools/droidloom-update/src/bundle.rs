@@ -1,13 +1,52 @@
 use crate::util::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::Command,
+};
+
 pub const MANIFEST: &str = "droidloom-update.json";
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub const PRESENTER: &str = "usr/bin/droidloom-wayland";
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILES: usize = 20_000;
+const MAX_COMPONENTS: usize = 64;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
+    pub path: String,
+    pub component: String,
+    pub size: u64,
+    pub sha256: String,
     pub mode: u32,
 }
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleKind {
+    Full,
+    PresenterDerivative,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    pub name: String,
+    pub source_commit: String,
+    pub cargo_lock_sha256: Option<String>,
+    pub source_lock_sha256: Option<String>,
+    pub target: String,
+    pub toolchain: String,
+    pub build_profile: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: u32,
@@ -15,7 +54,89 @@ pub struct Manifest {
     pub architecture: String,
     pub input_abi: u16,
     pub source_identity: String,
-    pub files: BTreeMap<String, Artifact>,
+    pub kind: BundleKind,
+    pub base_build_id: Option<String>,
+    pub components: Vec<Component>,
+    pub files: Vec<Artifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyManifest {
+    pub schema: u32,
+    pub build_id: String,
+    pub architecture: String,
+    pub input_abi: u16,
+    pub source_identity: String,
+    pub files: BTreeMap<String, LegacyArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyArtifact {
+    pub mode: u32,
+}
+
+pub enum ManifestRecord {
+    Legacy(LegacyManifest),
+    VerifiedFormat(Manifest),
+}
+
+/// Build provenance is captured before compilation and rechecked before sealing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildProvenance {
+    pub source_commit: String,
+    pub cargo_lock_sha256: String,
+    pub source_lock_sha256: String,
+    pub toolchain: String,
+    pub target: String,
+}
+
+impl BuildProvenance {
+    pub fn capture(repo: &Path, architecture: &str) -> Result<Self> {
+        let source_commit = clean_source_commit(repo)?;
+        let result = Self {
+            source_commit,
+            cargo_lock_sha256: hash(&repo.join("Cargo.lock"))?,
+            source_lock_sha256: hash(&repo.join("android/manifest/m2-sparse-source-lock.json"))?,
+            toolchain: output(Command::new("rustc").arg("--version"))?,
+            target: host_target(architecture)?.to_owned(),
+        };
+        Ok(result)
+    }
+
+    pub fn check_unchanged(&self, repo: &Path) -> Result<()> {
+        if clean_source_commit(repo)? != self.source_commit
+            || hash(&repo.join("Cargo.lock"))? != self.cargo_lock_sha256
+            || hash(&repo.join("android/manifest/m2-sparse-source-lock.json"))? != self.source_lock_sha256
+        {
+            return fail("source or build locks changed during the build; refusing to seal");
+        }
+        Ok(())
+    }
+
+    fn components(&self) -> Vec<Component> {
+        ["android", "presenter", "runtime"]
+            .into_iter()
+            .map(|name| Component {
+                name: name.into(),
+                source_commit: self.source_commit.clone(),
+                cargo_lock_sha256: (name != "android").then(|| self.cargo_lock_sha256.clone()),
+                source_lock_sha256: Some(self.source_lock_sha256.clone()),
+                target: self.target.clone(),
+                toolchain: self.toolchain.clone(),
+                build_profile: "release".into(),
+            })
+            .collect()
+    }
+}
+
+pub fn host_target(architecture: &str) -> Result<&'static str> {
+    match architecture {
+        "x86_64" => Ok("x86_64-unknown-linux-gnu"),
+        "aarch64" => Ok("aarch64-unknown-linux-gnu"),
+        _ => fail("unsupported bundle architecture"),
+    }
 }
 pub fn input_abi(data: &[u8]) -> Result<u16> {
     let prefix = b"DROIDLOOM_INPUT_ABI=";
@@ -121,7 +242,7 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
     {
         return fail("services.jar lacks compiled Droidloom navigation policy");
     }
-    for path in files(root)? {
+    for path in payload_files(root)? {
         if path
             .file_name()
             .is_some_and(|n| n == "droidloom-input-bridge.jar")
@@ -164,88 +285,260 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
     }
     Ok((arch, version))
 }
-fn inventory(root: &Path) -> Result<BTreeMap<String, Artifact>> {
-    let mut map = BTreeMap::new();
-    for path in files(root)? {
-        let relative = path
-            .strip_prefix(root)?
-            .to_str()
-            .ok_or("non-UTF8 bundle path")?;
-        if relative == MANIFEST {
-            continue;
-        }
-        map.insert(
-            relative.to_owned(),
-            Artifact {
-                mode: fs::metadata(path)?.permissions().mode() & 0o777,
-            },
-        );
-    }
-    Ok(map)
+pub fn valid_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
-pub fn seal(root: &Path, source_identity: String) -> Result<String> {
+
+pub fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn valid_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn valid_build_id(value: &str) -> bool {
+    value.len() <= 128
+        && value.split_once('-').is_some_and(|(time, pid)| {
+            !time.is_empty() && !pid.is_empty()
+                && time.bytes().all(|c| c.is_ascii_digit())
+                && pid.bytes().all(|c| c.is_ascii_digit())
+        })
+}
+
+pub fn new_build_id() -> Result<String> {
+    Ok(format!("{}-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?.as_nanos(), std::process::id()))
+}
+
+pub fn executable_architecture(path: &Path) -> Result<&'static str> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header)?;
+    architecture(&header)
+}
+
+/// Keep traversal bounded before either hashing or privileged staging starts.
+pub fn payload_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return fail("bundle root must be a directory, not a symlink");
+    }
+    let mut pending = vec![(root.to_owned(), 0usize)];
+    let mut result = Vec::new();
+    let mut entries = 0;
+    let mut total = 0u64;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > 64 { return fail("bundle directory nesting exceeds limit"); }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > MAX_FILES * 2 { return fail("bundle entry count exceeds limit"); }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                let size = entry.metadata()?.len();
+                total = total.checked_add(size).ok_or("bundle size overflow")?;
+                if size > MAX_FILE_BYTES || total > MAX_TOTAL_BYTES || result.len() >= MAX_FILES {
+                    return fail("bundle payload exceeds size or file-count limit");
+                }
+                result.push(entry.path());
+            } else {
+                return fail(format!("bundle symlinks and non-regular inputs are forbidden: {}", entry.path().display()));
+            }
+        }
+    }
+    result.sort();
+    Ok(result)
+}
+
+fn component_for(path: &str) -> &'static str {
+    if path == PRESENTER {
+        "presenter"
+    } else if path.starts_with("usr/lib/droidloom/runtime/") || path.starts_with("var/lib/droidloom/images/") {
+        "android"
+    } else {
+        "runtime"
+    }
+}
+
+pub fn inventory(root: &Path) -> Result<Vec<Artifact>> {
+    let mut result = Vec::new();
+    for path in payload_files(root)? {
+        let relative = path.strip_prefix(root)?.to_str().ok_or("non-UTF8 bundle path")?;
+        if relative == MANIFEST { continue; }
+        if !valid_relative_path(relative) { return fail("invalid component path"); }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.mode() & 0o7000 != 0 || metadata.len() == 0 {
+            return fail(format!("empty or privileged bundle component: {relative}"));
+        }
+        result.push(Artifact {
+            path: relative.into(),
+            component: component_for(relative).into(),
+            size: metadata.len(),
+            sha256: hash(&path)?,
+            mode: metadata.mode() & 0o777,
+        });
+    }
+    Ok(result)
+}
+
+pub fn validate_manifest(m: &Manifest) -> Result<()> {
+    if m.schema != 3 || !valid_build_id(&m.build_id) || m.input_abi == 0
+        || m.source_identity.is_empty() || m.source_identity.len() > 4096
+        || m.source_identity.chars().any(char::is_control)
+    {
+        return fail("invalid schema-3 bundle header");
+    }
+    let target = host_target(&m.architecture)?;
+    match (m.kind, m.base_build_id.as_deref()) {
+        (BundleKind::Full, None) => {}
+        (BundleKind::PresenterDerivative, Some(base)) if valid_build_id(base) && base != m.build_id => {}
+        _ => return fail("invalid bundle base identity"),
+    }
+    if m.files.is_empty() || m.files.len() > MAX_FILES || m.components.is_empty() || m.components.len() > MAX_COMPONENTS {
+        return fail("bundle record count exceeds limits");
+    }
+    let mut components = BTreeSet::new();
+    for c in &m.components {
+        if !matches!(c.name.as_str(), "android" | "presenter" | "runtime")
+            || !components.insert(c.name.as_str()) || !valid_commit(&c.source_commit)
+            || c.target != target || c.toolchain.is_empty() || c.toolchain.len() > 1024
+            || c.toolchain.chars().any(char::is_control) || c.build_profile != "release"
+            || c.cargo_lock_sha256.as_deref().is_some_and(|v| !valid_digest(v))
+            || c.source_lock_sha256.as_deref().is_some_and(|v| !valid_digest(v))
+            || (c.name == "android" && c.source_lock_sha256.is_none())
+            || (c.name != "android" && c.cargo_lock_sha256.is_none())
+        {
+            return fail("invalid or duplicate component provenance");
+        }
+    }
+    let mut previous: Option<&str> = None;
+    let mut total = 0u64;
+    for a in &m.files {
+        if !valid_relative_path(&a.path) || a.path == MANIFEST
+            || previous.is_some_and(|v| v >= a.path.as_str())
+            || !components.contains(a.component.as_str()) || a.component != component_for(&a.path)
+            || a.size == 0 || a.size > MAX_FILE_BYTES || !valid_digest(&a.sha256)
+            || a.mode & !0o777 != 0
+        {
+            return fail(format!("invalid, duplicate or unordered file record: {}", a.path));
+        }
+        previous = Some(&a.path);
+        total = total.checked_add(a.size).ok_or("bundle size overflow")?;
+        if total > MAX_TOTAL_BYTES { return fail("bundle total size exceeds limit"); }
+    }
+    if !m.files.iter().any(|a| a.path == PRESENTER) {
+        return fail("bundle lacks a recorded presenter");
+    }
+    Ok(())
+}
+
+pub fn verify_inventory(root: &Path, m: &Manifest) -> Result<()> {
+    validate_manifest(m)?;
+    let actual = payload_files(root)?;
+    let actual: BTreeSet<_> = actual.iter()
+        .map(|p| p.strip_prefix(root).map(Path::to_owned))
+        .collect::<std::result::Result<_, _>>()?;
+    let expected: BTreeSet<_> = m.files.iter().map(|a| PathBuf::from(&a.path))
+        .chain(std::iter::once(PathBuf::from(MANIFEST))).collect();
+    if actual != expected { return fail("bundle file inventory differs from its manifest"); }
+    for a in &m.files {
+        let path = root.join(&a.path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() != a.size || metadata.mode() & 0o7777 != a.mode {
+            return fail(format!("bundle size or permissions changed: {}", a.path));
+        }
+        if hash(&path)? != a.sha256 {
+            return fail(format!("bundle content hash changed: {}", a.path));
+        }
+    }
+    Ok(())
+}
+
+pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit { return fail("metadata input exceeds limit or is not a regular file"); }
+    let mut bytes = Vec::new();
+    file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit { return fail("metadata input exceeds limit"); }
+    Ok(bytes)
+}
+
+pub fn inspect(root: &Path) -> Result<ManifestRecord> {
+    let bytes = read_bounded(&root.join(MANIFEST), MAX_MANIFEST_BYTES)?;
+    let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+    match header.get("schema").and_then(serde_json::Value::as_u64) {
+        Some(3) => {
+            let m: Manifest = serde_json::from_slice(&bytes)?;
+            validate_manifest(&m)?;
+            Ok(ManifestRecord::VerifiedFormat(m))
+        }
+        Some(2) => {
+            let m: LegacyManifest = serde_json::from_slice(&bytes)?;
+            if m.schema != 2 || !valid_build_id(&m.build_id) || m.files.len() > MAX_FILES
+                || m.files.iter().any(|(p, a)| !valid_relative_path(p) || a.mode & !0o777 != 0)
+            {
+                return fail("invalid legacy bundle record");
+            }
+            Ok(ManifestRecord::Legacy(m))
+        }
+        _ => fail("unsupported bundle manifest schema"),
+    }
+}
+
+pub fn write_manifest(root: &Path, m: &Manifest) -> Result<()> {
+    validate_manifest(m)?;
+    let bytes = serde_json::to_vec_pretty(m)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES { return fail("bundle manifest exceeds size limit"); }
+    durable_write(&root.join(MANIFEST), bytes)
+}
+
+pub fn seal(root: &Path, provenance: &BuildProvenance) -> Result<String> {
     let (architecture, input_abi) = compatibility(root)?;
+    if provenance.target != host_target(&architecture)? { return fail("build provenance has the wrong target"); }
     let manifest = Manifest {
-        schema: 2,
-        build_id: format!(
-            "{}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos(),
-            std::process::id()
-        ),
+        schema: 3,
+        build_id: new_build_id()?,
         architecture,
         input_abi,
-        source_identity,
+        source_identity: provenance.source_commit.clone(),
+        kind: BundleKind::Full,
+        base_build_id: None,
+        components: provenance.components(),
         files: inventory(root)?,
     };
-    write(&root.join(MANIFEST), serde_json::to_vec_pretty(&manifest)?)?;
+    write_manifest(root, &manifest)?;
     Ok(manifest.build_id)
 }
+
 pub fn verify(root: &Path) -> Result<Manifest> {
-    let m: Manifest = serde_json::from_slice(&fs::read(root.join(MANIFEST))?)?;
-    if m.schema != 2
-        || m.build_id.is_empty()
-        || !m.build_id.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-    {
-        return fail("invalid bundle build record");
-    }
-    for (relative, artifact) in &m.files {
-        let path = Path::new(relative);
-        if path
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return fail("invalid component path");
-        }
-        let metadata = fs::metadata(root.join(path))?;
-        if !metadata.is_file() || metadata.len() == 0 {
-            return fail(format!("missing or empty component: {relative}"));
-        }
-        if artifact.mode & 0o111 != 0 && metadata.permissions().mode() & 0o111 == 0 {
-            return fail(format!("component is not executable: {relative}"));
-        }
-    }
-    let (arch, abi) = compatibility(root)?;
-    if arch != m.architecture || abi != m.input_abi {
-        return fail("manifest disagrees with compiled artifacts");
-    }
+    let root = root.canonicalize()?;
+    let m = match inspect(&root)? {
+        ManifestRecord::VerifiedFormat(m) => m,
+        ManifestRecord::Legacy(m) => return fail(format!(
+            "legacy schema 2 bundle {} ({}, input ABI {}, source {}) is not content-verified; build a clean schema-3 baseline before activation or derivation",
+            m.build_id, m.architecture, m.input_abi, m.source_identity)),
+    };
+    verify_inventory(&root, &m)?;
+    let (arch, abi) = compatibility(&root)?;
+    if arch != m.architecture || abi != m.input_abi { return fail("manifest disagrees with compiled artifacts"); }
     Ok(m)
 }
-pub fn source_identity(repo: &Path) -> Result<String> {
-    let revision =
-        output(
-            Command::new("git")
-                .current_dir(repo)
-                .args(["rev-parse", "--short", "HEAD"]),
-        )?;
-    let dirty = !output(
-        Command::new("git")
-            .current_dir(repo)
-            .args(["status", "--porcelain"]),
-    )?
-    .is_empty();
-    Ok(format!("{revision}{}", if dirty { "+local" } else { "" }))
+
+pub fn clean_source_commit(repo: &Path) -> Result<String> {
+    let revision = output(Command::new("git").current_dir(repo).args(["rev-parse", "HEAD"]))?;
+    if !valid_commit(&revision) || !output(Command::new("git").current_dir(repo).args(["status", "--porcelain", "--untracked-files=all"]))?.is_empty() {
+        return fail("bundle provenance requires a clean Git checkout at a full commit");
+    }
+    Ok(revision)
 }
 
 #[cfg(test)]

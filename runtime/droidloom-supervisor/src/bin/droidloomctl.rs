@@ -3,9 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    env, fs,
-    io::Write,
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    env,
     path::PathBuf,
     thread,
     time::{Duration, Instant},
@@ -15,6 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use droidloom_supervisor::control::{
     ControlRequest, DEFAULT_CELL_SPEC, DEFAULT_CONTROL_SOCKET, request, request_with_progress,
 };
+use droidloom_supervisor::session_binding::{SessionBinding, SessionDirectory, SessionRecord};
 use droidloom_window_policy::{
     LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore, WindowPreference,
 };
@@ -357,94 +356,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn session_lifecycle(
+fn session_service_active() -> Result<bool, Box<dyn std::error::Error>> {
+    let output = droidloom_cpu_placement::command("systemctl")
+        .args(["--user", "show", "--property=ActiveState", "--value", "droidloom.service"])
+        .output()?;
+    if !output.status.success() {
+        return Err("could not inspect droidloom.service; no session environment was changed".into());
+    }
+    match String::from_utf8(output.stdout)?.trim() {
+        "inactive" | "failed" => Ok(false),
+        "active" | "activating" | "reloading" | "deactivating" | "maintenance" => Ok(true),
+        _ => Err("droidloom.service returned an unknown state; no session environment was changed".into()),
+    }
+}
+
+fn run_session_service_command(
     operation: &str,
     json: bool,
-    requested_mode: Option<SessionMode>,
-    no_wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if operation != "stop" && PathBuf::from("/usr/share/droidloom/package.json").is_file() {
-        let status =
-            droidloom_cpu_placement::command("/usr/lib/droidloom/droidloom-package-helper")
-                .arg("prepare")
-                .status()?;
-        if !status.success() {
-            return Err("Droidloom setup did not complete; the runtime was not started".into());
-        }
-        let status = droidloom_cpu_placement::command("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()?;
-        if !status.success() {
-            return Err("could not reload the installed Droidloom user service".into());
-        }
-    }
-    let mut operation = operation;
-    if operation != "stop" {
-        let runtime =
-            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is missing")?);
-        if !runtime.is_absolute() {
-            return Err("XDG_RUNTIME_DIR must be absolute".into());
-        }
-        let directory = runtime.join("droidloom");
-        match fs::DirBuilder::new().mode(0o700).create(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = fs::symlink_metadata(&directory)?;
-        if !metadata.is_dir() || metadata.uid() != fs::metadata(&runtime)?.uid() {
-            return Err("Droidloom runtime directory must be a session-owned directory".into());
-        }
-        // Older clients created this directory with the default 0755 mode.
-        // Keep the presenter's private-socket directory invariant on every start.
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        let path = directory.join("session.env");
-        let previous = match fs::read_to_string(&path) {
-            Ok(value) => value
-                .trim()
-                .strip_prefix("DROIDLOOM_MODE=")
-                .ok_or("invalid session mode file")?
-                .parse::<SessionMode>()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionMode::Desktop,
-            Err(error) => return Err(error.into()),
-        };
-        let mode = requested_mode.unwrap_or(previous);
-        // A start with a different mode must actually change the running service.
-        if operation == "start"
-            && mode != previous
-            && droidloom_cpu_placement::command("systemctl")
-                .args(["--user", "is-active", "--quiet", "droidloom.service"])
-                .status()?
-                .success()
-        {
-            operation = "restart";
-        }
-        let temporary = directory.join(format!(".session-{}.env", std::process::id()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        writeln!(file, "DROIDLOOM_MODE={mode}")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-    }
-    // Import the caller's live session without requiring a logout after install.
-    if operation != "stop" {
-        let variables: Vec<_> = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP"]
-            .into_iter()
-            .filter(|name| env::var_os(name).is_some())
-            .collect();
-        if !variables.is_empty() {
-            let status = droidloom_cpu_placement::command("systemctl")
-                .args(["--user", "import-environment"])
-                .args(variables)
-                .status()?;
-            if !status.success() {
-                return Err("could not import the graphical session environment".into());
-            }
-        }
-    }
     if !json {
         eprintln!("Waiting for Droidloom services to {operation} (up to 160 seconds)...");
     }
@@ -454,9 +383,7 @@ fn session_lifecycle(
     let started = Instant::now();
     let mut next_update = Duration::from_secs(10);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
+        if let Some(status) = child.try_wait()? { break status; }
         if started.elapsed() >= Duration::from_secs(160) {
             let _ = child.kill();
             let _ = child.wait();
@@ -464,20 +391,89 @@ fn session_lifecycle(
         }
         if started.elapsed() >= next_update {
             if !json {
-                eprintln!(
-                    "Waiting for Droidloom services to {operation} ({} seconds elapsed; {} seconds remaining)...",
-                    started.elapsed().as_secs(),
-                    160 - started.elapsed().as_secs()
-                );
+                eprintln!("Waiting for Droidloom services to {operation} ({} seconds elapsed; {} seconds remaining)...",
+                    started.elapsed().as_secs(), 160 - started.elapsed().as_secs());
             }
             next_update += Duration::from_secs(10);
         }
         thread::sleep(Duration::from_millis(100));
     };
     if !status.success() {
-        return Err(
-            format!("{operation} failed; see journalctl --user -u droidloom.service").into(),
-        );
+        return Err(format!("{operation} failed; see journalctl --user -u droidloom.service").into());
+    }
+    Ok(())
+}
+
+fn session_lifecycle(
+    operation: &str,
+    json: bool,
+    requested_mode: Option<SessionMode>,
+    no_wait: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = SessionDirectory::from_environment()?;
+    let _transaction = directory.lock_commands()?;
+    if operation == "stop" {
+        // Stop is explicit recovery, so even an invalid legacy record must not
+        // prevent it. Internal --cell operations never enter this path.
+        run_session_service_command("stop", json)?;
+    } else {
+        let previous = directory.read_record()?;
+        let mode = requested_mode.unwrap_or_else(|| {
+            previous.as_ref().map_or(SessionMode::Desktop, SessionRecord::mode)
+        });
+        let binding = SessionBinding::from_environment(directory.runtime(), mode)?;
+        let active = session_service_active()?;
+        let owner_locked = directory.owner_locked()?;
+        let previous_binding = match &previous {
+            Some(SessionRecord::Bound(value)) => Some(value),
+            _ => None,
+        };
+        if owner_locked {
+            let owner = previous_binding.ok_or(
+                "Droidloom has a live presenter without a bound session record; stop that session explicitly",
+            )?;
+            if !owner.same_owner(&binding) {
+                return Err(format!(
+                    "Droidloom belongs to another graphical session ({}; compositor {}); its environment and applications were left unchanged",
+                    owner.compositor.socket.display(), owner.compositor.pid,
+                ).into());
+            }
+            if !active {
+                return Err("a presenter outside droidloom.service owns the runtime; stop it explicitly before starting the service".into());
+            }
+        } else if active {
+            return Err("a legacy or starting Droidloom service has no presenter ownership lease; explicitly stop it before starting a bound session".into());
+        }
+        let unchanged = active && operation == "start" && previous_binding.is_some_and(|old| {
+            old.mode == binding.mode && old.host_navigation == binding.host_navigation
+        });
+        if !unchanged {
+            // Ownership rejection precedes package preparation, reload, env
+            // writes and any command that could stop another desktop's apps.
+            if PathBuf::from("/usr/share/droidloom/package.json").is_file() {
+                let status = droidloom_cpu_placement::command("/usr/lib/droidloom/droidloom-package-helper")
+                    .arg("prepare").status()?;
+                if !status.success() {
+                    return Err("Droidloom setup did not complete; the runtime was not started".into());
+                }
+                let status = droidloom_cpu_placement::command("systemctl")
+                    .args(["--user", "daemon-reload"]).status()?;
+                if !status.success() {
+                    return Err("could not reload the installed Droidloom user service".into());
+                }
+            }
+            if active {
+                if !json {
+                    eprintln!("Restarting Droidloom closes Android windows; the graphical desktop remains running.");
+                }
+                run_session_service_command("stop", json)?;
+                if directory.owner_locked()? {
+                    return Err("Droidloom presenter lease remained held after the service stopped".into());
+                }
+            }
+            directory.write_binding(&binding)?;
+            run_session_service_command("start", json)?;
+        }
     }
     let message = if operation == "stop" {
         "Droidloom is stopped"

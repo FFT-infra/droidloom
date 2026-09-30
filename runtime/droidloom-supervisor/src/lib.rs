@@ -13,6 +13,7 @@ mod development_network;
 pub mod gapps;
 pub mod linux_plan;
 mod package_cache;
+pub mod session_binding;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};

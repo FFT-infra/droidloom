@@ -1,6 +1,6 @@
 //! Unix transport for the Denial-native Droidloom protocol.
 //!
-//! Unsafe code is confined to the Linux/Android socket ABI in [`SeqPacket`].
+//! Unsafe code is confined to the Linux/Android socket ABI.
 //! Typed callers use [`ProtocolSocket`], which validates every packet with the
 //! safe codec and binds each received descriptor to an exact protocol role.
 
@@ -31,6 +31,35 @@ pub struct PeerCredentials {
     pub uid: u32,
     /// Effective peer group ID.
     pub gid: u32,
+}
+
+/// Read kernel-authenticated credentials without taking ownership or assuming
+/// a sequenced-packet transport. Wayland uses an ordinary Unix stream.
+///
+/// # Errors
+///
+/// Propagates `SO_PEERCRED` failure or a malformed kernel response.
+pub fn peer_credentials(fd: BorrowedFd<'_>) -> Result<PeerCredentials, IpcError> {
+    let mut credentials = MaybeUninit::<libc::ucred>::uninit();
+    let mut length = libc::socklen_t::try_from(mem::size_of::<libc::ucred>())
+        .map_err(|_| IpcError::InvalidAncillary)?;
+    // SAFETY: the kernel writes at most the advertised ucred size into valid
+    // storage, and the borrowed descriptor remains live for the call.
+    let result = unsafe {
+        libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(), &raw mut length)
+    };
+    if result != 0 { return Err(io::Error::last_os_error().into()); }
+    if usize::try_from(length).ok() != Some(mem::size_of::<libc::ucred>()) {
+        return Err(IpcError::InvalidAncillary);
+    }
+    // SAFETY: successful getsockopt initialized the complete ucred.
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(PeerCredentials {
+        pid: u32::try_from(credentials.pid).map_err(|_| IpcError::InvalidAncillary)?,
+        uid: credentials.uid,
+        gid: credentials.gid,
+    })
 }
 
 /// One descriptor paired with the role validated from its packet.
@@ -456,33 +485,7 @@ impl SeqPacket {
     ///
     /// Propagates `SO_PEERCRED` failure or a malformed kernel response.
     pub fn peer_credentials(&self) -> Result<PeerCredentials, IpcError> {
-        let mut credentials = MaybeUninit::<libc::ucred>::uninit();
-        let mut length = libc::socklen_t::try_from(mem::size_of::<libc::ucred>())
-            .map_err(|_| IpcError::InvalidAncillary)?;
-        // SAFETY: the kernel writes at most the advertised `ucred` size into
-        // valid uninitialized storage, and the descriptor stays live.
-        let result = unsafe {
-            libc::getsockopt(
-                self.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                credentials.as_mut_ptr().cast(),
-                &raw mut length,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        if usize::try_from(length).ok() != Some(mem::size_of::<libc::ucred>()) {
-            return Err(IpcError::InvalidAncillary);
-        }
-        // SAFETY: successful `getsockopt` initialized the complete `ucred`.
-        let credentials = unsafe { credentials.assume_init() };
-        Ok(PeerCredentials {
-            pid: u32::try_from(credentials.pid).map_err(|_| IpcError::InvalidAncillary)?,
-            uid: credentials.uid,
-            gid: credentials.gid,
-        })
+        crate::peer_credentials(self.fd.as_fd())
     }
 
     /// Send exactly one record with up to four attached descriptors.
@@ -1137,6 +1140,20 @@ mod tests {
             denial.receive_record(),
             Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    fn borrowed_stream_credentials_do_not_change_transport_or_ownership() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::MetadataExt;
+        let (mut first, mut second) = std::os::unix::net::UnixStream::pair().unwrap();
+        let peer = crate::peer_credentials(first.as_fd()).unwrap();
+        assert_eq!(peer.pid, std::process::id());
+        assert_eq!(peer.uid, std::fs::metadata("/proc/self").unwrap().uid());
+        first.write_all(b"still a stream").unwrap();
+        let mut received = [0; 14];
+        second.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"still a stream");
     }
 
     #[test]
