@@ -26,8 +26,6 @@ pub struct SurfaceBridge {
     session: SharedSession,
     coordinator: TaskCoordinator,
     bootstrap_display: DisplayId,
-    bootstrap_width: u32,
-    bootstrap_height: u32,
 }
 
 impl SurfaceBridge {
@@ -40,6 +38,8 @@ impl SurfaceBridge {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        // The startup size is a bind-time check that the display exists with a
+        // usable geometry; later hellos read the display's current configure.
         if width == 0 || height == 0 {
             return Err("SurfaceFlinger bridge received an empty display size".to_owned());
         }
@@ -48,8 +48,6 @@ impl SurfaceBridge {
             session,
             coordinator,
             bootstrap_display: display,
-            bootstrap_width: width,
-            bootstrap_height: height,
         })
     }
 
