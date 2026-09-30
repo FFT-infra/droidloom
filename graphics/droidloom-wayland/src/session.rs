@@ -20,7 +20,6 @@ pub(crate) struct SessionLease {
     runtime: PathBuf,
     peer: PeerCredentials,
     peer_start_ticks: u64,
-    host_navigation: bool,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -61,24 +60,15 @@ impl SessionLease {
             }
             _ => return Err(invalid("incomplete compositor session binding")),
         };
-        let host_navigation = match environment("DROIDLOOM_HOST_NAVIGATION")?.as_deref() {
-            Some("1") => true,
-            Some("0") | None => false,
-            _ => {
-                eprintln!("Droidloom ignored invalid host-navigation assertion; client controls remain enabled");
-                false
-            }
-        };
         let endpoint = environment("DROIDLOOM_HOST_SOCKET")?.map_or_else(
             || runtime.join("droidloom/native-bridge.sock"), PathBuf::from);
-        Self::acquire(runtime, &display, expected, host_navigation, &endpoint)
+        Self::acquire(runtime, &display, expected, &endpoint)
     }
 
     fn acquire(
         runtime: PathBuf,
         display: &str,
         expected: Option<(u32, u64)>,
-        host_navigation: bool,
         endpoint: &Path,
     ) -> io::Result<Self> {
         if !runtime.is_absolute() || runtime.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
@@ -147,7 +137,7 @@ impl SessionLease {
         if expected.is_some_and(|identity| identity != (peer.pid, peer_start_ticks)) {
             return Err(invalid("Wayland compositor does not match the recorded session; refusing stale environment"));
         }
-        Ok(Self { _file: file, runtime, peer, peer_start_ticks, host_navigation })
+        Ok(Self { _file: file, runtime, peer, peer_start_ticks })
     }
 
     /// Check the actual Wayland connection too, closing the probe/connect race.
@@ -158,9 +148,6 @@ impl SessionLease {
         }
         Ok(())
     }
-
-    /// The explicit request; callers still gate it on the host's qualified capabilities.
-    pub(crate) fn host_navigation(&self) -> bool { self.host_navigation }
 
     /// Validated runtime root used by the presenter's endpoint setup.
     pub(crate) fn runtime_dir(&self) -> &Path { &self.runtime }
@@ -203,7 +190,7 @@ mod tests {
     }
 
     fn acquire(root: &Path) -> SessionLease {
-        SessionLease::acquire(root.to_owned(), "wayland-test", None, false,
+        SessionLease::acquire(root.to_owned(), "wayland-test", None,
             &root.join("droidloom/native-bridge.sock")).unwrap()
     }
 
@@ -212,12 +199,11 @@ mod tests {
         let root = private_root();
         let _wayland = UnixListener::bind(root.path().join("wayland-test")).unwrap();
         let first = acquire(root.path());
-        let error = SessionLease::acquire(root.path().to_owned(), "wayland-test", None, false,
+        let error = SessionLease::acquire(root.path().to_owned(), "wayland-test", None,
             &root.path().join("droidloom/native-bridge.sock")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(!root.path().join("droidloom/native-bridge.sock").exists());
         assert_eq!(first.runtime_dir(), root.path());
-        assert!(!first.host_navigation());
         drop(first);
         assert!(root.path().join("droidloom/owner.lock").exists());
         acquire(root.path());
@@ -231,7 +217,7 @@ mod tests {
         let endpoint = root.path().join("droidloom/native-bridge.sock");
         let legacy = UnixListener::bind(&endpoint).unwrap();
         assert!(live_unix_socket(&endpoint).unwrap());
-        let error = SessionLease::acquire(root.path().to_owned(), "wayland-test", None, false, &endpoint).unwrap_err();
+        let error = SessionLease::acquire(root.path().to_owned(), "wayland-test", None, &endpoint).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(endpoint.exists());
         drop(legacy);
@@ -251,7 +237,7 @@ mod tests {
         lease.verify_connection(connection.as_fd()).unwrap();
         drop(lease);
         let error = SessionLease::acquire(root.path().to_owned(), "wayland-test",
-            Some((std::process::id(), 1)), false, &root.path().join("droidloom/native-bridge.sock"));
+            Some((std::process::id(), 1)), &root.path().join("droidloom/native-bridge.sock"));
         assert!(error.is_err());
     }
 
@@ -274,11 +260,11 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let _wayland = UnixListener::bind(root.path().join("wayland-test")).unwrap();
         std::os::unix::fs::symlink(target.path(), root.path().join("droidloom")).unwrap();
-        assert!(SessionLease::acquire(root.path().to_owned(), "wayland-test", None, false,
+        assert!(SessionLease::acquire(root.path().to_owned(), "wayland-test", None,
             &root.path().join("droidloom/native-bridge.sock")).is_err());
         fs::remove_file(root.path().join("droidloom")).unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(SessionLease::acquire(root.path().to_owned(), "wayland-test", None, false,
+        assert!(SessionLease::acquire(root.path().to_owned(), "wayland-test", None,
             &root.path().join("droidloom/native-bridge.sock")).is_err());
     }
 }
