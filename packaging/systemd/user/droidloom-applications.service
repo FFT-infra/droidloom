@@ -6,6 +6,8 @@ ConditionPathExists=/etc/droidloom/cell.json
 
 [Service]
 Type=simple
+Environment=WAYLAND_DISPLAY= DISPLAY= XDG_CURRENT_DESKTOP= XDG_SESSION_ID=
+EnvironmentFile=-%t/droidloom/session.env
 ExecStart=/usr/bin/droidloom-applications
 Restart=on-failure
 RestartSec=2
