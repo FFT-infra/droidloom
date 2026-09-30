@@ -327,6 +327,11 @@ fn channel_error_code(error: &str) -> i32 {
         ERROR_NO_ENTRY
     } else if error.contains("export is not ready") {
         ERROR_TRY_AGAIN
+    } else if error.contains("display is no longer active") {
+        // A display the sink dropped, not a failure to read or write. Report it
+        // as backpressure so the task retries at the export cadence instead of
+        // being logged as an I/O failure and backing off for seconds.
+        ERROR_TRY_AGAIN
     } else {
         ERROR_IO
     }
@@ -356,6 +361,10 @@ mod tests {
         );
         assert_eq!(
             channel_error_code("Android task 7 export is not ready"),
+            ERROR_TRY_AGAIN
+        );
+        assert_eq!(
+            channel_error_code("Android task 7 display is no longer active"),
             ERROR_TRY_AGAIN
         );
         assert_eq!(
