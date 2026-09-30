@@ -8,9 +8,10 @@
 //!
 //! [`TopPullCandidate`] is the same idea for a drag out of the top edge, and
 //! nothing more than that: it classifies, it never confirms and the caller
-//! never consumes the contact. It exists so the pull can be drawn, and drawing
-//! is the whole of its effect — the shell's own top-edge gesture keeps the
-//! touch, fullscreen is not toggled from here, and a Back is never the result.
+//! never consumes the contact. It exists so the pull can be drawn, and that
+//! drawing plus the reveal its release can earn is the whole of its effect —
+//! the shell's own top-edge gesture keeps the touch, fullscreen is not toggled
+//! from here, and a Back is never the result.
 
 use droidloom_denial_protocol::TaskObjectId;
 
@@ -28,6 +29,12 @@ pub const FLING_TRAVEL: f64 = 24.0;
 pub const FLING_SPEED: f64 = 750.0;
 /// Retreat toward the start edge that aborts a committed swipe before release.
 pub const RETREAT_DISTANCE: f64 = 16.0;
+/// Downward travel a pull reveals with, at any speed.
+pub const TOP_CONFIRM_PULL: f64 = 32.0;
+/// Shorter travel that reveals only from a flick.
+pub const TOP_FLICK_PULL: f64 = 20.0;
+/// Milliseconds after the touch down within which a short pull is still a flick.
+pub const TOP_FLICK_MS: u64 = 200;
 
 /// One recognition update for a tracked contact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,16 +239,19 @@ pub enum PullUpdate {
 
 /// A single finger monitored for a downward pull out of the top edge.
 ///
-/// Nothing is decided here: the caller draws while this is pending and hides it
-/// otherwise, and the contact itself is never touched. That is deliberate — the
-/// top edge is where the shell's own gesture lives, so a client that consumed
-/// the touch or acted on it would be racing the shell for the same hand.
+/// Until the finger lifts the caller does nothing but draw: the contact itself
+/// is never touched. That is deliberate — the top edge is where the shell's own
+/// gesture lives, so a client that consumed the touch or acted on it would be
+/// racing the shell for the same hand. The one thing released here is the
+/// reveal, asked for at the release and never before it.
 #[derive(Clone, Copy, Debug)]
 pub struct TopPullCandidate {
     object: TaskObjectId,
     pointer_id: u32,
     start: (f64, f64),
     last: (f64, f64),
+    start_time_ms: u64,
+    last_time_ms: u64,
     cancelled: bool,
 }
 
@@ -255,6 +265,7 @@ impl TopPullCandidate {
         pointer_id: u32,
         position: (f64, f64),
         window_size: (u32, u32),
+        time_ms: u64,
     ) -> Option<Self> {
         if !position.0.is_finite() || !position.1.is_finite() {
             return None;
@@ -271,6 +282,8 @@ impl TopPullCandidate {
             pointer_id,
             start: position,
             last: position,
+            start_time_ms: time_ms,
+            last_time_ms: time_ms,
             cancelled: false,
         })
     }
@@ -291,12 +304,13 @@ impl TopPullCandidate {
     }
 
     /// Classify a motion sample.
-    pub fn on_motion(&mut self, position: (f64, f64)) -> PullUpdate {
+    pub fn on_motion(&mut self, position: (f64, f64), time_ms: u64) -> PullUpdate {
         if !position.0.is_finite() || !position.1.is_finite() {
             self.cancelled = true;
             return PullUpdate::Cancelled;
         }
         self.last = position;
+        self.last_time_ms = time_ms;
         if self.cancelled {
             return PullUpdate::Cancelled;
         }
@@ -313,6 +327,32 @@ impl TopPullCandidate {
             return PullUpdate::Cancelled;
         }
         PullUpdate::Pending
+    }
+
+    /// Finish the contact. `true` means the release has earned the fullscreen
+    /// pair.
+    ///
+    /// This is the only decision the pull makes, and it waits for the release
+    /// because the recognizer never confirms: the caller draws while the pull
+    /// is pending and nothing acts before the finger lifts. Travel past
+    /// [`TOP_CONFIRM_PULL`] is a deliberate pull and earns it however slowly it
+    /// was made; a shorter one earns it only as the old recognizer's quick
+    /// flick, timed from the last sample the finger produced rather than from
+    /// the release, so a flick that is held before letting go still counts.
+    pub fn on_up(&self) -> bool {
+        if self.cancelled {
+            return false;
+        }
+        let dx = self.last.0 - self.start.0;
+        let dy = self.last.1 - self.start.1;
+        // A pull that leans sideways belongs to the shell's own edge gesture
+        // however far down it went, and an upward one is nobody's pull.
+        if dy <= dx.abs() {
+            return false;
+        }
+        dy >= TOP_CONFIRM_PULL
+            || (dy >= TOP_FLICK_PULL
+                && self.last_time_ms.saturating_sub(self.start_time_ms) < TOP_FLICK_MS)
     }
 }
 
@@ -429,26 +469,26 @@ mod tests {
     }
 
     fn begin_pull() -> TopPullCandidate {
-        TopPullCandidate::begin(TASK, 3, (400.0, 12.0), WINDOW).unwrap()
+        TopPullCandidate::begin(TASK, 3, (400.0, 12.0), WINDOW, 0).unwrap()
     }
 
     #[test]
     fn a_pull_begins_in_the_top_band_only() {
-        assert!(TopPullCandidate::begin(TASK, 1, (400.0, 300.0), WINDOW).is_none());
-        assert!(TopPullCandidate::begin(TASK, 1, (400.0, TOP_MARGIN + 0.1), WINDOW).is_none());
-        assert!(TopPullCandidate::begin(TASK, 1, (400.0, -1.0), WINDOW).is_none());
-        assert!(TopPullCandidate::begin(TASK, 1, (900.0, 12.0), WINDOW).is_none());
-        assert!(TopPullCandidate::begin(TASK, 1, (400.0, 12.0), (0, 0)).is_none());
-        assert!(TopPullCandidate::begin(TASK, 1, (f64::NAN, 12.0), WINDOW).is_none());
-        assert!(TopPullCandidate::begin(TASK, 1, (400.0, TOP_MARGIN), WINDOW).is_some());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, 300.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, TOP_MARGIN + 0.1), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, -1.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (900.0, 12.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, 12.0), (0, 0), 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (f64::NAN, 12.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, TOP_MARGIN), WINDOW, 0).is_some());
     }
 
     #[test]
     fn a_downward_drag_reports_its_travel_and_never_cancels() {
         let mut pull = begin_pull();
-        assert_eq!(pull.on_motion((402.0, 40.0)), PullUpdate::Pending);
+        assert_eq!(pull.on_motion((402.0, 40.0), 40), PullUpdate::Pending);
         assert_eq!(pull.pull(), 28.0);
-        assert_eq!(pull.on_motion((405.0, 300.0)), PullUpdate::Pending);
+        assert_eq!(pull.on_motion((405.0, 300.0), 60), PullUpdate::Pending);
         assert_eq!(pull.object(), TASK);
         assert!(pull.matches(3) && !pull.matches(4));
     }
@@ -456,13 +496,13 @@ mod tests {
     #[test]
     fn sideways_and_upward_travel_abandon_the_pull() {
         let mut sideways = begin_pull();
-        assert_eq!(sideways.on_motion((440.0, 14.0)), PullUpdate::Cancelled);
+        assert_eq!(sideways.on_motion((440.0, 14.0), 40), PullUpdate::Cancelled);
         // Cancellation is permanent.
-        assert_eq!(sideways.on_motion((440.0, 90.0)), PullUpdate::Cancelled);
+        assert_eq!(sideways.on_motion((440.0, 90.0), 60), PullUpdate::Cancelled);
         let mut upward = begin_pull();
-        assert_eq!(upward.on_motion((400.0, 0.0)), PullUpdate::Cancelled);
+        assert_eq!(upward.on_motion((400.0, 0.0), 40), PullUpdate::Cancelled);
         let mut invalid = begin_pull();
-        assert_eq!(invalid.on_motion((f64::NAN, 40.0)), PullUpdate::Cancelled);
+        assert_eq!(invalid.on_motion((f64::NAN, 40.0), 0), PullUpdate::Cancelled);
     }
 
     #[test]
@@ -470,7 +510,46 @@ mod tests {
         // Under the slop the tab must not flicker away from a finger that is
         // really pulling down with a little drift.
         let mut pull = begin_pull();
-        assert_eq!(pull.on_motion((406.0, 40.0)), PullUpdate::Pending);
+        assert_eq!(pull.on_motion((406.0, 40.0), 40), PullUpdate::Pending);
         assert_eq!(pull.pull(), 28.0);
+    }
+
+    #[test]
+    fn a_long_pull_reveals_however_slowly_it_was_made() {
+        let mut pull = begin_pull();
+        assert_eq!(pull.on_motion((402.0, 60.0), 900), PullUpdate::Pending);
+        assert!(pull.on_up());
+    }
+
+    #[test]
+    fn a_short_flick_reveals_inside_the_flick_window() {
+        let mut pull = begin_pull();
+        assert_eq!(pull.on_motion((404.0, 36.0), 120), PullUpdate::Pending);
+        assert!(pull.pull() < TOP_CONFIRM_PULL);
+        assert!(pull.on_up());
+    }
+
+    #[test]
+    fn a_short_pull_released_slowly_does_not_reveal() {
+        let mut pull = begin_pull();
+        // The flick window is exclusive: down at its edge the pull is a slow
+        // one already.
+        let update = pull.on_motion((404.0, 36.0), TOP_FLICK_MS);
+        assert_eq!(update, PullUpdate::Pending);
+        assert!(!pull.on_up());
+    }
+
+    #[test]
+    fn a_pull_that_leans_sideways_never_reveals() {
+        // Down far enough to reveal, but leaning as much across as down: the
+        // side-swipe recognizer's gesture, not this one's.
+        let mut lean = begin_pull();
+        assert_eq!(lean.on_motion((433.0, 45.0), 120), PullUpdate::Pending);
+        assert!(lean.pull() >= TOP_CONFIRM_PULL);
+        assert!(!lean.on_up());
+        // Past the slop the sideways travel has already abandoned the pull.
+        let mut wide = begin_pull();
+        assert_eq!(wide.on_motion((440.0, 45.0), 120), PullUpdate::Cancelled);
+        assert!(!wide.on_up());
     }
 }

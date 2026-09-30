@@ -154,10 +154,6 @@ const MAX_BUFFER_DIMENSION: u32 = 16_384;
 /// How long a fullscreen reveal keeps the Back and Fullscreen pair up before
 /// it hides itself again.
 const FULLSCREEN_REVEAL: Duration = Duration::from_millis(3500);
-/// Downward travel a top-edge pull must reach to earn one: the old recognizer's
-/// `TOP_CONFIRM_DISPLACEMENT`. The candidate never confirms by itself — the
-/// shell's own gesture owns that band — so the release decides here.
-const FULLSCREEN_REVEAL_PULL: f64 = 32.0;
 /// Depth of the top band where the pointer alone brings the pair back.
 const FULLSCREEN_REVEAL_MARGIN: f64 = 4.0;
 /// Travel that drops a chrome button's touch press: `wl_touch.up` carries no
@@ -3932,8 +3928,13 @@ impl TouchHandler for App {
             && !pen_in_proximity
             && immersive
             && let Some((width, height)) = logical_size
-            && let Some(candidate) =
-                gesture::TopPullCandidate::begin(object, pointer_id, position, (width, height))
+            && let Some(candidate) = gesture::TopPullCandidate::begin(
+                object,
+                pointer_id,
+                position,
+                (width, height),
+                u64::from(time),
+            )
         {
             self.prepare_gesture_feedback(_qh, object);
             self.top_pull = Some(candidate);
@@ -3997,15 +3998,15 @@ impl TouchHandler for App {
         // A pull that ends simply stops being drawn, and the release falls
         // through to the application below. It consumes nothing and confirms
         // nothing — the shell's own top-edge gesture owns that band — but a
-        // pull that travelled far enough brings the fullscreen pair back, which
-        // is where the old implementation made the same decision.
+        // release the pull has earned brings the fullscreen pair back, which is
+        // where the old implementation made the same decision.
         let finished_pull = self
             .top_pull
             .take_if(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)));
         if let Some(candidate) = finished_pull {
             let object = candidate.object();
             self.hide_gesture_feedback(object);
-            if candidate.pull() >= FULLSCREEN_REVEAL_PULL {
+            if candidate.on_up() {
                 self.reveal_fullscreen_controls(object, FULLSCREEN_REVEAL);
             }
         }
@@ -4122,7 +4123,7 @@ impl TouchHandler for App {
             .top_pull
             .as_mut()
             .filter(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
-            .map(|candidate| candidate.on_motion(position))
+            .map(|candidate| candidate.on_motion(position, u64::from(_time)))
         {
             Some(gesture::PullUpdate::Pending) => self.feed_top_pull(),
             Some(gesture::PullUpdate::Cancelled) => {

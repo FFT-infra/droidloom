@@ -60,25 +60,42 @@ const RING_ALPHA: f32 = 0.28;
 /// through the settings portal exactly as `sctk-adwaita`'s `config.rs` reads it,
 /// so the two agree about where the window's own buttons landed.
 ///
-/// Read once and kept. The chrome is rebuilt whenever the frame's visibility
-/// flips, and a portal read that missed its reply timeout the second time would
-/// put the same window's buttons somewhere else than the first read did.
+/// A layout that was read is kept: the chrome is rebuilt whenever the frame's
+/// visibility flips, and a portal read that missed its reply timeout the second
+/// time would put the same window's buttons somewhere else than the first read
+/// did. A read that failed is not: that says nothing about the desktop, and
+/// keeping it would turn one missed reply into every window's answer, so it is
+/// retried at the next chrome.
 fn native_leading_buttons(capabilities: WindowManagerCapabilities) -> u32 {
-    static LAYOUT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    match LAYOUT.get_or_init(read_button_layout).as_deref() {
-        Some(layout) => match layout.split(':').take(2).collect::<Vec<_>>().as_slice() {
-            [left, _right] => native_cluster(left, capabilities),
-            // No separator means no layout at all; the library then falls back
-            // to its own default, which is the trailing side.
-            _ => 0,
+    static LAYOUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static MISSED: std::sync::Once = std::sync::Once::new();
+    let layout = match LAYOUT.get() {
+        Some(layout) => layout.as_str(),
+        None => match read_button_layout() {
+            Some(layout) => LAYOUT.get_or_init(|| layout),
+            // An unreadable layout is not a layout with nothing on the leading
+            // side: `sctk-adwaita` reads the same key while it builds the frame,
+            // so the two can miss each other without either being wrong. Zero
+            // would put our squares under the window's own Close, Minimize and
+            // Maximize, which is the one outcome the count exists to prevent, so
+            // an unknown layout reserves the widest cluster the library can
+            // draw. Said once, because the retry above means a session that
+            // never becomes readable would otherwise say it per window.
+            None => {
+                MISSED.call_once(|| {
+                    eprintln!(
+                        "Droidloom could not read the window button layout; reserving the widest leading cluster"
+                    );
+                });
+                return MAX_LEADING_BUTTONS;
+            }
         },
-        // An unreadable layout is not a layout with nothing on the leading
-        // side: `sctk-adwaita` reads the same key while it builds the frame, so
-        // the two can miss each other without either being wrong. Zero would
-        // put our squares under the window's own Close, Minimize and Maximize,
-        // which is the one outcome the count exists to prevent, so an unknown
-        // layout reserves the widest cluster the library can draw.
-        None => MAX_LEADING_BUTTONS,
+    };
+    match layout.split(':').take(2).collect::<Vec<_>>().as_slice() {
+        [left, _right] => native_cluster(left, capabilities),
+        // No separator means no layout at all; the library then falls back to
+        // its own default, which is the trailing side.
+        _ => 0,
     }
 }
 
