@@ -781,12 +781,17 @@ fn validate_request(request: &LaunchRequest) -> Result<(), LaunchError> {
             return Err(LaunchError::InvalidRequest("resolution dimensions must be in 1..=16384".into()));
         }
     }
-    if request.package.is_empty()
-        || !request
+    // A package id that looks like an application id needs a dot, but the
+    // framework's own single-segment package does not have one, and the task
+    // behind "the download finished, tap to install" is owned by `android`.
+    // Requiring the dot hid exactly the task that prompt exists to show.
+    let named = !request.package.is_empty()
+        && request
             .package
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        || !request.package.contains('.')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !named
+        || !(request.package == "android" || request.package.contains('.'))
         || request.user > i32::MAX as u32
     {
         return Err(LaunchError::InvalidRequest(
