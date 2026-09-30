@@ -25,8 +25,66 @@ const BUTTON: u32 = 35;
 const NATIVE_SIZE: u32 = 24;
 const NATIVE_MARGIN: u32 = 5;
 const NATIVE_SPACING: u32 = 13;
-/// Space between the Fullscreen button and the window's own button cluster.
+/// Space between our buttons and the window's own button cluster.
 const NATIVE_GAP: u32 = 8;
+
+/// How wide `sctk-adwaita` will draw its own buttons on one side.
+///
+/// The frame library does not publish this, so it is recomputed: the layout
+/// comes from the same settings-portal key the library reads, and the metrics
+/// from the same private constants. Getting this wrong is not cosmetic — the
+/// sheng desktop puts the window's Close, Minimize and Maximize on the *left*,
+/// and a chrome that assumed the usual right-hand cluster sat on top of them.
+fn native_cluster(config: &str, capabilities: WindowManagerCapabilities) -> u32 {
+    let count = config
+        .split(',')
+        .take(3)
+        .filter(|token| match token.trim() {
+            "close" => true,
+            "maximize" => capabilities.contains(WindowManagerCapabilities::MAXIMIZE),
+            "minimize" => capabilities.contains(WindowManagerCapabilities::MINIMIZE),
+            _ => false,
+        })
+        .count() as u32;
+    match count {
+        0 => 0,
+        n => {
+            NATIVE_MARGIN
+                + NATIVE_SIZE * n
+                + NATIVE_SPACING * n.saturating_sub(1)
+        }
+    }
+}
+
+/// The leading side of `org.gnome.desktop.wm.preferences button-layout`, read
+/// through the settings portal exactly as `sctk-adwaita`'s `config.rs` reads it,
+/// so the two agree about where the window's own buttons landed.
+fn native_leading_buttons(capabilities: WindowManagerCapabilities) -> u32 {
+    let Ok(output) = std::process::Command::new("dbus-send")
+        .args([
+            "--reply-timeout=100",
+            "--print-reply=literal",
+            "--dest=org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings.Read",
+            "string:org.gnome.desktop.wm.preferences",
+            "string:button-layout",
+        ])
+        .output()
+    else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(word) = text.rsplit(' ').next() else {
+        return 0;
+    };
+    match word.split(':').take(2).collect::<Vec<_>>().as_slice() {
+        [left, _right] => native_cluster(left, capabilities),
+        // No separator means no layout at all; the library then falls back to
+        // its own default, which is the trailing side.
+        _ => 0,
+    }
+}
 /// Inset of the floating Fullscreen button when there is no titlebar.
 const FLOATING_MARGIN: i32 = 6;
 
@@ -179,8 +237,9 @@ fn image(glyph: Glyph, palette: &Palette, visual: Visual, scale: u32) -> Vec<u8>
                 bytes.extend_from_slice(&[0, 0, 0, 0]);
                 continue;
             };
-            // ARGB8888 over the compositor: opaque, so alpha is fixed.
-            bytes.extend_from_slice(&[255, color[0], color[1], color[2]]);
+            // `wl_shm`'s ARGB8888 is ARGB32 in native byte order, so on every
+            // little-endian machine the bytes land blue first.
+            bytes.extend_from_slice(&[color[2], color[1], color[0], 255]);
         }
     }
     bytes
@@ -374,7 +433,9 @@ impl Button {
 pub(super) struct Chrome {
     back: Button,
     fullscreen: Button,
-    native_buttons: u32,
+    /// Width of the window's own button cluster on the leading side, which our
+    /// buttons must clear.
+    native_leading: u32,
 }
 
 impl Chrome {
@@ -384,6 +445,7 @@ impl Chrome {
         parent: &wl_surface::WlSurface,
         qh: &QueueHandle<App>,
         scale_120: u32,
+        capabilities: WindowManagerCapabilities,
     ) -> Result<Self, PresenterError> {
         // `sctk-adwaita` renders its parts at the ceiling of the fractional
         // scale, so the titlebar band is a whole number of buffer pixels.
@@ -393,7 +455,7 @@ impl Chrome {
         Ok(Self {
             back: Button::new(Action::Back, globals, compositor, parent, qh, scale)?,
             fullscreen: Button::new(Action::Fullscreen, globals, compositor, parent, qh, scale)?,
-            native_buttons: 1,
+            native_leading: native_leading_buttons(capabilities),
         })
     }
 
@@ -403,21 +465,25 @@ impl Chrome {
         self.back.set_fullscreen(fullscreen);
         self.fullscreen.set_fullscreen(fullscreen);
         if header < 0 {
-            // Decorated: Back at the leading edge, Fullscreen just inside the
-            // window's own Close / Maximize / Minimize cluster.
+            // Decorated: both buttons follow the window's own cluster, so they
+            // never land on top of it whichever side the desktop put it on.
             let inset = i32::try_from(header.unsigned_abs().saturating_sub(BUTTON) / 2).unwrap_or(0);
+            let first = self.native_leading.saturating_add(NATIVE_GAP);
+            let end = first.saturating_add(2 * BUTTON + NATIVE_GAP);
+            if end > content_width {
+                // No room beside the window's buttons; leave the titlebar alone
+                // rather than draw over the title.
+                self.back.set_visible(false);
+                self.fullscreen.set_visible(false);
+                return;
+            }
             self.back.set_visible(true);
-            self.back.set_position(0, header + inset);
-            let cluster = NATIVE_MARGIN
-                + NATIVE_SIZE
-                    .saturating_mul(self.native_buttons)
-                    .saturating_add(
-                        NATIVE_SPACING.saturating_mul(self.native_buttons.saturating_sub(1)),
-                    );
-            let right = content_width.saturating_sub(cluster + NATIVE_GAP + BUTTON);
+            self.back
+                .set_position(i32::try_from(first).unwrap_or(0), header + inset);
             self.fullscreen.set_visible(true);
+            let second = first.saturating_add(BUTTON + NATIVE_GAP);
             self.fullscreen
-                .set_position(i32::try_from(right).unwrap_or(0), header + inset);
+                .set_position(i32::try_from(second).unwrap_or(0), header + inset);
             return;
         }
         // Undecorated. The side swipe already covers Back, so only the way out
@@ -428,14 +494,6 @@ impl Chrome {
             .saturating_sub(FLOATING_MARGIN);
         self.fullscreen.set_visible(true);
         self.fullscreen.set_position(right, FLOATING_MARGIN);
-    }
-
-    /// Record how many buttons the frame draws on the right, so the Fullscreen
-    /// button stays clear of them.
-    pub(super) fn set_capabilities(&mut self, capabilities: WindowManagerCapabilities) {
-        self.native_buttons = 1
-            + u32::from(capabilities.contains(WindowManagerCapabilities::MAXIMIZE))
-            + u32::from(capabilities.contains(WindowManagerCapabilities::MINIMIZE));
     }
 
     pub(super) fn set_active(&mut self, active: bool) {
@@ -549,15 +607,32 @@ mod tests {
     }
 
     #[test]
-    fn the_fullscreen_button_clears_the_window_button_cluster() {
-        // Three native buttons (Close, Maximize, Minimize) occupy the rightmost
-        // 103 logical pixels, so a 1280-wide titlebar places Fullscreen at 1134.
-        let cluster = NATIVE_MARGIN
-            + NATIVE_SIZE * 3
-            + NATIVE_SPACING * 2;
-        assert_eq!(cluster, 103);
-        let right = 1280_u32.saturating_sub(cluster + NATIVE_GAP + BUTTON);
-        assert_eq!(right, 1134);
-        assert!(right + BUTTON + cluster + NATIVE_GAP <= 1280);
+    fn the_window_cluster_is_measured_on_whichever_side_the_desktop_chose() {
+        let all = WindowManagerCapabilities::MAXIMIZE | WindowManagerCapabilities::MINIMIZE;
+        // sheng's layout: the window's own three buttons lead, and the trailing
+        // side is the app menu, which sctk-adwaita cannot draw.
+        assert_eq!(native_cluster("close,minimize,maximize", all), 103);
+        // The usual GNOME default puts nothing on the leading side.
+        assert_eq!(native_cluster("appmenu", all), 0);
+        assert_eq!(native_cluster("", all), 0);
+        // Unknown tokens are skipped, and capabilities filter the rest.
+        assert_eq!(native_cluster("close,appmenu", all), 29);
+        assert_eq!(
+            native_cluster("close,minimize,maximize", WindowManagerCapabilities::empty()),
+            29
+        );
+    }
+
+    #[test]
+    fn our_buttons_never_overlap_the_window_cluster() {
+        let all = WindowManagerCapabilities::MAXIMIZE | WindowManagerCapabilities::MINIMIZE;
+        for layout in ["close,minimize,maximize", "close", "", "appmenu"] {
+            let leading = native_cluster(layout, all);
+            let first = leading + NATIVE_GAP;
+            let end = first + 2 * BUTTON + NATIVE_GAP;
+            // The window's own buttons end here; ours start after them.
+            assert!(first >= leading, "{layout}: {first} < {leading}");
+            assert!(end <= 1280, "{layout} does not fit a 1280 titlebar");
+        }
     }
 }

@@ -912,9 +912,9 @@ impl App {
             &parent,
             qh,
             scale_120,
+            capabilities,
         ) {
             Ok(mut chrome) => {
-                chrome.set_capabilities(capabilities);
                 chrome.set_active(active);
                 if let Some(task) = self.tasks.get_mut(&object) {
                     task.chrome = Some(chrome);
@@ -981,6 +981,7 @@ impl App {
                 // The frame reports the titlebar band as a negative offset; a
                 // zero offset means it draws none, and the chrome floats.
                 if let Some(chrome) = task.chrome.as_mut() {
+                    chrome.set_active(task.chrome_active);
                     chrome.place(width, y, fullscreen);
                 }
                 window.xdg_surface().set_window_geometry(

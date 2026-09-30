@@ -51,6 +51,9 @@ const ARROW_OUT: f64 = 0.157;
 const FAILSAFE: f64 = 0.5;
 /// How close a spring must be to its target to stop redrawing.
 const EPSILON: f64 = 0.02;
+/// Motion samples between indicator traces. Enough to read a swipe's geometry
+/// out of the journal without one line per event.
+const TRACE_EVERY: u32 = 8;
 
 /// The slate AOSP's current back panel uses, day and night.
 const NIGHT_PILL: [f32; 3] = [0x40 as f32, 0x46 as f32, 0x59 as f32];
@@ -99,6 +102,7 @@ pub(super) struct EdgePanel {
     /// Where the finger is, so the pill can follow it vertically.
     finger_y: f64,
     lean: f64,
+    samples: u32,
 }
 
 impl EdgePanel {
@@ -173,6 +177,7 @@ impl EdgePanel {
             elapsed: 0.0,
             finger_y: 0.0,
             lean: 0.0,
+            samples: 0,
         })
     }
 
@@ -213,6 +218,17 @@ impl EdgePanel {
         self.arrow_visible = arrow_step(self.width.value() / PILL_WIDTH, self.arrow_visible);
         self.place(content);
         self.redraw();
+        self.samples = self.samples.wrapping_add(1);
+        if self.samples % TRACE_EVERY == 0 {
+            eprintln!(
+                "Droidloom trace: stage=swipe event=track edge={} inward={inward:.1} translation={:.1} width={:.1} alpha={:.2} finger_y={y:.1} origin={:?}",
+                if self.from_left { "left" } else { "right" },
+                self.translation.value(),
+                self.width.value(),
+                self.alpha.value(),
+                self.origin,
+            );
+        }
     }
 
     /// The finger left. `confirmed` picks between the pop and the collapse.
@@ -226,6 +242,12 @@ impl EdgePanel {
             Phase::Cancelled
         };
         self.elapsed = 0.0;
+        eprintln!(
+            "Droidloom trace: stage=swipe event=release confirmed={confirmed} width={:.1} alpha={:.2} origin={:?}",
+            self.width.value(),
+            self.alpha.value(),
+            self.origin,
+        );
         self.translation.animate_to(self.translation.value(), 0.0);
         if confirmed {
             // AOSP's committed state: keep the width and throw the whole panel
@@ -273,6 +295,10 @@ impl EdgePanel {
             self.width.track(0.0);
             self.surface.attach(None, 0, 0);
             self.surface.commit();
+            eprintln!(
+                "Droidloom trace: stage=swipe event=done elapsed={:.3} settled={settled}",
+                self.elapsed
+            );
             return false;
         }
         true
@@ -441,15 +467,16 @@ fn distance_to_segment(x: f64, y: f64, (ax, ay): (f64, f64), (bx, by): (f64, f64
     (x - ax - t * dx).hypot(y - ay - t * dy)
 }
 
-/// ARGB8888 over `wl_shm` is premultiplied.
+/// ARGB8888 over `wl_shm` is premultiplied, and ARGB32 is a native-endian
+/// word: on a little-endian machine the bytes land blue, green, red, alpha.
 fn premultiply(rgb: [f32; 3], alpha: f64) -> [u8; 4] {
     let alpha = alpha.clamp(0.0, 1.0);
     let channel = |value: f32| (f64::from(value) * alpha).round().clamp(0.0, 255.0) as u8;
     [
-        (alpha * 255.0).round() as u8,
-        channel(rgb[0]),
-        channel(rgb[1]),
         channel(rgb[2]),
+        channel(rgb[1]),
+        channel(rgb[0]),
+        (alpha * 255.0).round() as u8,
     ]
 }
 
@@ -502,12 +529,19 @@ mod tests {
     fn premultiplied_alpha_never_exceeds_its_own_alpha() {
         for alpha in [0.0, 0.25, 0.5, 1.0] {
             let quad = premultiply([255.0, 128.0, 0.0], alpha);
-            for channel in quad[1..].iter() {
-                assert!(*channel <= quad[0]);
+            for channel in quad[..3].iter() {
+                assert!(*channel <= quad[3]);
             }
         }
         assert_eq!(premultiply([255.0; 3], 0.0), [0, 0, 0, 0]);
         assert_eq!(premultiply([255.0; 3], 1.0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn an_opaque_colour_keeps_its_channels_in_native_byte_order() {
+        // 0x404659 is the AOSP night pill: blue 0x59 first, alpha last.
+        let quad = premultiply([0x40 as f32, 0x46 as f32, 0x59 as f32], 1.0);
+        assert_eq!(quad, [0x59, 0x46, 0x40, 255]);
     }
 
     #[test]
