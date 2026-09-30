@@ -290,14 +290,14 @@ impl SurfaceBridge {
 
     fn select_channel(&self, task: u64) -> Result<(DisplayId, u32, u32), String> {
         let display = if task == 0 {
-            return Ok((
-                self.bootstrap_display,
-                self.bootstrap_width,
-                self.bootstrap_height,
-            ));
+            self.bootstrap_display
         } else {
             self.coordinator.direct_task_display(TaskId(task))?
         };
+        // Report the display's current configure, not the size captured at
+        // startup: an output rotation or mode change reconfigures the built-in
+        // display, and SurfaceFlinger refuses to present when the broker
+        // advertises the size its display does not have.
         let session = self
             .session
             .lock()
@@ -307,7 +307,7 @@ impl SurfaceBridge {
             .composer_for_display(display)
             .map_err(|error| error.to_string())?
             .latest_configure()
-            .ok_or_else(|| format!("direct task {task} has no Denial configure"))?;
+            .ok_or_else(|| format!("task {task} has no Denial configure"))?;
         Ok((display, configure.width, configure.height))
     }
 }
