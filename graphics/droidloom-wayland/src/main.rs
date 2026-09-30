@@ -151,6 +151,18 @@ const BTN_BACK: u32 = 0x116;
 const CONTINUOUS_SCROLL_PIXELS_PER_STEP: f64 = 10.0;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
+/// How long a fullscreen reveal keeps the Back and Fullscreen pair up before
+/// it hides itself again.
+const FULLSCREEN_REVEAL: Duration = Duration::from_millis(3500);
+/// Downward travel a top-edge pull must reach to earn one: the old recognizer's
+/// `TOP_CONFIRM_DISPLACEMENT`. The candidate never confirms by itself — the
+/// shell's own gesture owns that band — so the release decides here.
+const FULLSCREEN_REVEAL_PULL: f64 = 32.0;
+/// Depth of the top band where the pointer alone brings the pair back.
+const FULLSCREEN_REVEAL_MARGIN: f64 = 4.0;
+/// Travel that drops a chrome button's touch press: `wl_touch.up` carries no
+/// coordinates, so a press the finger has left is only visible on motion.
+const BUTTON_DRAG_SLOP: f64 = 12.0;
 
 fn app_display_title(package: &str) -> String {
     let component = package.rsplit('.').next().filter(|part| !part.is_empty()).unwrap_or(package);
@@ -296,6 +308,9 @@ struct TaskWindow {
     frame_shown: bool,
     /// The gesture indicator, built the first time this window sees one.
     gesture_feedback: Option<gesture_feedback::Feedback>,
+    /// When the Back and Fullscreen pair hides itself again, while a window
+    /// with no titlebar is showing it. `None` means it is down.
+    fullscreen_controls_revealed_until: Option<Instant>,
     decorations_hidden: bool,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
@@ -367,6 +382,13 @@ struct DecorationTouch {
     seat: wl_seat::WlSeat,
     down_serial: u32,
     acted_on_down: bool,
+    /// Where the contact landed, so the motion samples can tell whether it is
+    /// still on what it hit.
+    down_position: (f64, f64),
+    /// A chrome button's press, dropped once the finger travelled past
+    /// [`BUTTON_DRAG_SLOP`]. The frame does its own hit testing on every
+    /// sample, so this only concerns the buttons.
+    button_cancelled: bool,
 }
 
 impl Contact {
@@ -523,6 +545,9 @@ struct App {
     focused: Option<TaskObjectId>,
     /// Task under the mouse for native mouse routing, and its pressed buttons.
     mouse_focus: Option<TaskObjectId>,
+    /// The chrome button the pointer went down on. A release runs a button
+    /// only if it is the one that was pressed.
+    chrome_press: Option<(TaskObjectId, chrome::Action)>,
     mouse_buttons: BTreeSet<u32>,
     consumed_mouse_buttons: BTreeSet<u32>,
     pointer_contact: Option<Contact>,
@@ -779,6 +804,7 @@ impl App {
                 chrome_active: false,
                 frame_shown: false,
                 gesture_feedback: None,
+                fullscreen_controls_revealed_until: None,
                 decorations_hidden: false,
                 viewport,
                 fractional_scale,
@@ -963,7 +989,12 @@ impl App {
         {
             let task = self.tasks.get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
-            let fullscreen = task.fullscreen;
+            // The pair floats whenever the frame draws no titlebar for it, and
+            // stays hidden until a reveal asks for it: a frame that reports no
+            // offset says nothing, since it reports one for a hidden frame and
+            // a hidden titlebar too.
+            let chromeless = task.fullscreen || task.decorations_hidden;
+            let revealed = task.fullscreen_controls_revealed_until.is_some();
             if let Some(window) = task.window.as_ref() {
                 let (x, y, outer_width, outer_height, frame_needs_parent_commit) =
                     match task.window_frame.as_mut() {
@@ -977,11 +1008,14 @@ impl App {
                         }
                         _ => (0, 0, width, height, false),
                     };
-                // The frame reports the titlebar band as a negative offset; a
-                // zero offset means it draws none, and the chrome floats.
+                // The frame reports the titlebar band as a negative offset, and
+                // the chrome places itself against it. Whether the pair floats
+                // comes from the window instead: the frame reports a zero
+                // offset for a hidden frame and a hidden titlebar just as it
+                // does for fullscreen.
                 if let Some(chrome) = task.chrome.as_mut() {
                     chrome.set_active(task.chrome_active);
-                    chrome.place(width, y, fullscreen);
+                    chrome.place(width, y, chromeless, revealed);
                 }
                 window.xdg_surface().set_window_geometry(
                     x, y,
@@ -2112,10 +2146,12 @@ impl App {
             }
             PointerEventKind::Motion { .. } => match self.mouse_focus {
                 Some(focus) => {
-                    if event.position.1 <= 4.0 {
-                        let is_fs = self.tasks.get(&focus).is_some_and(|t| t.fullscreen || t.decorations_hidden);
-                        if is_fs {
-                        }
+                    // The top few pixels of a window with no titlebar are the
+                    // pointer's way back to the pair, the same as the pull.
+                    if event.position.1 <= FULLSCREEN_REVEAL_MARGIN
+                        && self.tasks.get(&focus).is_some_and(|task| task.fullscreen || task.decorations_hidden)
+                    {
+                        self.reveal_fullscreen_controls(focus, FULLSCREEN_REVEAL);
                     }
                     self.send_mouse(focus, MouseAction::Motion, event.position, 0, (0.0, 0.0))
                 }
@@ -2378,6 +2414,7 @@ impl App {
     }
 
     fn decoration_pointer_left(&mut self) {
+        self.chrome_press = None;
         for task in self.tasks.values_mut() {
             if let Some(frame) = task.window_frame.as_mut() {
                 frame.click_point_left();
@@ -2394,6 +2431,44 @@ impl App {
             chrome::Action::Back => self.send_back_key(object),
             chrome::Action::Fullscreen => self.toggle_fullscreen(object),
         }
+    }
+
+    /// Bring the Back and Fullscreen pair back for `duration`. In a window with
+    /// no titlebar this is the only way back to them.
+    fn reveal_fullscreen_controls(&mut self, object: TaskObjectId, duration: Duration) {
+        let Some(task) = self.tasks.get_mut(&object) else { return };
+        task.fullscreen_controls_revealed_until = Some(Instant::now() + duration);
+        if let Some(chrome) = task.chrome.as_mut() {
+            chrome.set_controls_revealed(true);
+        }
+    }
+
+    /// Put the pair away once its reveal has run out. Runs once per loop pass.
+    fn pump_fullscreen_controls_timeouts(&mut self) {
+        let now = Instant::now();
+        for task in self.tasks.values_mut() {
+            let Some(until) = task.fullscreen_controls_revealed_until else { continue };
+            if now < until {
+                continue;
+            }
+            task.fullscreen_controls_revealed_until = None;
+            if let Some(chrome) = task.chrome.as_mut() {
+                chrome.set_controls_revealed(false);
+            }
+        }
+    }
+
+    /// The nearest reveal deadline, so the loop wakes on it with no further
+    /// input and the pair goes away by itself.
+    fn next_controls_timeout_millis(&self) -> Option<i32> {
+        let now = Instant::now();
+        self.tasks
+            .values()
+            .filter_map(|task| task.fullscreen_controls_revealed_until)
+            .map(|until| {
+                i32::try_from(until.saturating_duration_since(now).as_millis()).unwrap_or(i32::MAX)
+            })
+            .min()
     }
 
     /// Give the window an indicator, reusing the last one it had.
@@ -3642,8 +3717,20 @@ impl PointerHandler for App {
                                     {
                                         chrome.press(action);
                                     }
+                                    self.chrome_press = Some((object, action));
                                 } else {
-                                    self.chrome_action(object, action);
+                                    // Only the button that was pressed runs:
+                                    // a release that has drifted onto the other
+                                    // one is not a click.
+                                    let was_pressed = self.chrome_press.take() == Some((object, action));
+                                    if let Some(chrome) =
+                                        self.tasks.get_mut(&object).and_then(|t| t.chrome.as_mut())
+                                    {
+                                        chrome.release(action);
+                                    }
+                                    if was_pressed {
+                                        self.chrome_action(object, action);
+                                    }
                                 }
                             }
                             DecorationHit::Frame(object) => {
@@ -3788,6 +3875,7 @@ impl TouchHandler for App {
                 self.decoration_touch = Some(DecorationTouch {
                     id, touch: _touch.clone(), hit, surface,
                     seat: seat.clone(), down_serial: serial, acted_on_down,
+                    down_position: position, button_cancelled: false,
                 });
                 if let Some(action) = action {
                     self.frame_action(&seat, object, serial, action);
@@ -3884,7 +3972,9 @@ impl TouchHandler for App {
                     {
                         chrome.reset();
                     }
-                    self.chrome_action(object, action);
+                    if !touch.button_cancelled {
+                        self.chrome_action(object, action);
+                    }
                 }
                 DecorationHit::Frame(object) => {
                     let action = self.tasks.get_mut(&object)
@@ -3904,14 +3994,20 @@ impl TouchHandler for App {
             return;
         }
 
-        // A pull that ends simply stops being drawn. It never confirmed
-        // anything, so the release falls through to the application below.
+        // A pull that ends simply stops being drawn, and the release falls
+        // through to the application below. It consumes nothing and confirms
+        // nothing — the shell's own top-edge gesture owns that band — but a
+        // pull that travelled far enough brings the fullscreen pair back, which
+        // is where the old implementation made the same decision.
         let finished_pull = self
             .top_pull
-            .take_if(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
-            .map(|candidate| candidate.object());
-        if let Some(object) = finished_pull {
+            .take_if(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)));
+        if let Some(candidate) = finished_pull {
+            let object = candidate.object();
             self.hide_gesture_feedback(object);
+            if candidate.pull() >= FULLSCREEN_REVEAL_PULL {
+                self.reveal_fullscreen_controls(object, FULLSCREEN_REVEAL);
+            }
         }
 
         if let Some(mut candidate) = self
@@ -3956,10 +4052,32 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
-        if let Some(surface) = self.decoration_touch.as_ref()
+        if let Some((surface, hit, down, cancelled)) = self.decoration_touch.as_ref()
             .filter(|touch| touch.id == id && touch.touch == *_touch)
-            .map(|touch| touch.surface.clone())
+            .map(|touch| {
+                (touch.surface.clone(), touch.hit, touch.down_position, touch.button_cancelled)
+            })
         {
+            // `wl_touch.up` carries no coordinates, so a release that lands on
+            // the button cannot tell that the finger left it. Past the slop the
+            // press is dropped and the button goes back to rest, as the old
+            // touch path did at 12px; the release then runs nothing.
+            if let DecorationHit::Button(object, _) = hit {
+                let (dx, dy) = (position.0 - down.0, position.1 - down.1);
+                if cancelled || dx * dx + dy * dy > BUTTON_DRAG_SLOP * BUTTON_DRAG_SLOP {
+                    if !cancelled {
+                        if let Some(touch) = self.decoration_touch.as_mut() {
+                            touch.button_cancelled = true;
+                        }
+                        if let Some(chrome) =
+                            self.tasks.get_mut(&object).and_then(|task| task.chrome.as_mut())
+                        {
+                            chrome.reset();
+                        }
+                    }
+                    return;
+                }
+            }
             self.decoration_pointer_task(&surface, position.0, position.1);
             return;
         }
@@ -4611,6 +4729,7 @@ fn run() -> Result<(), PresenterError> {
         touch: None,
         focused: None,
         mouse_focus: None,
+        chrome_press: None,
         mouse_buttons: BTreeSet::new(),
         consumed_mouse_buttons: BTreeSet::new(),
         pointer_contact: None,
@@ -4645,6 +4764,7 @@ fn run_presenter_loop(
     loop {
         event_queue.dispatch_pending(&mut app)?;
         app.unmap_requested_tasks()?;
+        app.pump_fullscreen_controls_timeouts();
         if let Some(error) = app.fatal.take() {
             return Err(PresenterError::Wayland(error));
         }
@@ -4741,7 +4861,7 @@ fn poll_sources(
             }
         }
     }
-    let timeout = poll_timeout_millis(release_fallback);
+    let timeout = poll_timeout_millis(release_fallback, app.next_controls_timeout_millis());
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
@@ -4788,13 +4908,21 @@ fn poll_sources(
     Ok(())
 }
 
-fn poll_timeout_millis(release_fallback: bool) -> i32 {
-    if release_fallback {
+/// How long the loop may wait before it has to look at a clock again: the
+/// sooner of the release fallback and the next fullscreen reveal deadline. A
+/// `-1` on either side means that side has no clock running.
+fn poll_timeout_millis(release_fallback: bool, controls_timeout: Option<i32>) -> i32 {
+    let fallback = if release_fallback {
         i32::try_from(RELEASE_POLL_FALLBACK.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
     } else {
         // Nothing left on this side runs on a clock: frames arrive because the
         // compositor or Android asked for them.
         -1
+    };
+    match controls_timeout {
+        Some(controls) if fallback < 0 => controls,
+        Some(controls) => fallback.min(controls),
+        None => fallback,
     }
 }
 
@@ -5110,8 +5238,18 @@ mod tests {
 
     #[test]
     fn idle_wait_has_no_clipboard_deadline_but_release_fallback_remains_bounded() {
-        assert_eq!(poll_timeout_millis(false), -1);
-        assert_eq!(poll_timeout_millis(true), 4);
+        assert_eq!(poll_timeout_millis(false, None), -1);
+        assert_eq!(poll_timeout_millis(true, None), 4);
+    }
+
+    #[test]
+    fn a_pending_reveal_is_the_sooner_of_the_two_clocks() {
+        // An idle presenter still wakes on the reveal deadline, and a running
+        // release fallback stays the sooner one.
+        assert_eq!(poll_timeout_millis(false, Some(3500)), 3500);
+        assert_eq!(poll_timeout_millis(false, Some(0)), 0);
+        assert_eq!(poll_timeout_millis(true, Some(3500)), 4);
+        assert_eq!(poll_timeout_millis(true, Some(1)), 1);
     }
 
     #[test]

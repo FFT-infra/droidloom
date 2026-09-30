@@ -226,8 +226,8 @@ fn top_stage(pull: f64) -> Option<usize> {
     Some(stage.min(TOP_STAGES - 1))
 }
 
-/// Where the teardrop's stage sits, so that its middle follows the finger down
-/// the edge and stays inside the window.
+/// Where the teardrop's stage sits: centred on where the finger landed, and
+/// kept inside the window.
 fn side_origin(from_left: bool, along: f64, window: (u32, u32)) -> (i32, i32) {
     let x = if from_left {
         0
@@ -361,8 +361,8 @@ impl Feedback {
         })
     }
 
-    /// Follow a Back swipe: the teardrop's depth tracks the finger, and its
-    /// middle follows it down the edge. `inward` and `along` are logical.
+    /// Follow a Back swipe: the teardrop's depth tracks the finger, and it
+    /// stays on the spot the finger landed on. `inward` and `along` are logical.
     pub(super) fn show_side(&mut self, from_left: bool, inward: f64, along: f64, window: (u32, u32)) {
         let Some(stage) = side_stage(inward) else {
             self.hide();

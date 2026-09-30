@@ -7,8 +7,9 @@
 //! image is not a control.
 //!
 //! The two buttons are also the only way out of fullscreen on a device with no
-//! keyboard, so once the titlebar is gone they stay visible as a centred pair
-//! floating over the content at the top.
+//! keyboard, so a window whose titlebar is gone reveals them as a centred pair
+//! floating over the content at the top, and hides them again when the reveal
+//! runs out.
 
 use super::*;
 use std::io::Write;
@@ -34,6 +35,14 @@ const BUTTON_PADDING: i32 = 2;
 /// Distance from the top of the titlebar band down to our square. It puts the
 /// disc's centre on the window buttons' centre line, `margin + size / 2`.
 const TITLEBAR_INSET: i32 = 3;
+/// The band `sctk-adwaita` reserves for its titlebar: its `HEADER_SIZE`, which
+/// is the whole of what the frame ever reports through `location().1`. Ours are
+/// placed against at least this depth, so a frame that reports less cannot push
+/// the discs out of the band and into the content.
+const TITLEBAR_BAND: i32 = 35;
+/// The most buttons `sctk-adwaita` draws on one side: its own parse takes three
+/// (`buttons.rs`, `parse_button_layout_side`).
+const MAX_LEADING_BUTTONS: u32 = 3;
 /// Half the gap between the floating pair, measured from the window's centre
 /// line, and how far the pair sits below the top edge. The pair is centred
 /// rather than tucked into a corner: fullscreen content reaches every edge.
@@ -50,8 +59,39 @@ const RING_ALPHA: f32 = 0.28;
 /// The leading side of `org.gnome.desktop.wm.preferences button-layout`, read
 /// through the settings portal exactly as `sctk-adwaita`'s `config.rs` reads it,
 /// so the two agree about where the window's own buttons landed.
+///
+/// Read once and kept. The chrome is rebuilt whenever the frame's visibility
+/// flips, and a portal read that missed its reply timeout the second time would
+/// put the same window's buttons somewhere else than the first read did.
 fn native_leading_buttons(capabilities: WindowManagerCapabilities) -> u32 {
-    let Ok(output) = std::process::Command::new("dbus-send")
+    static LAYOUT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    match LAYOUT.get_or_init(read_button_layout).as_deref() {
+        Some(layout) => match layout.split(':').take(2).collect::<Vec<_>>().as_slice() {
+            [left, _right] => native_cluster(left, capabilities),
+            // No separator means no layout at all; the library then falls back
+            // to its own default, which is the trailing side.
+            _ => 0,
+        },
+        // An unreadable layout is not a layout with nothing on the leading
+        // side: `sctk-adwaita` reads the same key while it builds the frame, so
+        // the two can miss each other without either being wrong. Zero would
+        // put our squares under the window's own Close, Minimize and Maximize,
+        // which is the one outcome the count exists to prevent, so an unknown
+        // layout reserves the widest cluster the library can draw.
+        None => MAX_LEADING_BUTTONS,
+    }
+}
+
+/// The desktop's button layout, or `None` when nothing could be read.
+fn read_button_layout() -> Option<String> {
+    portal_button_layout().or_else(gsettings_button_layout)
+}
+
+/// The settings portal's answer. `dbus-send` reports a portal that missed its
+/// 100ms reply as a non-zero exit with empty stdout, so the exit status is what
+/// decides, and an empty answer never parses as a layout.
+fn portal_button_layout() -> Option<String> {
+    let output = std::process::Command::new("dbus-send")
         .args([
             "--reply-timeout=100",
             "--print-reply=literal",
@@ -62,19 +102,31 @@ fn native_leading_buttons(capabilities: WindowManagerCapabilities) -> u32 {
             "string:button-layout",
         ])
         .output()
-    else {
-        return 0;
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let Some(word) = text.rsplit(' ').next() else {
-        return 0;
-    };
-    match word.split(':').take(2).collect::<Vec<_>>().as_slice() {
-        [left, _right] => native_cluster(left, capabilities),
-        // No separator means no layout at all; the library then falls back to
-        // its own default, which is the trailing side.
-        _ => 0,
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    // The reply is the portal's variant; the layout is its last word.
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.rsplit(' ')
+        .next()
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+}
+
+/// `gsettings` reads dconf directly, so it still answers when the portal does
+/// not. It prints the value in single quotes.
+fn gsettings_button_layout() -> Option<String> {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.wm.preferences", "button-layout"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let layout = text.trim().trim_matches('\'');
+    (!layout.is_empty()).then(|| layout.to_owned())
 }
 
 /// How many buttons `sctk-adwaita` draws on one side of its titlebar.
@@ -112,6 +164,14 @@ fn native_cluster_end(count: u32) -> i32 {
 /// border, and our square's padding carries it back to the disc.
 fn leading_x(count: u32) -> i32 {
     NATIVE_MARGIN as i32 + NATIVE_BORDER + (count * PERIOD) as i32 - BUTTON_PADDING
+}
+
+/// Our square's y in a titlebar the frame reports `header` as the negative
+/// offset of. The band is at least the depth the library reserves, so a frame
+/// reporting none — a hidden frame, or a hidden titlebar — keeps the squares
+/// off the content's top edge instead of parking them inside it.
+fn titlebar_y(header: i32) -> i32 {
+    header.min(-TITLEBAR_BAND) + TITLEBAR_INSET
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,8 +421,9 @@ struct Button {
     visual: Visual,
     active: bool,
     visible: bool,
-    fullscreen: bool,
-    floating: bool,
+    /// The window has no titlebar of its own, so the button floats over the
+    /// content and the Fullscreen action carries the state it switches to.
+    chromeless: bool,
     position: (i32, i32),
 }
 
@@ -446,8 +507,7 @@ impl Button {
             visual: Visual::Normal,
             active: true,
             visible: false,
-            fullscreen: false,
-            floating: false,
+            chromeless: false,
             position: (0, 0),
         })
     }
@@ -456,10 +516,10 @@ impl Button {
         let glyph = match self.action {
             Action::Back => Glyph::Back,
             // The Fullscreen button shows the state it switches to.
-            Action::Fullscreen if self.fullscreen => Glyph::Leave,
+            Action::Fullscreen if self.chromeless => Glyph::Leave,
             Action::Fullscreen => Glyph::Enter,
         };
-        let backing = if self.floating {
+        let backing = if self.chromeless {
             Backing::Floating
         } else {
             Backing::Header
@@ -486,10 +546,9 @@ impl Button {
         }
     }
 
-    fn set_state(&mut self, fullscreen: bool, floating: bool) {
-        if self.fullscreen != fullscreen || self.floating != floating {
-            self.fullscreen = fullscreen;
-            self.floating = floating;
+    fn set_state(&mut self, chromeless: bool) {
+        if self.chromeless != chromeless {
+            self.chromeless = chromeless;
             self.redraw();
         }
     }
@@ -539,6 +598,11 @@ pub(super) struct Chrome {
     /// Buffer pixels per logical pixel, and the logical square each button
     /// claims. Traced because a mismatch here is invisible in the source.
     scale: u32,
+    /// The window has no titlebar of its own, so the pair is held back until a
+    /// reveal asks for it.
+    chromeless: bool,
+    /// Whether the last placement left room for the pair inside the window.
+    fits: bool,
 }
 
 impl Chrome {
@@ -560,16 +624,30 @@ impl Chrome {
             fullscreen: Button::new(Action::Fullscreen, globals, compositor, parent, qh, scale)?,
             leading_buttons: native_leading_buttons(capabilities),
             scale,
+            chromeless: false,
+            fits: false,
         })
     }
 
     /// Place both buttons. `header` is `DecorationsFrame::location().1`, the
     /// negative offset of the titlebar, or zero when the frame draws none.
-    pub(super) fn place(&mut self, content_width: u32, header: i32, fullscreen: bool) {
-        let floating = header >= 0;
-        self.back.set_state(fullscreen, floating);
-        self.fullscreen.set_state(fullscreen, floating);
-        let (back_x, fullscreen_x, y) = if floating {
+    ///
+    /// `chromeless` is the window's own state — fullscreen, or decorations it
+    /// is not drawing — which is what decides the floating pair and its paint;
+    /// the frame reports a zero offset for a hidden frame, a `FULLSCREEN` state
+    /// and a hidden titlebar alike, and so says nothing about the window.
+    /// `revealed` is a live reveal, the only thing that shows the pair in a
+    /// window with no titlebar to hold it.
+    pub(super) fn place(
+        &mut self,
+        content_width: u32,
+        header: i32,
+        chromeless: bool,
+        revealed: bool,
+    ) {
+        self.back.set_state(chromeless);
+        self.fullscreen.set_state(chromeless);
+        let (back_x, fullscreen_x, y) = if chromeless {
             // No titlebar: the pair floats centred at the top, clear of the
             // side-swipe edge and of whatever the application draws in a
             // corner.
@@ -582,14 +660,16 @@ impl Chrome {
         } else {
             // Decorated: our two buttons take the slots after the window's own
             // cluster, so they never land on top of it whichever side the
-            // desktop put it on.
+            // desktop put it on. The band is at least the depth the frame
+            // reserves, so a shallower one cannot push the discs into the
+            // content below it.
             let first = leading_x(self.leading_buttons);
-            (first, first + PERIOD as i32, header + TITLEBAR_INSET)
+            (first, first + PERIOD as i32, titlebar_y(header))
         };
         let end = fullscreen_x.saturating_add(BUTTON as i32);
         let content_width = i32::try_from(content_width).unwrap_or(i32::MAX);
         eprintln!(
-            "Droidloom trace: stage=chrome event=place header={header} floating={floating} fullscreen={fullscreen} y={y} disc_centre_y={} back_x={back_x} full_x={fullscreen_x} leading_buttons={} cluster_end={} scale={} buffer_px={} content_width={content_width}",
+            "Droidloom trace: stage=chrome event=place header={header} chromeless={chromeless} revealed={revealed} y={y} disc_centre_y={} back_x={back_x} full_x={fullscreen_x} leading_buttons={} cluster_end={} scale={} buffer_px={} content_width={content_width}",
             y + (BUTTON / 2) as i32,
             self.leading_buttons,
             native_cluster_end(self.leading_buttons),
@@ -599,14 +679,31 @@ impl Chrome {
         // A pair that runs off the window is worse than none: on a device with
         // no keyboard the frame's own Close and the keyboard's `F11` remain.
         let fits = back_x >= 0 && end <= content_width;
-        for (button, x) in [(&mut self.back, back_x), (&mut self.fullscreen, fullscreen_x)] {
-            if fits {
-                // Position before showing: a desynchronized subsurface moves on
-                // its next commit, and the attach that shows it is that commit.
-                button.set_position(x, y);
-            }
-            button.set_visible(fits);
+        if fits {
+            // Position before showing: a desynchronized subsurface moves on
+            // its next commit, and the attach that shows it is that commit.
+            self.back.set_position(back_x, y);
+            self.fullscreen.set_position(fullscreen_x, y);
         }
+        self.chromeless = chromeless;
+        self.fits = fits;
+        self.apply_visibility(revealed);
+    }
+
+    /// Show or hide the pair. A window with a titlebar holds them always; one
+    /// without holds them only while a reveal is running, because on a device
+    /// with no keyboard they are the only way back out of fullscreen.
+    fn apply_visibility(&mut self, revealed: bool) {
+        let visible = self.fits && (!self.chromeless || revealed);
+        self.back.set_visible(visible);
+        self.fullscreen.set_visible(visible);
+    }
+
+    /// Show or hide the pair for a reveal that started or ran out between
+    /// configures. The placement does not change: a reveal only happens where
+    /// the pair floats.
+    pub(super) fn set_controls_revealed(&mut self, revealed: bool) {
+        self.apply_visibility(revealed);
     }
 
     pub(super) fn set_active(&mut self, active: bool) {
@@ -637,6 +734,12 @@ impl Chrome {
         }
     }
 
+    /// A release leaves the button under the pointer, so it goes back to hover
+    /// rather than staying painted pressed.
+    pub(super) fn release(&mut self, action: Action) {
+        self.button_mut(action).set_visual(Visual::Hover);
+    }
+
     pub(super) fn press(&mut self, action: Action) {
         self.button_mut(action).set_visual(Visual::Pressed);
     }
@@ -652,10 +755,6 @@ impl Chrome {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `sctk-adwaita`'s `HEADER_SIZE`, which is what the frame reports back
-    /// through `DecorationsFrame::location().1`.
-    const TITLEBAR_BAND: i32 = 35;
 
     #[test]
     fn every_image_is_the_size_the_surface_claims() {
@@ -794,6 +893,19 @@ mod tests {
             header + NATIVE_MARGIN as i32 + (NATIVE_SIZE / 2) as i32
         );
         assert!(TITLEBAR_INSET + BUTTON as i32 <= TITLEBAR_BAND);
+    }
+
+    #[test]
+    fn a_frame_that_reports_no_band_leaves_our_squares_off_the_content() {
+        // The library reserves 35px and reports the same offset back, so the
+        // ordinary case is unchanged.
+        assert_eq!(titlebar_y(-TITLEBAR_BAND), -32);
+        // A hidden frame, a FULLSCREEN state and a hidden titlebar all report
+        // zero, and the squares must not follow it into the content, where they
+        // would sit over the application's own pixels.
+        assert_eq!(titlebar_y(0), titlebar_y(-TITLEBAR_BAND));
+        assert_eq!(titlebar_y(-12), titlebar_y(-TITLEBAR_BAND));
+        assert!(titlebar_y(0) + BUTTON as i32 <= 0);
     }
 
     #[test]

@@ -46,7 +46,9 @@ pub struct SwipeFeedback {
     pub from_left: bool,
     /// How far the contact has travelled away from its edge.
     pub inward: f64,
-    /// The contact's position along the edge, in content coordinates.
+    /// Where the contact landed along the edge, in content coordinates. The
+    /// stage is drawn around this rather than around the finger, so the
+    /// indicator stays put and only its depth follows the hand.
     pub along: f64,
     /// Signed inward speed in logical pixels per second.
     pub speed: f64,
@@ -118,7 +120,7 @@ impl SwipeBackCandidate {
         SwipeFeedback {
             from_left: self.from_left,
             inward: if self.from_left { dx } else { -dx },
-            along: self.last.1,
+            along: self.start.1,
             speed: self.inward_speed,
             confirmed: self.confirmed,
         }
