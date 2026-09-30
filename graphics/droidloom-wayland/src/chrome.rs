@@ -436,6 +436,9 @@ pub(super) struct Chrome {
     /// Width of the window's own button cluster on the leading side, which our
     /// buttons must clear.
     native_leading: u32,
+    /// Buffer pixels per logical pixel, and the logical square each button
+    /// claims. Traced because a mismatch here is invisible in the source.
+    scale: u32,
 }
 
 impl Chrome {
@@ -456,6 +459,7 @@ impl Chrome {
             back: Button::new(Action::Back, globals, compositor, parent, qh, scale)?,
             fullscreen: Button::new(Action::Fullscreen, globals, compositor, parent, qh, scale)?,
             native_leading: native_leading_buttons(capabilities),
+            scale,
         })
     }
 
@@ -469,6 +473,14 @@ impl Chrome {
             // never land on top of it whichever side the desktop put it on.
             let inset = i32::try_from(header.unsigned_abs().saturating_sub(BUTTON) / 2).unwrap_or(0);
             let first = self.native_leading.saturating_add(NATIVE_GAP);
+            eprintln!(
+                "Droidloom trace: stage=chrome event=place header={header} inset={inset} native_leading={} scale={} buffer_px={} content_width={content_width} back_x={first} full_x={} y={}",
+                self.native_leading,
+                self.scale,
+                BUTTON * self.scale,
+                first.saturating_add(BUTTON + NATIVE_GAP),
+                header + inset,
+            );
             let end = first.saturating_add(2 * BUTTON + NATIVE_GAP);
             if end > content_width {
                 // No room beside the window's buttons; leave the titlebar alone
