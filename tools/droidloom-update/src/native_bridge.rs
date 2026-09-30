@@ -269,6 +269,41 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
         .arg(repo.join("android/manifest/native-bridge-lock.json")))
 }
 
+/// Publish the runtime APEX debuggerd binaries at their well-known system paths.
+///
+/// The image ships `crash_dump64` only inside `com.android.runtime.apex`. When
+/// the linker cannot read `/proc/self/exe` it falls back to its own argv[0] path
+/// and aborts with "unable to stat either /proc/self/exe or crash_dump64" when
+/// that path does not exist. A crashing crash_dump then makes the kernel invoke
+/// the dumper for the dumper, and each of those aborts the same way: one
+/// application crash becomes a process flood that starves the whole cell.
+///
+/// The symlink is created dangling when the tree has no APEX copy; it publishes
+/// the path the resolver checks, and the target appears with the APEX mount.
+fn link_apex_debuggerd(tree: &Path) -> Result<()> {
+    let runtime = tree.join("apex/com.android.runtime");
+    if !runtime.is_dir() {
+        return fail("system tree has no runtime APEX");
+    }
+    let bin = tree.join("system/bin");
+    for name in ["crash_dump64", "crash_dump32"] {
+        if !runtime.join("bin").join(name).exists() {
+            continue;
+        }
+        let link = bin.join(name);
+        if fs::symlink_metadata(&link).is_ok() {
+            continue;
+        }
+        let target = Path::new("/apex/com.android.runtime/bin").join(name);
+        std::os::unix::fs::symlink(&target, &link)?;
+        run(Command::new("chown").args(["-h", "0:0"]).arg(&link))?;
+        run(Command::new("setfattr")
+            .args(["-h", "-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+            .arg(&link))?;
+    }
+    Ok(())
+}
+
 fn guest_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -446,6 +481,7 @@ pub fn derive_image(
         "host_abi": if native_arm64 { "arm64-v8a" } else { "x86_64" },
         "native_executables": native_arm64, "files": inventory,
     });
+    link_apex_debuggerd(&tree)?;
     let manifest_path = tree.join("system/etc/droidloom-native-bridge.json");
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     run(Command::new("chown").arg("0:0").arg(&manifest_path))?;
@@ -502,6 +538,59 @@ mod tests {
     use super::*;
 
     const LOCK: &str = include_str!("../../../android/manifest/native-bridge-lock.json");
+
+    /// `chown` and `setfattr` need privileges the unit test does not have; the
+    /// path publication is what this covers, so stub both on PATH.
+    fn tool_stubs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["chown", "setfattr"] {
+            let tool = dir.path().join(name);
+            fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        dir
+    }
+
+    /// Journal corruption is not observed by this worktree's mutation sites, and
+    /// the stub directory keeps the helper's privileged commands inert.
+    #[test]
+    fn debuggerd_paths_are_published_when_the_apex_owns_them() {
+        // SAFETY: this test is the only one that mutates the environment, and
+        // the value is restored before it returns.
+        let stubs = tool_stubs();
+        let original = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{original}", stubs.path().display());
+        unsafe { std::env::set_var("PATH", &path) };
+
+        let tree = tempfile::tempdir().unwrap();
+        let runtime = tree.path().join("apex/com.android.runtime/bin");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(tree.path().join("system/bin")).unwrap();
+        fs::write(runtime.join("crash_dump64"), b"elf").unwrap();
+        link_apex_debuggerd(tree.path()).unwrap();
+
+        let link = tree.path().join("system/bin/crash_dump64");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("/apex/com.android.runtime/bin/crash_dump64")
+        );
+        // Only binaries the APEX actually carries are published, and an
+        // existing entry stays untouched.
+        assert!(fs::symlink_metadata(tree.path().join("system/bin/crash_dump32")).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, b"existing").unwrap();
+        link_apex_debuggerd(tree.path()).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"existing");
+
+        // A tree without the runtime APEX is rejected rather than silently skipped.
+        let bare = tempfile::tempdir().unwrap();
+        fs::create_dir_all(bare.path().join("system/bin")).unwrap();
+        assert!(link_apex_debuggerd(bare.path()).is_err());
+
+        // SAFETY: restoring the value this test replaced.
+        unsafe { std::env::set_var("PATH", original) };
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         output(
