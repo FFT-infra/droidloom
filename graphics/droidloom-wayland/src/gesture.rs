@@ -32,6 +32,19 @@ pub enum SwipeUpdate {
     Cancelled,
 }
 
+/// A live view of the swipe, for drawing feedback while it is still undecided.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SwipeFeedback {
+    pub from_left: bool,
+    /// How far the contact has travelled away from its edge.
+    pub inward: f64,
+    /// The contact's position along the edge, in content coordinates.
+    pub along: f64,
+    /// Signed inward speed in logical pixels per second.
+    pub speed: f64,
+    pub confirmed: bool,
+}
+
 /// A single finger monitored for an inward edge swipe over one task.
 #[derive(Clone, Copy, Debug)]
 pub struct SwipeBackCandidate {
@@ -43,6 +56,7 @@ pub struct SwipeBackCandidate {
     last: (f64, f64),
     last_time_ms: u64,
     peak_speed: f64,
+    inward_speed: f64,
     confirmed: bool,
     cancelled: bool,
     stealing: bool,
@@ -83,10 +97,28 @@ impl SwipeBackCandidate {
             last: position,
             last_time_ms: time_ms,
             peak_speed: 0.0,
+            inward_speed: 0.0,
             confirmed: false,
             cancelled: false,
             stealing: false,
         })
+    }
+
+    /// Which screen edge the contact entered from.
+    pub fn from_left(&self) -> bool {
+        self.from_left
+    }
+
+    /// The swipe's current geometry, for drawing feedback.
+    pub fn feedback(&self) -> SwipeFeedback {
+        let dx = self.last.0 - self.start.0;
+        SwipeFeedback {
+            from_left: self.from_left,
+            inward: if self.from_left { dx } else { -dx },
+            along: self.last.1,
+            speed: self.inward_speed,
+            confirmed: self.confirmed,
+        }
     }
 
     /// Whether this tracker belongs to the given Wayland touch id.
@@ -123,6 +155,12 @@ impl SwipeBackCandidate {
             if speed > self.peak_speed {
                 self.peak_speed = speed;
             }
+            // Signed inward velocity, so the indicator can lean with the hand.
+            self.inward_speed = if self.from_left {
+                sample_dx * 1000.0 / dt as f64
+            } else {
+                -sample_dx * 1000.0 / dt as f64
+            };
         }
         self.last = position;
         self.last_time_ms = time_ms;

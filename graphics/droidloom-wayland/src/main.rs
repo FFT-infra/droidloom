@@ -11,6 +11,9 @@ mod presentation_audit;
 mod text_input;
 mod gesture;
 mod session;
+mod spring;
+mod chrome;
+mod edge_panel;
 
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -69,7 +72,7 @@ use smithay_client_toolkit::shell::xdg::window::{
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::reexports::csd_frame::{
-    DecorationsFrame, FrameAction, FrameClick, ResizeEdge, WindowState,
+    DecorationsFrame, FrameAction, FrameClick, ResizeEdge, WindowManagerCapabilities, WindowState,
 };
 use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use sctk_adwaita::{AdwaitaFrame, FrameConfig};
@@ -284,6 +287,17 @@ struct TaskWindow {
     android_task: Option<u64>,
     window: Option<Window>,
     window_frame: Option<AdwaitaFrame<App>>,
+    /// Back and Fullscreen, stacked over the frame's titlebar.
+    chrome: Option<chrome::Chrome>,
+    /// The compositor's latest decoration capabilities and focus state, kept so
+    /// a chrome rebuilt after a fullscreen exit matches the titlebar under it.
+    chrome_capabilities: WindowManagerCapabilities,
+    chrome_active: bool,
+    /// Whether the frame drew a titlebar at the last configure. Showing a
+    /// frame rebuilds its subsurfaces, so the chrome is rebuilt to stay above.
+    frame_shown: bool,
+    /// The side-swipe indicator, built the first time this window sees one.
+    edge_panel: Option<edge_panel::EdgePanel>,
     decorations_hidden: bool,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
@@ -330,10 +344,27 @@ struct Contact {
     position_fixed: (i32, i32),
 }
 
+/// What a contact that landed on a window's decoration actually hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecorationHit {
+    /// The frame's own titlebar: the frame library owns the gesture.
+    Frame(TaskObjectId),
+    /// One of the chrome buttons drawn over the titlebar.
+    Button(TaskObjectId, chrome::Action),
+}
+
+impl DecorationHit {
+    fn object(self) -> TaskObjectId {
+        match self {
+            Self::Frame(object) | Self::Button(object, _) => object,
+        }
+    }
+}
+
 struct DecorationTouch {
     id: i32,
     touch: wl_touch::WlTouch,
-    object: TaskObjectId,
+    hit: DecorationHit,
     surface: wl_surface::WlSurface,
     seat: wl_seat::WlSeat,
     down_serial: u32,
@@ -374,7 +405,7 @@ struct TabletToolState {
     dirty_axes: bool,
     pending_actions: Vec<(TabletAction, u32)>,
     down_serial: u32,
-    decoration_down: Option<TaskObjectId>,
+    decoration_down: Option<DecorationHit>,
 }
 
 impl TabletToolState {
@@ -500,6 +531,9 @@ struct App {
     touch_contacts: HashMap<(wayland_client::backend::ObjectId, i32), Contact>,
     swipe_back: Option<gesture::SwipeBackCandidate>,
     decoration_touch: Option<DecorationTouch>,
+    /// The window whose edge indicator is still animating, and its frame clock.
+    overlay: Option<TaskObjectId>,
+    overlay_clock: Instant,
     next_buffer_id: u64,
     next_input_serial: u64,
     socket_path: PathBuf,
@@ -742,6 +776,11 @@ impl App {
                 android_task: None,
                 window,
                 window_frame: None,
+                chrome: None,
+                chrome_capabilities: WindowManagerCapabilities::empty(),
+                chrome_active: false,
+                frame_shown: false,
+                edge_panel: None,
                 decorations_hidden: false,
                 viewport,
                 fractional_scale,
@@ -833,13 +872,56 @@ impl App {
         frame.set_hidden(false);
         frame.update_state(configure.state);
         frame.update_wm_capabilities(configure.capabilities);
-
+        // The frame rebuilds its subsurfaces on every show, so the chrome is
+        // created later, in `configure_task`, over the finished titlebar.
+        task.chrome_capabilities = configure.capabilities;
+        task.chrome_active = configure.state.contains(WindowState::ACTIVATED);
         let (width, height) = frame.subtract_borders(
             requested.0.unwrap_or(NonZeroU32::MIN),
             requested.1.unwrap_or(NonZeroU32::MIN),
         );
 
         Ok((requested.0.and(width), requested.1.and(height)))
+    }
+
+    /// Build the titlebar buttons for a task that is showing its frame.
+    ///
+    /// This runs after the frame has been shown, because showing a frame
+    /// rebuilds its subsurfaces; creating the chrome first would leave the
+    /// titlebar stacked over its own buttons.
+    fn ensure_chrome(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
+        let Some((parent, scale_120, capabilities, active)) =
+            self.tasks.get(&object).and_then(|task| {
+                if task.headless() || task.chrome.is_some() {
+                    return None;
+                }
+                let window = task.window.as_ref()?;
+                Some((
+                    window.wl_surface().clone(),
+                    task.preferred_scale_120,
+                    task.chrome_capabilities,
+                    task.chrome_active,
+                ))
+            })
+        else {
+            return;
+        };
+        match chrome::Chrome::new(
+            &self.layer_globals,
+            self.compositor.as_ref(),
+            &parent,
+            qh,
+            scale_120,
+        ) {
+            Ok(mut chrome) => {
+                chrome.set_capabilities(capabilities);
+                chrome.set_active(active);
+                if let Some(task) = self.tasks.get_mut(&object) {
+                    task.chrome = Some(chrome);
+                }
+            }
+            Err(error) => eprintln!("Droidloom could not build the window buttons: {error}"),
+        }
     }
 
     fn configure_task(
@@ -849,6 +931,20 @@ impl App {
         width: u32,
         height: u32,
     ) -> Result<(), PresenterError> {
+        // Showing a frame again rebuilds its subsurfaces, which would stack
+        // over the old buttons, so a visibility change retires the chrome.
+        let shown = self
+            .tasks
+            .get(&object)
+            .and_then(|task| task.window_frame.as_ref())
+            .is_some_and(|frame| !frame.is_hidden());
+        if let Some(task) = self.tasks.get_mut(&object)
+            && task.frame_shown != shown
+        {
+            task.frame_shown = shown;
+            task.chrome = None;
+        }
+        self.ensure_chrome(qh, object);
         let width = width.max(1);
         let height = height.max(1);
         let (scale_120, buffer_width, buffer_height) = {
@@ -868,6 +964,7 @@ impl App {
         {
             let task = self.tasks.get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
+            let fullscreen = task.fullscreen;
             if let Some(window) = task.window.as_ref() {
                 let (x, y, outer_width, outer_height, frame_needs_parent_commit) =
                     match task.window_frame.as_mut() {
@@ -881,6 +978,11 @@ impl App {
                         }
                         _ => (0, 0, width, height, false),
                     };
+                // The frame reports the titlebar band as a negative offset; a
+                // zero offset means it draws none, and the chrome floats.
+                if let Some(chrome) = task.chrome.as_mut() {
+                    chrome.place(width, y, fullscreen);
+                }
                 window.xdg_surface().set_window_geometry(
                     x, y,
                     i32::try_from(outer_width).map_err(|_| PresenterError::Configuration("window width exceeds Wayland"))?,
@@ -1465,7 +1567,7 @@ impl App {
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
         for tool in &mut self.tablet_tools {
-            if tool.decoration_down == Some(object) {
+            if tool.decoration_down.is_some_and(|hit| hit.object() == object) {
                 tool.decoration_down = None;
             }
         }
@@ -1507,7 +1609,7 @@ impl App {
             sync_surface.destroy();
         }
         for tool in &mut self.tablet_tools {
-            if tool.decoration_down == Some(object) {
+            if tool.decoration_down.is_some_and(|hit| hit.object() == object) {
                 tool.decoration_down = None;
             }
             if let Some(surf) = &tool.surface {
@@ -2107,35 +2209,63 @@ impl App {
         let elapsed = self.start_time.elapsed();
         match action {
             TabletAction::Down => {
-                let Some((object, _)) =
+                let Some((hit, _)) =
                     self.decoration_pointer_task(&surface, position.0, position.1)
                 else {
                     return false;
                 };
-                self.tablet_tool_mut(tool_id).decoration_down = Some(object);
-                let frame_action = self
-                    .tasks
-                    .get_mut(&object)
-                    .and_then(|task| task.window_frame.as_mut())
-                    .and_then(|frame| frame.on_click(elapsed, FrameClick::Normal, true));
-                if let (Some(frame_action), Some(seat)) = (frame_action, seat) {
-                    self.frame_action(&seat, object, serial, frame_action);
+                self.tablet_tool_mut(tool_id).decoration_down = Some(hit);
+                match hit {
+                    DecorationHit::Button(object, action) => {
+                        if let Some(chrome) = self
+                            .tasks
+                            .get_mut(&object)
+                            .and_then(|task| task.chrome.as_mut())
+                        {
+                            chrome.press(action);
+                        }
+                    }
+                    DecorationHit::Frame(object) => {
+                        let frame_action = self
+                            .tasks
+                            .get_mut(&object)
+                            .and_then(|task| task.window_frame.as_mut())
+                            .and_then(|frame| frame.on_click(elapsed, FrameClick::Normal, true));
+                        if let (Some(frame_action), Some(seat)) = (frame_action, seat) {
+                            self.frame_action(&seat, object, serial, frame_action);
+                        }
+                    }
                 }
             }
             TabletAction::Up => {
-                let Some(object) = self.tablet_tool_mut(tool_id).decoration_down.take() else {
+                let Some(hit) = self.tablet_tool_mut(tool_id).decoration_down.take() else {
                     return true;
                 };
-                let frame_action = self
-                    .tasks
-                    .get_mut(&object)
-                    .and_then(|task| task.window_frame.as_mut())
-                    .and_then(|frame| frame.on_click(elapsed, FrameClick::Normal, false));
-                // Resize is started by the press; the release only finishes it.
-                if let (Some(frame_action), Some(seat)) = (frame_action, seat)
-                    && !matches!(frame_action, FrameAction::Resize(_))
-                {
-                    self.frame_action(&seat, object, serial, frame_action);
+                match hit {
+                    DecorationHit::Button(object, action) => {
+                        if let Some(chrome) = self
+                            .tasks
+                            .get_mut(&object)
+                            .and_then(|task| task.chrome.as_mut())
+                        {
+                            chrome.reset();
+                        }
+                        self.chrome_action(object, action);
+                    }
+                    DecorationHit::Frame(object) => {
+                        let frame_action = self
+                            .tasks
+                            .get_mut(&object)
+                            .and_then(|task| task.window_frame.as_mut())
+                            .and_then(|frame| frame.on_click(elapsed, FrameClick::Normal, false));
+                        // Resize is started by the press; the release only
+                        // finishes it.
+                        if let (Some(frame_action), Some(seat)) = (frame_action, seat)
+                            && !matches!(frame_action, FrameAction::Resize(_))
+                        {
+                            self.frame_action(&seat, object, serial, frame_action);
+                        }
+                    }
                 }
             }
             TabletAction::ProximityOut | TabletAction::Cancel => {
@@ -2213,10 +2343,21 @@ impl App {
         surface: &wl_surface::WlSurface,
         x: f64,
         y: f64,
-    ) -> Option<(TaskObjectId, CursorIcon)> {
+    ) -> Option<(DecorationHit, CursorIcon)> {
         let elapsed = self.start_time.elapsed();
         self.tasks.iter_mut().find_map(|(object, task)| {
-            if task.decorations_hidden || task.fullscreen {
+            if task.decorations_hidden {
+                return None;
+            }
+            // The chrome subsurfaces sit above the frame's titlebar, so they
+            // are tested first: a button must win over the header underneath it.
+            if let Some(chrome) = task.chrome.as_mut()
+                && let Some(action) = chrome.action_at(&surface.id())
+            {
+                chrome.hover(action);
+                return Some((DecorationHit::Button(*object, action), CursorIcon::Pointer));
+            }
+            if task.fullscreen {
                 return None;
             }
             let frame = task.window_frame.as_mut()?;
@@ -2226,7 +2367,7 @@ impl App {
                     window.wl_surface().commit();
                 }
             }
-            Some((*object, cursor))
+            Some((DecorationHit::Frame(*object), cursor))
         })
     }
 
@@ -2235,6 +2376,145 @@ impl App {
             if let Some(frame) = task.window_frame.as_mut() {
                 frame.click_point_left();
             }
+            if let Some(chrome) = task.chrome.as_mut() {
+                chrome.reset();
+            }
+        }
+    }
+
+    /// Run one chrome button.
+    fn chrome_action(&mut self, object: TaskObjectId, action: chrome::Action) {
+        match action {
+            chrome::Action::Back => self.send_back_key(object),
+            chrome::Action::Fullscreen => self.toggle_fullscreen(object),
+        }
+    }
+
+    /// Give the window an edge indicator, reusing the last one when it has
+    /// finished animating and still points the right way.
+    fn prepare_edge_panel(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        object: TaskObjectId,
+        from_left: bool,
+    ) {
+        let Some(parent) = self
+            .tasks
+            .get(&object)
+            .and_then(|task| task.window.as_ref())
+            .map(|window| window.wl_surface().clone())
+        else {
+            return;
+        };
+        let scale_120 = self
+            .tasks
+            .get(&object)
+            .map_or(FRACTIONAL_SCALE_DENOMINATOR, |task| task.preferred_scale_120);
+        let ready = self
+            .tasks
+            .get(&object)
+            .and_then(|task| task.edge_panel.as_ref())
+            .is_some_and(|panel| panel.from_left() == from_left && !panel.needs_frames());
+        if !ready {
+            match edge_panel::EdgePanel::new(
+                &self.layer_globals,
+                self.compositor.as_ref(),
+                &parent,
+                qh,
+                scale_120,
+                from_left,
+            ) {
+                Ok(panel) => {
+                    if let Some(task) = self.tasks.get_mut(&object) {
+                        task.edge_panel = Some(panel);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Droidloom could not build the edge indicator: {error}");
+                    return;
+                }
+            }
+        }
+        self.overlay = Some(object);
+        self.overlay_clock = Instant::now();
+    }
+
+    /// Let the indicator follow the finger. The candidate names the window, so
+    /// this stays right even after a finished panel dropped out of `overlay`.
+    fn feed_edge_panel(&mut self) {
+        let Some(candidate) = self.swipe_back.as_ref() else {
+            return;
+        };
+        let feedback = candidate.feedback();
+        let object = candidate.object();
+        let Some(content) = self.tasks.get(&object).and_then(|task| task.logical_size) else {
+            return;
+        };
+        if let Some(panel) = self
+            .tasks
+            .get_mut(&object)
+            .and_then(|task| task.edge_panel.as_mut())
+        {
+            panel.track(content, feedback.inward, feedback.along, feedback.speed);
+            self.overlay = Some(object);
+            self.overlay_clock = Instant::now();
+        }
+    }
+
+    /// Play the indicator's exit. `confirmed` is whether Back was sent.
+    fn release_edge_panel(&mut self, confirmed: bool) {
+        let Some(object) = self.overlay else { return };
+        if let Some(panel) = self
+            .tasks
+            .get_mut(&object)
+            .and_then(|task| task.edge_panel.as_mut())
+        {
+            panel.release(confirmed);
+        }
+        // The springs start here; the frame before this one does not exist.
+        self.overlay_clock = Instant::now();
+    }
+
+    /// Whether the edge indicator wants a frame of its own. Tracking needs
+    /// none: the finger supplies the geometry.
+    fn overlays_animating(&self) -> bool {
+        self.overlay
+            .and_then(|object| self.tasks.get(&object))
+            .and_then(|task| task.edge_panel.as_ref())
+            .is_some_and(|panel| panel.needs_frames() && !panel.tracking())
+    }
+
+    /// Advance the running indicator animation.
+    fn advance_overlays(&mut self) {
+        let Some(object) = self.overlay else { return };
+        // A tracking indicator always has a live contact. If the stream went
+        // away underneath it, collapse rather than leave it on screen.
+        if self.swipe_back.is_none()
+            && self
+                .tasks
+                .get(&object)
+                .and_then(|task| task.edge_panel.as_ref())
+                .is_some_and(edge_panel::EdgePanel::tracking)
+            && let Some(panel) = self
+                .tasks
+                .get_mut(&object)
+                .and_then(|task| task.edge_panel.as_mut())
+        {
+            panel.release(false);
+        }
+        let now = Instant::now();
+        let seconds = now.duration_since(self.overlay_clock).as_secs_f64();
+        self.overlay_clock = now;
+        let finished = match self
+            .tasks
+            .get_mut(&object)
+            .and_then(|task| task.edge_panel.as_mut())
+        {
+            Some(panel) => !panel.advance(seconds),
+            None => true,
+        };
+        if finished {
+            self.overlay = None;
         }
     }
 
@@ -3364,7 +3644,7 @@ impl PointerHandler for App {
             if matches!(event.kind, PointerEventKind::Leave { .. }) {
                 self.cursor_icon = None;
             }
-            if let Some((object, _)) = decoration_object {
+            if let Some((hit, _)) = decoration_object {
                 match event.kind {
                     PointerEventKind::Press { button, serial, time }
                     | PointerEventKind::Release { button, serial, time } => {
@@ -3374,24 +3654,40 @@ impl PointerHandler for App {
                             _ => continue,
                         };
                         let pressed = matches!(event.kind, PointerEventKind::Press { .. });
-                        let action = self
-                            .tasks
-                            .get_mut(&object)
-                            .and_then(|task| task.window_frame.as_mut())
-                            .and_then(|frame| {
-                                frame.on_click(
-                                    Duration::from_millis(time as u64),
-                                    click,
-                                    pressed,
-                                )
-                            });
-                        // AdwaitaFrame returns Resize for both press and release.
-                        // xdg_toplevel.resize needs only the initiating press serial.
-                        if let Some(action) = action
-                            && (pressed || !matches!(action, FrameAction::Resize(_)))
-                            && let Some(data) = pointer.data::<PointerData>()
-                        {
-                            self.frame_action(data.seat(), object, serial, action);
+                        match hit {
+                            DecorationHit::Button(object, action) => {
+                                if pressed {
+                                    if let Some(chrome) =
+                                        self.tasks.get_mut(&object).and_then(|t| t.chrome.as_mut())
+                                    {
+                                        chrome.press(action);
+                                    }
+                                } else {
+                                    self.chrome_action(object, action);
+                                }
+                            }
+                            DecorationHit::Frame(object) => {
+                                let action = self
+                                    .tasks
+                                    .get_mut(&object)
+                                    .and_then(|task| task.window_frame.as_mut())
+                                    .and_then(|frame| {
+                                        frame.on_click(
+                                            Duration::from_millis(time as u64),
+                                            click,
+                                            pressed,
+                                        )
+                                    });
+                                // AdwaitaFrame returns Resize for both press and
+                                // release. xdg_toplevel.resize needs only the
+                                // initiating press serial.
+                                if let Some(action) = action
+                                    && (pressed || !matches!(action, FrameAction::Resize(_)))
+                                    && let Some(data) = pointer.data::<PointerData>()
+                                {
+                                    self.frame_action(data.seat(), object, serial, action);
+                                }
+                            }
                         }
                     }
                     PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {}
@@ -3487,19 +3783,30 @@ impl TouchHandler for App {
         position: (f64, f64),
     ) {
         if self.decoration_touch.is_none()
-            && let Some((object, _)) =
+            && let Some((hit, _)) =
                 self.decoration_pointer_task(&surface, position.0, position.1)
         {
             if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
                 let seat = data.seat().clone();
-                let action = self.tasks.get_mut(&object)
-                    .and_then(|task| task.window_frame.as_mut())
-                    .and_then(|frame| frame.on_click(
-                        Duration::from_millis(time as u64), FrameClick::Normal, true
-                    ));
+                let object = hit.object();
+                let action = match hit {
+                    DecorationHit::Button(object, action) => {
+                        if let Some(chrome) =
+                            self.tasks.get_mut(&object).and_then(|t| t.chrome.as_mut())
+                        {
+                            chrome.press(action);
+                        }
+                        None
+                    }
+                    DecorationHit::Frame(object) => self.tasks.get_mut(&object)
+                        .and_then(|task| task.window_frame.as_mut())
+                        .and_then(|frame| frame.on_click(
+                            Duration::from_millis(time as u64), FrameClick::Normal, true
+                        )),
+                };
                 let acted_on_down = action.is_some();
                 self.decoration_touch = Some(DecorationTouch {
-                    id, touch: _touch.clone(), object, surface,
+                    id, touch: _touch.clone(), hit, surface,
                     seat: seat.clone(), down_serial: serial, acted_on_down,
                 });
                 if let Some(action) = action {
@@ -3525,6 +3832,7 @@ impl TouchHandler for App {
             // A second finger aborts the pending candidate; both streams stay
             // with the application.
             self.swipe_back = None;
+            self.release_edge_panel(false);
         }
         let pen_in_proximity = self
             .tablet_tools
@@ -3548,6 +3856,7 @@ impl TouchHandler for App {
                 u64::from(time),
             )
         {
+            self.prepare_edge_panel(_qh, object, candidate.from_left());
             self.swipe_back = Some(candidate);
         }
 
@@ -3577,17 +3886,29 @@ impl TouchHandler for App {
             .is_some_and(|touch| touch.id == id && touch.touch == *_touch)
         {
             let touch = self.decoration_touch.take().expect("matched decoration touch");
-            let action = self.tasks.get_mut(&touch.object)
-                .and_then(|task| task.window_frame.as_mut())
-                .and_then(|frame| {
-                    let action = (!touch.acted_on_down).then(|| frame.on_click(
-                        Duration::from_millis(time as u64), FrameClick::Normal, false
-                    )).flatten();
-                    frame.click_point_left();
-                    action
-                });
-            if let Some(action) = action {
-                self.frame_action(&touch.seat, touch.object, touch.down_serial, action);
+            match touch.hit {
+                // A button acts on release, so a press dragged off it cancels.
+                DecorationHit::Button(object, action) => {
+                    if let Some(chrome) = self.tasks.get_mut(&object).and_then(|t| t.chrome.as_mut())
+                    {
+                        chrome.reset();
+                    }
+                    self.chrome_action(object, action);
+                }
+                DecorationHit::Frame(object) => {
+                    let action = self.tasks.get_mut(&object)
+                        .and_then(|task| task.window_frame.as_mut())
+                        .and_then(|frame| {
+                            let action = (!touch.acted_on_down).then(|| frame.on_click(
+                                Duration::from_millis(time as u64), FrameClick::Normal, false
+                            )).flatten();
+                            frame.click_point_left();
+                            action
+                        });
+                    if let Some(action) = action {
+                        self.frame_action(&touch.seat, object, touch.down_serial, action);
+                    }
+                }
             }
             return;
         }
@@ -3598,6 +3919,7 @@ impl TouchHandler for App {
         {
             let stealing = candidate.stealing();
             let trigger = candidate.on_up(u64::from(time));
+            self.release_edge_panel(trigger.is_some());
             if let Some(object) = trigger {
                 if !stealing
                     && let Some(contact) = self.touch_contacts.remove(&(_touch.id(), id))
@@ -3648,6 +3970,7 @@ impl TouchHandler for App {
             .map(|candidate| candidate.on_motion(position, u64::from(_time)));
         match swipe_update {
             Some(gesture::SwipeUpdate::Confirmed) => {
+                self.feed_edge_panel();
                 let first = self.swipe_back.as_ref().is_some_and(|candidate| !candidate.stealing());
                 if first {
                     if let Some(candidate) = self.swipe_back.as_mut() {
@@ -3663,9 +3986,15 @@ impl TouchHandler for App {
                 return;
             }
             Some(gesture::SwipeUpdate::Cancelled) => {
+                // Never draw for a sample that already disqualified the swipe:
+                // a scroll that starts near the edge must not flash a pill.
                 self.swipe_back = None;
+                self.release_edge_panel(false);
             }
-            Some(gesture::SwipeUpdate::Pending) | None => {}
+            // The indicator follows the finger for as long as the swipe is
+            // undecided, so it never vanishes mid-gesture.
+            Some(gesture::SwipeUpdate::Pending) => self.feed_edge_panel(),
+            None => {}
         }
 
         let Some(mut contact) = self.touch_contacts.get(&(_touch.id(), id)).copied() else {
@@ -3702,12 +4031,17 @@ impl TouchHandler for App {
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
         self.swipe_back = None;
+        self.release_edge_panel(false);
         if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)
             && let Some(touch) = self.decoration_touch.take()
-            && let Some(frame) = self.tasks.get_mut(&touch.object)
-                .and_then(|task| task.window_frame.as_mut())
+            && let Some(task) = self.tasks.get_mut(&touch.hit.object())
         {
-            frame.click_point_left();
+            if let Some(frame) = task.window_frame.as_mut() {
+                frame.click_point_left();
+            }
+            if let Some(chrome) = task.chrome.as_mut() {
+                chrome.reset();
+            }
         }
         let keys = self.touch_contacts.keys().filter(|(device, _)| *device == _touch.id()).cloned().collect::<Vec<_>>();
         for key in keys {
@@ -4265,6 +4599,8 @@ fn run() -> Result<(), PresenterError> {
         touch_contacts: HashMap::new(),
         swipe_back: None,
         decoration_touch: None,
+        overlay: None,
+        overlay_clock: Instant::now(),
         next_buffer_id: 0,
         next_input_serial: 0,
         socket_path,
@@ -4302,6 +4638,7 @@ fn run_presenter_loop(
         app.clipboard.pump(&qh);
         app.unmap_requested_tasks()?;
         app.release_ready_frames()?;
+        app.advance_overlays();
         poll_sources(conn, &mut event_queue, &mut app, &mut poll_descriptors)?;
     }
 }
@@ -4388,7 +4725,7 @@ fn poll_sources(
             }
         }
     }
-    let timeout = poll_timeout_millis(release_fallback);
+    let timeout = poll_timeout_millis(release_fallback, app.overlays_animating());
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
@@ -4435,13 +4772,20 @@ fn poll_sources(
     Ok(())
 }
 
-fn poll_timeout_millis(release_fallback: bool) -> i32 {
-    if release_fallback {
-        i32::try_from(RELEASE_POLL_FALLBACK.as_nanos().div_ceil(1_000_000))
-            .unwrap_or(i32::MAX)
+/// Frame interval while an overlay is animating, in milliseconds.
+const OVERLAY_FRAME_MILLIS: u64 = 8;
+
+fn poll_timeout_millis(release_fallback: bool, animating: bool) -> i32 {
+    let mut timeout = if release_fallback {
+        i32::try_from(RELEASE_POLL_FALLBACK.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
     } else {
         -1
+    };
+    if animating {
+        let frame = i32::try_from(OVERLAY_FRAME_MILLIS).unwrap_or(i32::MAX);
+        timeout = if timeout < 0 { frame } else { timeout.min(frame) };
     }
+    timeout
 }
 
 fn split_point(point: u64) -> (u32, u32) {
@@ -4756,8 +5100,15 @@ mod tests {
 
     #[test]
     fn idle_wait_has_no_clipboard_deadline_but_release_fallback_remains_bounded() {
-        assert_eq!(poll_timeout_millis(false), -1);
-        assert_eq!(poll_timeout_millis(true), 4);
+        assert_eq!(poll_timeout_millis(false, false), -1);
+        assert_eq!(poll_timeout_millis(true, false), 4);
+    }
+
+    #[test]
+    fn an_animating_overlay_caps_the_wait_at_one_frame() {
+        assert_eq!(poll_timeout_millis(false, true), OVERLAY_FRAME_MILLIS as i32);
+        // The release fallback is faster than a frame, so it still wins.
+        assert_eq!(poll_timeout_millis(true, true), 4);
     }
 
     #[test]
