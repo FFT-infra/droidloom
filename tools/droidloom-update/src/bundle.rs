@@ -585,6 +585,14 @@ pub(crate) mod artifact_tests {
         elf[18] = 62;
         elf.extend(format!("DROIDLOOM_INPUT_ABI={composer};").bytes());
         write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"),elf).unwrap();
+        let mut presenter_elf = vec![0; 64];
+        presenter_elf[..4].copy_from_slice(b"\x7fELF");
+        presenter_elf[4] = 2;
+        presenter_elf[5] = 1;
+        presenter_elf[18] = 62;
+        let presenter = root.join(PRESENTER);
+        write(&presenter, presenter_elf).unwrap();
+        mode(&presenter, 0o755).unwrap();
         let d = tempfile::tempdir().unwrap();
         write(&d.path().join("classes.dex"),format!("dex\n039\0DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_CLIPBOARD_RELAY_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=1;DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;Lcom/android/droidloom/catalog/ApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks")).unwrap();
         let jar = root.join("usr/lib/droidloom/runtime/framework/droidloom-input-bridge.jar");
