@@ -40,14 +40,23 @@ final class TaskRegistration {
         }
         /** Why {@link #eligible()} refused this task, or null when it did not. */
         String rejection() { return rejection; }
-        boolean same(Task other) {
-            return other != null && id == other.id && user == other.user
-                    && display == other.display && owner.equals(other.owner);
-        }
     }
-    private Task last;
+    /** Identity of a registered binding; a task that changes shape is new. */
+    private static String key(Task task) {
+        return task.id + ":" + task.user + ":" + task.display + ":" + task.owner;
+    }
+    /**
+     * Bindings the host currently holds, by identity.
+     *
+     * Several tasks are on screen at once — a game and the package installer
+     * behind it — so this is a set, not the single "last" task it used to be.
+     * A single slot made every reconcile re-bind every other task, and the
+     * launcher refuses a task it has already bound, which took the whole pass
+     * down with it and left the installer's task unregistered.
+     */
+    private final java.util.Set<String> bound = new java.util.HashSet<>();
     private String rejection;
-    void clear() { last = null; rejection = null; }
+    void clear() { bound.clear(); rejection = null; }
     boolean needsRegistration(Task task) {
         // An ineligible or absent task cannot be registered, but it must not
         // erase the binding of the task that is registered: a task briefly
@@ -58,9 +67,21 @@ final class TaskRegistration {
         }
         rejection = null;
         task.rejection = null;
-        return !task.same(last);
+        return !bound.contains(key(task));
     }
-    void registered(Task task) { last = task; }
+    void registered(Task task) {
+        task.rejection = null;
+        bound.add(key(task));
+    }
+    /**
+     * Drop bindings for tasks Android no longer lists, so a task that comes
+     * back is registered again instead of being assumed still bound.
+     */
+    void retain(java.util.Collection<Task> present) {
+        java.util.Set<String> live = new java.util.HashSet<>();
+        for (Task task : present) live.add(key(task));
+        bound.retainAll(live);
+    }
     /**
      * Why the most recently seen ineligible task was refused, or null when
      * none was seen. Retained for the journal; it is not proof that the

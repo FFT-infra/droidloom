@@ -83,6 +83,32 @@ final class TaskObserver extends TaskStackListener {
         handler.postDelayed(reconcile, 50);
     }
 
+    /**
+     * Ask the launcher to publish one task as a host window. Returns null on
+     * success, or the launcher's own words when it refuses, which is the only
+     * description of the refusal anyone gets.
+     */
+    private String bind(TaskRegistration.Task target) throws Exception {
+        Process child = new ProcessBuilder("/vendor/bin/droidloom-task-launcher",
+                "--bind-task", Integer.toString(target.id),
+                "--user", Integer.toString(target.user), target.owner)
+                .redirectErrorStream(true).start();
+        byte[] output;
+        try (java.io.InputStream stream = child.getInputStream()) {
+            output = stream.readAllBytes();
+        }
+        if (!child.waitFor(10, TimeUnit.SECONDS)) {
+            child.destroyForcibly();
+            child.waitFor();
+            return "timed out";
+        }
+        if (child.exitValue() != 0) {
+            String text = new String(output, java.nio.charset.StandardCharsets.UTF_8).trim();
+            return "exit " + child.exitValue() + (text.isEmpty() ? "" : ": " + text);
+        }
+        return null;
+    }
+
     private void reconcile() {
         try {
             if (manager == null) return;
@@ -102,6 +128,7 @@ final class TaskObserver extends TaskStackListener {
             for (RunningTaskInfo info : tasks) {
                 if (!info.isFocused) candidates.add(info);
             }
+            List<TaskRegistration.Task> eligible = new ArrayList<>();
             for (RunningTaskInfo info : candidates) {
                 TaskRegistration.Task task = new TaskRegistration.Task(info.taskId, info.userId,
                         info.displayId,
@@ -120,20 +147,21 @@ final class TaskObserver extends TaskStackListener {
                     }
                     continue;
                 }
-                if (!state.needsRegistration(task)) continue;
-                final TaskRegistration.Task target = task;
-                Process child = new ProcessBuilder("/vendor/bin/droidloom-task-launcher",
-                        "--bind-task", Integer.toString(target.id),
-                        "--user", Integer.toString(target.user), target.owner)
-                        .redirectErrorStream(true)
-                        .redirectOutput(ProcessBuilder.Redirect.INHERIT).start();
-                if (!child.waitFor(10, TimeUnit.SECONDS)) {
-                    child.destroyForcibly();
-                    child.waitFor();
-                    throw new IllegalStateException("Task registration timed out");
-                }
-                if (child.exitValue() != 0) {
-                    throw new IllegalStateException("Task registration exited " + child.exitValue());
+                eligible.add(task);
+            }
+            // Bindings follow what Android still lists, so a task that returns
+            // is bound again rather than assumed to be held.
+            state.retain(eligible);
+            for (TaskRegistration.Task target : eligible) {
+                if (!state.needsRegistration(target)) continue;
+                // One task the launcher refuses must not cost the others their
+                // window. The installer behind a running game is exactly the
+                // task that used to be skipped this way.
+                String refusal = bind(target);
+                if (refusal != null) {
+                    Log.w(TAG, "Task " + target.id + " (" + target.owner + ") was refused: "
+                            + refusal);
+                    continue;
                 }
                 state.registered(target);
                 Log.i(TAG, "Published task=" + target.id + " package=" + target.owner);

@@ -18,14 +18,19 @@ public final class TaskRegistrationTest {
         check(state.needsRegistration(store));
         state.registered(store);
         check(!state.needsRegistration(store));
+        // Several tasks are on screen at once — a game and the package
+        // installer behind it — so a second task must not displace the first,
+        // and a task already bound must never be bound a second time.
         check(state.needsRegistration(tiktok)); // Play Store Open creates a new host window.
         check(state.needsRegistration(tiktok)); // Failed backend operation remains retryable.
         state.registered(tiktok);
         check(!state.needsRegistration(app(26, tiktok.owner))); // Stack/layout noise is inert.
+        check(!state.needsRegistration(store)); // The first binding still holds.
+        // A task Android stops listing is bound again when it comes back.
+        state.retain(java.util.List.of(tiktok));
         check(state.needsRegistration(store));
         state.registered(store);
-        check(state.needsRegistration(tiktok)); // Open an already running app again.
-        state.registered(tiktok);
+        check(!state.needsRegistration(store));
         // A focused task that is momentarily ineligible — a window briefly
         // hidden behind another — reports why but leaves the binding intact;
         // the retry budget is not spent and no window is torn down.
@@ -47,11 +52,14 @@ public final class TaskRegistrationTest {
         }
         check(!state.needsRegistration(tiktok)); // Still hidden: the binding survived.
         check(state.needsRegistration(app(26, "org.example.changed"))); // ID reuse/owner change.
-        // The caller registers on a positive answer, so the changed task now
-        // holds the binding and returning to tiktok is a new activation.
+        // The caller registers on a positive answer. The changed task is a
+        // second binding; tiktok's is still held, so switching back to it is
+        // not a new activation.
         state.registered(app(26, "org.example.changed"));
-        check(state.needsRegistration(tiktok)); // Returning from HOME must activate again.
-        state.registered(tiktok);
+        check(!state.needsRegistration(tiktok)); // Its binding was never dropped.
+        // Only when Android stops listing it does the binding go.
+        state.retain(java.util.List.of(tiktok));
+        check(state.needsRegistration(app(26, "org.example.changed")));
         state.clear();
         check(state.needsRegistration(tiktok)); // System-server reconnection rebuilds bindings.
         // Foreign activities inside an existing app task retain its base owner;
