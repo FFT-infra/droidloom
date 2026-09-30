@@ -10,9 +10,15 @@ mod notifications;
 mod insets;
 mod presentation_audit;
 mod text_input;
+#[cfg(test)]
+#[allow(dead_code)]
 mod gesture;
+mod chrome;
+mod interaction;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use chrome::{Action as TitlebarButtonKind, Button as TitlebarButton, VisualState as TitlebarButtonState};
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -140,717 +146,6 @@ const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
-const TITLEBAR_BUTTON_SIZE: u32 = 28;
-const DEFAULT_TITLEBAR_HEIGHT: i32 = 35;
-
-fn detect_titlebar_button_y(titlebar_height: i32) -> i32 {
-    -titlebar_height + 3
-}
-
-fn detect_fullscreen_button_y() -> i32 {
-    10
-}
-
-fn detect_fullscreen_button_x(kind: TitlebarButtonKind, window_width: i32) -> i32 {
-    let center = window_width / 2;
-    match kind {
-        TitlebarButtonKind::Back => center - 33,
-        TitlebarButtonKind::Fullscreen => center + 5,
-    }
-}
-
-fn detect_back_button_x() -> i32 {
-    static CACHED_X: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    *CACHED_X.get_or_init(|| {
-        let mut left_buttons_count = 0;
-        let portal_result = std::process::Command::new("dbus-send")
-            .args([
-                "--reply-timeout=100",
-                "--print-reply=literal",
-                "--dest=org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.portal.Settings.Read",
-                "string:org.gnome.desktop.wm.preferences",
-                "string:button-layout",
-            ])
-            .output();
-
-        let raw_layout = if let Ok(out) = portal_result {
-            String::from_utf8(out.stdout).ok().and_then(|text| {
-                text.split_whitespace().last().map(|s| s.to_owned())
-            })
-        } else {
-            None
-        };
-
-        let layout_str = raw_layout.or_else(|| {
-            std::process::Command::new("gsettings")
-                .args(["get", "org.gnome.desktop.wm.preferences", "button-layout"])
-                .output()
-                .ok()
-                .and_then(|out| String::from_utf8(out.stdout).ok())
-                .map(|s| s.trim().trim_matches('\'').to_owned())
-        });
-
-        if let Some(layout) = layout_str {
-            if let Some((left, _)) = layout.split_once(':') {
-                for button in left.split(',') {
-                    match button.trim() {
-                        "close" | "minimize" | "maximize" => left_buttons_count += 1,
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        if left_buttons_count == 0 {
-            4
-        } else {
-            // Adwaita headerbar: left margin 5, visible border 1 -> first button starts at x=6.
-            // Button size 24px, spacing 13px (37px period).
-            // N buttons end at 6 + N * 37 - 13.
-            // Placing Back button with standard 13px gap starts the next button at 6 + N * 37.
-            // Accounting for BackButton's 2px padding (28x28 surface, circle at 2..26),
-            // subsurface x is (6 + N * 37) - 2 = 4 + N * 37.
-            4 + left_buttons_count * 37
-        }
-    })
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TitlebarButtonKind {
-    Back,
-    Fullscreen,
-}
-
-fn detect_titlebar_button_x(kind: TitlebarButtonKind) -> i32 {
-    let index = match kind {
-        TitlebarButtonKind::Back => 0,
-        TitlebarButtonKind::Fullscreen => 1,
-    };
-    detect_back_button_x() + index * 37
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TitlebarButtonState {
-    Normal,
-    Hover,
-    Pressed,
-}
-
-struct TitlebarButton {
-    kind: TitlebarButtonKind,
-    surface: wl_surface::WlSurface,
-    subsurface: wl_subsurface::WlSubsurface,
-    state: TitlebarButtonState,
-    visible: bool,
-    buffer_normal: wl_buffer::WlBuffer,
-    buffer_hover: wl_buffer::WlBuffer,
-    buffer_pressed: wl_buffer::WlBuffer,
-}
-
-impl Drop for TitlebarButton {
-    fn drop(&mut self) {
-        self.subsurface.destroy();
-        self.surface.destroy();
-        self.buffer_normal.destroy();
-        self.buffer_hover.destroy();
-        self.buffer_pressed.destroy();
-    }
-}
-
-impl TitlebarButton {
-    fn new(
-        kind: TitlebarButtonKind,
-        globals: &layers::Globals,
-        compositor: &smithay_client_toolkit::compositor::CompositorState,
-        parent: &wl_surface::WlSurface,
-        qh: &QueueHandle<App>,
-        titlebar_height: i32,
-        is_fullscreen: bool,
-        window_width: i32,
-    ) -> Result<Self, PresenterError> {
-        let surface = compositor.create_surface(qh);
-        let subsurface = globals.subcompositor.get_subsurface(&surface, parent, qh, ());
-        let (x, y) = if is_fullscreen {
-            (
-                detect_fullscreen_button_x(kind, window_width),
-                detect_fullscreen_button_y(),
-            )
-        } else {
-            (
-                detect_titlebar_button_x(kind),
-                detect_titlebar_button_y(titlebar_height),
-            )
-        };
-        subsurface.set_position(x, y);
-        subsurface.set_desync();
-
-        let buffer_normal = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Normal, is_fullscreen)?;
-        let buffer_hover = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Hover, is_fullscreen)?;
-        let buffer_pressed = render_titlebar_button_buffer(globals, qh, kind, TitlebarButtonState::Pressed, is_fullscreen)?;
-
-        let visible = !is_fullscreen;
-        if visible {
-            surface.attach(Some(&buffer_normal), 0, 0);
-        } else {
-            surface.attach(None, 0, 0);
-        }
-        surface.commit();
-
-        Ok(Self {
-            kind,
-            surface,
-            subsurface,
-            state: TitlebarButtonState::Normal,
-            visible,
-            buffer_normal,
-            buffer_hover,
-            buffer_pressed,
-        })
-    }
-
-    fn set_visible(&mut self, visible: bool) {
-        if self.visible == visible {
-            return;
-        }
-        self.visible = visible;
-        if visible {
-            let buffer = match self.state {
-                TitlebarButtonState::Normal => &self.buffer_normal,
-                TitlebarButtonState::Hover => &self.buffer_hover,
-                TitlebarButtonState::Pressed => &self.buffer_pressed,
-            };
-            self.surface.attach(Some(buffer), 0, 0);
-            self.surface.damage_buffer(0, 0, TITLEBAR_BUTTON_SIZE as i32, TITLEBAR_BUTTON_SIZE as i32);
-        } else {
-            self.surface.attach(None, 0, 0);
-        }
-        self.surface.commit();
-    }
-
-    fn set_state(&mut self, state: TitlebarButtonState) {
-        if self.state == state {
-            return;
-        }
-        self.state = state;
-        if self.visible {
-            let buffer = match state {
-                TitlebarButtonState::Normal => &self.buffer_normal,
-                TitlebarButtonState::Hover => &self.buffer_hover,
-                TitlebarButtonState::Pressed => &self.buffer_pressed,
-            };
-            self.surface.attach(Some(buffer), 0, 0);
-            self.surface.damage_buffer(0, 0, TITLEBAR_BUTTON_SIZE as i32, TITLEBAR_BUTTON_SIZE as i32);
-            self.surface.commit();
-        }
-    }
-
-    fn update_position(&mut self, titlebar_height: i32, is_fullscreen: bool, window_width: i32) {
-        let (x, y) = if is_fullscreen {
-            (
-                detect_fullscreen_button_x(self.kind, window_width),
-                detect_fullscreen_button_y(),
-            )
-        } else {
-            (
-                detect_titlebar_button_x(self.kind),
-                detect_titlebar_button_y(titlebar_height),
-            )
-        };
-        self.subsurface.set_position(x, y);
-        self.surface.commit();
-    }
-}
-
-fn dist_to_segment(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let l2 = dx * dx + dy * dy;
-    if l2 == 0.0 {
-        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
-    }
-    let t = (((px - x1) * dx + (py - y1) * dy) / l2).clamp(0.0, 1.0);
-    let proj_x = x1 + t * dx;
-    let proj_y = y1 + t * dy;
-    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
-}
-
-fn render_titlebar_button_buffer(
-    globals: &layers::Globals,
-    qh: &QueueHandle<App>,
-    kind: TitlebarButtonKind,
-    state: TitlebarButtonState,
-    is_fullscreen: bool,
-) -> Result<wl_buffer::WlBuffer, PresenterError> {
-    let size = TITLEBAR_BUTTON_SIZE;
-    let mut pixels = vec![0u32; (size * size) as usize];
-
-    let center = (size as f32) / 2.0;
-    let radius = 12.0f32;
-
-    let (r_bg, g_bg, b_bg, bg_alpha_factor) = if is_fullscreen {
-        match state {
-            TitlebarButtonState::Normal => (0.15f32, 0.16f32, 0.18f32, 0.70f32),
-            TitlebarButtonState::Hover => (0.25f32, 0.27f32, 0.30f32, 0.85f32),
-            TitlebarButtonState::Pressed => (0.35f32, 0.38f32, 0.42f32, 0.95f32),
-        }
-    } else {
-        let theme = sctk_adwaita::theme::ColorTheme::auto();
-        let colors = theme.active;
-        let (r, g, b) = match state {
-            TitlebarButtonState::Normal => {
-                let c = colors.button_idle;
-                (c.red(), c.green(), c.blue())
-            }
-            TitlebarButtonState::Hover => {
-                let c = colors.button_hover;
-                (c.red(), c.green(), c.blue())
-            }
-            TitlebarButtonState::Pressed => {
-                let c = colors.button_hover;
-                let factor = if colors.button_icon.red() > 0.5 { 1.25f32 } else { 0.85f32 };
-                ((c.red() * factor).min(1.0), (c.green() * factor).min(1.0), (c.blue() * factor).min(1.0))
-            }
-        };
-        (r, g, b, 1.0f32)
-    };
-
-    let (r_icon, g_icon, b_icon) = if is_fullscreen {
-        (0.95f32, 0.95f32, 0.95f32)
-    } else {
-        let theme = sctk_adwaita::theme::ColorTheme::auto();
-        let c = theme.active.button_icon;
-        (c.red(), c.green(), c.blue())
-    };
-
-    let segments: &[((f32, f32), (f32, f32))] = match kind {
-        TitlebarButtonKind::Back => &[
-            ((16.0, 9.0), (11.0, 14.0)),
-            ((11.0, 14.0), (16.0, 19.0)),
-        ],
-        TitlebarButtonKind::Fullscreen => {
-            if is_fullscreen {
-                &[
-                    ((18.0, 13.5), (14.5, 13.5)),
-                    ((14.5, 13.5), (14.5, 10.0)),
-                    ((14.5, 13.5), (18.5, 9.5)),
-                    ((10.0, 14.5), (13.5, 14.5)),
-                    ((13.5, 14.5), (13.5, 18.0)),
-                    ((13.5, 14.5), (9.5, 18.5)),
-                ]
-            } else {
-                &[
-                    ((14.5, 9.5), (18.5, 9.5)),
-                    ((18.5, 9.5), (18.5, 13.5)),
-                    ((18.5, 9.5), (14.0, 14.0)),
-                    ((13.5, 18.5), (9.5, 18.5)),
-                    ((9.5, 18.5), (9.5, 14.5)),
-                    ((9.5, 18.5), (14.0, 14.0)),
-                ]
-            }
-        }
-    };
-    let stroke_radius = match kind {
-        TitlebarButtonKind::Back => 1.35f32,
-        TitlebarButtonKind::Fullscreen => 1.15f32,
-    };
-
-    for y in 0..size {
-        for x in 0..size {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-
-            let dist_center = ((px - center).powi(2) + (py - center).powi(2)).sqrt();
-            let base_circle_alpha = (radius + 0.5 - dist_center).clamp(0.0, 1.0);
-            let circle_alpha = base_circle_alpha * bg_alpha_factor;
-
-            let mut min_d = f32::MAX;
-            for &((x1, y1), (x2, y2)) in segments {
-                let d = dist_to_segment(px, py, x1, y1, x2, y2);
-                if d < min_d {
-                    min_d = d;
-                }
-            }
-            let stroke_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0);
-
-            let eff_stroke_a = stroke_alpha.min(base_circle_alpha);
-
-            let border_dist = (dist_center - 11.5).abs();
-            let border_alpha = if is_fullscreen {
-                (0.75 - border_dist).clamp(0.0, 1.0) * 0.28
-            } else {
-                0.0
-            };
-
-            let out_a = (circle_alpha + eff_stroke_a * (1.0 - circle_alpha) + border_alpha).min(1.0);
-            let out_r = eff_stroke_a * r_icon + circle_alpha * (1.0 - eff_stroke_a) * r_bg + border_alpha * 0.9;
-            let out_g = eff_stroke_a * g_icon + circle_alpha * (1.0 - eff_stroke_a) * g_bg + border_alpha * 0.9;
-            let out_b = eff_stroke_a * b_icon + circle_alpha * (1.0 - eff_stroke_a) * b_bg + border_alpha * 0.9;
-
-            let a = (out_a * 255.0).round().min(255.0) as u32;
-            let r = (out_r * 255.0).round().min(255.0) as u32;
-            let g = (out_g * 255.0).round().min(255.0) as u32;
-            let b = (out_b * 255.0).round().min(255.0) as u32;
-
-            pixels[(y * size + x) as usize] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-
-    let bytes = (size * size * 4) as usize;
-    let mut file = tempfile::tempfile()?;
-    let mut byte_data = Vec::with_capacity(bytes);
-    for pixel in pixels {
-        byte_data.extend_from_slice(&pixel.to_ne_bytes());
-    }
-    file.write_all(&byte_data)?;
-    let pool = globals.shm.create_pool(file.as_fd(), bytes as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        size as i32,
-        size as i32,
-        (size * 4) as i32,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-    pool.destroy();
-    Ok(buffer)
-}
-
-const GESTURE_FEEDBACK_SIDE_WIDTH: u32 = 48;
-const GESTURE_FEEDBACK_SIDE_HEIGHT: u32 = 144;
-const GESTURE_FEEDBACK_SIDE_STAGES: usize = 20;
-
-const GESTURE_FEEDBACK_TOP_WIDTH: u32 = 72;
-const GESTURE_FEEDBACK_TOP_HEIGHT: u32 = 32;
-const GESTURE_FEEDBACK_TOP_STAGES: usize = 12;
-
-fn edge_gesture_shape_x(norm_y: f32) -> f32 {
-    let t = norm_y.clamp(0.0, 1.0);
-    let y = if t > 0.5 { 1.0 - t } else { t };
-    if y <= 0.167 {
-        let p = y / 0.167;
-        p * p * 0.115
-    } else if y <= 0.350 {
-        let p = (y - 0.167) / (0.350 - 0.167);
-        0.115 + (0.620 - 0.115) * (p * p * (3.0 - 2.0 * p))
-    } else {
-        let p = (y - 0.350) / (0.500 - 0.350);
-        0.620 + (1.000 - 0.620) * (p * (2.0 - p))
-    }
-}
-
-fn render_side_gesture_buffer(
-    globals: &layers::Globals,
-    qh: &QueueHandle<App>,
-    is_left: bool,
-    stage: usize,
-) -> Result<wl_buffer::WlBuffer, PresenterError> {
-    let width = GESTURE_FEEDBACK_SIDE_WIDTH;
-    let height = GESTURE_FEEDBACK_SIDE_HEIGHT;
-    let mut pixels = vec![0u32; (width * height) as usize];
-
-    let depth = 2.0f32 + (stage.min(19) as f32) * 2.0f32;
-    let arrow_intensity = if stage < 7 {
-        0.0f32
-    } else if stage < 14 {
-        ((stage - 7) as f32 / 7.0f32).clamp(0.0, 1.0)
-    } else {
-        1.0f32
-    };
-
-    let (r_bg, g_bg, b_bg, a_bg) = (0.10f32, 0.11f32, 0.13f32, 0.88f32);
-    let (r_fg, g_fg, b_fg) = (1.0f32, 1.0f32, 1.0f32);
-
-    for y in 0..height {
-        let norm_y = (y as f32 + 0.5) / (height as f32);
-        let factor = edge_gesture_shape_x(norm_y);
-        let bound = factor * depth;
-
-        for x in 0..width {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-
-            let dist_to_boundary = if is_left {
-                bound - px
-            } else {
-                bound - ((width as f32) - px)
-            };
-
-            let bg_alpha = dist_to_boundary.clamp(0.0, 1.0) * a_bg;
-            if bg_alpha <= 0.0 {
-                continue;
-            }
-
-            let mut arrow_alpha = 0.0f32;
-            if arrow_intensity > 0.0 {
-                let arrow_center_x = if is_left {
-                    depth * 0.52
-                } else {
-                    (width as f32) - depth * 0.52
-                };
-                let arrow_center_y = (height as f32) / 2.0;
-
-                // Back arrow pointing LEFT on both left and right edges
-                let v = (arrow_center_x - 3.5, arrow_center_y);
-                let top = (arrow_center_x + 2.5, arrow_center_y - 6.0);
-                let bot = (arrow_center_x + 2.5, arrow_center_y + 6.0);
-
-                let d1 = dist_to_segment(px, py, top.0, top.1, v.0, v.1);
-                let d2 = dist_to_segment(px, py, bot.0, bot.1, v.0, v.1);
-                let min_d = d1.min(d2);
-
-                let stroke_radius = 1.35f32;
-                arrow_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0) * arrow_intensity;
-            }
-
-            let out_a = (bg_alpha + arrow_alpha * (1.0 - bg_alpha)).clamp(0.0, 1.0);
-            let out_r = arrow_alpha * r_fg + (1.0 - arrow_alpha) * bg_alpha * r_bg;
-            let out_g = arrow_alpha * g_fg + (1.0 - arrow_alpha) * bg_alpha * g_bg;
-            let out_b = arrow_alpha * b_fg + (1.0 - arrow_alpha) * bg_alpha * b_bg;
-
-            let a = (out_a * 255.0).round().min(255.0) as u32;
-            let r = (out_r * 255.0).round().min(255.0) as u32;
-            let g = (out_g * 255.0).round().min(255.0) as u32;
-            let b = (out_b * 255.0).round().min(255.0) as u32;
-
-            pixels[(y * width + x) as usize] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-
-    let bytes = (width * height * 4) as usize;
-    let mut file = tempfile::tempfile()?;
-    let mut byte_data = Vec::with_capacity(bytes);
-    for pixel in pixels {
-        byte_data.extend_from_slice(&pixel.to_ne_bytes());
-    }
-    file.write_all(&byte_data)?;
-    let pool = globals.shm.create_pool(file.as_fd(), bytes as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        (width * 4) as i32,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-    pool.destroy();
-    Ok(buffer)
-}
-
-fn render_top_gesture_buffer(
-    globals: &layers::Globals,
-    qh: &QueueHandle<App>,
-    stage: usize,
-) -> Result<wl_buffer::WlBuffer, PresenterError> {
-    let width = GESTURE_FEEDBACK_TOP_WIDTH;
-    let height = GESTURE_FEEDBACK_TOP_HEIGHT;
-    let mut pixels = vec![0u32; (width * height) as usize];
-
-    let depth = 4.0f32 + (stage.min(11) as f32) * 2.0f32;
-    let arrow_intensity = if stage < 4 {
-        0.0f32
-    } else if stage < 8 {
-        ((stage - 4) as f32 / 4.0f32).clamp(0.0, 1.0)
-    } else {
-        1.0f32
-    };
-
-    let (r_bg, g_bg, b_bg, a_bg) = (0.10f32, 0.11f32, 0.13f32, 0.88f32);
-    let (r_fg, g_fg, b_fg) = (1.0f32, 1.0f32, 1.0f32);
-
-    let center_x = (width as f32) / 2.0;
-
-    for y in 0..height {
-        let py = y as f32 + 0.5;
-        if py > depth + 1.0 {
-            continue;
-        }
-
-        for x in 0..width {
-            let px = x as f32 + 0.5;
-            let half_w = 26.0f32;
-            let dist_x = (px - center_x).abs();
-            if dist_x > half_w + 1.0 {
-                continue;
-            }
-
-            let dist_y = depth - py;
-            let dist_side = half_w - dist_x;
-            let corner_r = 10.0f32.min(depth / 2.0);
-
-            let dist_boundary = if dist_side < corner_r && dist_y < corner_r {
-                let dx = corner_r - dist_side;
-                let dy = corner_r - dist_y;
-                corner_r - (dx * dx + dy * dy).sqrt()
-            } else {
-                dist_y.min(dist_side)
-            };
-
-            let bg_alpha = dist_boundary.clamp(0.0, 1.0) * a_bg;
-            if bg_alpha <= 0.0 {
-                continue;
-            }
-
-            let mut arrow_alpha = 0.0f32;
-            if arrow_intensity > 0.0 {
-                let chevron_y = (depth * 0.6).max(8.0);
-                let v = (center_x, chevron_y + 3.0);
-                let left = (center_x - 5.5, chevron_y - 2.5);
-                let right = (center_x + 5.5, chevron_y - 2.5);
-
-                let d1 = dist_to_segment(px, py, left.0, left.1, v.0, v.1);
-                let d2 = dist_to_segment(px, py, right.0, right.1, v.0, v.1);
-                let min_d = d1.min(d2);
-
-                let stroke_radius = 1.25f32;
-                arrow_alpha = (stroke_radius + 0.5 - min_d).clamp(0.0, 1.0) * arrow_intensity;
-            }
-
-            let out_a = (bg_alpha + arrow_alpha * (1.0 - bg_alpha)).clamp(0.0, 1.0);
-            let out_r = arrow_alpha * r_fg + (1.0 - arrow_alpha) * bg_alpha * r_bg;
-            let out_g = arrow_alpha * g_fg + (1.0 - arrow_alpha) * bg_alpha * g_bg;
-            let out_b = arrow_alpha * b_fg + (1.0 - arrow_alpha) * bg_alpha * b_bg;
-
-            let a = (out_a * 255.0).round().min(255.0) as u32;
-            let r = (out_r * 255.0).round().min(255.0) as u32;
-            let g = (out_g * 255.0).round().min(255.0) as u32;
-            let b = (out_b * 255.0).round().min(255.0) as u32;
-
-            pixels[(y * width + x) as usize] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-
-    let bytes = (width * height * 4) as usize;
-    let mut file = tempfile::tempfile()?;
-    let mut byte_data = Vec::with_capacity(bytes);
-    for pixel in pixels {
-        byte_data.extend_from_slice(&pixel.to_ne_bytes());
-    }
-    file.write_all(&byte_data)?;
-    let pool = globals.shm.create_pool(file.as_fd(), bytes as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        (width * 4) as i32,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-    pool.destroy();
-    Ok(buffer)
-}
-
-struct GestureFeedbackView {
-    surface: wl_surface::WlSurface,
-    subsurface: wl_subsurface::WlSubsurface,
-    visible: bool,
-    buffers_left: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES],
-    buffers_right: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES],
-    buffers_top: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_TOP_STAGES],
-}
-
-impl Drop for GestureFeedbackView {
-    fn drop(&mut self) {
-        self.subsurface.destroy();
-        self.surface.destroy();
-        for b in &self.buffers_left {
-            b.destroy();
-        }
-        for b in &self.buffers_right {
-            b.destroy();
-        }
-        for b in &self.buffers_top {
-            b.destroy();
-        }
-    }
-}
-
-impl GestureFeedbackView {
-    fn new(
-        globals: &layers::Globals,
-        compositor: &smithay_client_toolkit::compositor::CompositorState,
-        parent: &wl_surface::WlSurface,
-        qh: &QueueHandle<App>,
-    ) -> Result<Self, PresenterError> {
-        let surface = compositor.create_surface(qh);
-        let subsurface = globals.subcompositor.get_subsurface(&surface, parent, qh, ());
-        subsurface.set_desync();
-
-        if let Ok(region) = smithay_client_toolkit::compositor::Region::new(compositor) {
-            surface.set_input_region(Some(region.wl_region()));
-        }
-
-        let mut buffers_left = Vec::with_capacity(GESTURE_FEEDBACK_SIDE_STAGES);
-        for stage in 0..GESTURE_FEEDBACK_SIDE_STAGES {
-            buffers_left.push(render_side_gesture_buffer(globals, qh, true, stage)?);
-        }
-        let mut buffers_right = Vec::with_capacity(GESTURE_FEEDBACK_SIDE_STAGES);
-        for stage in 0..GESTURE_FEEDBACK_SIDE_STAGES {
-            buffers_right.push(render_side_gesture_buffer(globals, qh, false, stage)?);
-        }
-        let mut buffers_top = Vec::with_capacity(GESTURE_FEEDBACK_TOP_STAGES);
-        for stage in 0..GESTURE_FEEDBACK_TOP_STAGES {
-            buffers_top.push(render_top_gesture_buffer(globals, qh, stage)?);
-        }
-
-        let buffers_left: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES] = buffers_left
-            .try_into()
-            .map_err(|_| PresenterError::Wayland("failed to convert left buffers".into()))?;
-        let buffers_right: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_SIDE_STAGES] = buffers_right
-            .try_into()
-            .map_err(|_| PresenterError::Wayland("failed to convert right buffers".into()))?;
-        let buffers_top: [wl_buffer::WlBuffer; GESTURE_FEEDBACK_TOP_STAGES] = buffers_top
-            .try_into()
-            .map_err(|_| PresenterError::Wayland("failed to convert top buffers".into()))?;
-
-        surface.attach(None, 0, 0);
-        surface.commit();
-
-        Ok(Self {
-            surface,
-            subsurface,
-            visible: false,
-            buffers_left,
-            buffers_right,
-            buffers_top,
-        })
-    }
-
-    fn update_side(&mut self, is_left: bool, stage: usize, x: i32, y: i32) {
-        self.subsurface.set_position(x, y);
-        let buffer = if is_left {
-            &self.buffers_left[stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1)]
-        } else {
-            &self.buffers_right[stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1)]
-        };
-        self.surface.attach(Some(buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, GESTURE_FEEDBACK_SIDE_WIDTH as i32, GESTURE_FEEDBACK_SIDE_HEIGHT as i32);
-        self.surface.commit();
-        self.visible = true;
-    }
-
-    fn update_top(&mut self, stage: usize, x: i32, y: i32) {
-        self.subsurface.set_position(x, y);
-        let buffer = &self.buffers_top[stage.min(GESTURE_FEEDBACK_TOP_STAGES - 1)];
-        self.surface.attach(Some(buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, GESTURE_FEEDBACK_TOP_WIDTH as i32, GESTURE_FEEDBACK_TOP_HEIGHT as i32);
-        self.surface.commit();
-        self.visible = true;
-    }
-
-    fn hide(&mut self) {
-        if self.visible {
-            self.surface.attach(None, 0, 0);
-            self.surface.commit();
-            self.visible = false;
-        }
-    }
-}
-
 /// One scroll step for a continuous (touchpad or finger) Wayland scroll,
 /// measured in surface pixels, following common toolkit behaviour.
 const CONTINUOUS_SCROLL_PIXELS_PER_STEP: f64 = 10.0;
@@ -991,6 +286,9 @@ struct TaskWindow {
     window: Option<Window>,
     window_frame: Option<AdwaitaFrame<App>>,
     titlebar_buttons: Vec<TitlebarButton>,
+    rail: Option<chrome::Rail>,
+    chrome_epoch: u64,
+    navigation_height: u32,
     decorations_hidden: bool,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
@@ -1012,8 +310,6 @@ struct TaskWindow {
     fullscreen: bool,
     maximized: bool,
     floating_size: Option<LogicalSize>,
-    fullscreen_controls_revealed_until: Option<Instant>,
-    gesture_feedback: Option<GestureFeedbackView>,
     unmap_requested: bool,
     closing: bool,
 }
@@ -1178,7 +474,7 @@ struct App {
     feedback: Option<DmabufFeedback>,
     compositor: Arc<CompositorState>,
     xdg_shell: XdgShell,
-    insets_manager: Option<insets::DenialInsetsManagerV1>,
+    _insets_manager: Option<insets::DenialInsetsManagerV1>,
     viewporter: WpViewporter,
     fractional_scale_manager: WpFractionalScaleManagerV1,
     sync_manager: WpLinuxDrmSyncobjManagerV1,
@@ -1186,6 +482,7 @@ struct App {
     gbm: GbmDevice<File>,
     listener: DenialEndpointListener,
     window_policy: WindowPolicyStore,
+    host_navigation: bool,
     endpoint: Option<DenialEndpoint>,
     tasks: BTreeMap<TaskObjectId, TaskWindow>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -1206,12 +503,11 @@ struct App {
     mouse_focus: Option<TaskObjectId>,
     mouse_buttons: BTreeSet<u32>,
     pointer_contact: Option<Contact>,
-    touch_contacts: BTreeMap<i32, Contact>,
-    edge_gestures: BTreeMap<i32, gesture::EdgeGestureTracker>,
+    touch_contacts: HashMap<(wayland_client::backend::ObjectId, i32), Contact>,
     decoration_touch: Option<DecorationTouch>,
-    titlebar_button_pointer: Option<(TaskObjectId, TitlebarButtonKind)>,
-    titlebar_button_touch: Option<(i32, TaskObjectId, TitlebarButtonKind, (f64, f64))>,
-    titlebar_button_tablet: Option<(TaskObjectId, TitlebarButtonKind)>,
+    titlebar_button_pointer: Option<interaction::ButtonPress<wayland_client::backend::ObjectId>>,
+    titlebar_button_touch: Option<interaction::ButtonPress<wayland_client::backend::ObjectId>>,
+    titlebar_button_tablet: Option<interaction::ButtonPress<u32>>,
     next_buffer_id: u64,
     next_input_serial: u64,
     socket_path: PathBuf,
@@ -1271,6 +567,7 @@ impl App {
     }
 
     fn handle_titlebar_button_click(&mut self, object: TaskObjectId, kind: TitlebarButtonKind) {
+        if self.focused != Some(object) || !self.tasks.get(&object).is_some_and(TaskWindow::accepts_present) { return; }
         match kind {
             TitlebarButtonKind::Back => {
                 self.send_back_key(object);
@@ -1281,178 +578,72 @@ impl App {
         }
     }
 
+    fn cancel_chrome_input(&mut self, object: Option<TaskObjectId>) {
+        let matches = |id| object.is_none() || object == Some(id);
+        let presses = [
+            self.titlebar_button_touch.take_if(|p| matches(p.object)).map(|p| (p.object, p.action)),
+            self.titlebar_button_pointer.take_if(|p| matches(p.object)).map(|p| (p.object, p.action)),
+            self.titlebar_button_tablet.take_if(|p| matches(p.object)).map(|p| (p.object, p.action)),
+        ];
+        for (object, action) in presses.into_iter().flatten() {
+            self.update_titlebar_button_state(object, action, TitlebarButtonState::Normal);
+        }
+    }
+
+    fn commit_chrome(&self, object: TaskObjectId) {
+        if let Some(task) = self.tasks.get(&object) {
+            if let Some(surface) = task.surface() { surface.commit(); }
+            if let Some(rail) = task.rail.as_ref() { rail.desynchronize(); }
+        }
+    }
+
     fn clear_titlebar_buttons(&mut self, object: TaskObjectId) {
         if let Some(task) = self.tasks.get_mut(&object) {
             task.titlebar_buttons.clear();
+            task.rail.take();
+            task.chrome_epoch = task.chrome_epoch.wrapping_add(1);
         }
-        if self.titlebar_button_pointer.is_some_and(|(obj, _)| obj == object) {
+        if self.titlebar_button_pointer.as_ref().is_some_and(|p| p.object == object) {
             self.titlebar_button_pointer = None;
         }
-        if self.titlebar_button_touch.is_some_and(|(_, obj, _, _)| obj == object) {
+        if self.titlebar_button_touch.as_ref().is_some_and(|press| press.object == object) {
             self.titlebar_button_touch = None;
         }
-        if self.titlebar_button_tablet.is_some_and(|(obj, _)| obj == object) {
+        if self.titlebar_button_tablet.as_ref().is_some_and(|p| p.object == object) {
             self.titlebar_button_tablet = None;
         }
     }
 
-    fn ensure_titlebar_buttons(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId, titlebar_height: i32) {
-        let Some(task) = self.tasks.get_mut(&object) else { return };
-        let is_fullscreen = task.fullscreen || task.decorations_hidden;
-        let should_be_visible = !is_fullscreen || task.fullscreen_controls_revealed_until.is_some();
-        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
-        let titlebar_h = if is_fullscreen { 0 } else { titlebar_height.max(DEFAULT_TITLEBAR_HEIGHT) };
-        if !task.titlebar_buttons.is_empty() {
-            for btn in &mut task.titlebar_buttons {
-                btn.update_position(titlebar_h, is_fullscreen, window_width);
-                btn.set_visible(should_be_visible);
-            }
-            return;
+    fn ensure_titlebar_buttons(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) -> Result<(), PresenterError> {
+        let Some(task) = self.tasks.get(&object) else { return Ok(()) };
+        if task.navigation_height == 0 || task.headless() {
+            self.clear_titlebar_buttons(object);
+            return Ok(());
         }
-        let Some(window) = task.window.as_ref() else { return };
-        let surface = window.wl_surface();
-        if let Ok(mut back) = TitlebarButton::new(
-            TitlebarButtonKind::Back,
-            &self.layer_globals,
-            &self.compositor,
-            surface,
-            qh,
-            titlebar_h,
-            is_fullscreen,
-            window_width,
-        ) {
-            back.set_visible(should_be_visible);
-            task.titlebar_buttons.push(back);
-        }
-        if let Ok(mut fs) = TitlebarButton::new(
-            TitlebarButtonKind::Fullscreen,
-            &self.layer_globals,
-            &self.compositor,
-            surface,
-            qh,
-            titlebar_h,
-            is_fullscreen,
-            window_width,
-        ) {
-            fs.set_visible(should_be_visible);
-            task.titlebar_buttons.push(fs);
-        }
-    }
-
-    fn ensure_gesture_feedback(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
-        let Some(task) = self.tasks.get_mut(&object) else { return };
-        if task.gesture_feedback.is_some() {
-            return;
-        }
-        let Some(window) = task.window.as_ref() else { return };
-        let surface = window.wl_surface();
-        if let Ok(feedback) = GestureFeedbackView::new(
-            &self.layer_globals,
-            &self.compositor,
-            surface,
-            qh,
-        ) {
-            task.gesture_feedback = Some(feedback);
-        }
-    }
-
-    fn reveal_fullscreen_controls(&mut self, object: TaskObjectId, duration: Duration) {
-        let Some(task) = self.tasks.get_mut(&object) else { return };
-        task.fullscreen_controls_revealed_until = Some(Instant::now() + duration);
-        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
-        let is_fullscreen = task.fullscreen || task.decorations_hidden;
-        for btn in &mut task.titlebar_buttons {
-            btn.update_position(0, is_fullscreen, window_width);
-            btn.set_visible(true);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn hide_fullscreen_controls(&mut self, object: TaskObjectId) {
-        let Some(task) = self.tasks.get_mut(&object) else { return };
-        task.fullscreen_controls_revealed_until = None;
-        if task.fullscreen || task.decorations_hidden {
-            for btn in &mut task.titlebar_buttons {
-                btn.set_visible(false);
-            }
-        }
-    }
-
-    fn pump_fullscreen_controls_timeouts(&mut self) {
-        let now = Instant::now();
-        for task in self.tasks.values_mut() {
-            if let Some(until) = task.fullscreen_controls_revealed_until {
-                if now >= until {
-                    task.fullscreen_controls_revealed_until = None;
-                    if task.fullscreen || task.decorations_hidden {
-                        for btn in &mut task.titlebar_buttons {
-                            btn.set_visible(false);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn next_controls_timeout_millis(&self) -> Option<i32> {
-        let now = Instant::now();
-        let mut min_remaining = None;
-        for task in self.tasks.values() {
-            if let Some(until) = task.fullscreen_controls_revealed_until {
-                let remaining = if until > now {
-                    until.duration_since(now)
-                } else {
-                    Duration::ZERO
-                };
-                let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
-                min_remaining = Some(min_remaining.map_or(millis, |cur: i32| cur.min(millis)));
-            }
-        }
-        min_remaining
+        let Some((width, height)) = task.logical_size else { return Ok(()) };
+        let layout = chrome::Layout::new(LogicalSize { width, height }, task.preferred_scale_120, task.fullscreen)?;
+        if task.rail.as_ref().is_some_and(|rail| rail.layout == layout) { return Ok(()); }
+        let Some(surface) = task.surface().cloned() else { return Ok(()) };
+        let rail = chrome::Rail::new(&self.layer_globals, &self.compositor, &self.viewporter, &surface, qh, layout)?;
+        let buttons = vec![
+            TitlebarButton::new(TitlebarButtonKind::Back, &self.layer_globals, &self.compositor, &self.viewporter, &rail, qh)?,
+            TitlebarButton::new(TitlebarButtonKind::Fullscreen, &self.layer_globals, &self.compositor, &self.viewporter, &rail, qh)?,
+        ];
+        self.clear_titlebar_buttons(object);
+        let task = self.tasks.get_mut(&object).expect("task was checked above");
+        task.rail = Some(rail);
+        task.titlebar_buttons = buttons;
+        Ok(())
     }
 
     fn toggle_decorations(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
         let Some(task) = self.tasks.get_mut(&object) else { return };
-        if task.headless() || task.fullscreen {
-            return;
-        }
+        if task.headless() || task.fullscreen { return; }
         task.decorations_hidden = !task.decorations_hidden;
-        let is_hidden = task.decorations_hidden;
-        if let Some(frame) = task.window_frame.as_mut() {
-            frame.set_hidden(is_hidden);
-        }
-        self.clear_titlebar_buttons(object);
-        self.ensure_titlebar_buttons(qh, object, if is_hidden { 0 } else { DEFAULT_TITLEBAR_HEIGHT });
-        let Some(task) = self.tasks.get_mut(&object) else { return };
+        if let Some(frame) = task.window_frame.as_mut() { frame.set_hidden(task.decorations_hidden); }
         let Some((width, height)) = task.logical_size else { return };
-        let scale_120 = task.preferred_scale_120;
-        if let Some(window) = task.window.as_ref() {
-            let (x, y, outer_width, outer_height, _frame_needs_parent_commit) =
-                match task.window_frame.as_mut() {
-                    Some(frame) if !frame.is_hidden() => {
-                        frame.set_scaling_factor(f64::from(scale_120) / 120.0);
-                        if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
-                            frame.resize(w, h);
-                        }
-                        let (x, y) = frame.location();
-                        let (w, h) = frame.add_borders(width, height);
-                        let needs_parent_commit = frame.draw();
-                        (x, y, w, h, needs_parent_commit)
-                    }
-                    _ => {
-                        if let Some(frame) = task.window_frame.as_mut() {
-                            let _ = frame.draw();
-                        }
-                        (0, 0, width, height, true)
-                    }
-                };
-            window.xdg_surface().set_window_geometry(
-                x,
-                y,
-                i32::try_from(outer_width).unwrap_or(i32::MAX),
-                i32::try_from(outer_height).unwrap_or(i32::MAX),
-            );
-            window.wl_surface().commit();
+        if let Err(error) = self.configure_task(qh, object, width, height) {
+            eprintln!("Droidloom kept the last usable window layout: {error}");
         }
     }
 
@@ -1619,10 +810,7 @@ impl App {
                 let title = format_task_title(package, false, false);
                 window.set_title(&title);
                 window.set_app_id(package.to_owned());
-                window.set_min_size(Some((1, 1)));
-                if let Some(manager) = &self.insets_manager {
-                    manager.set_self_managed(window.wl_surface());
-                }
+                window.set_min_size(Some((96, 128)));
                 // fractional-scale-v1 keeps the wl_surface at scale 1 and uses a
                 // viewport to map the higher-resolution buffer into XDG logical
                 // coordinates.
@@ -1651,6 +839,9 @@ impl App {
                 window,
                 window_frame: None,
                 titlebar_buttons: Vec::new(),
+                rail: None,
+                chrome_epoch: 0,
+                navigation_height: if headless || self.host_navigation { 0 } else { chrome::HEIGHT },
                 decorations_hidden: false,
                 viewport,
                 fractional_scale,
@@ -1673,8 +864,6 @@ impl App {
                 fullscreen: false,
                 maximized: false,
                 floating_size: None,
-                fullscreen_controls_revealed_until: None,
-                gesture_feedback: None,
                 unmap_requested: false,
                 closing: false,
             },
@@ -1711,6 +900,7 @@ impl App {
         if task.headless() {
             return Ok(requested);
         }
+        let reserve = task.navigation_height;
         let is_fullscreen = task.fullscreen || configure.state.contains(WindowState::FULLSCREEN);
         let hide_decorations = configure.decoration_mode != DecorationMode::Client
             || is_fullscreen
@@ -1719,12 +909,7 @@ impl App {
             if let Some(frame) = task.window_frame.as_mut() {
                 frame.set_hidden(true);
             }
-            if is_fullscreen || task.decorations_hidden {
-                self.ensure_titlebar_buttons(qh, object, 0);
-            } else {
-                self.clear_titlebar_buttons(object);
-            }
-            return Ok(requested);
+            return Ok((requested.0, chrome::content_height(requested.1, reserve)?));
         }
         if task.window_frame.is_none() {
             let window = task.window.as_ref()
@@ -1750,15 +935,12 @@ impl App {
         frame.update_state(configure.state);
         frame.update_wm_capabilities(configure.capabilities);
 
-        let titlebar_height = (-frame.location().1).max(DEFAULT_TITLEBAR_HEIGHT);
         let (width, height) = frame.subtract_borders(
             requested.0.unwrap_or(NonZeroU32::MIN),
             requested.1.unwrap_or(NonZeroU32::MIN),
         );
 
-        self.ensure_titlebar_buttons(qh, object, titlebar_height);
-
-        Ok((requested.0.and(width), requested.1.and(height)))
+        Ok((requested.0.and(width), chrome::content_height(requested.1.and(height), reserve)?))
     }
 
     fn configure_task(
@@ -1787,18 +969,21 @@ impl App {
         {
             let task = self.tasks.get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
+            let body_height = height.checked_add(task.navigation_height)
+                .filter(|h| *h <= MAX_BUFFER_DIMENSION)
+                .ok_or(PresenterError::Configuration("window chrome exceeds geometry limit"))?;
             if let Some(window) = task.window.as_ref() {
                 let (x, y, outer_width, outer_height, frame_needs_parent_commit) =
                     match task.window_frame.as_mut() {
                         Some(frame) if !frame.is_hidden() => {
                             frame.set_scaling_factor(f64::from(scale_120) / 120.0);
-                            frame.resize(NonZeroU32::new(width).unwrap(), NonZeroU32::new(height).unwrap());
+                            frame.resize(NonZeroU32::new(width).unwrap(), NonZeroU32::new(body_height).unwrap());
                             let (x, y) = frame.location();
-                            let (w, h) = frame.add_borders(width, height);
+                            let (w, h) = frame.add_borders(width, body_height);
                             let needs_parent_commit = frame.draw();
                             (x, y, w, h, needs_parent_commit)
                         }
-                        _ => (0, 0, width, height, false),
+                        _ => (0, 0, width, body_height, false),
                     };
                 window.xdg_surface().set_window_geometry(
                     x, y,
@@ -1824,10 +1009,11 @@ impl App {
                 || task.buffer_size != (buffer_width, buffer_height)
         };
         if !needs_pool {
+            self.ensure_titlebar_buttons(qh, object)?;
+            self.commit_chrome(object);
             return Ok(());
         }
 
-        self.retire_host_targets(object)?;
         let serial = self
             .tasks
             .get(&object)
@@ -1836,7 +1022,10 @@ impl App {
         let mut targets: Vec<RenderTarget> = Vec::with_capacity(TARGET_POOL_LENGTH);
         for _ in 0..TARGET_POOL_LENGTH {
             let id = self.allocate_buffer_id()?;
-            let target = self.allocate_target(qh, id, buffer_width, buffer_height, width, height)?;
+            let target = match self.allocate_target(qh, id, buffer_width, buffer_height, width, height) {
+                Ok(target) => target,
+                Err(error) => { self.discard_prepared_targets(object, targets); return Err(error); }
+            };
             let planes = target.planes.iter().map(AsFd::as_fd).collect::<Vec<_>>();
             let result = self
                 .endpoint
@@ -1844,18 +1033,16 @@ impl App {
                 .ok_or(PresenterError::Configuration("endpoint disappeared"))?
                 .register_render_target(object, serial, &target.metadata, &planes);
             if let Err(error) = result {
-                for registered in &targets {
-                    let _ = self
-                        .endpoint
-                        .as_mut()
-                        .expect("endpoint existed during target registration")
-                        .unregister_render_target(object, registered.metadata.id);
-                }
+                if let Some(buffer) = target.wayland { buffer.destroy(); }
+                self.discard_prepared_targets(object, targets);
                 return Err(error.into());
             }
             targets.push(target);
         }
 
+        // New targets are registered but not inserted into the task yet, so only
+        // the old set is retired. Allocation failure above leaves that set alive.
+        self.retire_host_targets(object)?;
         let refresh = self.task_refresh_millihz(object);
         {
             let task = self
@@ -1863,15 +1050,6 @@ impl App {
                 .get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.logical_size = Some((width, height));
-            let is_fullscreen = task.fullscreen || task.decorations_hidden;
-            let titlebar_h = if is_fullscreen {
-                0
-            } else {
-                task.window_frame.as_ref().map_or(DEFAULT_TITLEBAR_HEIGHT, |f| (-f.location().1).max(DEFAULT_TITLEBAR_HEIGHT))
-            };
-            for btn in &mut task.titlebar_buttons {
-                btn.update_position(titlebar_h, is_fullscreen, width as i32);
-            }
             task.applied_opaque = None;
             task.buffer_size = (buffer_width, buffer_height);
             task.configure_serial = serial;
@@ -1895,7 +1073,20 @@ impl App {
                 Transform::Normal,
                 refresh,
             )?;
+        self.ensure_titlebar_buttons(qh, object)?;
+        self.commit_chrome(object);
         self.update_output_refreshes()
+    }
+
+    fn discard_prepared_targets(&mut self, object: TaskObjectId, targets: Vec<RenderTarget>) {
+        for target in targets {
+            if let Some(endpoint) = self.endpoint.as_mut() {
+                if let Err(error) = endpoint.unregister_render_target(object, target.metadata.id) {
+                    eprintln!("Droidloom target rollback failed: {error}");
+                }
+            }
+            if let Some(buffer) = target.wayland { buffer.destroy(); }
+        }
     }
 
     fn allocate_buffer_id(&mut self) -> Result<BufferId, PresenterError> {
@@ -2353,7 +1544,7 @@ impl App {
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             task.titlebar_buttons.clear();
-            task.gesture_feedback.take();
+            task.rail.take();
             if let Some(surface) = task.surface() {
                 for tool in &mut self.tablet_tools {
                     if tool.surface.as_ref() == Some(surface) {
@@ -2384,13 +1575,13 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
-        if let Some((obj, _)) = self.titlebar_button_pointer && obj == object {
+        if self.titlebar_button_pointer.as_ref().is_some_and(|p| p.object == object) {
             self.titlebar_button_pointer = None;
         }
-        if let Some((_, obj, _, _)) = self.titlebar_button_touch && obj == object {
+        if self.titlebar_button_touch.as_ref().is_some_and(|press| press.object == object) {
             self.titlebar_button_touch = None;
         }
-        if let Some((obj, _)) = self.titlebar_button_tablet && obj == object {
+        if self.titlebar_button_tablet.as_ref().is_some_and(|p| p.object == object) {
             self.titlebar_button_tablet = None;
         }
         for tool in &mut self.tablet_tools {
@@ -2436,14 +1627,14 @@ impl App {
             sync_surface.destroy();
         }
         task.titlebar_buttons.clear();
-        task.gesture_feedback.take();
-        if let Some((obj, _)) = self.titlebar_button_pointer && obj == object {
+        task.rail.take();
+        if self.titlebar_button_pointer.as_ref().is_some_and(|p| p.object == object) {
             self.titlebar_button_pointer = None;
         }
-        if let Some((_, obj, _, _)) = self.titlebar_button_touch && obj == object {
+        if self.titlebar_button_touch.as_ref().is_some_and(|press| press.object == object) {
             self.titlebar_button_touch = None;
         }
-        if let Some((obj, _)) = self.titlebar_button_tablet && obj == object {
+        if self.titlebar_button_tablet.as_ref().is_some_and(|p| p.object == object) {
             self.titlebar_button_tablet = None;
         }
         for tool in &mut self.tablet_tools {
@@ -2676,6 +1867,7 @@ impl App {
     /// Release every key and button this task still holds, as a physical
     /// keyboard or mouse would when its window stops receiving input.
     fn release_task_input(&mut self, object: TaskObjectId) {
+        self.cancel_chrome_input(Some(object));
         let held = self
             .pressed_keys
             .iter()
@@ -2925,7 +2117,6 @@ impl App {
                     if event.position.1 <= 4.0 {
                         let is_fs = self.tasks.get(&focus).is_some_and(|t| t.fullscreen || t.decorations_hidden);
                         if is_fs {
-                            self.reveal_fullscreen_controls(focus, gesture::FULLSCREEN_REVEAL_DURATION);
                         }
                     }
                     self.send_mouse(focus, MouseAction::Motion, event.position, 0, (0.0, 0.0))
@@ -2999,31 +2190,40 @@ impl App {
             return false;
         };
         let Some(surface) = tool.surface.clone() else { return false };
+        let position = (f64::from(tool.x_fixed) / 65_536.0, f64::from(tool.y_fixed) / 65_536.0);
         if self.task_for_surface(&surface).is_some() {
             return false;
         }
         if let Some((object, kind)) = self.task_and_button_for_surface(&surface) {
             match action {
                 TabletAction::Down => {
-                    self.titlebar_button_tablet = Some((object, kind));
+                    let epoch = self.tasks.get(&object).map_or(0, |t| t.chrome_epoch);
+                    self.titlebar_button_tablet = interaction::ButtonPress::begin(tool_id, 0, object, kind, epoch, position);
                     self.update_titlebar_button_state(object, kind, TitlebarButtonState::Pressed);
                     return true;
                 }
                 TabletAction::Up => {
-                    if let Some((down_object, down_kind)) = self.titlebar_button_tablet.take() {
-                        self.update_titlebar_button_state(down_object, down_kind, TitlebarButtonState::Normal);
-                        if down_object == object && down_kind == kind {
-                            self.handle_titlebar_button_click(object, kind);
-                        }
+                    if let Some(mut press) = self.titlebar_button_tablet.take() {
+                        self.update_titlebar_button_state(press.object, press.action, TitlebarButtonState::Normal);
+                        let matched = press.matches(&tool_id, 0) && press.object == object && press.action == kind;
+                        press.motion(position);
+                        let epoch = self.tasks.get(&object).map_or(u64::MAX, |t| t.chrome_epoch);
+                        if matched && press.release(epoch).is_some() { self.handle_titlebar_button_click(object, kind); }
                         return true;
                     }
                 }
                 TabletAction::ProximityOut | TabletAction::Cancel => {
-                    if let Some((down_object, down_kind)) = self.titlebar_button_tablet.take() {
-                        self.update_titlebar_button_state(down_object, down_kind, TitlebarButtonState::Normal);
+                    if let Some(press) = self.titlebar_button_tablet.take() {
+                        self.update_titlebar_button_state(press.object, press.action, TitlebarButtonState::Normal);
                     }
                 }
-                _ => {}
+                _ => {
+                    if let Some(press) = self.titlebar_button_tablet.as_mut() {
+                        if press.matches(&tool_id, 0) && !press.motion(position) {
+                            self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
+                        }
+                    }
+                }
             }
             return true;
         }
@@ -3105,6 +2305,7 @@ impl App {
         if self.focused == object {
             return Ok(());
         }
+        self.cancel_chrome_input(None);
         if let Some(previous) = self.focused
             && let Some(task) = self.tasks.get_mut(&previous)
         {
@@ -3615,9 +2816,6 @@ impl WindowHandler for App {
         }
 
         if was_fullscreen != is_fullscreen {
-            if let Some(task) = self.tasks.get_mut(&object) {
-                task.fullscreen_controls_revealed_until = None;
-            }
             self.clear_titlebar_buttons(object);
         }
 
@@ -3625,14 +2823,15 @@ impl WindowHandler for App {
             match self.content_configure_size(qh, object, &configure) {
                 Ok((width, height)) => (width.map(NonZeroU32::get), height.map(NonZeroU32::get)),
                 Err(error) => {
-                    self.fail(&error);
+                    eprintln!("Droidloom rejected unsupported window geometry: {error}");
                     return;
                 }
             };
 
-        let bounds = configure
-            .suggested_bounds
-            .and_then(|(width, height)| LogicalSize::new(width, height).ok());
+        let reserved = self.tasks.get(&object).map_or(0, |task| task.navigation_height
+            + task.window_frame.as_ref().filter(|f| !f.is_hidden()).map_or(0, |f| (-f.location().1).max(0) as u32));
+        let bounds = configure.suggested_bounds.and_then(|(width, height)|
+            height.checked_sub(reserved).and_then(|height| LogicalSize::new(width, height).ok()));
 
         let size = if is_floating {
             match (requested_width, requested_height) {
@@ -3963,6 +3162,7 @@ impl SeatHandler for App {
         _seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        self.cancel_chrome_input(None);
         match capability {
             Capability::Keyboard => {
                 self.keyboard = None;
@@ -3984,6 +3184,7 @@ impl SeatHandler for App {
     }
 
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.cancel_chrome_input(None);
         self.text_input.remove_resource();
         self.keyboard = None;
         self.keyboard_seat = None;
@@ -4281,15 +3482,26 @@ impl PointerHandler for App {
                         self.titlebar_button_pointer = None;
                         self.cursor_icon = None;
                     }
+                    PointerEventKind::Motion { .. } => {
+                        if let Some(press) = self.titlebar_button_pointer.as_mut() {
+                            if !press.motion(event.position) {
+                                self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
+                            }
+                        }
+                    }
                     PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
                         self.update_titlebar_button_state(object, kind, TitlebarButtonState::Pressed);
-                        self.titlebar_button_pointer = Some((object, kind));
+                        let epoch = self.tasks.get(&object).map_or(0, |t| t.chrome_epoch);
+                        self.titlebar_button_pointer = interaction::ButtonPress::begin(pointer.id(), 0, object, kind, epoch, event.position);
                     }
                     PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
-                        let was_pressed = self.titlebar_button_pointer.take() == Some((object, kind));
+                        let press = self.titlebar_button_pointer.take();
                         self.update_titlebar_button_state(object, kind, TitlebarButtonState::Hover);
-                        if was_pressed {
-                            self.handle_titlebar_button_click(object, kind);
+                        if let Some(mut press) = press {
+                            let matched = press.matches(&pointer.id(), 0) && press.object == object && press.action == kind;
+                            press.motion(event.position);
+                            let epoch = self.tasks.get(&object).map_or(u64::MAX, |t| t.chrome_epoch);
+                            if matched && press.release(epoch).is_some() { self.handle_titlebar_button_click(object, kind); }
                         }
                     }
                     _ => {}
@@ -4453,9 +3665,19 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        let previous_press = self.titlebar_button_touch.take();
+        let had_press = previous_press.is_some();
+        if let Some(press) = previous_press {
+            self.update_titlebar_button_state(press.object, press.action, TitlebarButtonState::Normal);
+        }
         if let Some((object, kind)) = self.task_and_button_for_surface(&surface) {
-            self.titlebar_button_touch = Some((id, object, kind, position));
-            self.update_titlebar_button_state(object, kind, TitlebarButtonState::Pressed);
+            if !had_press {
+                let epoch = self.tasks.get(&object).map_or(0, |task| task.chrome_epoch);
+                self.titlebar_button_touch = interaction::ButtonPress::begin(_touch.id(), id, object, kind, epoch, position);
+                if self.titlebar_button_touch.is_some() {
+                    self.update_titlebar_button_state(object, kind, TitlebarButtonState::Pressed);
+                }
+            }
             return;
         }
         if self.decoration_touch.is_none()
@@ -4491,21 +3713,6 @@ impl TouchHandler for App {
             self.activation.input(serial, data.seat(), &surface);
         }
 
-        let (logical_size, is_fullscreen) = self.tasks.get(&object).map_or(
-            ((1920, 1080), false),
-            |t| (t.logical_size.unwrap_or((1920, 1080)), t.fullscreen || t.decorations_hidden),
-        );
-
-        if self.edge_gestures.is_empty() {
-            if let Some(candidate) = gesture::EdgeGestureTracker::new_candidate(
-                id, object, serial, pointer_id, position, logical_size, is_fullscreen,
-            ) {
-                self.ensure_gesture_feedback(_qh, object);
-                self.edge_gestures.insert(id, candidate);
-                return;
-            }
-        }
-
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
         let contact = Contact {
             object,
@@ -4515,7 +3722,7 @@ impl TouchHandler for App {
         if let Err(error) = self.send_input(object, contact.event(TouchAction::Down)) {
             self.fail(&error);
         } else {
-            self.touch_contacts.insert(id, contact);
+            self.touch_contacts.insert((_touch.id(), id), contact);
         }
     }
 
@@ -4528,13 +3735,13 @@ impl TouchHandler for App {
         time: u32,
         id: i32,
     ) {
-        if let Some((touch_id, object, kind, _)) = self.titlebar_button_touch {
-            if touch_id == id {
-                self.titlebar_button_touch = None;
-                self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
-                self.handle_titlebar_button_click(object, kind);
-                return;
-            }
+        if self.titlebar_button_touch.as_ref().is_some_and(|press| press.matches(&_touch.id(), id)) {
+            let press = self.titlebar_button_touch.take().expect("matched chrome contact");
+            let object = press.object; let kind = press.action;
+            let epoch = self.tasks.get(&object).map_or(u64::MAX, |task| task.chrome_epoch);
+            self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
+            if press.release(epoch).is_some() { self.handle_titlebar_button_click(object, kind); }
+            return;
         }
         if self.decoration_touch.as_ref()
             .is_some_and(|touch| touch.id == id && touch.touch == *_touch)
@@ -4555,39 +3762,7 @@ impl TouchHandler for App {
             return;
         }
 
-        if let Some(tracker) = self.edge_gestures.remove(&id) {
-            if let Some(task) = self.tasks.get_mut(&tracker.object) {
-                if let Some(feedback) = task.gesture_feedback.as_mut() {
-                    feedback.hide();
-                }
-            }
-            match tracker.on_up() {
-                gesture::EdgeUpResult::TriggerBack => {
-                    self.send_back_key(tracker.object);
-                }
-                gesture::EdgeUpResult::TriggerTopReveal => {
-                    self.reveal_fullscreen_controls(tracker.object, gesture::FULLSCREEN_REVEAL_DURATION);
-                }
-                gesture::EdgeUpResult::TapAtEdge { pos } => {
-                    let (x_fixed, y_fixed) = self.fixed_position(tracker.object, pos);
-                    let contact = Contact {
-                        object: tracker.object,
-                        pointer_id: tracker.pointer_id,
-                        position_fixed: (x_fixed, y_fixed),
-                    };
-                    if let Err(error) = self.send_input(tracker.object, contact.event(TouchAction::Down)) {
-                        self.fail(&error);
-                    }
-                    if let Err(error) = self.send_input(tracker.object, contact.event(TouchAction::Up)) {
-                        self.fail(&error);
-                    }
-                }
-                gesture::EdgeUpResult::None => {}
-            }
-            return;
-        }
-
-        let Some(contact) = self.touch_contacts.remove(&id) else {
+        let Some(contact) = self.touch_contacts.remove(&(_touch.id(), id)) else {
             return;
         };
         // wl_touch.up carries no coordinates. Android still needs the last
@@ -4606,17 +3781,15 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
-        if let Some((touch_id, object, kind, start_pos)) = self.titlebar_button_touch {
-            if touch_id == id {
-                let dx = position.0 - start_pos.0;
-                let dy = position.1 - start_pos.1;
-                if dx * dx + dy * dy > 144.0 {
-                    self.titlebar_button_touch = None;
+        if let Some(press) = self.titlebar_button_touch.as_mut() {
+            if press.matches(&_touch.id(), id) {
+                let object = press.object; let kind = press.action;
+                if !press.motion(position) {
                     self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
                 }
+                return;
             }
         }
-
         if let Some(surface) = self.decoration_touch.as_ref()
             .filter(|touch| touch.id == id && touch.touch == *_touch)
             .map(|touch| touch.surface.clone())
@@ -4625,114 +3798,14 @@ impl TouchHandler for App {
             return;
         }
 
-        let gesture_update = self.edge_gestures.get_mut(&id).map(|tracker| {
-            let res = tracker.on_motion(position);
-            (res, tracker.object, tracker.kind, tracker.start_pos)
-        });
-        if let Some((res, object, kind, start_pos)) = gesture_update {
-            match res {
-                gesture::EdgeMotionResult::StayPending
-                | gesture::EdgeMotionResult::ConfirmedBack
-                | gesture::EdgeMotionResult::ConfirmedTopReveal => {
-                    match kind {
-                        gesture::EdgeGestureKind::Back { is_left } => {
-                            let inward_dx = if is_left {
-                                position.0 - start_pos.0
-                            } else {
-                                start_pos.0 - position.0
-                            };
-                            if let Some(task) = self.tasks.get_mut(&object) {
-                                if let Some(feedback) = task.gesture_feedback.as_mut() {
-                                    if inward_dx < 4.0 {
-                                        feedback.hide();
-                                    } else {
-                                        let stage = ((inward_dx - 4.0) / 1.8).floor().max(0.0) as usize;
-                                        let stage = stage.min(GESTURE_FEEDBACK_SIDE_STAGES - 1);
-                                        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
-                                        let window_height = task.logical_size.map_or(1080, |s| s.1 as i32);
-                                        let x = if is_left {
-                                            0
-                                        } else {
-                                            window_width - GESTURE_FEEDBACK_SIDE_WIDTH as i32
-                                        };
-                                        let y = (start_pos.1 - (GESTURE_FEEDBACK_SIDE_HEIGHT as f64 / 2.0)).round() as i32;
-                                        let y = y.clamp(0, (window_height - GESTURE_FEEDBACK_SIDE_HEIGHT as i32).max(0));
-                                        feedback.update_side(is_left, stage, x, y);
-                                    }
-                                }
-                            }
-                        }
-                        gesture::EdgeGestureKind::TopReveal => {
-                            let dy = position.1 - start_pos.1;
-                            if let Some(task) = self.tasks.get_mut(&object) {
-                                if let Some(feedback) = task.gesture_feedback.as_mut() {
-                                    if dy < 3.0 {
-                                        feedback.hide();
-                                    } else {
-                                        let stage = ((dy - 3.0) / 2.5).floor().max(0.0) as usize;
-                                        let stage = stage.min(GESTURE_FEEDBACK_TOP_STAGES - 1);
-                                        let window_width = task.logical_size.map_or(1920, |s| s.0 as i32);
-                                        let x = (window_width - GESTURE_FEEDBACK_TOP_WIDTH as i32) / 2;
-                                        feedback.update_top(stage, x, 0);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return;
-                }
-                gesture::EdgeMotionResult::CancelScroll => {
-                    if let Some(task) = self.tasks.get_mut(&object) {
-                        if let Some(feedback) = task.gesture_feedback.as_mut() {
-                            feedback.hide();
-                        }
-                    }
-                    let trk = self.edge_gestures.remove(&id).unwrap();
-                    let (start_xf, start_yf) = self.fixed_position(trk.object, trk.start_pos);
-                    let (cur_xf, cur_yf) = self.fixed_position(trk.object, position);
-                    let contact = Contact {
-                        object: trk.object,
-                        pointer_id: trk.pointer_id,
-                        position_fixed: (cur_xf, cur_yf),
-                    };
-                    if let Err(error) = self.send_input(
-                        trk.object,
-                        InputEvent::Touch {
-                            action: TouchAction::Down,
-                            pointer_id: trk.pointer_id,
-                            x_fixed: start_xf,
-                            y_fixed: start_yf,
-                            pressure: u16::MAX,
-                        },
-                    ) {
-                        self.fail(&error);
-                    }
-                    if let Err(error) = self.send_input(
-                        trk.object,
-                        InputEvent::Touch {
-                            action: TouchAction::Motion,
-                            pointer_id: trk.pointer_id,
-                            x_fixed: cur_xf,
-                            y_fixed: cur_yf,
-                            pressure: u16::MAX,
-                        },
-                    ) {
-                        self.fail(&error);
-                    }
-                    self.touch_contacts.insert(id, contact);
-                    return;
-                }
-            }
-        }
-
-        let Some(mut contact) = self.touch_contacts.get(&id).copied() else {
+        let Some(mut contact) = self.touch_contacts.get(&(_touch.id(), id)).copied() else {
             return;
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
         if let Err(error) = self.send_input(contact.object, contact.event(TouchAction::Motion)) {
             self.fail(&error);
         } else {
-            self.touch_contacts.insert(id, contact);
+            self.touch_contacts.insert((_touch.id(), id), contact);
         }
     }
 
@@ -4758,8 +3831,9 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        if let Some((_, object, kind, _)) = self.titlebar_button_touch.take() {
-            self.update_titlebar_button_state(object, kind, TitlebarButtonState::Normal);
+        if self.titlebar_button_touch.as_ref().is_some_and(|press| press.device == _touch.id()) {
+            let press = self.titlebar_button_touch.take().expect("matched chrome device");
+            self.update_titlebar_button_state(press.object, press.action, TitlebarButtonState::Normal);
         }
         if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)
             && let Some(touch) = self.decoration_touch.take()
@@ -4768,16 +3842,9 @@ impl TouchHandler for App {
         {
             frame.click_point_left();
         }
-        let gestures = std::mem::take(&mut self.edge_gestures);
-        for (_, tracker) in gestures {
-            if let Some(task) = self.tasks.get_mut(&tracker.object) {
-                if let Some(feedback) = task.gesture_feedback.as_mut() {
-                    feedback.hide();
-                }
-            }
-        }
-        let contacts = std::mem::take(&mut self.touch_contacts);
-        for (_, contact) in contacts {
+        let keys = self.touch_contacts.keys().filter(|(device, _)| *device == _touch.id()).cloned().collect::<Vec<_>>();
+        for key in keys {
+            let Some(contact) = self.touch_contacts.remove(&key) else { continue };
             if let Err(error) = self.send_input(
                 contact.object,
                 InputEvent::Touch {
@@ -5300,7 +4367,7 @@ fn run() -> Result<(), PresenterError> {
         feedback: None,
         compositor,
         xdg_shell,
-        insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        _insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
         viewporter,
         fractional_scale_manager,
         sync_manager,
@@ -5308,6 +4375,8 @@ fn run() -> Result<(), PresenterError> {
         gbm,
         listener,
         window_policy,
+        host_navigation: env::var("DROIDLOOM_HOST_NAVIGATION").as_deref() == Ok("1")
+            && globals.bind::<insets::DenialInsetsManagerV1, _, _>(&qh, 1..=1, ()).is_ok(),
         endpoint: None,
         tasks: BTreeMap::new(),
         keyboard: None,
@@ -5325,8 +4394,7 @@ fn run() -> Result<(), PresenterError> {
         mouse_focus: None,
         mouse_buttons: BTreeSet::new(),
         pointer_contact: None,
-        touch_contacts: BTreeMap::new(),
-        edge_gestures: BTreeMap::new(),
+        touch_contacts: HashMap::new(),
         decoration_touch: None,
         titlebar_button_pointer: None,
         titlebar_button_touch: None,
@@ -5358,7 +4426,6 @@ fn run_presenter_loop(
     loop {
         event_queue.dispatch_pending(&mut app)?;
         app.unmap_requested_tasks()?;
-        app.pump_fullscreen_controls_timeouts();
         if let Some(error) = app.fatal.take() {
             return Err(PresenterError::Wayland(error));
         }
@@ -5455,13 +4522,7 @@ fn poll_sources(
             }
         }
     }
-    let fallback_timeout = poll_timeout_millis(release_fallback);
-    let controls_timeout = app.next_controls_timeout_millis();
-    let timeout = match (fallback_timeout, controls_timeout) {
-        (t, Some(ct)) if t < 0 => ct,
-        (t, Some(ct)) => t.min(ct),
-        (t, None) => t,
-    };
+    let timeout = poll_timeout_millis(release_fallback);
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
