@@ -44,6 +44,13 @@ licenses; applying a patch does not give Droidloom ownership of that code.
   `graphics/droidloom-wayland/protocol/denial-insets-v1.xml`.
   Their copyright holders are recorded in the files. The interface license
   does not change the GPL license of Droidloom's implementation.
+- The edge-swipe teardrop indicator in
+  `graphics/droidloom-wayland/src/gesture_feedback.rs` is derived from
+  [helloklf/EdgeGesture](https://github.com/helloklf/EdgeGesture), which is
+  GPL-3.0. Commit `2262dbd` carried its teardrop shape and staged animation
+  into Droidloom and the port keeps them, so those elements retain that
+  project's license and copyright rather than Droidloom's. The verbatim GPLv3
+  text in LICENSES covers both grants.
 - Android applications installed by users, including WhatsApp, remain under
   their own terms. They are not part of the Droidloom source license.
 

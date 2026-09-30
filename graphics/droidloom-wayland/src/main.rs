@@ -11,10 +11,8 @@ mod presentation_audit;
 mod text_input;
 mod gesture;
 mod session;
-mod spring;
 mod chrome;
-mod edge_panel;
-
+mod gesture_feedback;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
@@ -296,8 +294,8 @@ struct TaskWindow {
     /// Whether the frame drew a titlebar at the last configure. Showing a
     /// frame rebuilds its subsurfaces, so the chrome is rebuilt to stay above.
     frame_shown: bool,
-    /// The side-swipe indicator, built the first time this window sees one.
-    edge_panel: Option<edge_panel::EdgePanel>,
+    /// The gesture indicator, built the first time this window sees one.
+    gesture_feedback: Option<gesture_feedback::Feedback>,
     decorations_hidden: bool,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
@@ -530,10 +528,10 @@ struct App {
     pointer_contact: Option<Contact>,
     touch_contacts: HashMap<(wayland_client::backend::ObjectId, i32), Contact>,
     swipe_back: Option<gesture::SwipeBackCandidate>,
+    /// A top-edge pull being drawn. It never becomes an action, so nothing here
+    /// decides anything: the indicator follows the finger and that is all.
+    top_pull: Option<gesture::TopPullCandidate>,
     decoration_touch: Option<DecorationTouch>,
-    /// The window whose edge indicator is still animating, and its frame clock.
-    overlay: Option<TaskObjectId>,
-    overlay_clock: Instant,
     next_buffer_id: u64,
     next_input_serial: u64,
     socket_path: PathBuf,
@@ -780,7 +778,7 @@ impl App {
                 chrome_capabilities: WindowManagerCapabilities::empty(),
                 chrome_active: false,
                 frame_shown: false,
-                edge_panel: None,
+                gesture_feedback: None,
                 decorations_hidden: false,
                 viewport,
                 fractional_scale,
@@ -943,6 +941,7 @@ impl App {
         {
             task.frame_shown = shown;
             task.chrome = None;
+            task.gesture_feedback = None;
         }
         self.ensure_chrome(qh, object);
         let width = width.max(1);
@@ -1642,6 +1641,9 @@ impl App {
         if self.swipe_back.as_ref().is_some_and(|candidate| candidate.object() == object) {
             self.swipe_back = None;
         }
+        if self.top_pull.as_ref().is_some_and(|candidate| candidate.object() == object) {
+            self.top_pull = None;
+        }
         eprintln!(
             "Droidloom destroyed terminal Android xdg_toplevel object={}",
             object.0
@@ -1888,6 +1890,9 @@ impl App {
         self.pressed_keys.retain(|_, owner| *owner != object);
         if self.swipe_back.as_ref().is_some_and(|candidate| candidate.object() == object) {
             self.swipe_back = None;
+        }
+        if self.top_pull.as_ref().is_some_and(|candidate| candidate.object() == object) {
+            self.top_pull = None;
         }
         if self.mouse_focus == Some(object) {
             self.mouse_focus = None;
@@ -2391,14 +2396,8 @@ impl App {
         }
     }
 
-    /// Give the window an edge indicator, reusing the last one when it has
-    /// finished animating and still points the right way.
-    fn prepare_edge_panel(
-        &mut self,
-        qh: &QueueHandle<Self>,
-        object: TaskObjectId,
-        from_left: bool,
-    ) {
+    /// Give the window an indicator, reusing the last one it had.
+    fn prepare_gesture_feedback(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
         let Some(parent) = self
             .tasks
             .get(&object)
@@ -2411,111 +2410,91 @@ impl App {
             .tasks
             .get(&object)
             .map_or(FRACTIONAL_SCALE_DENOMINATOR, |task| task.preferred_scale_120);
-        let ready = self
+        if self
             .tasks
             .get(&object)
-            .and_then(|task| task.edge_panel.as_ref())
-            .is_some_and(|panel| panel.from_left() == from_left && !panel.needs_frames());
-        if !ready {
-            match edge_panel::EdgePanel::new(
+            .is_some_and(|task| task.gesture_feedback.is_none())
+        {
+            match gesture_feedback::Feedback::new(
                 &self.layer_globals,
                 self.compositor.as_ref(),
                 &parent,
                 qh,
                 scale_120,
-                from_left,
             ) {
-                Ok(panel) => {
+                Ok(feedback) => {
                     if let Some(task) = self.tasks.get_mut(&object) {
-                        task.edge_panel = Some(panel);
+                        task.gesture_feedback = Some(feedback);
                     }
                 }
-                Err(error) => {
-                    eprintln!("Droidloom could not build the edge indicator: {error}");
-                    return;
-                }
+                Err(error) => eprintln!("Droidloom could not build the gesture indicator: {error}"),
             }
         }
-        self.overlay = Some(object);
-        self.overlay_clock = Instant::now();
     }
 
-    /// Let the indicator follow the finger. The candidate names the window, so
-    /// this stays right even after a finished panel dropped out of `overlay`.
-    fn feed_edge_panel(&mut self) {
+    /// Let the indicator follow the Back swipe. The candidate names the window,
+    /// so this stays right even when another window has since taken focus.
+    fn feed_gesture_feedback(&mut self) {
         let Some(candidate) = self.swipe_back.as_ref() else {
             return;
         };
         let feedback = candidate.feedback();
         let object = candidate.object();
-        let Some(content) = self.tasks.get(&object).and_then(|task| task.logical_size) else {
+        let Some(window) = self.tasks.get(&object).and_then(|task| task.logical_size) else {
             return;
         };
-        if let Some(panel) = self
+        if let Some(indicator) = self
             .tasks
             .get_mut(&object)
-            .and_then(|task| task.edge_panel.as_mut())
+            .and_then(|task| task.gesture_feedback.as_mut())
         {
-            panel.track(content, feedback.inward, feedback.along, feedback.speed);
-            self.overlay = Some(object);
-            self.overlay_clock = Instant::now();
+            indicator.show_side(feedback.from_left, feedback.inward, feedback.along, window);
         }
     }
 
-    /// Play the indicator's exit. `confirmed` is whether Back was sent.
-    fn release_edge_panel(&mut self, confirmed: bool) {
-        let Some(object) = self.overlay else { return };
-        if let Some(panel) = self
-            .tasks
-            .get_mut(&object)
-            .and_then(|task| task.edge_panel.as_mut())
-        {
-            panel.release(confirmed);
-        }
-        // The springs start here; the frame before this one does not exist.
-        self.overlay_clock = Instant::now();
-    }
-
-    /// Whether the edge indicator wants a frame of its own. Tracking needs
-    /// none: the finger supplies the geometry.
-    fn overlays_animating(&self) -> bool {
-        self.overlay
-            .and_then(|object| self.tasks.get(&object))
-            .and_then(|task| task.edge_panel.as_ref())
-            .is_some_and(|panel| panel.needs_frames() && !panel.tracking())
-    }
-
-    /// Advance the running indicator animation.
-    fn advance_overlays(&mut self) {
-        let Some(object) = self.overlay else { return };
-        // A tracking indicator always has a live contact. If the stream went
-        // away underneath it, collapse rather than leave it on screen.
-        if self.swipe_back.is_none()
-            && self
-                .tasks
-                .get(&object)
-                .and_then(|task| task.edge_panel.as_ref())
-                .is_some_and(edge_panel::EdgePanel::tracking)
-            && let Some(panel) = self
-                .tasks
-                .get_mut(&object)
-                .and_then(|task| task.edge_panel.as_mut())
-        {
-            panel.release(false);
-        }
-        let now = Instant::now();
-        let seconds = now.duration_since(self.overlay_clock).as_secs_f64();
-        self.overlay_clock = now;
-        let finished = match self
-            .tasks
-            .get_mut(&object)
-            .and_then(|task| task.edge_panel.as_mut())
-        {
-            Some(panel) => !panel.advance(seconds),
-            None => true,
+    /// Let the indicator follow a top pull.
+    fn feed_top_pull(&mut self) {
+        let Some(candidate) = self.top_pull.as_ref() else {
+            return;
         };
-        if finished {
-            self.overlay = None;
+        let pull = candidate.pull();
+        let object = candidate.object();
+        let Some(window) = self.tasks.get(&object).and_then(|task| task.logical_size) else {
+            return;
+        };
+        if let Some(indicator) = self
+            .tasks
+            .get_mut(&object)
+            .and_then(|task| task.gesture_feedback.as_mut())
+        {
+            indicator.show_top(pull, window);
+        }
+    }
+
+    /// Take a window's indicator down. Whether a Back was sent does not matter:
+    /// every stage is finger-driven, so there is no exit left to play.
+    fn hide_gesture_feedback(&mut self, object: TaskObjectId) {
+        if let Some(indicator) = self
+            .tasks
+            .get_mut(&object)
+            .and_then(|task| task.gesture_feedback.as_mut())
+        {
+            indicator.hide();
+        }
+    }
+
+    /// Drop whichever contact was being watched, indicator and all. The contact
+    /// itself is left alone, so the application still owns the whole stream.
+    fn abandon_gestures(&mut self) {
+        let object = self
+            .swipe_back
+            .as_ref()
+            .map(gesture::SwipeBackCandidate::object)
+            .or_else(|| self.top_pull.as_ref().map(gesture::TopPullCandidate::object));
+        self.swipe_back = None;
+        self.top_pull = None;
+        if let Some(object) = object {
+            self.hide_gesture_feedback(object);
         }
     }
 
@@ -3829,12 +3808,9 @@ impl TouchHandler for App {
 
         // Monitor-only side-swipe candidate: the application keeps receiving
         // this contact until the recognizer commits and the caller cancels.
-        if self.swipe_back.is_some() {
-            // A second finger aborts the pending candidate; both streams stay
-            // with the application.
-            self.swipe_back = None;
-            self.release_edge_panel(false);
-        }
+        // A second finger abandons whatever was pending; both streams stay with
+        // the application.
+        self.abandon_gestures();
         let pen_in_proximity = self
             .tablet_tools
             .iter()
@@ -3844,10 +3820,10 @@ impl TouchHandler for App {
         let immersive = self.tasks.get(&object).is_some_and(|task| {
             task.fullscreen || self.immersion.as_ref().is_some_and(|imm| imm.object == object)
         });
+        let logical_size = self.tasks.get(&object).and_then(|task| task.logical_size);
         if !pen_in_proximity
             && immersive
-            && let Some((width, height)) =
-                self.tasks.get(&object).and_then(|task| task.logical_size)
+            && let Some((width, height)) = logical_size
             && let Some(candidate) = gesture::SwipeBackCandidate::begin(
                 object,
                 pointer_id,
@@ -3857,8 +3833,22 @@ impl TouchHandler for App {
                 u64::from(time),
             )
         {
-            self.prepare_edge_panel(_qh, object, candidate.from_left());
+            self.prepare_gesture_feedback(_qh, object);
             self.swipe_back = Some(candidate);
+        }
+        // A finger that missed the side band may still be pulling the top edge
+        // down. Nothing is consumed and no Back is ever the result: the shell's
+        // own top-edge gesture keeps the contact, and fullscreen is not toggled
+        // from here.
+        if self.swipe_back.is_none()
+            && !pen_in_proximity
+            && immersive
+            && let Some((width, height)) = logical_size
+            && let Some(candidate) =
+                gesture::TopPullCandidate::begin(object, pointer_id, position, (width, height))
+        {
+            self.prepare_gesture_feedback(_qh, object);
+            self.top_pull = Some(candidate);
         }
 
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
@@ -3914,13 +3904,23 @@ impl TouchHandler for App {
             return;
         }
 
+        // A pull that ends simply stops being drawn. It never confirmed
+        // anything, so the release falls through to the application below.
+        let finished_pull = self
+            .top_pull
+            .take_if(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
+            .map(|candidate| candidate.object());
+        if let Some(object) = finished_pull {
+            self.hide_gesture_feedback(object);
+        }
+
         if let Some(mut candidate) = self
             .swipe_back
             .take_if(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
         {
             let stealing = candidate.stealing();
             let trigger = candidate.on_up(u64::from(time));
-            self.release_edge_panel(trigger.is_some());
+            self.hide_gesture_feedback(candidate.object());
             if let Some(object) = trigger {
                 if !stealing
                     && let Some(contact) = self.touch_contacts.remove(&(_touch.id(), id))
@@ -3971,7 +3971,7 @@ impl TouchHandler for App {
             .map(|candidate| candidate.on_motion(position, u64::from(_time)));
         match swipe_update {
             Some(gesture::SwipeUpdate::Confirmed) => {
-                self.feed_edge_panel();
+                self.feed_gesture_feedback();
                 let first = self.swipe_back.as_ref().is_some_and(|candidate| !candidate.stealing());
                 if first {
                     if let Some(candidate) = self.swipe_back.as_mut() {
@@ -3989,12 +3989,30 @@ impl TouchHandler for App {
             Some(gesture::SwipeUpdate::Cancelled) => {
                 // Never draw for a sample that already disqualified the swipe:
                 // a scroll that starts near the edge must not flash a pill.
-                self.swipe_back = None;
-                self.release_edge_panel(false);
+                let object = self.swipe_back.take().map(|candidate| candidate.object());
+                if let Some(object) = object {
+                    self.hide_gesture_feedback(object);
+                }
             }
             // The indicator follows the finger for as long as the swipe is
             // undecided, so it never vanishes mid-gesture.
-            Some(gesture::SwipeUpdate::Pending) => self.feed_edge_panel(),
+            Some(gesture::SwipeUpdate::Pending) => self.feed_gesture_feedback(),
+            None => {}
+        }
+
+        match self
+            .top_pull
+            .as_mut()
+            .filter(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
+            .map(|candidate| candidate.on_motion(position))
+        {
+            Some(gesture::PullUpdate::Pending) => self.feed_top_pull(),
+            Some(gesture::PullUpdate::Cancelled) => {
+                let object = self.top_pull.take().map(|candidate| candidate.object());
+                if let Some(object) = object {
+                    self.hide_gesture_feedback(object);
+                }
+            }
             None => {}
         }
 
@@ -4031,8 +4049,7 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        self.swipe_back = None;
-        self.release_edge_panel(false);
+        self.abandon_gestures();
         if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)
             && let Some(touch) = self.decoration_touch.take()
             && let Some(task) = self.tasks.get_mut(&touch.hit.object())
@@ -4599,9 +4616,8 @@ fn run() -> Result<(), PresenterError> {
         pointer_contact: None,
         touch_contacts: HashMap::new(),
         swipe_back: None,
+        top_pull: None,
         decoration_touch: None,
-        overlay: None,
-        overlay_clock: Instant::now(),
         next_buffer_id: 0,
         next_input_serial: 0,
         socket_path,
@@ -4639,7 +4655,6 @@ fn run_presenter_loop(
         app.clipboard.pump(&qh);
         app.unmap_requested_tasks()?;
         app.release_ready_frames()?;
-        app.advance_overlays();
         poll_sources(conn, &mut event_queue, &mut app, &mut poll_descriptors)?;
     }
 }
@@ -4726,7 +4741,7 @@ fn poll_sources(
             }
         }
     }
-    let timeout = poll_timeout_millis(release_fallback, app.overlays_animating());
+    let timeout = poll_timeout_millis(release_fallback);
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
@@ -4773,20 +4788,14 @@ fn poll_sources(
     Ok(())
 }
 
-/// Frame interval while an overlay is animating, in milliseconds.
-const OVERLAY_FRAME_MILLIS: u64 = 8;
-
-fn poll_timeout_millis(release_fallback: bool, animating: bool) -> i32 {
-    let mut timeout = if release_fallback {
+fn poll_timeout_millis(release_fallback: bool) -> i32 {
+    if release_fallback {
         i32::try_from(RELEASE_POLL_FALLBACK.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
     } else {
+        // Nothing left on this side runs on a clock: frames arrive because the
+        // compositor or Android asked for them.
         -1
-    };
-    if animating {
-        let frame = i32::try_from(OVERLAY_FRAME_MILLIS).unwrap_or(i32::MAX);
-        timeout = if timeout < 0 { frame } else { timeout.min(frame) };
     }
-    timeout
 }
 
 fn split_point(point: u64) -> (u32, u32) {
@@ -5101,15 +5110,8 @@ mod tests {
 
     #[test]
     fn idle_wait_has_no_clipboard_deadline_but_release_fallback_remains_bounded() {
-        assert_eq!(poll_timeout_millis(false, false), -1);
-        assert_eq!(poll_timeout_millis(true, false), 4);
-    }
-
-    #[test]
-    fn an_animating_overlay_caps_the_wait_at_one_frame() {
-        assert_eq!(poll_timeout_millis(false, true), OVERLAY_FRAME_MILLIS as i32);
-        // The release fallback is faster than a frame, so it still wins.
-        assert_eq!(poll_timeout_millis(true, true), 4);
+        assert_eq!(poll_timeout_millis(false), -1);
+        assert_eq!(poll_timeout_millis(true), 4);
     }
 
     #[test]
