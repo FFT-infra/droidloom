@@ -3,6 +3,7 @@ mod android;
 mod assemble;
 mod bundle;
 mod dependencies;
+mod derive;
 mod image_policy;
 mod install;
 mod licenses;
@@ -92,8 +93,19 @@ enum Action {
     },
     /// Show the complete build plan without changing anything.
     Plan,
-    /// Verify an already built bundle.
+    /// Verify an already built bundle. Legacy schema 2 is explicitly unverified.
     Verify { payload: PathBuf },
+    /// Stage a verified presenter-only derivative; never installs or restarts.
+    DerivePresenter {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        presenter: PathBuf,
+        #[arg(long)]
+        build_record: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Privileged activation worker; normally invoked automatically through polkit.
     #[command(hide = true)]
     Apply {
@@ -178,6 +190,11 @@ fn execute(args: Args) -> Result<()> {
         Some(Action::Recover { uid }) => return install::recover(*uid),
         Some(Action::Apply { payload, uid }) => {
             return install::apply(&payload.canonicalize()?, *uid);
+        }
+        Some(Action::DerivePresenter { base, presenter, build_record, output }) => {
+            let id = derive::run(&repository(args.source.clone())?, base, presenter, build_record, output)?;
+            println!("Verified presenter derivative {id}: {} (not installed)", output.display());
+            return Ok(());
         }
         Some(Action::Verify { payload }) => {
             let m = bundle::verify(payload)?;
@@ -289,8 +306,8 @@ fn execute(args: Args) -> Result<()> {
             }
         }
     }
-    let identity = bundle::source_identity(&repo)?;
-    eprintln!("Building complete Droidloom release from {identity}");
+    let provenance = bundle::BuildProvenance::capture(&repo, target_arch)?;
+    eprintln!("Building complete Droidloom release from {}", provenance.source_commit);
     if cross {
         eprintln!(
             "Cross build for {product}: orchestration continues in this host updater; the staged payload carries the fresh {target_arch} binaries"
@@ -349,6 +366,12 @@ fn execute(args: Args) -> Result<()> {
     } else {
         cargo.join("release")
     };
+    let build_record = work.join("presenter-build-record.json");
+    let flags = host_build.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+    derive::PresenterBuildRecord::write_after_build(
+        &repo, &provenance, &host_out.join("droidloom-wayland"), &build_record, flags,
+    )?;
+    eprintln!("Presenter build record: {}", build_record.display());
     let fresh = host_out.join("droidloom-update");
     if !args.bootstrapped && !cross {
         // The updater is part of the build too. Use its new orchestration in this update.

@@ -107,6 +107,89 @@ pub fn copy(source: &Path, destination: &Path) -> Result<()> {
         .arg(source)
         .arg(destination))
 }
+pub fn open_directory(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?)
+}
+
+/// Resolve each component through held directory descriptors, never through a
+/// user-replaceable symlink while privileged staging is in progress.
+pub fn open_beneath(root: &fs::File, relative: &Path) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let parts: Vec<_> = relative.components().collect();
+    if parts.is_empty() || parts.iter().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return fail("invalid relative staging path");
+    }
+    let mut directory = root.try_clone()?;
+    for (i, part) in parts.iter().enumerate() {
+        let name = std::ffi::CString::new(part.as_os_str().as_bytes())?;
+        let last = i + 1 == parts.len();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+            | if last { libc::O_NONBLOCK } else { libc::O_DIRECTORY };
+        // SAFETY: name is NUL-terminated and directory owns its valid descriptor.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
+        // SAFETY: openat returned a new, uniquely owned descriptor.
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        if last {
+            if !file.metadata()?.is_file() { return fail("staged input is not a regular file"); }
+            return Ok(file);
+        }
+        directory = file;
+    }
+    fail("staging path has no file")
+}
+
+pub fn hash_beneath(root: &fs::File, relative: &Path) -> Result<String> {
+    let mut file = open_beneath(root, relative)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 131072];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 { break; }
+        digest.update(&buffer[..n]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+pub fn copy_beneath(root: &fs::File, relative: &Path, destination: &Path) -> Result<u32> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let file = open_beneath(root, relative)?;
+    let permissions = file.metadata()?.permissions().mode() & 0o7777;
+    if permissions & 0o7000 != 0 { return fail("privileged file mode is not allowed in a bundle"); }
+    fs::create_dir_all(destination.parent().ok_or("staged file has no parent")?)?;
+    let fd = file.as_raw_fd();
+    let mut command = Command::new("cp");
+    command.args(["--reflink=auto", "--sparse=always", "--preserve=mode,timestamps", "--"])
+        .arg(format!("/proc/self/fd/{fd}")).arg(destination);
+    // SAFETY: the child only changes descriptor flags before exec. The parent
+    // retains CLOEXEC; file stays alive until cp has completed.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                Err(std::io::Error::last_os_error())
+            } else { Ok(()) }
+        });
+    }
+    run(&mut command)?;
+    Ok(permissions)
+}
+
+/// Publish only into an absent path, including under concurrent builders.
+pub fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let target = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    // SAFETY: both paths are valid C strings and renameat2 does not retain them.
+    let result = unsafe { libc::renameat2(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, target.as_ptr(), libc::RENAME_NOREPLACE) };
+    if result != 0 { return Err(std::io::Error::last_os_error().into()); }
+    fs::File::open(destination.parent().ok_or("published directory has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
 pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut result = Vec::new();
     for entry in fs::read_dir(root)? {
