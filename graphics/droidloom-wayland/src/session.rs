@@ -87,7 +87,13 @@ impl SessionLease {
         let uid = fs::metadata("/proc/self")?.uid();
         let meta = fs::symlink_metadata(&runtime)?;
         if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
-            return Err(invalid("runtime root must be private and session-owned"));
+            return Err(invalid(format!(
+                "runtime root must be private and session-owned (dir={} uid={} want_uid={} mode={:o})",
+                meta.is_dir(),
+                meta.uid(),
+                uid,
+                meta.mode() & 0o7777
+            )));
         }
         let directory = runtime.join("droidloom");
         match fs::DirBuilder::new().mode(0o700).create(&directory) {
@@ -188,6 +194,14 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
 
+    /// tempfile creates a 0755 directory under the usual umask; the lease
+    /// requires a private 0700 root, so every fixture root is narrowed first.
+    fn private_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
     fn acquire(root: &Path) -> SessionLease {
         SessionLease::acquire(root.to_owned(), "wayland-test", None, false,
             &root.join("droidloom/native-bridge.sock")).unwrap()
@@ -195,7 +209,7 @@ mod tests {
 
     #[test]
     fn lease_excludes_another_presenter_without_touching_its_endpoint() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let _wayland = UnixListener::bind(root.path().join("wayland-test")).unwrap();
         let first = acquire(root.path());
         let error = SessionLease::acquire(root.path().to_owned(), "wayland-test", None, false,
@@ -211,7 +225,7 @@ mod tests {
 
     #[test]
     fn legacy_live_socket_is_not_mistaken_for_a_stale_file() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let _wayland = UnixListener::bind(root.path().join("wayland-test")).unwrap();
         fs::DirBuilder::new().mode(0o700).create(root.path().join("droidloom")).unwrap();
         let endpoint = root.path().join("droidloom/native-bridge.sock");
@@ -229,7 +243,7 @@ mod tests {
 
     #[test]
     fn identity_checks_cover_the_actual_connection_and_start_time() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let socket = root.path().join("wayland-test");
         let _wayland = UnixListener::bind(&socket).unwrap();
         let lease = acquire(root.path());
@@ -243,7 +257,7 @@ mod tests {
 
     #[test]
     fn lease_is_not_inherited_by_exec_children() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let _wayland = UnixListener::bind(root.path().join("wayland-test")).unwrap();
         let lease = acquire(root.path());
         let mut child = Command::new("sh").args(["-c", "printf ready; sleep 0.3"])
@@ -256,7 +270,7 @@ mod tests {
 
     #[test]
     fn foreign_and_symlink_runtime_paths_are_rejected() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let target = tempfile::tempdir().unwrap();
         let _wayland = UnixListener::bind(root.path().join("wayland-test")).unwrap();
         std::os::unix::fs::symlink(target.path(), root.path().join("droidloom")).unwrap();

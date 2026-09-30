@@ -15,6 +15,7 @@ mod text_input;
 mod gesture;
 mod chrome;
 mod interaction;
+mod session;
 
 use chrome::{Action as TitlebarButtonKind, Button as TitlebarButton, VisualState as TitlebarButtonState};
 
@@ -4253,10 +4254,10 @@ fn main() {
 }
 
 fn run() -> Result<(), PresenterError> {
-    let runtime_root = PathBuf::from(
-        env::var("XDG_RUNTIME_DIR")
-            .map_err(|_| PresenterError::Configuration("XDG_RUNTIME_DIR is missing"))?,
-    );
+    // Bind this presenter to the live compositor session before any endpoint
+    // preparation; the guard stays alive for the whole presenter lifetime.
+    let lease = session::SessionLease::acquire_from_environment()?;
+    let runtime_root = lease.runtime_dir().to_owned();
     let socket_path = env::var_os("DROIDLOOM_HOST_SOCKET").map_or_else(
         || runtime_root.join("droidloom/native-bridge.sock"),
         PathBuf::from,
@@ -4307,6 +4308,9 @@ fn run() -> Result<(), PresenterError> {
     .with_session_mode(session_mode);
 
     let conn = Connection::connect_to_env()?;
+    // The probe connection above and the real connection must be the same
+    // compositor; close the verification/connect race explicitly.
+    lease.verify_connection(conn.as_fd())?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
     let compositor = Arc::new(CompositorState::bind(&globals, &qh)?);
@@ -4337,6 +4341,11 @@ fn run() -> Result<(), PresenterError> {
         "Droidloom tablet trace: stage=initial-seats-bound count={}",
         tablet_seats.len()
     );
+    // The Denial insets global is a private capability marker: only a matching
+    // Denial compositor advertises it, so the session assertion is honored only
+    // when the host can actually draw and route native controls.
+    let insets_manager: Option<insets::DenialInsetsManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let host_navigation = lease.host_navigation() && insets_manager.is_some();
     let mut app = App {
         activation: activation::Activation::new(&globals, &qh),
         layer_globals: layers::Globals { subcompositor: globals.bind(&qh, 1..=1, ())?, shm: globals.bind(&qh, 1..=1, ())?, alpha: globals.bind(&qh, 1..=1, ()).ok() },
@@ -4367,7 +4376,7 @@ fn run() -> Result<(), PresenterError> {
         feedback: None,
         compositor,
         xdg_shell,
-        _insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        _insets_manager: insets_manager,
         viewporter,
         fractional_scale_manager,
         sync_manager,
@@ -4375,8 +4384,7 @@ fn run() -> Result<(), PresenterError> {
         gbm,
         listener,
         window_policy,
-        host_navigation: env::var("DROIDLOOM_HOST_NAVIGATION").as_deref() == Ok("1")
-            && globals.bind::<insets::DenialInsetsManagerV1, _, _>(&qh, 1..=1, ()).is_ok(),
+        host_navigation,
         endpoint: None,
         tasks: BTreeMap::new(),
         keyboard: None,
