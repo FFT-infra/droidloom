@@ -696,6 +696,10 @@ impl App {
         package: &str,
     ) -> Result<(), PresenterError> {
         let headless = package == BOOTSTRAP_PACKAGE;
+        eprintln!(
+            "Droidloom trace: stage=window event=create object={} package={package} headless={headless}",
+            object.0
+        );
         if !headless && let Err(error) = self.window_policy.reload_policy() {
             eprintln!("Droidloom kept the last valid window policy: {error}");
         }
@@ -1719,6 +1723,16 @@ impl App {
                 self.next_input_serial, object.0
             );
         }
+        eprintln!(
+            "Droidloom trace: stage=input object={} serial={} event={}",
+            object.0,
+            self.next_input_serial,
+            match &event {
+                InputEvent::Touch { action, .. } => format!("Touch({action:?})"),
+                InputEvent::Key { action, .. } => format!("Key({action:?})"),
+                other => format!("{other:?}").chars().take(40).collect(),
+            }
+        );
         self.endpoint
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
@@ -2660,6 +2674,12 @@ impl WindowHandler for App {
             saved_floating
         };
 
+        if was_fullscreen != is_fullscreen || was_maximized != is_maximized {
+            eprintln!(
+                "Droidloom trace: stage=window event=state object={} fullscreen={was_fullscreen}->{is_fullscreen} maximized={was_maximized}->{is_maximized} logical={previous:?}",
+                object.0
+            );
+        }
         if let Some(task) = self.tasks.get_mut(&object) {
             task.fullscreen = is_fullscreen;
             task.maximized = is_maximized;
@@ -3510,7 +3530,13 @@ impl TouchHandler for App {
             .tablet_tools
             .iter()
             .any(|tool| tool.supported && tool.surface.is_some());
+        // Side-swipe Back belongs to the immersive presentation: in an
+        // ordinary window the edges are the application's own gestures.
+        let immersive = self.tasks.get(&object).is_some_and(|task| {
+            task.fullscreen || self.immersion.as_ref().is_some_and(|imm| imm.object == object)
+        });
         if !pen_in_proximity
+            && immersive
             && let Some((width, height)) =
                 self.tasks.get(&object).and_then(|task| task.logical_size)
             && let Some(candidate) = gesture::SwipeBackCandidate::begin(
