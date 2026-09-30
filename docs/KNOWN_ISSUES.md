@@ -4,75 +4,11 @@ These limitations apply to the current pacman preview. Installation and APK
 commands are in [INSTALL.md](INSTALL.md); source builds are in
 [BUILDING.md](BUILDING.md).
 
-## Video decode
-
-- **Sheng Iris hardware decode is standard and enabled by default.** The path
-  is Android `MediaCodec` → Codec2 AIDL → AOSP `v4l2_codec2` → the host's
-  Qualcomm Iris stateful V4L2 decoder, with DMA-BUF buffers. Sheng builds
-  include the Codec2 service and capability XML by default, and a cell exposes
-  the decoder when its `cell.json` sets `"video_decoder": "iris"`. Codec2 sizes input buffers from
-  the OUTPUT `sizeimage` that Iris reports when the service starts: 7,077,888
-  bytes for H.264, HEVC and AV1 and 14,155,776 bytes for VP9 on sheng. That
-  size is a floor. A client `max-input-size` can raise the buffers but never
-  shrink them below it, which the driver rejects with `EFAULT` at the first
-  `VIDIOC_QBUF` instead of decoding anything. A qualification run on sheng
-  decoded a 60-frame clip with H.264, HEVC, VP9 and AV1 at 1080p and 4K, with
-  both ByteBuffer and Surface output. Longer playback, seeking, mid-stream
-  resolution changes and concurrent decoders are untested. The capability XML
-  now advertises 4K30 or 1080p60, bitrate up to 120 Mbps and four concurrent
-  decoder instances, and all four `c2.v4l2` decoders rank 256, ahead of
-  Android's software codecs at 512. An app that selects a decoder by format
-  therefore gets hardware, and falls back to software only outside those limits
-  or once the vendor service has admitted four instances. The 120 Mbps ceiling
-  is an advertised bound, not a measured throughput, and decoding more than one
-  stream at a time has not been measured.
-
-## Sheng daily-use integration
-
-- **Android playback reaches the host sink, with underruns; capture does not
-  exist yet.** The cell's primary output is an `AUDIO_DEVICE_OUT_BUS` port whose
-  stream Droidloom's patched audio HAL writes to `/dev/socket/droidloom/audio`,
-  the endpoint the supervisor projects into the cell; the `droidloom-audio` user
-  service forwards one stream at a time to the session's PipeWire sink. On sheng
-  the in-cell HAL logged `AHAL_DriverSocket: connect: sending 48000 Hz`, Douyin
-  video playback produced a 56.8 s host stream and a notification sound a 4.8 s
-  one, so application audio leaves the cell. The longer stream also logged
-  `AudioFlinger: prepareTracks_l BUFFER TIMEOUT` underruns, so sustained
-  playback still needs measuring. Nothing captures in the other direction:
-  recording returns silence, and microphone support must not be described as
-  available.
-- **Pen and window acceptance is still partial.** The Android bridge maps Linux
-  `BTN_STYLUS` and `BTN_STYLUS2` to Android's standard primary and secondary
-  stylus-button key codes; Droidloom contains no StarNote-specific action. The
-  user has confirmed pen input and finger dragging work on sheng, but button
-  press/release traces, pressure, tilt, palm rejection, reconnect, edge resize,
-  and saved window size still need repeatable device tests.
-- **UU remote-play acceptance is pending external test inputs.** UU Remote
-  (`com.netease.uuremote` 4.42.0) is installed on sheng, but a signed-in account
-  and a test peer are still required before its video and audio paths can be
-  judged.
-- **Douyin keeps its phone layout, and product identity is not the gate.**
-  The installed Douyin renders the phone layout, with its bottom navigation bar,
-  in a freeform task. A complete Xiaomi identity measured through a file
-  override (`ro.product.model=24018RPACC`, `brand` and `manufacturer` `Xiaomi`,
-  device and name `sheng`, Xiaomi fingerprint) changed nothing, runtime MIUI
-  properties (`ro.miui.ui.version.name`, notch height) changed nothing, and a
-  fullscreen attempt was letterboxed by the application's own portrait lock, so
-  the landscape fullscreen condition could not be constructed at all. The APKs
-  reference no `Lmiui/` class, so the decision does not read MIUI framework
-  state; every `com.ss.android.ugc.aweme.pad_api` interface ships a
-  `*Downgrade` fallback and the predicates are an `isPadABon` A/B flag and
-  `isPadLandscapeMode`. `isInMultiWindowMode` appears in roughly twenty dex
-  files, and Droidloom fixes the display to freeform, so a multi-window test can
-  suppress a tablet layout before any device check runs. The identity override
-  was removed: it bought nothing and made the device report a tablet it is not.
-  Confirming either cause requires changing the window model, a display per task
-  or no freeform, which affects every application.
-- **Cell internet depends on the host's forwarding chains.** Droidloom adds
-  exact-match accept rules for the cell to `ufw-user-forward` and
-  `DOCKER-USER`, the two chains that forward traffic ahead of a host drop
-  policy. A host that drops forwarded traffic from some other chain leaves the
-  cell without internet until an equivalent rule exists.
+Device-specific measurements and acceptance records for the downstream sheng
+product (Iris decoder buffer sizes, Android audio/pen/UU/Douyin findings, the
+host's forwarding chains) live outside this repository in
+`srv/docs/10-sheng-device-records.md`. Repository documentation states general
+behavior only.
 
 ## Application compatibility
 
@@ -574,9 +510,9 @@ The subsequent source fixes and full-suite results are recorded above.
 - **Android task profiles lose CPU and I/O placement on cgroup-v2-only hosts.**
   Android expresses CPU sets and I/O priorities by joining the legacy `cpuset`,
   `cpu` and `blkio` hierarchies. A host that already owns those controllers in
-  cgroup v2 cannot provide the v1 hierarchies, and the sheng target is such a
-  host: Droidloom reports both backends unavailable (`blkio` busy, `cpuset`
-  invalid) before Android starts. The cell now removes those joins from the platform's
+  cgroup v2 cannot provide the v1 hierarchies: Droidloom reports both backends
+  unavailable (`blkio` busy, `cpuset` invalid) before Android starts. The cell
+  now removes those joins from the platform's
   task profiles instead of letting each one fail, so services start without
   `failed to set task profiles` and keep their remaining actions (memory,
   freezer, scheduler policy, timer slack). What is missing is the placement
@@ -585,15 +521,13 @@ The subsequent source fixes and full-suite results are recorded above.
   A cgroup v2 backend that declares `cpuset` next to the existing `memory` and
   `freezer` controllers, creates Android's `apps`/`system` sub-hierarchies and
   expresses the same groups through the v2 controller is the follow-up.
-- **The tablet cell's density comes from the product, because the panel reports
-  no physical size.** SurfaceFlinger takes the density of an internal display
-  from `ro.sf.lcd_density` and falls back to its TV density (213 dpi) when the
-  property is unset, which is what sheng ran with until the tablet product
-  declared `ro.sf.lcd_density=320`. The panel is a 12.4-inch 3048x2032 display
-  (about 295 ppi) with no EDID, so nothing else in the stack can derive the
-  right scale; 320 is the density Android's own rule picks for that pixel
-  density. A per-user `droidloomctl dpi` override still outranks the product
-  default and persists in the Android data image.
+- **A cell's density comes from the product when its panel reports no physical
+  size.** SurfaceFlinger takes the density of an internal display from
+  `ro.sf.lcd_density` and falls back to its TV density (213 dpi) when the
+  property is unset. A panel with no EDID leaves nothing else in the stack able
+  to derive the right scale, so the product declares the density Android's own
+  rule would pick for that pixel density. A per-user `droidloomctl dpi` override
+  still outranks the product default and persists in the Android data image.
 - **The cell never sees a physical input device.** Kernel hotplug uevents reach
   every uevent listener, including the cell's ueventd, so a device attached to
   the host was published as `/dev/input/event*` inside the cell and Android read
