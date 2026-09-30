@@ -1,259 +1,180 @@
-// Droidloom Wayland Touchscreen Edge Gesture Recognizer
-// Provides edge-swipe back navigation and top-edge fullscreen controls reveal.
+//! Finger-only side-swipe Back recognition.
+//!
+//! The recognizer never consumes a stream before it commits: while a candidate
+//! is pending the application receives every event, and the caller pilfers the
+//! contact exactly once by cancelling it when the swipe confirms. Pen tools,
+//! additional fingers, vertical scrolling and outward drags never produce a
+//! Back. There is no animation, no timer and no cross-contact state.
 
-use std::time::Duration;
 use droidloom_denial_protocol::TaskObjectId;
 
-/// Margin in surface-local pixels from the left or right edge to intercept back gestures.
-pub const EDGE_SWIPE_MARGIN: f64 = 36.0;
+/// Width of the edge band where a swipe may begin, in logical pixels.
+pub const EDGE_MARGIN: f64 = 24.0;
+/// Travel that classifies an undecided swipe.
+pub const SLOP: f64 = 10.0;
+/// Inward travel that commits a Back.
+pub const CONFIRM_DISTANCE: f64 = 48.0;
+/// Travel a fling must reach before velocity alone can commit it.
+pub const FLING_TRAVEL: f64 = 24.0;
+/// Logical pixels per second that qualify a fling.
+pub const FLING_SPEED: f64 = 750.0;
+/// Retreat toward the start edge that aborts a committed swipe before release.
+pub const RETREAT_DISTANCE: f64 = 16.0;
 
-/// Margin in surface-local pixels from the top edge in fullscreen to intercept reveal gestures.
-pub const TOP_EDGE_MARGIN: f64 = 48.0;
-
-/// Distance in pixels required to confirm a horizontal back swipe.
-pub const BACK_CONFIRM_DISPLACEMENT: f64 = 36.0;
-
-/// Distance in pixels required to confirm a top-edge pull-down.
-pub const TOP_CONFIRM_DISPLACEMENT: f64 = 32.0;
-
-/// Vertical distance in pixels after which an edge touch is classified as vertical scrolling.
-pub const SCROLL_DISAMBIGUATION_SLOP: f64 = 20.0;
-
-/// Tap threshold: movements below this are treated as taps if released without confirming.
-pub const TAP_THRESHOLD: f64 = 15.0;
-
-/// Duration for which fullscreen controls stay revealed when triggered.
-pub const FULLSCREEN_REVEAL_DURATION: Duration = Duration::from_millis(3500);
-
+/// One recognition update for a tracked contact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EdgeGestureKind {
-    Back { is_left: bool },
-    TopReveal,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EdgeGesturePhase {
+pub enum SwipeUpdate {
+    /// Undecided; the application keeps receiving the stream.
     Pending,
+    /// The swipe committed; the caller cancels the contact exactly once.
     Confirmed,
+    /// The candidate disqualified; the application keeps the whole stream.
     Cancelled,
 }
 
+/// A single finger monitored for an inward edge swipe over one task.
 #[derive(Clone, Copy, Debug)]
-pub struct EdgeGestureTracker {
-    #[allow(dead_code)]
-    pub id: i32,
-    pub object: TaskObjectId,
-    pub kind: EdgeGestureKind,
-    pub phase: EdgeGesturePhase,
-    pub start_pos: (f64, f64),
-    pub current_pos: (f64, f64),
-    #[allow(dead_code)]
-    pub serial: u32,
-    pub pointer_id: u32,
-    pub start_time: std::time::Instant,
+pub struct SwipeBackCandidate {
+    object: TaskObjectId,
+    /// Wayland touch id, kept as the protocol's contact identity.
+    pointer_id: u32,
+    from_left: bool,
+    start: (f64, f64),
+    last: (f64, f64),
+    last_time_ms: u64,
+    peak_speed: f64,
+    confirmed: bool,
+    cancelled: bool,
+    stealing: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EdgeMotionResult {
-    StayPending,
-    ConfirmedBack,
-    ConfirmedTopReveal,
-    CancelScroll,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EdgeUpResult {
-    TriggerBack,
-    TriggerTopReveal,
-    TapAtEdge { pos: (f64, f64) },
-    None,
-}
-
-impl EdgeGestureTracker {
-    /// Detects whether an initial touch down qualifies as a candidate edge gesture.
-    pub fn new_candidate(
-        id: i32,
+impl SwipeBackCandidate {
+    /// Begin monitoring a touch that starts inside the content's edge band.
+    ///
+    /// Positions are content-local logical coordinates. Degenerate geometry,
+    /// non-finite input and touches that start outside the band yield `None`.
+    pub fn begin(
         object: TaskObjectId,
-        serial: u32,
         pointer_id: u32,
-        pos: (f64, f64),
+        position: (f64, f64),
         window_size: (u32, u32),
-        is_fullscreen: bool,
+        edge: f64,
+        time_ms: u64,
     ) -> Option<Self> {
-        let (width, height) = window_size;
-        let width_f = width as f64;
-        let height_f = height as f64;
-
-        if is_fullscreen && pos.1 <= TOP_EDGE_MARGIN {
-            return Some(Self {
-                id,
-                object,
-                kind: EdgeGestureKind::TopReveal,
-                phase: EdgeGesturePhase::Pending,
-                start_pos: pos,
-                current_pos: pos,
-                serial,
-                pointer_id,
-                start_time: std::time::Instant::now(),
-            });
-        }
-
-        // Top/bottom edge exclusion for side back gestures:
-        // Avoid interfering with top panel / status bar or bottom bar / IME
-        if pos.1 < 36.0 || (height_f > 72.0 && pos.1 > height_f - 36.0) {
+        let (width, height) = (f64::from(window_size.0), f64::from(window_size.1));
+        if !position.0.is_finite() || !position.1.is_finite() || !edge.is_finite() {
             return None;
         }
-
-        if pos.0 <= EDGE_SWIPE_MARGIN {
-            return Some(Self {
-                id,
-                object,
-                kind: EdgeGestureKind::Back { is_left: true },
-                phase: EdgeGesturePhase::Pending,
-                start_pos: pos,
-                current_pos: pos,
-                serial,
-                pointer_id,
-                start_time: std::time::Instant::now(),
-            });
+        if width <= edge * 2.0 || height <= 0.0 || position.1 < 0.0 || position.1 > height {
+            return None;
         }
-
-        if width_f > EDGE_SWIPE_MARGIN && pos.0 >= (width_f - EDGE_SWIPE_MARGIN) {
-            return Some(Self {
-                id,
-                object,
-                kind: EdgeGestureKind::Back { is_left: false },
-                phase: EdgeGesturePhase::Pending,
-                start_pos: pos,
-                current_pos: pos,
-                serial,
-                pointer_id,
-                start_time: std::time::Instant::now(),
-            });
-        }
-
-        None
+        let from_left = if position.0 <= edge {
+            true
+        } else if position.0 >= width - edge {
+            false
+        } else {
+            return None;
+        };
+        Some(Self {
+            object,
+            pointer_id,
+            from_left,
+            start: position,
+            last: position,
+            last_time_ms: time_ms,
+            peak_speed: 0.0,
+            confirmed: false,
+            cancelled: false,
+            stealing: false,
+        })
     }
 
-    /// Evaluates motion updates to classify gestures or cancel to in-app scrolling.
-    pub fn on_motion(&mut self, new_pos: (f64, f64)) -> EdgeMotionResult {
-        self.current_pos = new_pos;
-        let dx = new_pos.0 - self.start_pos.0;
-        let dy = new_pos.1 - self.start_pos.1;
-        let abs_dx = dx.abs();
-        let abs_dy = dy.abs();
-
-        match self.kind {
-            EdgeGestureKind::Back { is_left } => {
-                if self.phase == EdgeGesturePhase::Cancelled {
-                    return EdgeMotionResult::CancelScroll;
-                }
-
-                let inward_dx = if is_left { dx } else { -dx };
-
-                // If previously confirmed, check if user aborted by sliding back towards the edge
-                if self.phase == EdgeGesturePhase::Confirmed {
-                    if inward_dx < 16.0 {
-                        self.phase = EdgeGesturePhase::Pending;
-                        return EdgeMotionResult::StayPending;
-                    }
-                    return EdgeMotionResult::ConfirmedBack;
-                }
-
-                // Vertical scroll disambiguation check:
-                // Only cancel if vertical movement is dominant (dy > 1.6 * dx)
-                // AND exceeds the slop threshold (20px).
-                if abs_dy >= SCROLL_DISAMBIGUATION_SLOP && abs_dy > 1.6 * abs_dx {
-                    self.phase = EdgeGesturePhase::Cancelled;
-                    return EdgeMotionResult::CancelScroll;
-                }
-
-                // Outward drag into bezel cancel
-                if inward_dx < -12.0 {
-                    self.phase = EdgeGesturePhase::Cancelled;
-                    return EdgeMotionResult::CancelScroll;
-                }
-
-                // Inward travel check: natural thumb arc allows up to ~50 degree diagonal
-                if inward_dx >= BACK_CONFIRM_DISPLACEMENT && abs_dx > 0.85 * abs_dy {
-                    self.phase = EdgeGesturePhase::Confirmed;
-                    return EdgeMotionResult::ConfirmedBack;
-                }
-
-                // Rapid swipe / fling check:
-                let elapsed = self.start_time.elapsed().as_millis();
-                if inward_dx >= 20.0 && elapsed < 200 && abs_dx > abs_dy {
-                    self.phase = EdgeGesturePhase::Confirmed;
-                    return EdgeMotionResult::ConfirmedBack;
-                }
-
-                EdgeMotionResult::StayPending
-            }
-            EdgeGestureKind::TopReveal => {
-                if self.phase == EdgeGesturePhase::Confirmed {
-                    return EdgeMotionResult::ConfirmedTopReveal;
-                }
-                if self.phase == EdgeGesturePhase::Cancelled {
-                    return EdgeMotionResult::CancelScroll;
-                }
-
-                if abs_dx >= 20.0 && abs_dx > dy * 1.5 {
-                    self.phase = EdgeGesturePhase::Cancelled;
-                    return EdgeMotionResult::CancelScroll;
-                }
-
-                if dy >= TOP_CONFIRM_DISPLACEMENT && dy > abs_dx {
-                    self.phase = EdgeGesturePhase::Confirmed;
-                    return EdgeMotionResult::ConfirmedTopReveal;
-                }
-
-                let elapsed = self.start_time.elapsed().as_millis();
-                if dy >= 20.0 && elapsed < 200 && dy > abs_dx {
-                    self.phase = EdgeGesturePhase::Confirmed;
-                    return EdgeMotionResult::ConfirmedTopReveal;
-                }
-
-                EdgeMotionResult::StayPending
-            }
-        }
+    /// Whether this tracker belongs to the given Wayland touch id.
+    pub fn matches(&self, pointer_id: u32) -> bool {
+        self.pointer_id == pointer_id
     }
 
-    /// Evaluates touch release to produce the final action.
-    pub fn on_up(&self) -> EdgeUpResult {
-        match self.phase {
-            EdgeGesturePhase::Confirmed => match self.kind {
-                EdgeGestureKind::Back { .. } => EdgeUpResult::TriggerBack,
-                EdgeGestureKind::TopReveal => EdgeUpResult::TriggerTopReveal,
-            },
-            EdgeGesturePhase::Pending => {
-                let dx = self.current_pos.0 - self.start_pos.0;
-                let dy = self.current_pos.1 - self.start_pos.1;
-                let abs_dx = dx.abs();
-                let abs_dy = dy.abs();
-                let elapsed = self.start_time.elapsed().as_millis();
+    /// The task the swipe started on.
+    pub fn object(&self) -> TaskObjectId {
+        self.object
+    }
 
-                match self.kind {
-                    EdgeGestureKind::Back { is_left } => {
-                        let inward_dx = if is_left { dx } else { -dx };
-                        if inward_dx >= 18.0 && elapsed < 250 && abs_dx > 0.85 * abs_dy {
-                            return EdgeUpResult::TriggerBack;
-                        }
-                    }
-                    EdgeGestureKind::TopReveal => {
-                        if dy >= 18.0 && elapsed < 250 && dy > abs_dx {
-                            return EdgeUpResult::TriggerTopReveal;
-                        }
-                    }
-                }
+    /// Whether the caller has already cancelled this contact for the swipe.
+    pub fn stealing(&self) -> bool {
+        self.stealing
+    }
 
-                if abs_dx < TAP_THRESHOLD && abs_dy < TAP_THRESHOLD {
-                    EdgeUpResult::TapAtEdge { pos: self.start_pos }
-                } else {
-                    EdgeUpResult::None
-                }
-            }
-            EdgeGesturePhase::Cancelled => EdgeUpResult::None,
+    /// Record that the caller pilfered the contact.
+    pub fn mark_stealing(&mut self) {
+        self.stealing = true;
+    }
+
+    /// Classify a motion sample.
+    pub fn on_motion(&mut self, position: (f64, f64), time_ms: u64) -> SwipeUpdate {
+        if !position.0.is_finite() || !position.1.is_finite() {
+            self.cancelled = true;
+            return SwipeUpdate::Cancelled;
         }
+        let dt = time_ms.saturating_sub(self.last_time_ms);
+        let sample_dx = position.0 - self.last.0;
+        let sample_dy = position.1 - self.last.1;
+        if dt > 0 {
+            let speed = sample_dx.hypot(sample_dy) * 1000.0 / dt as f64;
+            if speed > self.peak_speed {
+                self.peak_speed = speed;
+            }
+        }
+        self.last = position;
+        self.last_time_ms = time_ms;
+
+        if self.cancelled {
+            return SwipeUpdate::Cancelled;
+        }
+        let dx = position.0 - self.start.0;
+        let dy = position.1 - self.start.1;
+        let inward = if self.from_left { dx } else { -dx };
+
+        if self.confirmed {
+            if inward < RETREAT_DISTANCE {
+                self.cancelled = true;
+                return SwipeUpdate::Cancelled;
+            }
+            return SwipeUpdate::Confirmed;
+        }
+        // Vertical dominance hands the whole sequence back to the application.
+        if dy.abs() >= SLOP && dy.abs() > dx.abs() {
+            self.cancelled = true;
+            return SwipeUpdate::Cancelled;
+        }
+        // Pulling outward toward the bezel is not a Back.
+        if inward < -SLOP {
+            self.cancelled = true;
+            return SwipeUpdate::Cancelled;
+        }
+        if inward >= CONFIRM_DISTANCE
+            || (inward >= FLING_TRAVEL && self.peak_speed >= FLING_SPEED)
+        {
+            self.confirmed = true;
+            return SwipeUpdate::Confirmed;
+        }
+        SwipeUpdate::Pending
+    }
+
+    /// Finish the contact. `Some(object)` means one Back must be sent.
+    ///
+    /// Confirmation happens on motion samples only; a stream that never
+    /// classified stays with the application, so release only re-checks the
+    /// retreat threshold.
+    pub fn on_up(&mut self, _time_ms: u64) -> Option<TaskObjectId> {
+        if self.cancelled {
+            return None;
+        }
+        let dx = self.last.0 - self.start.0;
+        let inward = if self.from_left { dx } else { -dx };
+        if inward < RETREAT_DISTANCE {
+            return None;
+        }
+        self.confirmed.then_some(self.object)
     }
 }
 
@@ -261,70 +182,111 @@ impl EdgeGestureTracker {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_edge_swipe_back_left_confirmed() {
-        let mut tracker = EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
-        ).expect("should be candidate");
-        assert_eq!(tracker.kind, EdgeGestureKind::Back { is_left: true });
-        assert_eq!(tracker.on_motion((20.0, 502.0)), EdgeMotionResult::StayPending);
-        assert_eq!(tracker.on_motion((52.0, 505.0)), EdgeMotionResult::ConfirmedBack);
-        assert_eq!(tracker.on_up(), EdgeUpResult::TriggerBack);
+    const WINDOW: (u32, u32) = (800, 600);
+    const TASK: TaskObjectId = TaskObjectId(7);
+
+    fn begin_left() -> SwipeBackCandidate {
+        SwipeBackCandidate::begin(TASK, 3, (10.0, 300.0), WINDOW, EDGE_MARGIN, 1_000).unwrap()
     }
 
     #[test]
-    fn test_edge_swipe_back_right_confirmed() {
-        let mut tracker = EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (1910.0, 500.0), (1920, 1080), false,
-        ).expect("should be candidate");
-        assert_eq!(tracker.kind, EdgeGestureKind::Back { is_left: false });
-        assert_eq!(tracker.on_motion((1860.0, 503.0)), EdgeMotionResult::ConfirmedBack);
-        assert_eq!(tracker.on_up(), EdgeUpResult::TriggerBack);
+    fn a_slow_inward_swipe_confirms_at_the_distance_threshold() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((30.0, 302.0), 1_016), SwipeUpdate::Pending);
+        assert_eq!(candidate.on_motion((60.0, 305.0), 1_032), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(1_050), Some(TASK));
     }
 
     #[test]
-    fn test_vertical_scroll_cancelled_to_app() {
-        let mut tracker = EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
-        ).expect("should be candidate");
-        assert_eq!(tracker.on_motion((12.0, 470.0)), EdgeMotionResult::CancelScroll);
-        assert_eq!(tracker.on_up(), EdgeUpResult::None);
+    fn the_right_edge_mirrors_the_left_edge() {
+        let mut candidate =
+            SwipeBackCandidate::begin(TASK, 4, (790.0, 200.0), WINDOW, EDGE_MARGIN, 0).unwrap();
+        assert_eq!(candidate.on_motion((760.0, 202.0), 100), SwipeUpdate::Pending);
+        assert_eq!(candidate.on_motion((735.0, 205.0), 220), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(260), Some(TASK));
     }
 
     #[test]
-    fn test_edge_swipe_back_abort_by_sliding_back() {
-        let mut tracker = EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (10.0, 500.0), (1920, 1080), false,
-        ).expect("should be candidate");
-        assert_eq!(tracker.on_motion((52.0, 505.0)), EdgeMotionResult::ConfirmedBack);
-        // Slide back to edge (inward_dx = 12.0 - 10.0 = 2.0 < 16.0)
-        assert_eq!(tracker.on_motion((12.0, 505.0)), EdgeMotionResult::StayPending);
-        // Aborted back to edge, user releases -> tap at edge or none
-        assert_ne!(tracker.on_up(), EdgeUpResult::TriggerBack);
+    fn vertical_scrolling_cancels_and_never_confirms() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((11.0, 320.0), 16), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_motion((80.0, 320.0), 32), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_up(48), None);
     }
 
     #[test]
-    fn test_tap_at_edge_triggers_tap() {
-        let tracker = EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (8.0, 300.0), (1920, 1080), false,
-        ).expect("should be candidate");
-        assert_eq!(tracker.on_up(), EdgeUpResult::TapAtEdge { pos: (8.0, 300.0) });
+    fn outward_drag_is_not_a_back() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((-4.0, 301.0), 16), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_up(24), None);
     }
 
     #[test]
-    fn test_fullscreen_top_reveal() {
-        let mut tracker = EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (500.0, 10.0), (1920, 1080), true,
-        ).expect("should be candidate in fullscreen");
-        assert_eq!(tracker.kind, EdgeGestureKind::TopReveal);
-        assert_eq!(tracker.on_motion((502.0, 42.0)), EdgeMotionResult::ConfirmedTopReveal);
-        assert_eq!(tracker.on_up(), EdgeUpResult::TriggerTopReveal);
+    fn a_fast_fling_confirms_before_the_distance_threshold() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((36.0, 301.0), 1_016), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(1_020), Some(TASK));
     }
 
     #[test]
-    fn test_content_touch_not_candidate() {
-        assert!(EdgeGestureTracker::new_candidate(
-            1, TaskObjectId(100), 1, 0, (200.0, 300.0), (1920, 1080), false,
-        ).is_none());
+    fn retreat_after_confirmation_aborts_the_back() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((60.0, 302.0), 16), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_motion((12.0, 302.0), 32), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_up(48), None);
+    }
+
+    #[test]
+    fn shallow_retreat_keeps_the_confirmation() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((60.0, 302.0), 16), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_motion((30.0, 302.0), 32), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(48), Some(TASK));
+    }
+
+    #[test]
+    fn a_motionless_tap_is_not_a_back() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_up(1_100), None);
+    }
+
+    #[test]
+    fn invalid_samples_cancel_instead_of_guessing() {
+        let mut candidate = begin_left();
+        assert_eq!(
+            candidate.on_motion((f64::NAN, 300.0), 16),
+            SwipeUpdate::Cancelled
+        );
+        assert_eq!(candidate.on_up(24), None);
+    }
+
+    #[test]
+    fn content_middle_and_degenerate_geometry_never_begin() {
+        assert!(
+            SwipeBackCandidate::begin(TASK, 1, (400.0, 300.0), WINDOW, EDGE_MARGIN, 0).is_none()
+        );
+        assert!(
+            SwipeBackCandidate::begin(TASK, 1, (10.0, 700.0), WINDOW, EDGE_MARGIN, 0).is_none()
+        );
+        assert!(
+            SwipeBackCandidate::begin(TASK, 1, (10.0, 300.0), (40, 600), EDGE_MARGIN, 0).is_none()
+        );
+    }
+
+    #[test]
+    fn identity_and_replay_are_deterministic() {
+        let candidate = begin_left();
+        assert!(candidate.matches(3));
+        assert!(!candidate.matches(4));
+        let trace = [(20.0, 301.0, 16u64), (50.0, 304.0, 32), (70.0, 306.0, 48)];
+        let run = || {
+            let mut candidate = begin_left();
+            let mut updates = Vec::new();
+            for (x, y, time) in trace {
+                updates.push(candidate.on_motion((x, y), 1_000 + time));
+            }
+            (updates, candidate.on_up(1_060))
+        };
+        assert_eq!(run(), run());
     }
 }

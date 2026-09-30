@@ -9,8 +9,6 @@ mod fence_wakeup;
 mod notifications;
 mod presentation_audit;
 mod text_input;
-#[cfg(test)]
-#[allow(dead_code)]
 mod gesture;
 mod session;
 
@@ -143,6 +141,10 @@ const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
+const KEY_LEFT: u32 = 105;
+/// Mouse buttons that request Android Back instead of a pointer click.
+const BTN_SIDE: u32 = 0x113;
+const BTN_BACK: u32 = 0x116;
 /// One scroll step for a continuous (touchpad or finger) Wayland scroll,
 /// measured in surface pixels, following common toolkit behaviour.
 const CONTINUOUS_SCROLL_PIXELS_PER_STEP: f64 = 10.0;
@@ -493,8 +495,10 @@ struct App {
     /// Task under the mouse for native mouse routing, and its pressed buttons.
     mouse_focus: Option<TaskObjectId>,
     mouse_buttons: BTreeSet<u32>,
+    consumed_mouse_buttons: BTreeSet<u32>,
     pointer_contact: Option<Contact>,
     touch_contacts: HashMap<(wayland_client::backend::ObjectId, i32), Contact>,
+    swipe_back: Option<gesture::SwipeBackCandidate>,
     decoration_touch: Option<DecorationTouch>,
     next_buffer_id: u64,
     next_input_serial: u64,
@@ -1528,6 +1532,9 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
+        if self.swipe_back.as_ref().is_some_and(|candidate| candidate.object() == object) {
+            self.swipe_back = None;
+        }
         eprintln!(
             "Droidloom destroyed terminal Android xdg_toplevel object={}",
             object.0
@@ -1762,6 +1769,9 @@ impl App {
     /// Drop routing state for a task that no longer accepts input at all.
     fn forget_task_input(&mut self, object: TaskObjectId) {
         self.pressed_keys.retain(|_, owner| *owner != object);
+        if self.swipe_back.as_ref().is_some_and(|candidate| candidate.object() == object) {
+            self.swipe_back = None;
+        }
         if self.mouse_focus == Some(object) {
             self.mouse_focus = None;
             self.mouse_buttons.clear();
@@ -1818,6 +1828,12 @@ impl App {
                 self.toggle_fullscreen(object);
                 return true;
             }
+        }
+        if keycode == KEY_LEFT && modifiers.alt
+            && !modifiers.logo && !modifiers.ctrl && !modifiers.shift
+        {
+            self.send_back_key(object);
+            return true;
         }
         if keycode == KEY_B && modifiers.ctrl && modifiers.alt && !modifiers.logo {
             self.toggle_decorations(qh, object);
@@ -1894,7 +1910,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     fn send_back_key(&mut self, object: TaskObjectId) {
         if let Err(error) = self.send_input(
             object,
@@ -1985,6 +2000,13 @@ impl App {
                 None => Ok(()),
             },
             PointerEventKind::Press { button, .. } => {
+                if matches!(button, BTN_SIDE | BTN_BACK) {
+                    if let Some(focus) = self.mouse_focus.or(object) {
+                        self.send_back_key(focus);
+                    }
+                    self.consumed_mouse_buttons.insert(button);
+                    return;
+                }
                 let Some(focus) = self.mouse_focus.or(object) else { return };
                 self.mouse_focus = Some(focus);
                 // The stream can miss a release while the compositor owns the
@@ -2003,6 +2025,9 @@ impl App {
                 }
             }
             PointerEventKind::Release { button, .. } => {
+                if self.consumed_mouse_buttons.remove(&button) {
+                    return;
+                }
                 // Clear the tracked press whether or not a target is known, so
                 // a lost focus cannot wedge the button down forever.
                 let pressed = self.mouse_buttons.remove(&button);
@@ -3474,6 +3499,32 @@ impl TouchHandler for App {
             self.activation.input(serial, data.seat(), &surface);
         }
 
+        // Monitor-only side-swipe candidate: the application keeps receiving
+        // this contact until the recognizer commits and the caller cancels.
+        if self.swipe_back.is_some() {
+            // A second finger aborts the pending candidate; both streams stay
+            // with the application.
+            self.swipe_back = None;
+        }
+        let pen_in_proximity = self
+            .tablet_tools
+            .iter()
+            .any(|tool| tool.supported && tool.surface.is_some());
+        if !pen_in_proximity
+            && let Some((width, height)) =
+                self.tasks.get(&object).and_then(|task| task.logical_size)
+            && let Some(candidate) = gesture::SwipeBackCandidate::begin(
+                object,
+                pointer_id,
+                position,
+                (width, height),
+                gesture::EDGE_MARGIN,
+                u64::from(time),
+            )
+        {
+            self.swipe_back = Some(candidate);
+        }
+
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
         let contact = Contact {
             object,
@@ -3515,6 +3566,28 @@ impl TouchHandler for App {
             return;
         }
 
+        if let Some(mut candidate) = self
+            .swipe_back
+            .take_if(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
+        {
+            let stealing = candidate.stealing();
+            let trigger = candidate.on_up(u64::from(time));
+            if let Some(object) = trigger {
+                if !stealing
+                    && let Some(contact) = self.touch_contacts.remove(&(_touch.id(), id))
+                    && let Err(error) =
+                        self.send_input(contact.object, contact.event(TouchAction::Cancel))
+                {
+                    self.fail(&error);
+                }
+                self.send_back_key(object);
+                return;
+            }
+            if stealing {
+                // The contact was already cancelled when the swipe committed.
+                return;
+            }
+        }
         let Some(contact) = self.touch_contacts.remove(&(_touch.id(), id)) else {
             return;
         };
@@ -3540,6 +3613,33 @@ impl TouchHandler for App {
         {
             self.decoration_pointer_task(&surface, position.0, position.1);
             return;
+        }
+
+        let swipe_update = self
+            .swipe_back
+            .as_mut()
+            .filter(|candidate| u32::try_from(id).is_ok_and(|contact| candidate.matches(contact)))
+            .map(|candidate| candidate.on_motion(position, u64::from(_time)));
+        match swipe_update {
+            Some(gesture::SwipeUpdate::Confirmed) => {
+                let first = self.swipe_back.as_ref().is_some_and(|candidate| !candidate.stealing());
+                if first {
+                    if let Some(candidate) = self.swipe_back.as_mut() {
+                        candidate.mark_stealing();
+                    }
+                    if let Some(contact) = self.touch_contacts.remove(&(_touch.id(), id))
+                        && let Err(error) =
+                            self.send_input(contact.object, contact.event(TouchAction::Cancel))
+                    {
+                        self.fail(&error);
+                    }
+                }
+                return;
+            }
+            Some(gesture::SwipeUpdate::Cancelled) => {
+                self.swipe_back = None;
+            }
+            Some(gesture::SwipeUpdate::Pending) | None => {}
         }
 
         let Some(mut contact) = self.touch_contacts.get(&(_touch.id(), id)).copied() else {
@@ -3575,6 +3675,7 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        self.swipe_back = None;
         if self.decoration_touch.as_ref().is_some_and(|touch| touch.touch == *_touch)
             && let Some(touch) = self.decoration_touch.take()
             && let Some(frame) = self.tasks.get_mut(&touch.object)
@@ -4133,8 +4234,10 @@ fn run() -> Result<(), PresenterError> {
         focused: None,
         mouse_focus: None,
         mouse_buttons: BTreeSet::new(),
+        consumed_mouse_buttons: BTreeSet::new(),
         pointer_contact: None,
         touch_contacts: HashMap::new(),
+        swipe_back: None,
         decoration_touch: None,
         next_buffer_id: 0,
         next_input_serial: 0,
