@@ -4,11 +4,10 @@ These limitations apply to the current pacman preview. Installation and APK
 commands are in [INSTALL.md](INSTALL.md); source builds are in
 [BUILDING.md](BUILDING.md).
 
-Device-specific measurements and acceptance records for the downstream sheng
-product (Iris decoder buffer sizes, Android audio/pen/UU/Douyin findings, the
-host's forwarding chains) live outside this repository in
-`srv/docs/10-sheng-device-records.md`. Repository documentation states general
-behavior only.
+Current tasks and acceptance gaps for the downstream sheng product live outside
+this repository in `srv/docs/11-outstanding.md`. Historical investigation notes
+are not statements of current product behavior; this document covers general
+preview limitations.
 
 ## Application compatibility
 
