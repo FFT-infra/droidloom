@@ -5,6 +5,7 @@
 //! One child is spawned per recording stream.
 
 use std::io::{self, Read, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -74,22 +75,22 @@ fn record_command() -> Command {
 
 fn record_with<W: Write>(mut command: Command, mut sink: W) -> Result<u64, SourceError> {
     let mut recorder = command.spawn().map_err(SourceError::Spawn)?;
-    let mut pipe = recorder
-        .stdout
-        .take()
-        .ok_or_else(|| SourceError::Spawn(io::Error::other("host recorder has no standard output")))?;
+    let mut pipe = recorder.stdout.take().ok_or_else(|| {
+        SourceError::Spawn(io::Error::other("host recorder has no standard output"))
+    })?;
     let forwarded = pump(&mut pipe, &mut sink);
     drop(pipe);
-    let _ = recorder.kill();
-    let status = recorder.wait()?;
-    if !status.success() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if status.signal().is_none() {
-                return Err(SourceError::Recorder(status));
-            }
-        }
+    // A recorder that already failed must not be mistaken for our cleanup.
+    // On Unix, Child::kill sends SIGKILL (9). Only that requested termination
+    // is expected when the peer closes; other signal exits remain failures.
+    let (status, stopped_by_bridge) = if let Some(status) = recorder.try_wait()? {
+        (status, false)
+    } else {
+        let stopped = recorder.kill().is_ok();
+        (recorder.wait()?, stopped)
+    };
+    if !(status.success() || stopped_by_bridge && status.signal() == Some(9)) {
+        return Err(SourceError::Recorder(status));
     }
     Ok(forwarded?)
 }
@@ -118,6 +119,71 @@ fn pump<W: Write>(source: &mut impl Read, sink: &mut W) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_signal_failure_is_not_a_successful_empty_capture() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "kill -TERM $$"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let result = record_with(command, io::sink());
+        assert!(
+            matches!(result, Err(SourceError::Recorder(status)) if status.signal().is_some()),
+            "a recorder killed by a signal must not report successful capture: {result:?}"
+        );
+    }
+
+    #[test]
+    fn recorder_successful_eof_preserves_samples() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf pcm"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut samples = Vec::new();
+        assert_eq!(record_with(command, &mut samples).unwrap(), 3);
+        assert_eq!(samples, b"pcm");
+    }
+
+    #[test]
+    fn closed_peer_stops_the_owned_recorder_without_failing_capture() {
+        struct ClosedPeer;
+        impl Write for ClosedPeer {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf pcm; exec sleep 30"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        assert_eq!(record_with(command, ClosedPeer).unwrap(), 0);
+    }
+
+    #[test]
+    fn recorder_nonzero_exit_is_reported() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        assert!(matches!(
+            record_with(command, io::sink()),
+            Err(SourceError::Recorder(status)) if status.code() == Some(7)
+        ));
+    }
 
     #[test]
     fn documented_input_format_matches_the_stream_parameters() {
