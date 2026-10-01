@@ -14,6 +14,9 @@ use std::ptr;
 
 use droidloom_transport::BufferMetadata;
 
+#[path = "texture_coordinates.rs"]
+mod texture_coordinates;
+
 use crate::minigbm::{ImportedRenderTarget, PreparedLayer};
 
 type EglDisplay = *mut c_void;
@@ -605,25 +608,15 @@ fn vertices(
     let top = 2.0 * frame.top as f32 / target_height as f32 - 1.0;
     let bottom = 2.0 * frame.bottom as f32 / target_height as f32 - 1.0;
     let crop = layer.source_crop;
-    let mut uv = [
-        [crop.left / source_width, crop.top / source_height],
-        [crop.right / source_width, crop.top / source_height],
-        [crop.left / source_width, crop.bottom / source_height],
-        [crop.right / source_width, crop.bottom / source_height],
-    ];
-    if layer.transform & 1 != 0 {
-        for coordinate in &mut uv {
-            coordinate[0] = 1.0 - coordinate[0];
-        }
-    }
-    if layer.transform & 2 != 0 {
-        for coordinate in &mut uv {
-            coordinate[1] = 1.0 - coordinate[1];
-        }
-    }
-    if layer.transform & 4 != 0 {
-        uv = [uv[2], uv[0], uv[3], uv[1]];
-    }
+    let uv = texture_coordinates::transformed_uv(
+        [
+            crop.left / source_width,
+            crop.top / source_height,
+            crop.right / source_width,
+            crop.bottom / source_height,
+        ],
+        layer.transform,
+    );
     Ok([
         left, top, uv[0][0], uv[0][1], right, top, uv[1][0], uv[1][1], left, bottom, uv[2][0],
         uv[2][1], right, bottom, uv[3][0], uv[3][1],
