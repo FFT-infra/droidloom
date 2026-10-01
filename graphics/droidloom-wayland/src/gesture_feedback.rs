@@ -109,10 +109,21 @@ fn arrow_intensity(stage: usize, start: usize, ramp: usize) -> f32 {
     }
 }
 
+fn side_arrow_points(from_left: bool, depth: f32) -> [(f32, f32); 3] {
+    let centre_x = if from_left { depth / 2.0 } else { SIDE_WIDTH as f32 - depth / 2.0 };
+    let centre_y = SIDE_HEIGHT as f32 / 2.0;
+    [
+        (centre_x - 3.0, centre_y),
+        (centre_x + 3.0, centre_y - 6.0),
+        (centre_x + 3.0, centre_y + 6.0),
+    ]
+}
+
 /// One stage of the side teardrop, growing inward from `from_left`'s edge.
 ///
-/// The chevron points left on both edges: it names the gesture — Back — rather
-/// than the direction the hand happened to travel.
+/// Android 16 BackPanelController keeps both arrows pointing the same way for
+/// one layout direction. Preserve left-pointing Back for this LTR host while
+/// mirroring the background placement, not the meaning of the action.
 fn side_image(from_left: bool, stage: usize, scale: u32) -> Vec<u32> {
     let width = SIDE_WIDTH * scale;
     let height = SIDE_HEIGHT * scale;
@@ -120,26 +131,17 @@ fn side_image(from_left: bool, stage: usize, scale: u32) -> Vec<u32> {
 
     let depth = SIDE_DEPTH + stage.min(SIDE_STAGES - 1) as f32 * SIDE_DEPTH_STAGE;
     let arrow = arrow_intensity(stage, SIDE_ARROW_START, SIDE_ARROW_RAMP);
-    let centre_x = if from_left {
-        depth * 0.52
-    } else {
-        SIDE_WIDTH as f32 - depth * 0.52
-    };
-    let centre_y = SIDE_HEIGHT as f32 / 2.0;
-    let tip = (centre_x - 3.5, centre_y);
-    let top = (centre_x + 2.5, centre_y - 6.0);
-    let bottom = (centre_x + 2.5, centre_y + 6.0);
+    let [tip, top, bottom] = side_arrow_points(from_left, depth);
 
     for y in 0..height {
         let sample_y = (y as f32 + 0.5) / scale as f32;
         let reach = teardrop(sample_y / SIDE_HEIGHT as f32) * depth;
         for x in 0..width {
             let sample_x = (x as f32 + 0.5) / scale as f32;
-            let from_edge = if from_left {
-                sample_x
-            } else {
-                SIDE_WIDTH as f32 - sample_x
-            };
+            // Mirror the integer sample index first so both edges use exactly
+            // the same floating-point coordinate at every buffer scale.
+            let edge_pixel = if from_left { x } else { width - 1 - x };
+            let from_edge = (edge_pixel as f32 + 0.5) / scale as f32;
             let slab = (reach - from_edge).clamp(0.0, 1.0) * SLAB_ALPHA;
             let mut pixel = paint(SLAB, slab);
             if arrow > 0.0 {
@@ -418,6 +420,39 @@ mod tests {
         let left = (0..width).find(|x| ink(*x)).unwrap_or(width);
         let right = (0..width).rev().find(|x| ink(*x)).unwrap_or(0);
         (left, right)
+    }
+
+    #[test]
+    fn arrow_bounding_boxes_are_centred_equally_from_both_edges() {
+        for depth in [18.0, 26.0, 40.0] {
+            let left = side_arrow_points(true, depth);
+            let right = side_arrow_points(false, depth);
+            let left_centre = (left[0].0 + left[1].0) / 2.0;
+            let right_centre_from_edge = SIDE_WIDTH as f32 - (right[0].0 + right[1].0) / 2.0;
+            assert!((left_centre - right_centre_from_edge).abs() < 0.00001);
+            assert!((left_centre - depth / 2.0).abs() < 0.00001);
+            assert!(left[0].0 < left[1].0 && right[0].0 < right[1].0,
+                "LTR Back arrows keep the same direction, as on Android");
+        }
+    }
+
+    #[test]
+    fn backgrounds_mirror_at_every_supported_buffer_scale() {
+        for scale in [1, 2, 3] {
+            let width = SIDE_WIDTH * scale;
+            let height = SIDE_HEIGHT * scale;
+            for stage in [0, 3, SIDE_ARROW_START] {
+                let left = side_image(true, stage, scale);
+                let right = side_image(false, stage, scale);
+                for y in 0..height {
+                    for x in 0..width {
+                        assert_eq!(left[(y * width + x) as usize],
+                            right[(y * width + width - 1 - x) as usize],
+                            "background mismatch scale={scale} stage={stage} x={x} y={y}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

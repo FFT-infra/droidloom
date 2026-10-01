@@ -192,6 +192,37 @@ fn titlebar_y(header: i32) -> i32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Presentation {
+    Windowed,
+    Frameless,
+    Fullscreen,
+}
+
+impl Presentation {
+    pub(super) fn for_window(fullscreen: bool, decorations_hidden: bool) -> Self {
+        if fullscreen { Self::Fullscreen } else if decorations_hidden { Self::Frameless } else { Self::Windowed }
+    }
+
+    fn floating(self) -> bool {
+        self != Self::Windowed
+    }
+}
+
+pub(super) fn retain_reveal_deadline(
+    previous: Presentation,
+    current: Presentation,
+    deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    if previous == current { deadline } else { None }
+}
+
+pub(super) fn button_contains(x: f64, y: f64) -> bool {
+    x.is_finite() && y.is_finite()
+        && x >= 0.0 && y >= 0.0
+        && x < f64::from(BUTTON) && y < f64::from(BUTTON)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     Back,
     Fullscreen,
@@ -429,6 +460,10 @@ fn image_index(
         + visual.index()
 }
 
+fn fullscreen_glyph(presentation: Presentation) -> Glyph {
+    if presentation == Presentation::Fullscreen { Glyph::Leave } else { Glyph::Enter }
+}
+
 struct Button {
     action: Action,
     surface: wl_surface::WlSurface,
@@ -438,9 +473,8 @@ struct Button {
     visual: Visual,
     active: bool,
     visible: bool,
-    /// The window has no titlebar of its own, so the button floats over the
-    /// content and the Fullscreen action carries the state it switches to.
-    chromeless: bool,
+    /// Presentation controls backing separately from the fullscreen action.
+    presentation: Presentation,
     position: (i32, i32),
 }
 
@@ -524,7 +558,7 @@ impl Button {
             visual: Visual::Normal,
             active: true,
             visible: false,
-            chromeless: false,
+            presentation: Presentation::Windowed,
             position: (0, 0),
         })
     }
@@ -532,11 +566,10 @@ impl Button {
     fn image(&self) -> &wl_buffer::WlBuffer {
         let glyph = match self.action {
             Action::Back => Glyph::Back,
-            // The Fullscreen button shows the state it switches to.
-            Action::Fullscreen if self.chromeless => Glyph::Leave,
-            Action::Fullscreen => Glyph::Enter,
+            // The Fullscreen button shows the action, not decoration visibility.
+            Action::Fullscreen => fullscreen_glyph(self.presentation),
         };
-        let backing = if self.chromeless {
+        let backing = if self.presentation.floating() {
             Backing::Floating
         } else {
             Backing::Header
@@ -563,9 +596,9 @@ impl Button {
         }
     }
 
-    fn set_state(&mut self, chromeless: bool) {
-        if self.chromeless != chromeless {
-            self.chromeless = chromeless;
+    fn set_presentation(&mut self, presentation: Presentation) {
+        if self.presentation != presentation {
+            self.presentation = presentation;
             self.redraw();
         }
     }
@@ -659,11 +692,12 @@ impl Chrome {
         &mut self,
         content_width: u32,
         header: i32,
-        chromeless: bool,
+        presentation: Presentation,
         revealed: bool,
     ) {
-        self.back.set_state(chromeless);
-        self.fullscreen.set_state(chromeless);
+        let chromeless = presentation.floating();
+        self.back.set_presentation(presentation);
+        self.fullscreen.set_presentation(presentation);
         let (back_x, fullscreen_x, y) = if chromeless {
             // No titlebar: the pair floats centred at the top, clear of the
             // side-swipe edge and of whatever the application draws in a
@@ -729,7 +763,8 @@ impl Chrome {
     }
 
     /// The action owning `surface`, when the surface is one of the buttons.
-    pub(super) fn action_at(&self, surface: &wayland_client::backend::ObjectId) -> Option<Action> {
+    pub(super) fn action_at(&self, surface: &wayland_client::backend::ObjectId, x: f64, y: f64) -> Option<Action> {
+        if !button_contains(x, y) { return None; }
         [&self.back, &self.fullscreen]
             .into_iter()
             .find(|button| button.visible && button.surface.id() == *surface)
@@ -772,6 +807,38 @@ impl Chrome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_hit_bounds_are_finite_and_half_open() {
+        assert!(button_contains(0.0, 0.0));
+        assert!(button_contains(f64::from(BUTTON) - 0.01, 1.0));
+        for (x, y) in [(-0.1, 1.0), (1.0, -0.1), (f64::from(BUTTON), 1.0), (1.0, f64::from(BUTTON)), (f64::NAN, 1.0)] {
+            assert!(!button_contains(x, y), "outside button: {x}, {y}");
+        }
+    }
+
+    #[test]
+    fn fullscreen_roundtrip_does_not_reuse_a_reveal_deadline() {
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(3500));
+        let windowed = retain_reveal_deadline(Presentation::Fullscreen, Presentation::Windowed, deadline);
+        assert!(windowed.is_none());
+        assert!(retain_reveal_deadline(Presentation::Windowed, Presentation::Fullscreen, windowed).is_none());
+        assert!(retain_reveal_deadline(Presentation::Frameless, Presentation::Windowed, deadline).is_none());
+    }
+
+    #[test]
+    fn unchanged_presentation_keeps_its_reveal_deadline() {
+        let deadline = Some(std::time::Instant::now());
+        assert_eq!(retain_reveal_deadline(Presentation::Fullscreen, Presentation::Fullscreen, deadline), deadline);
+    }
+
+    #[test]
+    fn frameless_is_floating_but_still_enters_fullscreen() {
+        assert!(Presentation::Frameless.floating());
+        assert_eq!(fullscreen_glyph(Presentation::Frameless), Glyph::Enter);
+        assert_eq!(fullscreen_glyph(Presentation::Fullscreen), Glyph::Leave);
+        assert_eq!(fullscreen_glyph(Presentation::Windowed), Glyph::Enter);
+    }
 
     #[test]
     fn every_image_is_the_size_the_surface_claims() {

@@ -589,12 +589,33 @@ impl App {
         })
     }
 
+    fn cancel_chrome_press(&mut self, object: TaskObjectId) {
+        if self.chrome_press.is_some_and(|(target, _)| target == object) {
+            self.chrome_press = None;
+        }
+        if let Some(touch) = self.decoration_touch.as_mut()
+            && matches!(touch.hit, DecorationHit::Button(target, _) if target == object)
+        {
+            touch.button_cancelled = true;
+        }
+        if let Some(chrome) = self.tasks.get_mut(&object).and_then(|task| task.chrome.as_mut()) {
+            chrome.reset();
+        }
+    }
+
     fn toggle_decorations(&mut self, qh: &QueueHandle<Self>, object: TaskObjectId) {
         let Some(task) = self.tasks.get_mut(&object) else { return };
         if task.headless() || task.fullscreen { return; }
+        let previous = chrome::Presentation::for_window(task.fullscreen, task.decorations_hidden);
         task.decorations_hidden = !task.decorations_hidden;
+        task.fullscreen_controls_revealed_until = chrome::retain_reveal_deadline(
+            previous,
+            chrome::Presentation::for_window(task.fullscreen, task.decorations_hidden),
+            task.fullscreen_controls_revealed_until,
+        );
         if let Some(frame) = task.window_frame.as_mut() { frame.set_hidden(task.decorations_hidden); }
         let Some((width, height)) = task.logical_size else { return };
+        self.cancel_chrome_press(object);
         if let Err(error) = self.configure_task(qh, object, width, height) {
             eprintln!("Droidloom kept the last usable window layout: {error}");
         }
@@ -989,7 +1010,7 @@ impl App {
             // stays hidden until a reveal asks for it: a frame that reports no
             // offset says nothing, since it reports one for a hidden frame and
             // a hidden titlebar too.
-            let chromeless = task.fullscreen || task.decorations_hidden;
+            let presentation = chrome::Presentation::for_window(task.fullscreen, task.decorations_hidden);
             let revealed = task.fullscreen_controls_revealed_until.is_some();
             if let Some(window) = task.window.as_ref() {
                 let (x, y, outer_width, outer_height, frame_needs_parent_commit) =
@@ -1011,7 +1032,7 @@ impl App {
                 // does for fullscreen.
                 if let Some(chrome) = task.chrome.as_mut() {
                     chrome.set_active(task.chrome_active);
-                    chrome.place(width, y, chromeless, revealed);
+                    chrome.place(width, y, presentation, revealed);
                 }
                 window.xdg_surface().set_window_geometry(
                     x, y,
@@ -2384,18 +2405,15 @@ impl App {
     ) -> Option<(DecorationHit, CursorIcon)> {
         let elapsed = self.start_time.elapsed();
         self.tasks.iter_mut().find_map(|(object, task)| {
-            if task.decorations_hidden {
-                return None;
-            }
             // The chrome subsurfaces sit above the frame's titlebar, so they
             // are tested first: a button must win over the header underneath it.
             if let Some(chrome) = task.chrome.as_mut()
-                && let Some(action) = chrome.action_at(&surface.id())
+                && let Some(action) = chrome.action_at(&surface.id(), x, y)
             {
                 chrome.hover(action);
                 return Some((DecorationHit::Button(*object, action), CursorIcon::Pointer));
             }
-            if task.fullscreen {
+            if task.fullscreen || task.decorations_hidden {
                 return None;
             }
             let frame = task.window_frame.as_mut()?;
@@ -3012,9 +3030,17 @@ impl WindowHandler for App {
             );
         }
         if let Some(task) = self.tasks.get_mut(&object) {
+            task.fullscreen_controls_revealed_until = chrome::retain_reveal_deadline(
+                chrome::Presentation::for_window(task.fullscreen, task.decorations_hidden),
+                chrome::Presentation::for_window(is_fullscreen, task.decorations_hidden),
+                task.fullscreen_controls_revealed_until,
+            );
             task.fullscreen = is_fullscreen;
             task.maximized = is_maximized;
             task.floating_size = floating_size;
+        }
+        if was_fullscreen != is_fullscreen {
+            self.cancel_chrome_press(object);
         }
 
         let (requested_width, requested_height) =
@@ -3680,6 +3706,16 @@ impl PointerHandler for App {
                     PointerEventKind::Axis { .. } => None,
                 }
             };
+            if matches!(event.kind, PointerEventKind::Motion { .. } | PointerEventKind::Release { .. })
+                && let Some(pressed) = self.chrome_press
+                && !decoration_object.as_ref().is_some_and(|(hit, _)| {
+                    matches!(*hit, DecorationHit::Button(object, action) if (object, action) == pressed)
+                })
+            {
+                // An implicit grab keeps delivering the original surface even
+                // outside its bounds. Leaving cancels; re-entering cannot rearm.
+                self.cancel_chrome_press(pressed.0);
+            }
             let cursor = decoration_object.as_ref().map_or(CursorIcon::Default, |(_, icon)| *icon);
             if matches!(event.kind, PointerEventKind::Enter { .. })
                 || (matches!(event.kind, PointerEventKind::Motion { .. })
@@ -3924,9 +3960,10 @@ impl TouchHandler for App {
         // down. Nothing is consumed and no Back is ever the result: the shell's
         // own top-edge gesture keeps the contact, and fullscreen is not toggled
         // from here.
+        let can_reveal = immersive || self.tasks.get(&object).is_some_and(|task| task.decorations_hidden);
         if self.swipe_back.is_none()
             && !pen_in_proximity
-            && immersive
+            && can_reveal
             && let Some((width, height)) = logical_size
             && let Some(candidate) = gesture::TopPullCandidate::begin(
                 object,
@@ -3973,7 +4010,11 @@ impl TouchHandler for App {
                     {
                         chrome.reset();
                     }
-                    if !touch.button_cancelled {
+                    let still_visible = self.tasks.get(&object)
+                        .and_then(|task| task.chrome.as_ref())
+                        .and_then(|chrome| chrome.action_at(&touch.surface.id(), touch.down_position.0, touch.down_position.1))
+                        == Some(action);
+                    if !touch.button_cancelled && still_visible {
                         self.chrome_action(object, action);
                     }
                 }
@@ -4065,7 +4106,9 @@ impl TouchHandler for App {
             // touch path did at 12px; the release then runs nothing.
             if let DecorationHit::Button(object, _) = hit {
                 let (dx, dy) = (position.0 - down.0, position.1 - down.1);
-                if cancelled || dx * dx + dy * dy > BUTTON_DRAG_SLOP * BUTTON_DRAG_SLOP {
+                if cancelled || !chrome::button_contains(position.0, position.1)
+                    || dx * dx + dy * dy > BUTTON_DRAG_SLOP * BUTTON_DRAG_SLOP
+                {
                     if !cancelled {
                         if let Some(touch) = self.decoration_touch.as_mut() {
                             touch.button_cancelled = true;
