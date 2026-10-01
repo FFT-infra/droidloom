@@ -326,7 +326,35 @@ pub fn assemble(
     crate::licenses::project(repo, &notices)?;
     crate::licenses::rust(repo, &notices.join("rust"))?;
     let product_name = product.file_name().and_then(OsStr::to_str).ok_or("Android product output has no name")?;
-    configure_local(repo, payload, uid, target_arch, product_name)
+    configure_local(repo, payload, uid, target_arch, product_name)?;
+    normalize_install_permissions(payload)
+}
+
+/// Staged runtime files are public installation data, not private build state.
+/// Do not inherit a builder's umask into root-owned files used by desktop or
+/// Android service users. Keep the staging root private and never follow links.
+pub(crate) fn normalize_install_permissions(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return fail("installation staging root must be a real directory");
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            normalize_install_permissions(&entry.path())?;
+            mode(&entry.path(), 0o755)?;
+        } else if kind.is_file() {
+            let executable = entry.metadata()?.permissions().mode() & 0o111 != 0;
+            mode(&entry.path(), if executable { 0o755 } else { 0o644 })?;
+        } else if !kind.is_symlink() {
+            return fail("non-regular installation payload");
+        }
+        // Package staging has its own generated aliases. Leave those alone;
+        // source-bundle sealing still rejects all symlinks independently.
+    }
+    Ok(())
 }
 
 /// Stage the complete artifact recipe without reading any build-host configuration.
@@ -768,6 +796,63 @@ fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_install_modes_do_not_inherit_private_build_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stage = tempfile::tempdir().unwrap();
+        mode(stage.path(), 0o700).unwrap();
+        let config = stage.path().join("usr/lib/environment.d/60-droidloom.conf");
+        let library = stage.path().join("usr/lib/droidloom/runtime/lib64/composer.so");
+        write(&config, b"DROIDLOOM_MODE=desktop\n").unwrap();
+        write(&library, b"permission fixture, not an ELF").unwrap();
+        mode(&config, 0o600).unwrap();
+        mode(&library, 0o700).unwrap();
+        mode(config.parent().unwrap(), 0o700).unwrap();
+        mode(library.parent().unwrap(), 0o700).unwrap();
+
+        normalize_install_permissions(stage.path()).unwrap();
+        normalize_install_permissions(stage.path()).unwrap();
+        assert_eq!(fs::metadata(&config).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(fs::metadata(&library).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(config.parent().unwrap()).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(library.parent().unwrap()).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(stage.path()).unwrap().permissions().mode() & 0o7777, 0o700);
+        assert_eq!(fs::read(&config).unwrap(), b"DROIDLOOM_MODE=desktop\n");
+        assert_eq!(fs::read(&library).unwrap(), b"permission fixture, not an ELF");
+    }
+
+    #[test]
+    fn install_mode_normalization_never_follows_package_aliases() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let stage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("untouched");
+        write(&secret, b"outside").unwrap();
+        mode(&secret, 0o600).unwrap();
+        symlink(outside.path(), stage.path().join("alias")).unwrap();
+        normalize_install_permissions(stage.path()).unwrap();
+        assert_eq!(fs::metadata(&secret).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert!(normalize_install_permissions(&stage.path().join("alias")).is_err());
+        // Source bundles still reject links; allowing a generated package alias
+        // here does not relax their inventory validation.
+        assert!(crate::bundle::inventory(stage.path()).is_err());
+    }
+
+    #[test]
+    fn install_modes_remove_write_and_privilege_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stage = tempfile::tempdir().unwrap();
+        let file = stage.path().join("binary");
+        write(&file, b"permission fixture").unwrap();
+        mode(&file, 0o6777).unwrap();
+        normalize_install_permissions(stage.path()).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o755);
+    }
+
     #[test]
     fn no_product_enables_an_unvalidated_video_decoder_by_default() {
         for product in ["droidloom_sheng", "droidloom_arm64", "droidloom_x86_64"] {

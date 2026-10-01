@@ -428,6 +428,12 @@ pub fn validate_manifest(m: &Manifest) -> Result<()> {
         {
             return fail(format!("invalid, duplicate or unordered file record: {}", a.path));
         }
+        if (a.path.starts_with("usr/") || a.path.starts_with("etc/"))
+            && (a.mode & 0o004 == 0 || a.mode & 0o022 != 0
+                || (a.mode & 0o111 != 0 && a.mode & 0o001 == 0))
+        {
+            return fail(format!("runtime component has unsafe installation permissions: {} (mode {:o})", a.path, a.mode));
+        }
         previous = Some(&a.path);
         total = total.checked_add(a.size).ok_or("bundle size overflow")?;
         if total > MAX_TOTAL_BYTES { return fail("bundle total size exceeds limit"); }
@@ -617,6 +623,32 @@ pub(crate) mod artifact_tests {
         copy(&jar, &root.join("usr/lib/droidloom/runtime/systemui/SystemUI.apk")).unwrap();
         write(&root.join("usr/lib/droidloom/runtime/ime/home-setup"), b"#!/system/bin/sh\n").unwrap();
     }
+    #[test]
+    fn refuses_runtime_files_unreadable_by_installed_service_users() {
+        for relative in [
+            "usr/lib/environment.d/60-droidloom.conf",
+            "usr/lib/droidloom/runtime/lib64/restricted.so",
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            let file = d.path().join(relative);
+            write(&file, b"permission-validation fixture").unwrap();
+            mode(&file, 0o600).unwrap();
+            assert!(seal(d.path(), &test_provenance("x86_64")).is_err(),
+                "root-owned runtime data must be readable after installation: {relative}");
+        }
+    }
+
+    #[test]
+    fn refuses_unsafe_runtime_execution_permissions() {
+        for permissions in [0o744, 0o775, 0o777] {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            mode(&d.path().join(PRESENTER), permissions).unwrap();
+            assert!(seal(d.path(), &test_provenance("x86_64")).is_err());
+        }
+    }
+
     #[test]
     fn refuses_bundle_without_minimal_system_apps() {
         let provenance = test_provenance("x86_64");

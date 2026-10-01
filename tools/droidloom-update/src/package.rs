@@ -83,6 +83,7 @@ pub fn stage(repo: &Path, work: &Path, destination: &Path, clean: bool, jobs: us
     )?;
     package_layout(repo, &cargo.join("release"), stage.path())?;
     package_notices(repo, &work, stage.path())?;
+    assemble::normalize_install_permissions(stage.path())?;
     if destination.exists() {
         fs::remove_dir_all(destination)?;
     }
