@@ -13,6 +13,8 @@ mod gesture;
 mod session;
 mod chrome;
 mod gesture_feedback;
+#[cfg(test)]
+mod window_lifecycle_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
@@ -343,6 +345,16 @@ impl TaskWindow {
 
     fn surface(&self) -> Option<&wl_surface::WlSurface> {
         self.window.as_ref().map(Window::wl_surface)
+    }
+
+    fn drop_native_window(&mut self) {
+        // SCTK owns the role tree: WindowInner::Drop destroys the toplevel
+        // decoration before the toplevel and the xdg surface before the wl
+        // surface. A raw `xdg_toplevel().destroy()` here would skip that
+        // order, and a compositor with server-side decorations answers with
+        // a protocol error. The visual unmap is the caller's null-buffer
+        // attach and commit; taking the handle only releases the role tree.
+        self.window.take();
     }
 }
 
@@ -1669,16 +1681,11 @@ impl App {
                 }
             }
         }
-        // Window is reference counted by SCTK. Taking our handle below does
-        // not guarantee that WindowInner is dropped here, so relying on Drop
-        // can leave the compositor-side toplevel mapped until some unrelated
-        // callback releases the final clone. The close request is terminal:
-        // destroy the role explicitly and let the remaining surface/buffer
-        // objects drain independently.
-        if let Some(window) = task.window.as_ref() {
-            window.xdg_toplevel().destroy();
-        }
-        task.window.take();
+        // The close request is terminal: release the role tree. When no
+        // callback retains another handle, SCTK drops WindowInner here and
+        // destroys the decoration, toplevel, xdg surface and wl surface in
+        // protocol order. Remaining buffer objects drain independently.
+        task.drop_native_window();
         task.unmap_requested = false;
 
         if self.focused == Some(object) {
