@@ -29,10 +29,6 @@
       "target": "/vendor/etc/init/droidloom-input-bridge.rc"
     },
     {
-      "source": "/usr/lib/droidloom/current/camera/bin/virtual_camera",
-      "target": "/system/bin/droidloom-virtual-camera"
-    },
-    {
       "source": "/usr/lib/droidloom/storage/vold",
       "target": "/system/bin/vold"
     },

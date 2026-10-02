@@ -280,6 +280,29 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
 ///
 /// The symlink is created dangling when the tree has no APEX copy; it publishes
 /// the path the resolver checks, and the target appears with the APEX mount.
+/// Publish the cell's virtual camera HAL at its platform path.
+///
+/// The HAL links the camera service client, whose closure needs
+/// `libandroidicu.so` from the i18n APEX. Only binaries inside a platform
+/// partition resolve that apex from their linker namespace, so a copy under
+/// `/droidloom/...` dies at exec with "library libandroidicu.so not found".
+/// Staging it into the system image keeps it a plain platform binary, exactly
+/// like upstream's virtual_camera.
+fn publish_virtual_camera(product: &Path, tree: &Path) -> Result<()> {
+    let source = product.join("system/bin/virtual_camera");
+    let target = tree.join("system/bin/droidloom-virtual-camera");
+    if fs::symlink_metadata(&target).is_ok() {
+        return fail("system image already carries droidloom-virtual-camera");
+    }
+    copy(&source, &target)?;
+    mode(&target, 0o755)?;
+    run(Command::new("chown").arg("0:0").arg(&target))?;
+    run(Command::new("setfattr")
+        .args(["-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+        .arg(&target))?;
+    Ok(())
+}
+
 fn link_apex_debuggerd(tree: &Path) -> Result<()> {
     let bin = tree.join("system/bin");
     for name in ["crash_dump64", "crash_dump32"] {
@@ -475,6 +498,7 @@ pub fn derive_image(
         "native_executables": native_arm64, "files": inventory,
     });
     link_apex_debuggerd(&tree)?;
+    publish_virtual_camera(product, &tree)?;
     let manifest_path = tree.join("system/etc/droidloom-native-bridge.json");
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     run(Command::new("chown").arg("0:0").arg(&manifest_path))?;
