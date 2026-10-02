@@ -19,6 +19,7 @@ use wayland_server::{
 #[derive(Default)]
 struct Server {
     events: Arc<Mutex<Vec<&'static str>>>,
+    scales: Arc<Mutex<Vec<(u32, i32)>>>,
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     toplevel_alive: bool,
     xdg_surface_alive: bool,
@@ -114,6 +115,13 @@ impl ServerDispatch<server_surface::WlSurface, ()> for Server {
             server_surface::Request::Attach {
                 buffer: Some(_), ..
             } => surface.post_error(0_u32, "fixture expects a null-buffer unmap"),
+            server_surface::Request::SetBufferScale { scale } => {
+                state
+                    .scales
+                    .lock()
+                    .unwrap()
+                    .push((surface.id().protocol_id(), scale));
+            }
             _ => {}
         }
     }
@@ -220,7 +228,10 @@ impl ServerDispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> f
 struct Harness {
     conn: Connection,
     _queue: EventQueue<App>,
+    compositor: CompositorState,
+    qh: QueueHandle<App>,
     events: Arc<Mutex<Vec<&'static str>>>,
+    scales: Arc<Mutex<Vec<(u32, i32)>>>,
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
 }
@@ -239,8 +250,10 @@ impl Harness {
             );
         }
         let events = Arc::new(Mutex::new(Vec::new()));
+        let scales = Arc::new(Mutex::new(Vec::new()));
         let mut state = Server {
             events: events.clone(),
+            scales: scales.clone(),
             ..Server::default()
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -267,7 +280,10 @@ impl Harness {
             Self {
                 conn,
                 _queue: queue,
+                compositor,
+                qh,
                 events,
+                scales,
                 stop,
                 server: Some(server),
             },
@@ -276,6 +292,12 @@ impl Harness {
     }
     fn events(&self) -> Vec<&'static str> {
         self.events.lock().unwrap().clone()
+    }
+    fn scales(&self) -> Vec<(u32, i32)> {
+        self.scales.lock().unwrap().clone()
+    }
+    fn extra_surface(&self) -> wl_surface::WlSurface {
+        self.compositor.create_surface(&self.qh)
     }
 }
 impl Drop for Harness {
@@ -399,4 +421,32 @@ fn task_without_decoration_manager_destroys_its_role_once() {
     task.drop_native_window();
     server.conn.roundtrip().unwrap();
     assert_eq!(server.events(), ["toplevel", "xdg_surface", "wl_surface"]);
+}
+
+#[test]
+fn preferred_scale_change_pins_only_the_window_surface() {
+    let (server, window) = Harness::new(true);
+    // Neither a chrome button nor a gesture-feedback slab is the task window
+    // itself: both pre-render their buffers at an integer scale they apply
+    // when they build them, so the preferred-scale callback must leave their
+    // own buffer scale alone.
+    let chrome = server.extra_surface();
+    let feedback = server.extra_surface();
+    let task = task(window);
+    let window_surface = task.surface().unwrap().clone();
+    let tasks = BTreeMap::from([(TaskObjectId(1), task)]);
+    for surface in [&chrome, &feedback] {
+        surface.set_buffer_scale(2);
+        apply_preferred_buffer_scale(&tasks, surface);
+    }
+    apply_preferred_buffer_scale(&tasks, &window_surface);
+    server.conn.roundtrip().unwrap();
+    assert_eq!(
+        server.scales(),
+        [
+            (chrome.id().protocol_id(), 2),
+            (feedback.id().protocol_id(), 2),
+            (window_surface.id().protocol_id(), 1),
+        ]
+    );
 }

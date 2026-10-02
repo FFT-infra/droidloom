@@ -2919,6 +2919,24 @@ impl App {
     }
 }
 
+/// The compositor announced a preferred buffer scale for `surface`. Only the
+/// task window surfaces are pinned to buffer scale 1: their buffers are
+/// mapped through a `wp_viewport`. The chrome and gesture-feedback
+/// subsurfaces pre-render at an integer scale they apply themselves, so
+/// pinning those to 1 would stretch their buffers by the compositor's
+/// preferred factor.
+fn apply_preferred_buffer_scale(
+    tasks: &BTreeMap<TaskObjectId, TaskWindow>,
+    surface: &wl_surface::WlSurface,
+) {
+    let is_window = tasks
+        .values()
+        .any(|task| task.surface().is_some_and(|candidate| candidate == surface));
+    if is_window {
+        surface.set_buffer_scale(1);
+    }
+}
+
 impl CompositorHandler for App {
     fn scale_factor_changed(
         &mut self,
@@ -2927,7 +2945,7 @@ impl CompositorHandler for App {
         surface: &wl_surface::WlSurface,
         _new_factor: i32,
     ) {
-        surface.set_buffer_scale(1);
+        apply_preferred_buffer_scale(&self.tasks, surface);
     }
 
     fn transform_changed(
