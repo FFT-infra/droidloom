@@ -10,7 +10,6 @@
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <log/log.h>
-#include <system/window.h>
 #include <vndk/window.h>
 
 #include <sys/un.h>
@@ -32,6 +31,22 @@ namespace camera = aidl::android::companion::virtualcamera;
 using ndk::ScopedAStatus;
 constexpr char kEndpoint[] = "/dev/socket/droidloom/camera";
 constexpr auto kDequeueTimeout = std::chrono::milliseconds(500);
+
+// system/window.h is outside the vendor header set. These are its stable
+// command and API ids, and the wrappers mirror its inline implementations
+// through the public ANativeWindow perform() vtable; the format is the NDK's
+// RGBA_8888, the same value the window header names.
+constexpr int kNativeWindowApiCpu = 2;
+constexpr int kNativeWindowApiConnect = 13;
+constexpr int kNativeWindowApiDisconnect = 14;
+
+int windowApiConnect(ANativeWindow* window, int api) {
+    return window->perform(window, kNativeWindowApiConnect, api);
+}
+
+int windowApiDisconnect(ANativeWindow* window, int api) {
+    return window->perform(window, kNativeWindowApiDisconnect, api);
+}
 
 int connectHost(const std::atomic_bool& stopped) {
     const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -186,9 +201,11 @@ class Capture {
     }
 
     void run() {
-        bool connected = native_window_api_connect(mWindow, NATIVE_WINDOW_API_CPU) == 0;
+        bool connected = windowApiConnect(mWindow, kNativeWindowApiCpu) == 0;
         bool ready = connected &&
-            ANativeWindow_setBuffersGeometry(mWindow, kWidth, kHeight, WINDOW_FORMAT_RGBA_8888) == 0 &&
+            ANativeWindow_setBuffersDimensions(mWindow, kWidth, kHeight) == 0 &&
+            ANativeWindow_setBuffersFormat(
+                mWindow, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) == 0 &&
             ANativeWindow_setUsage(mWindow, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
                                            AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) == 0;
         bool success = false;
@@ -208,7 +225,7 @@ class Capture {
                 }
             }
         }
-        if (connected) native_window_api_disconnect(mWindow, NATIVE_WINDOW_API_CPU);
+        if (connected) windowApiDisconnect(mWindow, kNativeWindowApiCpu);
         if (!success && !mStopped.load()) {
             ALOGE("Camera %u stream failed; closing its HAL session", mCameraId);
             mFailed();
