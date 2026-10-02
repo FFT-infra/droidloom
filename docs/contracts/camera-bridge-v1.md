@@ -76,6 +76,17 @@ source discovery without opening a sensor. The sheng libcamera simple-pipeline
 stop fix and its separate installation boundary are documented in
 [`packaging/host/libcamera`](../../packaging/host/libcamera/README.md).
 
+## Partition placement
+
+The producer dequeues gralloc buffers and the HAL links the camera client
+library, so both must run from platform partitions: `droidloom-virtual-camera`
+is staged into the system image under `/system/bin`, and the producer is a
+vendor module installed at `/vendor/bin`. Copies under `/droidloom/...` load
+in the default linker namespace and fail at exec ("libandroidicu.so not
+found") or on first dequeue ("gralloc-mapper is missing"). The HAL does not
+use lazy AIDL registration: init starts it directly, and a lazy registrar
+would shut it down before the first client arrives.
+
 Rust tests cover framing, padded rows, credentials, cancellation, handoff and
 listener lifetime. `droidloom-camera-protocol-tests`, `virtual_camera_cpu_yuv_tests`
 and the non-capturing `droidloom-camera-layout-probe` cover the Android-side
