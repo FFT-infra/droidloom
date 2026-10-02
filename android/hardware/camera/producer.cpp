@@ -9,7 +9,6 @@
 #include <android/binder_process.h>
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
-#include <apex/window.h>
 #include <log/log.h>
 #include <system/window.h>
 #include <vndk/window.h>
@@ -191,9 +190,7 @@ class Capture {
         bool ready = connected &&
             ANativeWindow_setBuffersGeometry(mWindow, kWidth, kHeight, WINDOW_FORMAT_RGBA_8888) == 0 &&
             ANativeWindow_setUsage(mWindow, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
-                                           AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) == 0 &&
-            ANativeWindow_setDequeueTimeout(mWindow,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(kDequeueTimeout).count()) == 0;
+                                           AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) == 0;
         bool success = false;
         if (ready && !mStopped.load()) {
             const int fd = connectHost(mStopped);
