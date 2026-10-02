@@ -13,6 +13,7 @@ cc_binary {
     header_libs: [
         "libnativewindow_headers",
         "libnativebase_headers",
+        "libsystem_headers",
     ],
     shared_libs: [
         "libbinder_ndk",
