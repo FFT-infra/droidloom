@@ -8,6 +8,12 @@ cc_binary {
     cpp_std: "c++17",
     cflags: ["-Wall", "-Wextra", "-Werror"],
     static_libs: ["virtual_camera_service_aidl-ndk"],
+    // vndk/window.h includes nativebase/nativebase.h; both header sets are
+    // separate modules, so a vendor build must ask for them explicitly.
+    header_libs: [
+        "libnativewindow_headers",
+        "libnativebase_headers",
+    ],
     shared_libs: [
         "libbinder_ndk",
         "liblog",
