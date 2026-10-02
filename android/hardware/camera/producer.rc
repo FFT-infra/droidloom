@@ -16,7 +16,7 @@ service droidloom-virtual-camera /system/bin/droidloom-virtual-camera
     # provider. init owns its lifetime and restarts it if it ever exits.
     disabled
 
-service droidloom-camera-producer /droidloom/camera/bin/droidloom-camera-producer
+service droidloom-camera-producer /vendor/bin/droidloom-camera-producer
     class core
     user system
     group system

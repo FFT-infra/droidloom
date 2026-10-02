@@ -1,5 +1,9 @@
 cc_binary {
     name: "droidloom-camera-producer",
+    // The producer dequeues gralloc buffers and must resolve the platform
+    // gralloc mapper, which only a vendor-partition process can see; a copy
+    // running from /droidloom aborts with "gralloc-mapper is missing".
+    vendor: true,
     srcs: ["producer.cpp"],
     cpp_std: "c++17",
     cflags: ["-Wall", "-Wextra", "-Werror"],

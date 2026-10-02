@@ -51,6 +51,7 @@ PRODUCT_PACKAGES += \
     android.hardware.graphics.composer3-service.droidloom \
     droidloom-task-launcher \
     droidloom-input-bridge \
+    droidloom-camera-producer \
     droidloom-lmkd-compat \
     droidloom-classpath-wrapper \
     android.hardware.graphics.allocator-service.minigbm \
