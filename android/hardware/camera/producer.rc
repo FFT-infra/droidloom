@@ -1,4 +1,7 @@
-service droidloom-virtual-camera /droidloom/camera/bin/virtual_camera
+# /system/bin is where the platform linker namespace resolves the HAL's
+# libmedia/libandroidicu closure; a binary under /droidloom/... loads in the
+# default namespace and fails with "libandroidicu.so not found".
+service droidloom-virtual-camera /system/bin/droidloom-virtual-camera
     class core
     user system
     group system
