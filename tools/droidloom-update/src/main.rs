@@ -350,7 +350,12 @@ fn execute(args: Args) -> Result<()> {
         if let Ok(sysroot) = std::env::var("PKG_CONFIG_SYSROOT_DIR")
             && !sysroot.is_empty()
         {
-            rustflags.push_str(&format!(" -C link-arg=-L{sysroot}/usr/lib"));
+            // Fedora-style sysroots keep target libraries in usr/lib64 while
+            // the older imported set sits in usr/lib; rpath-link lets the
+            // linker resolve the transitives of the GStreamer closure.
+            rustflags.push_str(&format!(
+                " -C link-arg=-L{sysroot}/usr/lib -C link-arg=-L{sysroot}/usr/lib64 -C link-arg=-Wl,-rpath-link,{sysroot}/usr/lib64"
+            ));
         }
         host_build.env(
             "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
