@@ -11,6 +11,7 @@ members = [
     "runtime/droidloom-window-policy",
     "graphics/droidloom-audio",
     "graphics/droidloom-camera",
+    "graphics/droidloom-listenfd",
     "graphics/droidloom-composer",
     "graphics/droidloom-denial-ipc",
     "graphics/droidloom-denial-endpoint",

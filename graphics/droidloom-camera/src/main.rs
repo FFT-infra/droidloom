@@ -48,7 +48,6 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> io::Result<()> {
-    let mut activated = listenfd::ListenFd::from_env();
     gstreamer::init().map_err(io::Error::other)?;
     if args.check {
         let sources = capture::sources()?;
@@ -71,12 +70,7 @@ fn run(args: &Args) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
     let uid = fs::metadata("/proc/self")?.uid();
     let endpoint = root.join("droidloom/camera.sock");
-    if activated.len() > 1 {
-        return Err(io::Error::other(
-            "camera service expects one activation socket",
-        ));
-    }
-    let listener = open_listener(&endpoint, &root, uid, activated.take_unix_listener(0)?)?;
+    let listener = open_listener(&endpoint, &root, uid, droidloom_listenfd::inherited()?)?;
     notify_ready()?;
     let capture = Arc::new(CaptureSlot::default());
     let connections = Arc::new(AtomicUsize::new(0));
