@@ -279,7 +279,7 @@ fn execute(args: Args) -> Result<()> {
     // A prepared package workspace runs inside the rootless builder, which
     // supplies build tools and does not run host systemd or install services.
     if package_work.is_none() {
-        dependencies::ensure()?;
+        dependencies::ensure(!cross)?;
     }
     if work.join("source-projection.json").exists() {
         android::recover(&work.join("source-projection.json"), &source)?;
