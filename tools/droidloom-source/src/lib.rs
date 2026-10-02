@@ -447,8 +447,9 @@ pub fn materialize(
 /// Existing projects must be clean and still resolve to the same URL and
 /// commit recorded by the new plan. The new plan must be a strict extension of
 /// the published manifest: reconciliation never changes or removes an input.
-/// A sparse project may add explicitly locked paths at the same commit; it may
-/// not drop a previously materialized sparse path.
+/// A sparse project may add explicitly locked paths at the same commit, or
+/// replace paths with ancestors that retain their complete contents. It may
+/// not drop previously materialized source inputs.
 /// Each missing project is staged and renamed independently, so interruption
 /// leaves either a complete exact checkout or no checkout at that path. The
 /// manifest is replaced atomically only after the complete tree verifies.
@@ -566,10 +567,12 @@ fn validate_plan_extension(
         let compatible = replacement.is_some_and(|candidate| {
             candidate.sparse_paths == project.sparse_paths
                 || project.sparse_paths.is_empty()
-                || project
-                    .sparse_paths
-                    .iter()
-                    .all(|path| candidate.sparse_paths.contains(path))
+                || project.sparse_paths.iter().all(|path| {
+                    candidate
+                        .sparse_paths
+                        .iter()
+                        .any(|parent| path.starts_with(parent))
+                })
         });
         if !compatible {
             problems.push(format!(
@@ -1149,6 +1152,30 @@ mod tests {
 
         let mut contracted = expanded;
         contracted.projects[0].sparse_paths = vec!["tools".into()];
+        assert!(validate_plan_extension(&initial, &contracted).is_err());
+    }
+
+    #[test]
+    fn reconciliation_accepts_sparse_ancestors_without_dropping_inputs() {
+        let mut initial = build_plan(&valid_lock()).unwrap();
+        initial.projects[0].sparse_paths = vec![
+            "graphics/allocator/2.0".into(),
+            "graphics/allocator/3.0".into(),
+            "graphics/bufferqueue/1.0".into(),
+        ];
+        let mut expanded = initial.clone();
+        expanded.projects[0].sparse_paths = vec![
+            "graphics/allocator".into(),
+            "graphics/bufferqueue".into(),
+            "camera/device/aidl".into(),
+        ];
+        validate_plan_extension(&initial, &expanded).unwrap();
+
+        let mut sibling = expanded.clone();
+        sibling.projects[0].sparse_paths[0] = "graphics/allocators".into();
+        assert!(validate_plan_extension(&initial, &sibling).is_err());
+        let mut contracted = expanded;
+        contracted.projects[0].sparse_paths.remove(1);
         assert!(validate_plan_extension(&initial, &contracted).is_err());
     }
 
