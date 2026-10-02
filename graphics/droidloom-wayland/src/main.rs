@@ -1857,7 +1857,23 @@ impl App {
                 },
                 None => return Ok(()),
             };
-            self.process_action(qh, action)?;
+            match self.process_action(qh, action) {
+                Ok(()) => {}
+                // An action and the task it names can cross on the wire while
+                // the task ends (a dying application) or unmaps. Dropping that
+                // one stale action keeps every other Android task alive; a
+                // mismatch for a task we still hold stays fatal.
+                Err(PresenterError::UnknownTask(object)) if !self.tasks.contains_key(&object) => {
+                    eprintln!(
+                        "droidloom-wayland: dropping endpoint action for ended Android task {}",
+                        object.0
+                    );
+                }
+                Err(PresenterError::Endpoint(EndpointError::UnknownObject(_) | EndpointError::UnknownFrame { .. })) => {
+                    eprintln!("droidloom-wayland: dropping stale endpoint reply");
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -1922,10 +1938,19 @@ impl App {
                 other => format!("{other:?}").chars().take(40).collect(),
             }
         );
-        self.endpoint
+        match self
+            .endpoint
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
-            .send_input(object, self.next_input_serial, timestamp, event)?;
+            .send_input(object, self.next_input_serial, timestamp, event)
+        {
+            Ok(()) => {}
+            // Input can outrun a task that just ended or unmapped; a keystroke
+            // or button release with no destination is dropped, not a reason
+            // to tear down the presenter.
+            Err(EndpointError::UnknownObject(_) | EndpointError::UnknownFrame { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
         if let Some((action, tool_id)) = tablet_trace {
             eprintln!(
                 "Droidloom tablet trace: stage=denial-sent action={action:?} tool={tool_id} task={}",
