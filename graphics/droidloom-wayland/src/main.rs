@@ -601,6 +601,32 @@ impl App {
         })
     }
 
+    /// Ask the endpoint to close an Android task. Closing a task the endpoint
+    /// no longer tracks is already satisfied: the Android side ended it on its
+    /// own and only our window is still draining. That race must not be
+    /// escalated into a transport failure, which would take down every other
+    /// task, so it is logged and the native window still unmaps.
+    fn request_task_close(&mut self, object: TaskObjectId) {
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            match endpoint.send_close(object) {
+                Ok(()) => {}
+                Err(EndpointError::UnknownObject(_)) => {
+                    eprintln!(
+                        "droidloom-wayland: Android task {} already ended; completing its window close",
+                        object.0
+                    );
+                }
+                Err(error) => {
+                    self.fail(&error);
+                    return;
+                }
+            }
+        }
+        if let Some(task) = self.tasks.get_mut(&object) {
+            task.unmap_requested = true;
+        }
+    }
+
     fn cancel_chrome_press(&mut self, object: TaskObjectId) {
         if self.chrome_press.is_some_and(|(target, _)| target == object) {
             self.chrome_press = None;
@@ -2603,16 +2629,7 @@ impl App {
     ) {
         match action {
             FrameAction::Close => {
-                if let Some(endpoint) = self.endpoint.as_ref() {
-                    match endpoint.send_close(object) {
-                        Ok(()) => {
-                            if let Some(task) = self.tasks.get_mut(&object) {
-                                task.unmap_requested = true;
-                            }
-                        }
-                        Err(error) => self.fail(&error),
-                    }
-                }
+                self.request_task_close(object);
             }
             FrameAction::Minimize => {
                 if let Some(window) = self.tasks.get(&object).and_then(|task| task.window.as_ref()) {
@@ -2971,17 +2988,8 @@ impl WindowHandler for App {
                 .is_some_and(|candidate| candidate.wl_surface() == window.wl_surface())
                 .then_some(*object)
         });
-        if let Some(object) = object
-            && let Some(endpoint) = self.endpoint.as_ref()
-        {
-            match endpoint.send_close(object) {
-                Ok(()) => {
-                    if let Some(task) = self.tasks.get_mut(&object) {
-                        task.unmap_requested = true;
-                    }
-                }
-                Err(error) => self.fail(&error),
-            }
+        if let Some(object) = object {
+            self.request_task_close(object);
         }
     }
 
