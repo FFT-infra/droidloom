@@ -30,23 +30,6 @@ using namespace droidloom::camera;
 namespace camera = aidl::android::companion::virtualcamera;
 using ndk::ScopedAStatus;
 constexpr char kEndpoint[] = "/dev/socket/droidloom/camera";
-constexpr auto kDequeueTimeout = std::chrono::milliseconds(500);
-
-// system/window.h is outside the vendor header set. These are its stable
-// command and API ids, and the wrappers mirror its inline implementations
-// through the public ANativeWindow perform() vtable; the format is the NDK's
-// RGBA_8888, the same value the window header names.
-constexpr int kNativeWindowApiCpu = 2;
-constexpr int kNativeWindowApiConnect = 13;
-constexpr int kNativeWindowApiDisconnect = 14;
-
-int windowApiConnect(ANativeWindow* window, int api) {
-    return window->perform(window, kNativeWindowApiConnect, api);
-}
-
-int windowApiDisconnect(ANativeWindow* window, int api) {
-    return window->perform(window, kNativeWindowApiDisconnect, api);
-}
 
 int connectHost(const std::atomic_bool& stopped) {
     const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -98,63 +81,33 @@ std::optional<uint32_t> catalogue() {
     return result;
 }
 
-// Own the dequeued buffer until queue succeeds; every other path returns it without posting pixels.
+// Own the mapped buffer until it is posted; every path returns it to the queue.
 class WindowBuffer {
   public:
     explicit WindowBuffer(ANativeWindow* window) : mWindow(window) {}
     ~WindowBuffer() {
-        if (mLocked) AHardwareBuffer_unlock(mHardware, &mFence);
-        if (mBuffer != nullptr) ANativeWindow_cancelBuffer(mWindow, mBuffer, mFence);
+        if (mLocked) ANativeWindow_unlockAndPost(mWindow);
     }
 
     bool write(const std::vector<uint8_t>& frame, uint64_t timestamp,
                const std::atomic_bool& stopped) {
-        if (ANativeWindow_dequeueBuffer(mWindow, &mBuffer, &mFence) != 0) return false;
-        if (mFence >= 0) {
-            const auto ready = waitSocket(mFence, POLLIN,
-                                         std::chrono::steady_clock::now() + kDequeueTimeout, stopped);
-            if (ready != IoResult::Ok) return false;
-            close(mFence);
-            mFence = -1;
-        }
-        mHardware = ANativeWindowBuffer_getHardwareBuffer(mBuffer);
-        if (mHardware == nullptr || stopped.load()) return false;
-        AHardwareBuffer_Desc description{};
-        AHardwareBuffer_describe(mHardware, &description);
-        if (description.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ||
-            description.width != kWidth || description.height != kHeight ||
-            description.stride > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-            return false;
-        }
-        void* pixels = nullptr;
-        if (AHardwareBuffer_lock(mHardware, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-                                 -1, nullptr, &pixels) != 0) {
-            return false;
-        }
+        ANativeWindow_Buffer buffer{};
+        if (ANativeWindow_lock(mWindow, &buffer, nullptr) != 0) return false;
         mLocked = true;
-        if (!copyFrame(frame.data(), frame.size(), pixels, description.width,
-                       description.height, description.stride)) {
-            return false;
-        }
-        const int unlocked = AHardwareBuffer_unlock(mHardware, &mFence);
-        mLocked = false;
-        if (unlocked != 0) return false;
+        const bool copied = !stopped.load() &&
+            copyFrame(frame.data(), frame.size(), buffer.bits, buffer.width,
+                      buffer.height, buffer.stride);
         if (stopped.load() ||
             ANativeWindow_setBuffersTimestamp(mWindow, static_cast<int64_t>(timestamp)) != 0) {
             return false;
         }
-        const int result = ANativeWindow_queueBuffer(mWindow, mBuffer, mFence);
-        mFence = -1;  // queueBuffer consumes the fence even when it fails.
-        if (result != 0) return false;
-        mBuffer = nullptr;
-        return true;
+        if (ANativeWindow_unlockAndPost(mWindow) != 0) return false;
+        mLocked = false;
+        return copied;
     }
 
   private:
     ANativeWindow* mWindow;
-    ANativeWindowBuffer* mBuffer = nullptr;
-    AHardwareBuffer* mHardware = nullptr;
-    int mFence = -1;
     bool mLocked = false;
 };
 
@@ -201,13 +154,11 @@ class Capture {
     }
 
     void run() {
-        bool connected = windowApiConnect(mWindow, kNativeWindowApiCpu) == 0;
-        bool ready = connected &&
-            ANativeWindow_setBuffersDimensions(mWindow, kWidth, kHeight) == 0 &&
-            ANativeWindow_setBuffersFormat(
-                mWindow, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) == 0 &&
-            ANativeWindow_setUsage(mWindow, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
-                                           AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) == 0;
+        // The HAL configures the queue for the stream's format and size; the
+        // NDK geometry call keeps the producer side explicit about it.
+        bool ready = ANativeWindow_setBuffersGeometry(
+                         mWindow, kWidth, kHeight,
+                         AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) == 0;
         bool success = false;
         if (ready && !mStopped.load()) {
             const int fd = connectHost(mStopped);
@@ -225,7 +176,6 @@ class Capture {
                 }
             }
         }
-        if (connected) windowApiDisconnect(mWindow, kNativeWindowApiCpu);
         if (!success && !mStopped.load()) {
             ALOGE("Camera %u stream failed; closing its HAL session", mCameraId);
             mFailed();
