@@ -349,7 +349,10 @@ class Producer final : public camera::BnVirtualCameraCallback {
 std::shared_ptr<camera::IVirtualCameraService> waitForService() {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     do {
-        ndk::SpAIBinder binder(AServiceManager_checkService("virtual_camera"));
+        // getService (unlike checkService) asks servicemanager to start the
+        // lazy virtual_camera provider; it exits again when idle, so a poll
+        // with checkService would never see it.
+        ndk::SpAIBinder binder(AServiceManager_getService("virtual_camera"));
         if (binder.get() != nullptr) return camera::IVirtualCameraService::fromBinder(binder);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     } while (std::chrono::steady_clock::now() < deadline);

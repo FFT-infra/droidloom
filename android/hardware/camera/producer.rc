@@ -2,8 +2,14 @@ service droidloom-virtual-camera /droidloom/camera/bin/virtual_camera
     class core
     user system
     group system
+    capabilities SYS_NICE
+    rlimit rtprio 10 10
+    task_profiles CameraServiceCapacity CameraServicePerformance
     interface aidl virtual_camera
     interface aidl android.hardware.camera.provider.ICameraProvider/virtual/0
+    # The HAL is a lazy AIDL service: it exits when idle and servicemanager
+    # restarts it on demand, exactly like the upstream virtual_camera unit.
+    oneshot
     disabled
 
 service droidloom-camera-producer /droidloom/camera/bin/droidloom-camera-producer
