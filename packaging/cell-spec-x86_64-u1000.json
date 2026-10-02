@@ -167,6 +167,10 @@
   ],
   "android_runtime_directories": [
     {
+      "source": "/usr/lib/droidloom/current/camera",
+      "target": "/droidloom/camera"
+    },
+    {
       "source": "/usr/lib/droidloom/current/ime",
       "target": "/droidloom/ime"
     },

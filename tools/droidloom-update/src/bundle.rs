@@ -11,6 +11,16 @@ use std::{
 
 pub const MANIFEST: &str = "droidloom-update.json";
 pub const PRESENTER: &str = "usr/bin/droidloom-wayland";
+pub(crate) const CAMERA_EXECUTABLES: &[&str] = &[
+    "usr/bin/droidloom-camera",
+    "usr/lib/droidloom/runtime/camera/bin/virtual_camera",
+    "usr/lib/droidloom/runtime/camera/bin/droidloom-camera-producer",
+];
+pub(crate) const CAMERA_DATA: &[&str] = &[
+    "usr/lib/systemd/user/droidloom-camera.service",
+    "usr/lib/systemd/user/droidloom-camera.socket",
+    "usr/lib/droidloom/runtime/camera/producer.rc",
+];
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FILES: usize = 20_000;
 const MAX_COMPONENTS: usize = 64;
@@ -192,6 +202,33 @@ fn architecture(data: &[u8]) -> Result<&'static str> {
         _ => fail("unsupported ELF architecture"),
     }
 }
+pub(crate) fn camera_payload_present(root: &Path) -> bool {
+    CAMERA_EXECUTABLES.iter().chain(CAMERA_DATA).any(|path| root.join(path).exists())
+}
+
+fn verify_camera_payload(root: &Path, expected_arch: &str) -> Result<()> {
+    // Older complete releases have no camera closure and remain valid rollback
+    // targets. A partially included camera must never become an installable bundle.
+    if !camera_payload_present(root) {
+        return Ok(());
+    }
+    for path in CAMERA_EXECUTABLES.iter().chain(CAMERA_DATA) {
+        let metadata = fs::symlink_metadata(root.join(path))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return fail(format!("missing camera component: {path}"));
+        }
+    }
+    for path in CAMERA_EXECUTABLES {
+        let path = root.join(path);
+        if fs::metadata(&path)?.permissions().mode() & 0o111 != 0o111
+            || executable_architecture(&path)? != expected_arch
+        {
+            return fail(format!("camera executable is inaccessible or has the wrong architecture: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
 fn compatibility(root: &Path) -> Result<(String, u16)> {
     let runtime = root.join("usr/lib/droidloom/runtime");
     let home = dex(&runtime.join("ime/DroidloomHome.apk"))?;
@@ -283,6 +320,7 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
     if bridges == 0 {
         return fail("missing Android bridge");
     }
+    verify_camera_payload(root, &arch)?;
     Ok((arch, version))
 }
 pub fn valid_relative_path(value: &str) -> bool {
@@ -623,6 +661,62 @@ pub(crate) mod artifact_tests {
         copy(&jar, &root.join("usr/lib/droidloom/runtime/systemui/SystemUI.apk")).unwrap();
         write(&root.join("usr/lib/droidloom/runtime/ime/home-setup"), b"#!/system/bin/sh\n").unwrap();
     }
+    pub(crate) fn camera_fixture(root: &Path) {
+        for relative in CAMERA_EXECUTABLES {
+            copy(&root.join(PRESENTER), &root.join(relative)).unwrap();
+            mode(&root.join(relative), 0o755).unwrap();
+        }
+        for relative in CAMERA_DATA {
+            write(&root.join(relative), b"camera runtime fixture\n").unwrap();
+            mode(&root.join(relative), 0o644).unwrap();
+        }
+    }
+
+    #[test]
+    fn complete_camera_closure_and_older_camera_free_bundles_verify() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 5, 5);
+        let provenance = test_provenance("x86_64");
+        seal(d.path(), &provenance).unwrap();
+        verify(d.path()).unwrap();
+        assert!(!camera_payload_present(d.path()));
+        camera_fixture(d.path());
+        seal(d.path(), &provenance).unwrap();
+        verify(d.path()).unwrap();
+        assert!(camera_payload_present(d.path()));
+    }
+
+    #[test]
+    fn camera_closure_rejects_each_missing_component() {
+        for relative in CAMERA_EXECUTABLES.iter().chain(CAMERA_DATA) {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            camera_fixture(d.path());
+            let provenance = test_provenance("x86_64");
+            seal(d.path(), &provenance).unwrap();
+            fs::remove_file(d.path().join(relative)).unwrap();
+            assert!(verify(d.path()).is_err(), "removed {relative}");
+            assert!(seal(d.path(), &provenance).is_err(), "resealed incomplete {relative}");
+        }
+    }
+
+    #[test]
+    fn camera_executables_require_execute_permissions_and_native_architecture() {
+        for relative in CAMERA_EXECUTABLES {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            camera_fixture(d.path());
+            let provenance = test_provenance("x86_64");
+            mode(&d.path().join(relative), 0o644).unwrap();
+            assert!(seal(d.path(), &provenance).is_err());
+            mode(&d.path().join(relative), 0o755).unwrap();
+            let mut bytes = fs::read(d.path().join(relative)).unwrap();
+            bytes[18] = 183;
+            write(&d.path().join(relative), bytes).unwrap();
+            assert!(seal(d.path(), &provenance).is_err());
+        }
+    }
+
     #[test]
     fn refuses_runtime_files_unreadable_by_installed_service_users() {
         for relative in [
@@ -716,6 +810,7 @@ pub(crate) mod artifact_tests {
         write(&file, &bytes).unwrap();
         assert!(verify(d.path()).is_err(), "same size and mode with different bytes must fail");
     }
+    #[test]
     fn rejects_foreign_architecture_in_other_component() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);

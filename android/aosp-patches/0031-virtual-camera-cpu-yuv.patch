@@ -1,0 +1,1271 @@
+diff --git a/services/camera/virtualcamera/Android.bp b/services/camera/virtualcamera/Android.bp
+--- a/services/camera/virtualcamera/Android.bp
++++ b/services/camera/virtualcamera/Android.bp
+@@ -36,6 +36,7 @@
+         "android.hardware.camera.metadata-V2-ndk",
+         "android.hardware.camera.provider-V2-ndk",
+         "libaidlcommonsupport",
++        "libyuv",
+         "virtual_camera_service_aidl-ndk",
+     ],
+     cflags: [
+@@ -56,6 +57,7 @@
+     name: "libvirtualcamera_utils",
+     srcs: [
+         "util/AidlUtil.cc",
++        "util/CpuYuvRenderer.cc",
+         "util/EglDisplayContext.cc",
+         "util/EglFramebuffer.cc",
+         "util/EglProgram.cc",
+diff --git a/services/camera/virtualcamera/VirtualCameraDevice.cc b/services/camera/virtualcamera/VirtualCameraDevice.cc
+--- a/services/camera/virtualcamera/VirtualCameraDevice.cc
++++ b/services/camera/virtualcamera/VirtualCameraDevice.cc
+@@ -741,7 +741,8 @@
+ 
+ VirtualCameraDevice::VirtualCameraDevice(
+     const std::string& cameraId,
+-    const VirtualCameraConfiguration& configuration, int32_t deviceId)
++    const VirtualCameraConfiguration& configuration, int32_t deviceId,
++    bool cpuYuv)
+     : mCameraId(cameraId),
+       mVirtualCameraClientCallback(configuration.virtualCameraCallback),
+       mSupportedInputConfigurations(configuration.supportedStreamConfigs),
+@@ -749,7 +750,8 @@
+           configuration.perFrameCameraMetadataEnabled),
+       mConfigCameraCharacteristics(configuration.cameraCharacteristics),
+       mIsMultiInputStreamEnabled(flags::camera_multiple_input_streams() &&
+-                                 configuration.isMultiInputStreamEnabled) {
++                                 configuration.isMultiInputStreamEnabled),
++      mCpuYuv(cpuYuv) {
+   std::optional<AidlCameraMetadata> metadata = initCameraCharacteristics(
+       mSupportedInputConfigurations, configuration.sensorOrientation,
+       configuration.lensFacing, mConfigCameraCharacteristics, deviceId);
+diff --git a/services/camera/virtualcamera/VirtualCameraDevice.h b/services/camera/virtualcamera/VirtualCameraDevice.h
+--- a/services/camera/virtualcamera/VirtualCameraDevice.h
++++ b/services/camera/virtualcamera/VirtualCameraDevice.h
+@@ -43,7 +43,7 @@
+       const std::string& cameraId,
+       const aidl::android::companion::virtualcamera::VirtualCameraConfiguration&
+           configuration,
+-      int32_t deviceId);
++      int32_t deviceId, bool cpuYuv = false);
+ 
+   virtual ~VirtualCameraDevice() override = default;
+ 
+@@ -100,6 +100,10 @@
+ 
+   const std::string& getCameraId() const {
+     return mCameraId;
++  }
++
++  bool usesCpuYuv() const {
++    return mCpuYuv;
+   }
+ 
+   bool isPerFrameCameraMetadataEnabled() const {
+@@ -174,6 +178,7 @@
+   std::atomic_int mNextInputStreamId;
+ 
+   const bool mIsMultiInputStreamEnabled;
++  const bool mCpuYuv;
+   std::mutex mSessionLock;
+   std::weak_ptr<VirtualCameraSession> mSession GUARDED_BY(mSessionLock);
+ };
+diff --git a/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.cc b/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.cc
+--- a/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.cc
++++ b/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.cc
+@@ -77,13 +77,17 @@
+   }
+ }
+ 
+-std::shared_ptr<EglFrameBuffer> allocateTemporaryFramebuffer(
+-    EGLDisplay eglDisplay, const uint width, const int height) {
++std::shared_ptr<AHardwareBuffer> allocateTemporaryBuffer(
++    const uint width, const int height, bool cpuOnly) {
++  const uint64_t usage = cpuOnly
++                             ? AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
++                                   AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN
++                             : kHardwareBufferUsage;
+   const AHardwareBuffer_Desc desc{.width = static_cast<uint32_t>(width),
+                                   .height = static_cast<uint32_t>(height),
+                                   .layers = 1,
+                                   .format = kHardwareBufferFormat,
+-                                  .usage = kHardwareBufferUsage,
++                                  .usage = usage,
+                                   .rfu0 = 0,
+                                   .rfu1 = 0};
+ 
+@@ -96,9 +100,7 @@
+     return nullptr;
+   }
+ 
+-  return std::make_shared<EglFrameBuffer>(
+-      eglDisplay,
+-      std::shared_ptr<AHardwareBuffer>(hwBufferPtr, AHardwareBuffer_release));
++  return std::shared_ptr<AHardwareBuffer>(hwBufferPtr, AHardwareBuffer_release);
+ }
+ 
+ std::vector<uint8_t> createExif(
+@@ -145,13 +147,17 @@
+ 
+ VirtualCameraImageTransformingHandler::VirtualCameraImageTransformingHandler(
+     VirtualCameraSessionContext& sessionContext, Resolution inputSurfaceSize,
+-    std::function<void(void)> frameReadyCallback)
++    std::function<void(void)> frameReadyCallback, bool cpuYuv)
+     : mSessionContext{sessionContext} {
+   mEglDisplayContext = std::make_unique<EglDisplayContext>();
+-  mEglTextureYuvProgram =
+-      std::make_unique<EglTextureProgram>(EglTextureProgram::TextureFormat::YUV);
+-  mEglTextureRgbProgram = std::make_unique<EglTextureProgram>(
+-      EglTextureProgram::TextureFormat::RGBA);
++  if (!cpuYuv) {
++    mEglTextureYuvProgram =
++        std::make_unique<EglTextureProgram>(EglTextureProgram::TextureFormat::YUV);
++    mEglTextureRgbProgram = std::make_unique<EglTextureProgram>(
++        EglTextureProgram::TextureFormat::RGBA);
++  } else {
++    mCpuYuvRenderer = std::make_unique<CpuYuvRenderer>();
++  }
+   mEglSurfaceTexture = std::make_unique<EglSurfaceTexture>(
+       inputSurfaceSize.width, inputSurfaceSize.height);
+   mEglSurfaceTexture->setFrameAvailableListener(
+@@ -206,8 +212,8 @@
+   ALOGV("%s: Creating thumbnail with size %d x %d, quality %d", __func__,
+         resolution.width, resolution.height, quality);
+   Resolution bufferSize = roundTo2DctSize(resolution);
+-  std::shared_ptr<EglFrameBuffer> framebuffer = allocateTemporaryFramebuffer(
+-      mEglDisplayContext->getEglDisplay(), bufferSize.width, bufferSize.height);
++  std::shared_ptr<AHardwareBuffer> framebuffer = allocateTemporaryBuffer(
++      bufferSize.width, bufferSize.height, mCpuYuvRenderer != nullptr);
+   if (framebuffer == nullptr) {
+     ALOGE(
+         "Failed to allocate temporary framebuffer for JPEG thumbnail "
+@@ -217,7 +223,7 @@
+ 
+   // TODO(b/324383963) Add support for letterboxing if the thumbnail sizes
+   // doesn't correspond to input texture aspect ratio.
+-  if (!renderIntoEglFramebuffer(*framebuffer, /*fence=*/nullptr,
++  if (!renderIntoHardwareBuffer(framebuffer, /*fence=*/nullptr,
+                                 Rect(resolution.width, resolution.height))
+            .isOk()) {
+     ALOGE(
+@@ -232,7 +238,7 @@
+         resolution.height);
+   std::optional<size_t> compressedSize =
+       compressJpeg(resolution.width, resolution.height, quality,
+-                   framebuffer->getHardwareBuffer(), {},
++                   framebuffer, {},
+                    compressedThumbnail.size(), compressedThumbnail.data());
+   if (!compressedSize.has_value()) {
+     ALOGE("%s: Failed to compress jpeg thumbnail", __func__);
+@@ -275,16 +281,16 @@
+   // size.
+   Resolution bufferSize =
+       roundTo2DctSize(Resolution(stream->width, stream->height));
+-  std::shared_ptr<EglFrameBuffer> framebuffer = allocateTemporaryFramebuffer(
+-      mEglDisplayContext->getEglDisplay(), bufferSize.width, bufferSize.height);
++  std::shared_ptr<AHardwareBuffer> framebuffer = allocateTemporaryBuffer(
++      bufferSize.width, bufferSize.height, mCpuYuvRenderer != nullptr);
+   if (framebuffer == nullptr) {
+     ALOGE("Failed to allocate temporary framebuffer for JPEG compression");
+     return cameraStatus(Status::INTERNAL_ERROR);
+   }
+ 
+   // Render into temporary framebuffer.
+-  ndk::ScopedAStatus status = renderIntoEglFramebuffer(
+-      *framebuffer, /*fence=*/nullptr, Rect(stream->width, stream->height));
++  ndk::ScopedAStatus status = renderIntoHardwareBuffer(
++      framebuffer, /*fence=*/nullptr, Rect(stream->width, stream->height));
+   if (!status.isOk()) {
+     ALOGE("Failed to render input texture into temporary framebuffer");
+     return status;
+@@ -306,7 +312,7 @@
+   void* outBuffer = (*planesLock).planes[0].data;
+   std::optional<size_t> compressedSize = compressJpeg(
+       stream->width, stream->height, requestSettings.jpegQuality,
+-      framebuffer->getHardwareBuffer(), app1ExifData, outBufferSize, outBuffer);
++      framebuffer, app1ExifData, outBufferSize, outBuffer);
+ 
+   if (!compressedSize.has_value()) {
+     ALOGE("%s: Failed to compress JPEG image", __func__);
+@@ -353,6 +359,13 @@
+       std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch());
+ 
++  // CPU conversion never imports the YUV destination as an EGL framebuffer.
++  if (mCpuYuvRenderer != nullptr) {
++    return renderIntoHardwareBuffer(
++        mSessionContext.fetchHardwareBuffer(streamId, bufferId),
++        requestBuffer.getFence());
++  }
++
+   // Render test pattern using EGL.
+   std::shared_ptr<EglFrameBuffer> framebuffer =
+       mSessionContext.fetchOrCreateEglFramebuffer(
+@@ -375,7 +388,26 @@
+   ALOGV("Rendering to buffer %d, stream %d took %lld ns", bufferId, streamId,
+         after.count() - before.count());
+ 
+-  return ndk::ScopedAStatus::ok();
++  return status;
++}
++
++ndk::ScopedAStatus VirtualCameraImageTransformingHandler::renderIntoHardwareBuffer(
++    std::shared_ptr<AHardwareBuffer> buffer, sp<Fence> fence,
++    std::optional<Rect> viewport) {
++  if (buffer == nullptr) {
++    return cameraStatus(Status::ILLEGAL_ARGUMENT);
++  }
++  mEglDisplayContext->makeCurrent();
++  if (mCpuYuvRenderer != nullptr) {
++    if (mEglSurfaceTexture->getCurrentBuffer() == nullptr) {
++      return cameraStatus(Status::INTERNAL_ERROR);
++    }
++    return mCpuYuvRenderer->render(mEglSurfaceTexture->getTextureId(),
++                                   mEglSurfaceTexture->getTransformMatrix(),
++                                   buffer, fence, viewport);
++  }
++  EglFrameBuffer framebuffer(mEglDisplayContext->getEglDisplay(), buffer);
++  return renderIntoEglFramebuffer(framebuffer, fence, viewport);
+ }
+ 
+ ndk::ScopedAStatus VirtualCameraImageTransformingHandler::renderIntoEglFramebuffer(
+@@ -391,7 +423,9 @@
+   }
+ 
+   mEglDisplayContext->makeCurrent();
+-  framebuffer.beforeDraw();
++  if (!framebuffer.beforeDraw()) {
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
+ 
+   Rect viewportRect =
+       viewport.value_or(Rect(framebuffer.getWidth(), framebuffer.getHeight()));
+@@ -419,7 +453,9 @@
+       return cameraStatus(Status::INTERNAL_ERROR);
+     }
+   }
+-  framebuffer.afterDraw();
++  if (!framebuffer.afterDraw()) {
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
+ 
+   return ndk::ScopedAStatus::ok();
+ }
+diff --git a/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.h b/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.h
+--- a/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.h
++++ b/services/camera/virtualcamera/VirtualCameraImageTransformingHandler.h
+@@ -36,6 +36,7 @@
+ #include "aidl/android/hardware/camera/device/Stream.h"
+ #include "aidl/android/hardware/camera/device/StreamBuffer.h"
+ #include "android/binder_auto_utils.h"
++#include "util/CpuYuvRenderer.h"
+ #include "util/EglDisplayContext.h"
+ #include "util/EglFramebuffer.h"
+ #include "util/EglProgram.h"
+@@ -57,7 +58,7 @@
+  public:
+   VirtualCameraImageTransformingHandler(
+       VirtualCameraSessionContext& sessionContext, Resolution inputSurfaceSize,
+-      std::function<void(void)> frameReadyCallback);
++      std::function<void(void)> frameReadyCallback, bool cpuYuv = false);
+   virtual ~VirtualCameraImageTransformingHandler();
+ 
+   virtual bool waitForInputFrame(const std::chrono::nanoseconds timeout) override;
+@@ -123,12 +124,17 @@
+       EglFrameBuffer& framebuffer, sp<Fence> fence = nullptr,
+       std::optional<Rect> viewport = std::nullopt);
+ 
++  ndk::ScopedAStatus renderIntoHardwareBuffer(
++      std::shared_ptr<AHardwareBuffer> buffer, sp<Fence> fence = nullptr,
++      std::optional<Rect> viewport = std::nullopt);
++
+   VirtualCameraSessionContext& mSessionContext;
+ 
+   // EGL helpers - constructed and accessed only from capture thread.
+   std::unique_ptr<EglDisplayContext> mEglDisplayContext;
+   std::unique_ptr<EglTextureProgram> mEglTextureYuvProgram;
+   std::unique_ptr<EglTextureProgram> mEglTextureRgbProgram;
++  std::unique_ptr<CpuYuvRenderer> mCpuYuvRenderer;
+   std::unique_ptr<EglSurfaceTexture> mEglSurfaceTexture;
+ };
+ 
+diff --git a/services/camera/virtualcamera/VirtualCameraProvider.cc b/services/camera/virtualcamera/VirtualCameraProvider.cc
+--- a/services/camera/virtualcamera/VirtualCameraProvider.cc
++++ b/services/camera/virtualcamera/VirtualCameraProvider.cc
+@@ -161,14 +161,14 @@
+ 
+ std::shared_ptr<VirtualCameraDevice> VirtualCameraProvider::createCamera(
+     const VirtualCameraConfiguration& configuration,
+-    const std::string& cameraId, const int32_t deviceId) {
++    const std::string& cameraId, const int32_t deviceId, bool cpuYuv) {
+   if (cameraId.empty()) {
+     ALOGE("%s: Cannot create camera with empty cameraId", __func__);
+     return nullptr;
+   }
+ 
+   auto camera = ndk::SharedRefBase::make<VirtualCameraDevice>(
+-      cameraId, configuration, deviceId);
++      cameraId, configuration, deviceId, cpuYuv);
+   std::shared_ptr<ICameraProviderCallback> callback;
+   {
+     const std::lock_guard<std::mutex> lock(mLock);
+diff --git a/services/camera/virtualcamera/VirtualCameraProvider.h b/services/camera/virtualcamera/VirtualCameraProvider.h
+--- a/services/camera/virtualcamera/VirtualCameraProvider.h
++++ b/services/camera/virtualcamera/VirtualCameraProvider.h
+@@ -75,7 +75,7 @@
+   std::shared_ptr<VirtualCameraDevice> createCamera(
+       const aidl::android::companion::virtualcamera::VirtualCameraConfiguration&
+           configuration,
+-      const std::string& cameraId, int32_t deviceId);
++      const std::string& cameraId, int32_t deviceId, bool cpuYuv = false);
+ 
+   std::shared_ptr<VirtualCameraDevice> getCamera(const std::string& name);
+ 
+diff --git a/services/camera/virtualcamera/VirtualCameraRenderThread.cc b/services/camera/virtualcamera/VirtualCameraRenderThread.cc
+--- a/services/camera/virtualcamera/VirtualCameraRenderThread.cc
++++ b/services/camera/virtualcamera/VirtualCameraRenderThread.cc
+@@ -136,12 +136,13 @@
+     VirtualCameraSessionContext& sessionContext, int inputSurfaceIndex,
+     Format imageFormat, const Resolution inputSurfaceSize,
+     const Resolution reportedSensorSize,
+-    std::shared_ptr<ICameraDeviceCallback> cameraDeviceCallback)
++    std::shared_ptr<ICameraDeviceCallback> cameraDeviceCallback, bool cpuYuv)
+     : mCameraDeviceCallback(cameraDeviceCallback),
+       mImageFormat{imageFormat},
+       mInputSurfaceSize(inputSurfaceSize),
+       mReportedSensorSize(reportedSensorSize),
+       mInputSurfaceIndex(inputSurfaceIndex),
++      mCpuYuv(cpuYuv),
+       mSessionContext(sessionContext),
+       mInputSurfaceFuture(mInputSurfacePromise.get_future()) {
+   ALOGV("Creation of VirtualCameraRenderThread with inputSurfaceSize: %dx%d",
+@@ -708,7 +709,8 @@
+ 
+   } else {
+     mImageHandler = std::make_unique<VirtualCameraImageTransformingHandler>(
+-        mSessionContext, mInputSurfaceSize, [this] { requestTextureUpdate(); });
++        mSessionContext, mInputSurfaceSize, [this] { requestTextureUpdate(); },
++        mCpuYuv);
+   }
+ 
+   mInputSurfacePromise.set_value(mImageHandler->getInputSurface());
+diff --git a/services/camera/virtualcamera/VirtualCameraRenderThread.h b/services/camera/virtualcamera/VirtualCameraRenderThread.h
+--- a/services/camera/virtualcamera/VirtualCameraRenderThread.h
++++ b/services/camera/virtualcamera/VirtualCameraRenderThread.h
+@@ -105,7 +105,7 @@
+       Resolution inputSurfaceSize, Resolution reportedSensorSize,
+       std::shared_ptr<
+           ::aidl::android::hardware::camera::device::ICameraDeviceCallback>
+-          cameraDeviceCallback);
++          cameraDeviceCallback, bool cpuYuv = false);
+ 
+   ~VirtualCameraRenderThread();
+ 
+@@ -201,6 +201,7 @@
+   const Resolution mInputSurfaceSize;
+   const Resolution mReportedSensorSize;
+   const int mInputSurfaceIndex;
++  const bool mCpuYuv;
+ 
+   VirtualCameraSessionContext& mSessionContext;
+ 
+diff --git a/services/camera/virtualcamera/VirtualCameraService.cc b/services/camera/virtualcamera/VirtualCameraService.cc
+--- a/services/camera/virtualcamera/VirtualCameraService.cc
++++ b/services/camera/virtualcamera/VirtualCameraService.cc
+@@ -43,6 +43,8 @@
+ #include "android/hardware_buffer.h"
+ #include "binder/Status.h"
+ #include "fmt/format.h"
++#include "util/CpuYuvConversion.h"
++#include "util/CpuYuvRenderer.h"
+ #include "util/EglDisplayContext.h"
+ #include "util/EglUtil.h"
+ #include "util/Permissions.h"
+@@ -88,10 +90,9 @@
+ constexpr char kCreateVirtualDevicePermission[] =
+     "android.permission.CREATE_VIRTUAL_DEVICE";
+ 
+-constexpr std::array<const char*, 3> kRequiredEglExtensions = {
++constexpr std::array<const char*, 2> kRequiredEglExtensions = {
+     "GL_OES_EGL_image_external",
+     "GL_OES_EGL_image_external_essl3",
+-    "GL_EXT_YUV_target",
+ };
+ 
+ // Numerical portion for id to assign to next created camera.
+@@ -237,7 +238,17 @@
+   return ndk::ScopedAStatus::ok();
+ }
+ 
+-ndk::ScopedAStatus verifyHardwareBufferSupport() {
++ndk::ScopedAStatus verifyHardwareBufferSupport(bool& cpuYuv) {
++  EglDisplayContext context;
++  cpuYuv = !isGlExtensionSupported("GL_EXT_YUV_target");
++  if (cpuYuv) {
++    if (CpuYuvRenderer::isSupported()) {
++      return ndk::ScopedAStatus::ok();
++    }
++    return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
++        EX_UNSUPPORTED_OPERATION,
++        "Cannot create virtual camera: RGBA readback or CPU YUV buffer access is unsupported");
++  }
+   static constexpr AHardwareBuffer_Desc desc{
+       .width = static_cast<uint32_t>(kVgaWidth),
+       .height = static_cast<uint32_t>(kVgaHeight),
+@@ -301,6 +312,7 @@
+         Status::EX_ILLEGAL_ARGUMENT);
+   }
+ 
++  bool cpuYuv = false;
+   if (mCheckHardwareRequirements) {
+     auto status = verifyRequiredEglExtensions();
+     if (!status.isOk()) {
+@@ -308,10 +320,19 @@
+       return status;
+     }
+ 
+-    status = verifyHardwareBufferSupport();
++    status = verifyHardwareBufferSupport(cpuYuv);
+     if (!status.isOk()) {
+       *_aidl_return = false;
+       return status;
++    }
++    if (cpuYuv && std::any_of(configuration.supportedStreamConfigs.begin(),
++                             configuration.supportedStreamConfigs.end(),
++                             [](const auto& config) {
++                               return !validCpuYuvSize(config.width, config.height);
++                             })) {
++      *_aidl_return = false;
++      return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
++          EX_UNSUPPORTED_OPERATION, "Input size exceeds CPU YUV conversion limits");
+     }
+   }
+ 
+@@ -334,7 +355,7 @@
+   }
+ 
+   std::shared_ptr<VirtualCameraDevice> camera =
+-      mVirtualCameraProvider->createCamera(configuration, cameraId, deviceId);
++      mVirtualCameraProvider->createCamera(configuration, cameraId, deviceId, cpuYuv);
+   if (camera == nullptr) {
+     ALOGE("Failed to create camera for binder token 0x%" PRIxPTR,
+           reinterpret_cast<uintptr_t>(token.get()));
+diff --git a/services/camera/virtualcamera/VirtualCameraSession.cc b/services/camera/virtualcamera/VirtualCameraSession.cc
+--- a/services/camera/virtualcamera/VirtualCameraSession.cc
++++ b/services/camera/virtualcamera/VirtualCameraSession.cc
+@@ -56,6 +56,7 @@
+ #include "system/camera_metadata.h"
+ #include "ui/GraphicBuffer.h"
+ #include "util/AidlUtil.h"
++#include "util/CameraBufferUsage.h"
+ #include "util/MetadataUtil.h"
+ #include "util/Util.h"
+ 
+@@ -162,7 +163,7 @@
+   return *metadata;
+ }
+ 
+-HalStream getHalStream(const Stream& stream) {
++HalStream getHalStream(const Stream& stream, bool cpuYuv) {
+   HalStream halStream;
+   halStream.id = stream.id;
+   halStream.physicalCameraId = stream.physicalCameraId;
+@@ -180,10 +181,7 @@
+   halStream.overrideDataSpace = stream.dataSpace;
+ 
+   halStream.producerUsage = static_cast<BufferUsage>(
+-      static_cast<int64_t>(stream.usage) |
+-      static_cast<int64_t>(BufferUsage::CAMERA_OUTPUT) |
+-      static_cast<int64_t>(BufferUsage::GPU_RENDER_TARGET) |
+-      static_cast<int64_t>(BufferUsage::CPU_WRITE_OFTEN));
++      cameraProducerUsage(stream.usage, cpuYuv));
+ 
+   halStream.supportOffline = false;
+   return halStream;
+@@ -470,7 +468,7 @@
+   {
+     std::lock_guard<std::mutex> lock(mLock);
+     for (int i = 0; i < in_requestedConfiguration.streams.size(); ++i) {
+-      halStreams[i] = getHalStream(streams[i]);
++      halStreams[i] = getHalStream(streams[i], virtualCamera->usesCpuYuv());
+       if (mSessionContext.initializeStream(streams[i])) {
+         ALOGV("Configured new output stream: %s", streams[i].toString().c_str());
+       }
+@@ -543,7 +541,8 @@
+     mRenderThread = std::make_unique<VirtualCameraRenderThread>(
+         mSessionContext, inputConfig->index, inputConfig->imageFormat,
+         resolutionFromInputConfig(*inputConfig),
+-        virtualCamera->getMaxInputResolution(), mCameraDeviceCallback);
++        virtualCamera->getMaxInputResolution(), mCameraDeviceCallback,
++        virtualCamera->usesCpuYuv());
+ 
+     if (!mRenderThread->start()) {
+       ALOGE("%s: failed to start render thread", __func__);
+@@ -661,7 +660,8 @@
+       std::make_unique<VirtualCameraRenderThread>(
+           mSessionContext, inputConfig.index, inputConfig.imageFormat,
+           resolutionFromInputConfig(inputConfig),
+-          virtualCamera.getMaxInputResolution(), mCameraDeviceCallback);
++          virtualCamera.getMaxInputResolution(), mCameraDeviceCallback,
++          virtualCamera.usesCpuYuv());
+   newThread->start();
+ 
+   if (mVirtualCameraClientCallback != nullptr) {
+diff --git a/services/camera/virtualcamera/tests/Android.bp b/services/camera/virtualcamera/tests/Android.bp
+--- a/services/camera/virtualcamera/tests/Android.bp
++++ b/services/camera/virtualcamera/tests/Android.bp
+@@ -2,6 +2,17 @@
+     default_team: "trendy_team_virtual_device_framework",
+     // See: http://go/android-license-faq
+     default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++cc_test {
++    name: "virtual_camera_cpu_yuv_tests",
++    host_supported: true,
++    gtest: false,
++    srcs: ["CpuYuvConversionTest.cc"],
++    static_libs: ["libyuv"],
++    shared_libs: ["libjpeg"],
++    cflags: ["-Wall", "-Werror"],
++    test_suites: ["general-tests"],
+ }
+ 
+ cc_test {
+diff --git a/services/camera/virtualcamera/tests/CpuYuvConversionTest.cc b/services/camera/virtualcamera/tests/CpuYuvConversionTest.cc
+new file mode 100644
+--- /dev/null
++++ b/services/camera/virtualcamera/tests/CpuYuvConversionTest.cc
+@@ -0,0 +1,259 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include <vector>
++
++#include "../util/CameraBufferUsage.h"
++#include "../util/CpuYuvConversion.h"
++
++using android::companion::virtualcamera::cameraProducerUsage;
++
++using android::companion::virtualcamera::CpuYuvPlanes;
++using android::companion::virtualcamera::rgbaToCpuYuv420;
++using android::companion::virtualcamera::validCpuYuvSize;
++
++namespace {
++void require(bool ok, const char* expression, int line) {
++  if (!ok) {
++    std::fprintf(stderr, "FAIL line %d: %s\n", line, expression);
++    std::exit(1);
++  }
++}
++#define CHECK(condition) require((condition), #condition, __LINE__)
++
++constexpr uint8_t kPadding = 0xcc;
++struct Color {
++  uint8_t r, g, b;
++  int y, cb, cr;
++};
++constexpr std::array<Color, 6> kColors{{
++    {0, 0, 0, 0, 128, 128},
++    {255, 255, 255, 255, 128, 128},
++    {255, 0, 0, 76, 85, 255},
++    {0, 255, 0, 150, 44, 21},
++    {0, 0, 255, 29, 255, 107},
++    {64, 64, 64, 64, 128, 128},
++}};
++
++bool near(uint8_t actual, int expected) {
++  return std::abs(static_cast<int>(actual) - expected) <= 1;
++}
++
++std::vector<uint8_t> quadrants() {
++  std::vector<uint8_t> rgba(4 * 4 * 4);
++  const std::array<size_t, 4> colors{2, 3, 4, 1};
++  for (int row = 0; row < 4; ++row) {
++    for (int col = 0; col < 4; ++col) {
++      const Color color = kColors[colors[(row / 2) * 2 + col / 2]];
++      const size_t index = static_cast<size_t>(row * 4 + col) * 4;
++      rgba[index] = color.r;
++      rgba[index + 1] = color.g;
++      rgba[index + 2] = color.b;
++      rgba[index + 3] = 255;
++    }
++  }
++  return rgba;
++}
++
++void backendUsageSelection() {
++  // Android BufferUsage ABI values; the shared helper takes the real AIDL enum
++  // in both getHalStream and the hardware-buffer capability probe.
++  enum class Usage : uint64_t {
++    CPU_READ_OFTEN = 3,
++    CPU_WRITE_OFTEN = 0x30,
++    GPU_TEXTURE = 0x100,
++    GPU_RENDER_TARGET = 0x200,
++    VIDEO_ENCODER = 0x10000,
++    CAMERA_OUTPUT = 0x20000,
++  };
++  constexpr uint64_t render = static_cast<uint64_t>(Usage::GPU_RENDER_TARGET);
++  constexpr uint64_t camera = static_cast<uint64_t>(Usage::CAMERA_OUTPUT);
++  constexpr uint64_t write = static_cast<uint64_t>(Usage::CPU_WRITE_OFTEN);
++  const uint64_t consumer = static_cast<uint64_t>(Usage::GPU_TEXTURE) |
++                            static_cast<uint64_t>(Usage::VIDEO_ENCODER) |
++                            (uint64_t{1} << 40);
++  const auto requested = static_cast<Usage>(consumer);
++  const uint64_t cpu = cameraProducerUsage(requested, true);
++  CHECK((cpu & render) == 0);
++  CHECK(cpu == (consumer | camera | write));
++  const uint64_t gpu = cameraProducerUsage(requested, false);
++  CHECK((gpu & render) != 0);
++  CHECK(gpu == (consumer | camera | write | render));
++  // A consumer's explicit requirement must never be silently removed.
++  CHECK((cameraProducerUsage(static_cast<Usage>(consumer | render), true) &
++         render) != 0);
++  // Probe the same camera-output allocation path as an ImageReader stream.
++  const uint64_t probe = cameraProducerUsage(Usage::CPU_READ_OFTEN, true);
++  CHECK(probe == (3 | camera | write));
++  CHECK((probe & render) == 0);
++}
++
++void colorsAndFullRange() {
++  std::vector<uint8_t> scratch;
++  for (const auto& color : kColors) {
++    std::array<uint8_t, 16> rgba{};
++    for (size_t i = 0; i < rgba.size(); i += 4) {
++      rgba[i] = color.r;
++      rgba[i + 1] = color.g;
++      rgba[i + 2] = color.b;
++      rgba[i + 3] = 0;  // Alpha does not change camera color samples.
++    }
++    std::array<uint8_t, 6> out{};
++    CHECK(rgbaToCpuYuv420(rgba.data(), rgba.size(), 2, 2,
++                          {out.data(), out.data() + 4, out.data() + 5, 2, 1, 1},
++                          scratch));
++    for (size_t i = 0; i < 4; ++i) CHECK(near(out[i], color.y));
++    CHECK(near(out[4], color.cb));
++    CHECK(near(out[5], color.cr));
++  }
++}
++
++void rowOrderAndChannels() {
++  const auto rgba = quadrants();
++  std::array<uint8_t, 24> out{};
++  std::vector<uint8_t> scratch;
++  CHECK(rgbaToCpuYuv420(rgba.data(), rgba.size(), 4, 4,
++                        {out.data(), out.data() + 16, out.data() + 20, 4, 2, 1},
++                        scratch));
++  const std::array<size_t, 4> colors{2, 3, 4, 1};
++  for (size_t row = 0; row < 4; ++row) {
++    for (size_t col = 0; col < 4; ++col) {
++      CHECK(near(out[row * 4 + col],
++                 kColors[colors[(row / 2) * 2 + col / 2]].y));
++    }
++  }
++  for (size_t i = 0; i < 4; ++i) {
++    CHECK(near(out[16 + i], kColors[colors[i]].cb));
++    CHECK(near(out[20 + i], kColors[colors[i]].cr));
++  }
++}
++
++void planarPadding() {
++  const auto rgba = quadrants();
++  std::vector<uint8_t> y(7 * 4 + 8, kPadding);
++  std::vector<uint8_t> cb(5 * 2 + 8, kPadding);
++  std::vector<uint8_t> cr(5 * 2 + 8, kPadding);
++  std::vector<uint8_t> scratch;
++  CHECK(rgbaToCpuYuv420(rgba.data(), rgba.size(), 4, 4,
++                        {y.data(), cb.data(), cr.data(), 7, 5, 1}, scratch));
++  for (size_t i = 0; i < y.size(); ++i) {
++    if (i >= 7 * 4 || i % 7 >= 4) CHECK(y[i] == kPadding);
++  }
++  for (size_t i = 0; i < cb.size(); ++i) {
++    if (i >= 5 * 2 || i % 5 >= 2) {
++      CHECK(cb[i] == kPadding);
++      CHECK(cr[i] == kPadding);
++    }
++  }
++  CHECK(near(y[0], 76));
++  CHECK(near(y[2 * 7], 29));
++  CHECK(near(cb[0], 85));
++  CHECK(near(cr[5], 107));
++}
++
++void interleavedChroma() {
++  const auto rgba = quadrants();
++  for (const bool nv21 : {false, true}) {
++    std::vector<uint8_t> y(6 * 4 + 8, kPadding);
++    std::vector<uint8_t> uv(8 * 2 + 8, kPadding);
++    std::vector<uint8_t> scratch;
++    uint8_t* cb = uv.data() + (nv21 ? 1 : 0);
++    uint8_t* cr = uv.data() + (nv21 ? 0 : 1);
++    CHECK(rgbaToCpuYuv420(rgba.data(), rgba.size(), 4, 4,
++                          {y.data(), cb, cr, 6, 8, 2}, scratch));
++    const std::array<size_t, 4> colors{2, 3, 4, 1};
++    for (size_t i = 0; i < 4; ++i) {
++      const size_t offset = (i / 2) * 8 + (i % 2) * 2;
++      CHECK(near(cb[offset], kColors[colors[i]].cb));
++      CHECK(near(cr[offset], kColors[colors[i]].cr));
++    }
++    for (size_t i = 0; i < uv.size(); ++i) {
++      if (i >= 16 || i % 8 >= 4) CHECK(uv[i] == kPadding);
++    }
++  }
++}
++
++void invalidInputsDoNotWrite() {
++  const auto rgba = quadrants();
++  std::vector<uint8_t> output(32, kPadding);
++  std::vector<uint8_t> scratch;
++  const CpuYuvPlanes valid{output.data(), output.data() + 16,
++                            output.data() + 20, 4, 2, 1};
++  auto reject = [&](const uint8_t* input, size_t size, int w, int h,
++                    CpuYuvPlanes planes) {
++    CHECK(!rgbaToCpuYuv420(input, size, w, h, planes, scratch));
++    for (uint8_t byte : output) CHECK(byte == kPadding);
++  };
++  reject(nullptr, rgba.size(), 4, 4, valid);
++  reject(rgba.data(), rgba.size() - 1, 4, 4, valid);
++  for (const auto [w, h] : std::array<std::array<int, 2>, 5>{{
++           {0, 4}, {-2, 4}, {3, 4}, {4, 3}, {4096, 4098}}}) {
++    reject(rgba.data(), rgba.size(), w, h, valid);
++  }
++  auto bad = valid;
++  bad.y = nullptr;
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++  bad = valid;
++  bad.ystride = 3;
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++  bad = valid;
++  bad.cstride = 1;
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++  bad = valid;
++  bad.chromaStep = 2;
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++  bad = valid;
++  bad.chromaStep = 0;
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++  bad = valid;
++  bad.ystride = std::numeric_limits<size_t>::max();
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++  bad = valid;
++  bad.cstride = std::numeric_limits<size_t>::max();
++  reject(rgba.data(), rgba.size(), 4, 4, bad);
++}
++
++void boundedSizesAndScratchReuse() {
++  CHECK(validCpuYuvSize(640, 480));
++  CHECK(validCpuYuvSize(4096, 4096));
++  CHECK(!validCpuYuvSize(4096, 4098));
++  CHECK(!validCpuYuvSize(std::numeric_limits<int>::max(), 2));
++  auto rgba = quadrants();
++  std::array<uint8_t, 24> out{};
++  std::vector<uint8_t> scratch;
++  CHECK(rgbaToCpuYuv420(rgba.data(), rgba.size(), 4, 4,
++                        {out.data(), out.data() + 16, out.data() + 20, 4, 2, 1},
++                        scratch));
++  const auto* allocation = scratch.data();
++  CHECK(rgbaToCpuYuv420(rgba.data(), rgba.size(), 2, 2,
++                        {out.data(), out.data() + 4, out.data() + 5, 2, 1, 1},
++                        scratch));
++  CHECK(scratch.data() == allocation);
++}
++}  // namespace
++
++int main() {
++  const std::array<void (*)(), 7> tests{
++      backendUsageSelection, colorsAndFullRange, rowOrderAndChannels,
++      planarPadding, interleavedChroma, invalidInputsDoNotWrite,
++      boundedSizesAndScratchReuse};
++  for (auto test : tests) test();
++  std::puts("CPU YUV conversion and usage: 7 tests passed");
++}
+diff --git a/services/camera/virtualcamera/util/CameraBufferUsage.h b/services/camera/virtualcamera/util/CameraBufferUsage.h
+new file mode 100644
+--- /dev/null
++++ b/services/camera/virtualcamera/util/CameraBufferUsage.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_COMPANION_VIRTUALCAMERA_CAMERABUFFERUSAGE_H
++#define ANDROID_COMPANION_VIRTUALCAMERA_CAMERABUFFERUSAGE_H
++
++#include <cstdint>
++
++namespace android::companion::virtualcamera {
++
++// Shared by the capability probe and HalStream advertisement. Preserve the
++// consumer's requirements, but only request GPU rendering for the GPU backend.
++template <typename BufferUsage>
++constexpr uint64_t cameraProducerUsage(BufferUsage consumerUsage, bool cpuYuv) {
++  return static_cast<uint64_t>(consumerUsage) |
++         static_cast<uint64_t>(BufferUsage::CAMERA_OUTPUT) |
++         static_cast<uint64_t>(BufferUsage::CPU_WRITE_OFTEN) |
++         (cpuYuv ? 0 : static_cast<uint64_t>(BufferUsage::GPU_RENDER_TARGET));
++}
++
++}  // namespace android::companion::virtualcamera
++
++#endif  // ANDROID_COMPANION_VIRTUALCAMERA_CAMERABUFFERUSAGE_H
+diff --git a/services/camera/virtualcamera/util/CpuYuvConversion.h b/services/camera/virtualcamera/util/CpuYuvConversion.h
+new file mode 100644
+--- /dev/null
++++ b/services/camera/virtualcamera/util/CpuYuvConversion.h
+@@ -0,0 +1,97 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_COMPANION_VIRTUALCAMERA_CPUYUVCONVERSION_H
++#define ANDROID_COMPANION_VIRTUALCAMERA_CPUYUVCONVERSION_H
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++#include "libyuv/convert_from_argb.h"
++
++namespace android::companion::virtualcamera {
++
++// Keep readback and conversion allocations bounded independently of gralloc.
++constexpr size_t kMaxCpuYuvPixels = 4096U * 4096U;
++
++inline bool validCpuYuvSize(int width, int height) {
++  return width > 0 && height > 0 && !(width & 1) && !(height & 1) &&
++         static_cast<size_t>(width) <=
++             kMaxCpuYuvPixels / static_cast<size_t>(height);
++}
++
++struct CpuYuvPlanes {
++  uint8_t* y;
++  uint8_t* cb;
++  uint8_t* cr;
++  size_t ystride;
++  size_t cstride;
++  size_t chromaStep;
++};
++
++// Rows have the same order as glReadPixels and the existing YUV framebuffer.
++// SurfaceTexture's transform is applied while drawing, not a second time here.
++inline bool rgbaToCpuYuv420(const uint8_t* rgba, size_t rgbaBytes, int width,
++                           int height, const CpuYuvPlanes& out,
++                           std::vector<uint8_t>& scratch) {
++  if (!validCpuYuvSize(width, height) || rgba == nullptr || out.y == nullptr ||
++      out.cb == nullptr || out.cr == nullptr ||
++      (out.chromaStep != 1 && out.chromaStep != 2)) {
++    return false;
++  }
++  const size_t w = static_cast<size_t>(width);
++  const size_t h = static_cast<size_t>(height);
++  const size_t pixels = w * h;
++  const size_t chromaWidth = w / 2;
++  const size_t chromaHeight = h / 2;
++  const size_t chromaRowBytes = (chromaWidth - 1) * out.chromaStep + 1;
++  const size_t maxOffset = std::numeric_limits<ptrdiff_t>::max();
++  if (rgbaBytes < pixels * 4 || out.ystride < w ||
++      out.cstride < chromaRowBytes || out.ystride > maxOffset / h ||
++      out.cstride > maxOffset / chromaHeight) {
++    return false;
++  }
++
++  scratch.resize(pixels + pixels / 2);
++  uint8_t* y = scratch.data();
++  uint8_t* cb = y + pixels;
++  uint8_t* cr = cb + pixels / 4;
++  // libyuv ABGR names register order: little-endian memory is R,G,B,A.
++  // J420 preserves the full-range BT.601 conversion used by the GPU shader.
++  if (libyuv::ABGRToJ420(rgba, width * 4, y, width, cb, width / 2, cr,
++                        width / 2, width, height) != 0) {
++    return false;
++  }
++  for (size_t row = 0; row < h; ++row) {
++    std::memcpy(out.y + row * out.ystride, y + row * w, w);
++  }
++  for (size_t row = 0; row < chromaHeight; ++row) {
++    for (size_t col = 0; col < chromaWidth; ++col) {
++      out.cb[row * out.cstride + col * out.chromaStep] =
++          cb[row * chromaWidth + col];
++      out.cr[row * out.cstride + col * out.chromaStep] =
++          cr[row * chromaWidth + col];
++    }
++  }
++  return true;
++}
++
++}  // namespace android::companion::virtualcamera
++
++#endif  // ANDROID_COMPANION_VIRTUALCAMERA_CPUYUVCONVERSION_H
+diff --git a/services/camera/virtualcamera/util/CpuYuvRenderer.cc b/services/camera/virtualcamera/util/CpuYuvRenderer.cc
+new file mode 100644
+--- /dev/null
++++ b/services/camera/virtualcamera/util/CpuYuvRenderer.cc
+@@ -0,0 +1,163 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "VirtualCameraCpuYuvRenderer"
++#include "CpuYuvRenderer.h"
++
++#include "aidl/android/hardware/camera/common/Status.h"
++#include "aidl/android/hardware/graphics/common/BufferUsage.h"
++#include "util/CameraBufferUsage.h"
++#include "log/log.h"
++#include "util/CpuYuvConversion.h"
++#include "util/EglUtil.h"
++#include "util/Util.h"
++
++namespace android::companion::virtualcamera {
++using ::aidl::android::hardware::camera::common::Status;
++using ::aidl::android::hardware::graphics::common::BufferUsage;
++
++CpuYuvRenderer::~CpuYuvRenderer() {
++  glDeleteFramebuffers(1, &mFramebuffer);
++  glDeleteTextures(1, &mTexture);
++}
++
++bool CpuYuvRenderer::prepareFramebuffer(int width, int height) {
++  if (!mProgram.isInitialized() || !validCpuYuvSize(width, height)) {
++    return false;
++  }
++  if (mFramebuffer == 0) {
++    glGenFramebuffers(1, &mFramebuffer);
++    glGenTextures(1, &mTexture);
++  }
++  glBindFramebuffer(GL_FRAMEBUFFER, mFramebuffer);
++  if (width != mWidth || height != mHeight) {
++    glBindTexture(GL_TEXTURE_2D, mTexture);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
++                 GL_UNSIGNED_BYTE, nullptr);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, mTexture, 0);
++    if (checkEglError("allocate CPU camera readback framebuffer") ||
++        glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++      return false;
++    }
++    mWidth = width;
++    mHeight = height;
++    mRgba.resize(static_cast<size_t>(width) * height * 4);
++  }
++  return !checkEglError("bind CPU camera readback framebuffer");
++}
++
++bool CpuYuvRenderer::readPixels() {
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++  glPixelStorei(GL_PACK_ALIGNMENT, 1);
++  glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++  glPixelStorei(GL_PACK_SKIP_ROWS, 0);
++  glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++  glReadPixels(0, 0, mWidth, mHeight, GL_RGBA, GL_UNSIGNED_BYTE, mRgba.data());
++  glBindFramebuffer(GL_FRAMEBUFFER, 0);
++  return !checkEglError("read CPU camera RGBA pixels");
++}
++
++bool CpuYuvRenderer::isSupported() {
++  CpuYuvRenderer renderer;
++  if (!renderer.prepareFramebuffer(16, 16)) {
++    return false;
++  }
++  glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
++  glClear(GL_COLOR_BUFFER_BIT);
++  if (!renderer.readPixels() || renderer.mRgba[0] != 255 ||
++      renderer.mRgba[1] != 0 || renderer.mRgba[2] != 0) {
++    return false;
++  }
++  const AHardwareBuffer_Desc desc{
++      .width = 16, .height = 16, .layers = 1,
++      .format = AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420,
++      .usage = cameraProducerUsage(BufferUsage::CPU_READ_OFTEN, true)};
++  AHardwareBuffer* raw = nullptr;
++  if (AHardwareBuffer_allocate(&desc, &raw) != 0) {
++    return false;
++  }
++  std::shared_ptr<AHardwareBuffer> buffer(raw, AHardwareBuffer_release);
++  {
++    YCbCrLockGuard lock(buffer, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN);
++    if (lock.getStatus() != OK) {
++      return false;
++    }
++    const android_ycbcr& planes = *lock;
++    if (!rgbaToCpuYuv420(renderer.mRgba.data(), renderer.mRgba.size(), 16, 16,
++                        {static_cast<uint8_t*>(planes.y),
++                         static_cast<uint8_t*>(planes.cb),
++                         static_cast<uint8_t*>(planes.cr), planes.ystride,
++                         planes.cstride, planes.chroma_step}, renderer.mYuv)) {
++      return false;
++    }
++  }
++  YCbCrLockGuard readLock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN);
++  return readLock.getStatus() == OK && (*readLock).y != nullptr &&
++         *static_cast<uint8_t*>((*readLock).y) == renderer.mYuv[0];
++}
++
++ndk::ScopedAStatus CpuYuvRenderer::render(
++    GLuint texture, const std::array<float, 16>& transform,
++    std::shared_ptr<AHardwareBuffer> destination, sp<Fence> fence,
++    std::optional<Rect> viewport) {
++  if (destination == nullptr || texture == 0) {
++    return cameraStatus(Status::ILLEGAL_ARGUMENT);
++  }
++  AHardwareBuffer_Desc desc{};
++  AHardwareBuffer_describe(destination.get(), &desc);
++  if (desc.format != AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 ||
++      !validCpuYuvSize(desc.width, desc.height)) {
++    return cameraStatus(Status::ILLEGAL_ARGUMENT);
++  }
++  const Rect rect = viewport.value_or(Rect(desc.width, desc.height));
++  if (rect.left < 0 || rect.top < 0 || rect.getWidth() <= 0 ||
++      rect.getHeight() <= 0 || rect.right > static_cast<int32_t>(desc.width) ||
++      rect.bottom > static_cast<int32_t>(desc.height)) {
++    return cameraStatus(Status::ILLEGAL_ARGUMENT);
++  }
++  if (fence != nullptr && fence->isValid() && fence->wait(500) != OK) {
++    ALOGE("Acquire fence timed out before CPU camera conversion");
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
++  if (!prepareFramebuffer(desc.width, desc.height)) {
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
++  glViewport(0, 0, mWidth, mHeight);
++  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glViewport(rect.left, rect.top, rect.getWidth(), rect.getHeight());
++  if (!mProgram.draw(texture, transform) || !readPixels()) {
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
++  YCbCrLockGuard lock(destination, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN);
++  if (lock.getStatus() != OK) {
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
++  const android_ycbcr& planes = *lock;
++  if (!rgbaToCpuYuv420(mRgba.data(), mRgba.size(), mWidth, mHeight,
++                      {static_cast<uint8_t*>(planes.y),
++                       static_cast<uint8_t*>(planes.cb),
++                       static_cast<uint8_t*>(planes.cr), planes.ystride,
++                       planes.cstride, planes.chroma_step}, mYuv)) {
++    return cameraStatus(Status::INTERNAL_ERROR);
++  }
++  return ndk::ScopedAStatus::ok();
++}
++
++}  // namespace android::companion::virtualcamera
+diff --git a/services/camera/virtualcamera/util/CpuYuvRenderer.h b/services/camera/virtualcamera/util/CpuYuvRenderer.h
+new file mode 100644
+--- /dev/null
++++ b/services/camera/virtualcamera/util/CpuYuvRenderer.h
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_COMPANION_VIRTUALCAMERA_CPUYUVRENDERER_H
++#define ANDROID_COMPANION_VIRTUALCAMERA_CPUYUVRENDERER_H
++
++#include <array>
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "GLES3/gl3.h"
++#include "android/binder_auto_utils.h"
++#include "android/hardware_buffer.h"
++#include "ui/Fence.h"
++#include "ui/Rect.h"
++#include "util/EglProgram.h"
++
++namespace android::companion::virtualcamera {
++
++// Uses only ordinary RGBA rendering; the destination YUV buffer is CPU-mapped.
++// Construct, use and destroy on the thread owning the current EGL context.
++class CpuYuvRenderer {
++ public:
++  ~CpuYuvRenderer();
++  static bool isSupported();
++  ndk::ScopedAStatus render(GLuint texture,
++                           const std::array<float, 16>& transform,
++                           std::shared_ptr<AHardwareBuffer> destination,
++                           sp<Fence> fence,
++                           std::optional<Rect> viewport = std::nullopt);
++
++ private:
++  bool prepareFramebuffer(int width, int height);
++  bool readPixels();
++
++  EglTextureProgram mProgram{EglTextureProgram::TextureFormat::RGBA,
++                            EglTextureProgram::OutputFormat::RGBA};
++  GLuint mTexture = 0;
++  GLuint mFramebuffer = 0;
++  int mWidth = 0;
++  int mHeight = 0;
++  std::vector<uint8_t> mRgba;
++  std::vector<uint8_t> mYuv;
++};
++
++}  // namespace android::companion::virtualcamera
++
++#endif  // ANDROID_COMPANION_VIRTUALCAMERA_CPUYUVRENDERER_H
+diff --git a/services/camera/virtualcamera/util/EglProgram.cc b/services/camera/virtualcamera/util/EglProgram.cc
+--- a/services/camera/virtualcamera/util/EglProgram.cc
++++ b/services/camera/virtualcamera/util/EglProgram.cc
+@@ -48,7 +48,6 @@
+     })";
+ 
+ constexpr char kJuliaFractalFragmentShader[] = R"(#version 300 es
+-    #extension GL_EXT_YUV_target : require
+     precision mediump float;
+ 
+     const float kIter = 64.0;
+@@ -73,7 +72,11 @@
+ 
+     void main() {
+       float juliaVal = julia(vFractalCoord, uC);
+-      fragColor = vec4(yuv_2_rgb(vec3(juliaVal, vUVCoord.x, vUVCoord.y), itu_601_full_range), 0.0);
++      vec2 chroma = vUVCoord - vec2(0.5);
++      vec3 rgb = vec3(juliaVal + 1.402 * chroma.y,
++                      juliaVal - 0.344136 * chroma.x - 0.714136 * chroma.y,
++                      juliaVal + 1.772 * chroma.x);
++      fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+     })";
+ 
+ constexpr char kExternalTextureVertexShader[] = R"(#version 300 es
+@@ -108,6 +111,17 @@
+     void main() {
+       vec4 rgbaColor = texture(uTexture, vTextureCoord);
+       fragColor = vec4(rgb_2_yuv(rgbaColor.xyz, itu_601_full_range), 0.0);
++    })";
++
++// Ordinary RGB output works for both RGB and YUV external input textures.
++constexpr char kExternalTextureRgbaOutputFragmentShader[] = R"(#version 300 es
++    #extension GL_OES_EGL_image_external_essl3 : require
++    precision mediump float;
++    in vec2 vTextureCoord;
++    out vec4 fragColor;
++    uniform samplerExternalOES uTexture;
++    void main() {
++      fragColor = texture(uTexture, vTextureCoord);
+     })";
+ 
+ constexpr int kCoordsPerVertex = 3;
+@@ -261,17 +275,22 @@
+   return true;
+ }
+ 
+-EglTextureProgram::EglTextureProgram(const TextureFormat textureFormat) {
+-  if (!isGlExtensionSupported(kGlExtYuvTarget)) {
++EglTextureProgram::EglTextureProgram(const TextureFormat textureFormat,
++                                     const OutputFormat outputFormat) {
++  if (outputFormat == OutputFormat::YUV &&
++      !isGlExtensionSupported(kGlExtYuvTarget)) {
+     ALOGE(
+         "Cannot initialize external texture program due to missing "
+         "GL_EXT_YUV_target extension");
+     return;
+   }
+ 
+-  const char* fragmentShaderSrc = textureFormat == TextureFormat::YUV
+-                                      ? kExternalYuvTextureFragmentShader
+-                                      : kExternalRgbaTextureFragmentShader;
++  const char* fragmentShaderSrc =
++      outputFormat == OutputFormat::RGBA
++          ? kExternalTextureRgbaOutputFragmentShader
++          : (textureFormat == TextureFormat::YUV
++                 ? kExternalYuvTextureFragmentShader
++                 : kExternalRgbaTextureFragmentShader);
+   if (initialize(kExternalTextureVertexShader, fragmentShaderSrc)) {
+     ALOGV("Successfully initialized EGL shaders for external texture program.");
+   } else {
+diff --git a/services/camera/virtualcamera/util/EglProgram.h b/services/camera/virtualcamera/util/EglProgram.h
+--- a/services/camera/virtualcamera/util/EglProgram.h
++++ b/services/camera/virtualcamera/util/EglProgram.h
+@@ -37,7 +37,7 @@
+  protected:
+   // Compile & link program from the vertex & fragment shader source.
+   bool initialize(const char* vertexShaderSrc, const char* fragmentShaderSrc);
+-  GLuint mProgram;
++  GLuint mProgram = 0;
+   // Whether the EGL Program was successfully compiled and linked.
+   bool mIsInitialized = false;
+ };
+@@ -65,8 +65,10 @@
+ class EglTextureProgram : public EglProgram {
+  public:
+   enum class TextureFormat { RGBA, YUV };
++  enum class OutputFormat { YUV, RGBA };
+ 
+-  EglTextureProgram(TextureFormat textureFormat = TextureFormat::YUV);
++  EglTextureProgram(TextureFormat textureFormat = TextureFormat::YUV,
++                    OutputFormat outputFormat = OutputFormat::YUV);
+   virtual ~EglTextureProgram();
+ 
+   // Draw texture over whole viewport, applying transformMatrix to texture

@@ -1,0 +1,10 @@
+[Unit]
+Description=Droidloom cell camera endpoint
+PartOf=droidloom.service
+ConditionPathExists=/etc/droidloom/cell.json
+
+[Socket]
+ListenStream=%t/droidloom/camera.sock
+SocketMode=0666
+DirectoryMode=0700
+RemoveOnStop=true

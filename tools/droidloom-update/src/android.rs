@@ -11,6 +11,8 @@ pub const TARGETS: &[&str] = &[
     "android.hardware.graphics.composer3-service.droidloom",
     "droidloom-task-launcher",
     "droidloom-input-bridge",
+    "virtual_camera",
+    "droidloom-camera-producer",
     "DroidloomIME",
     "DroidloomHome",
     "TouchService",
@@ -132,6 +134,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "hardware/interfaces",
         "android/aosp-patches/0029-audio-bus-socket-driver.patch",
+    ),
+    (
+        "frameworks/av",
+        "android/aosp-patches/0031-virtual-camera-cpu-yuv.patch",
     ),
     (
         "system/memory/libmeminfo",
@@ -629,6 +635,7 @@ pub fn build_targets(
         "graphics",
         "runtime/droidloom-cpu-placement",
         "android/framework",
+        "android/hardware/camera",
         "android/lmkd-compat",
         "android/runtime",
         "android/native-bridge",
@@ -721,7 +728,10 @@ pub fn build_targets(
         .current_dir(init.path())
         .arg("apply")
         .arg(repo.join("android/apex-compat/0001-droidloom-classpath-projection.patch")))?;
-    copy(&init.path().join("rootdir/init.rc"), &work.join("init.rc"))?;
+    write(
+        &work.join("init.rc"),
+        format!("import /droidloom/camera/producer.rc\n{}", fs::read_to_string(init.path().join("rootdir/init.rc"))?),
+    )?;
     p.stabilize_all()?;
     bootstrap(source, out)?;
     copy(

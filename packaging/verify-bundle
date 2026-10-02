@@ -14,6 +14,16 @@ MARKER = re.compile(rb'DROIDLOOM_INPUT_ABI=([0-9]{1,5});')
 RUNTIME = pathlib.Path('usr/lib/droidloom/runtime')
 COMPOSER = RUNTIME / 'bin/android.hardware.graphics.composer3-service.droidloom'
 BRIDGE = RUNTIME / 'framework/droidloom-input-bridge.jar'
+CAMERA_EXECUTABLES = [
+    pathlib.Path('usr/bin/droidloom-camera'),
+    RUNTIME / 'camera/bin/virtual_camera',
+    RUNTIME / 'camera/bin/droidloom-camera-producer',
+]
+CAMERA_DATA = [
+    pathlib.Path('usr/lib/systemd/user/droidloom-camera.service'),
+    pathlib.Path('usr/lib/systemd/user/droidloom-camera.socket'),
+    RUNTIME / 'camera/producer.rc',
+]
 
 
 def abi(data, label):
@@ -42,12 +52,25 @@ def compatibility(root):
         receiver = abi(dex, str(jar.relative_to(root)))
         if sender != receiver:
             raise ValueError(f'input protocol mismatch: Composer v{sender}, {jar.relative_to(root)} v{receiver}')
-    for name in ['droidloomd', 'droidloomctl', 'droidloom-supervisor',
-                 'droidloom-wayland', 'droidloom-audio', 'droidloom-applications']:
-        with (root / 'usr/bin' / name).open('rb') as source:
+    executables = [pathlib.Path('usr/bin') / name for name in [
+        'droidloomd', 'droidloomctl', 'droidloom-supervisor',
+        'droidloom-wayland', 'droidloom-audio', 'droidloom-applications']]
+    if any((root / path).exists() for path in CAMERA_EXECUTABLES + CAMERA_DATA):
+        for path in CAMERA_EXECUTABLES + CAMERA_DATA:
+            if not (root / path).is_file() or (root / path).stat().st_size == 0:
+                raise ValueError(f'missing camera component: {path}')
+            mode = (root / path).stat().st_mode
+            if mode & 0o044 != 0o044 or mode & 0o022:
+                raise ValueError(f'camera component is inaccessible or writable by others: {path}')
+        for path in CAMERA_EXECUTABLES:
+            if (root / path).stat().st_mode & 0o111 != 0o111:
+                raise ValueError(f'camera executable is inaccessible: {path}')
+        executables += CAMERA_EXECUTABLES
+    for path in executables:
+        with (root / path).open('rb') as source:
             header = source.read(20)
         if header[:4] != b'\x7fELF' or header[5:6] != b'\x01' or int.from_bytes(header[18:20], 'little') != machine:
-            raise ValueError(f'{name}: host and Android architectures do not match')
+            raise ValueError(f'{path}: host and Android architectures do not match')
     return {'architecture': arch, 'input_protocol': sender}
 
 

@@ -10,6 +10,7 @@ pub const HOST_PACKAGES: &[&str] = &[
     "droidloom-supervisor",
     "droidloom-wayland",
     "droidloom-audio",
+    "droidloom-camera",
     "droidloom-applications",
     "droidloom-doctor",
     "droidloom-update",
@@ -21,6 +22,7 @@ pub const HOST_BINARIES: &[&str] = &[
     "droidloom-supervisor",
     "droidloom-wayland",
     "droidloom-audio",
+    "droidloom-camera",
     "droidloom-applications",
     "droidloom-doctor",
     "droidloom-update",
@@ -387,6 +389,8 @@ pub fn assemble_artifacts(
         ("system/bin/netd", "bin/netd-cell-policy"),
         ("system/bin/servicemanager", "bin/servicemanager"),
         ("system/bin/surfaceflinger", "bin/surfaceflinger"),
+        ("system/bin/virtual_camera", "camera/bin/virtual_camera"),
+        ("system/bin/droidloom-camera-producer", "camera/bin/droidloom-camera-producer"),
         (
             "vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom",
             "bin/android.hardware.graphics.composer3-service.droidloom",
@@ -521,6 +525,7 @@ pub fn assemble_artifacts(
         ),
         ("packaging/ime/setup", "ime/setup"),
         ("packaging/home/setup", "ime/home-setup"),
+        ("android/hardware/camera/producer.rc", "camera/producer.rc"),
         (
             "android/framework/droidloom-home/droidloom-home.rc",
             "ime/droidloom-home.rc",
@@ -599,6 +604,8 @@ pub fn assemble_artifacts(
         "system/droidloomd.service",
         "user/droidloom.service",
         "user/droidloom-audio.service",
+        "user/droidloom-camera.service",
+        "user/droidloom-camera.socket",
         "user/droidloom-applications.service",
     ] {
         copy(

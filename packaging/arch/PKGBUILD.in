@@ -10,7 +10,8 @@ license=(GPL-3.0-or-later)
 options=(!strip !debug !lto !purge)
 makedepends=(rustup git rsync curl unzip zip meson ninja pkgconf llvm clang glslang
   spirv-llvm-translator bison flex android-tools erofs-utils e2fsprogs
-  python python-yaml python-mako ccache mesa libdrm wayland libxkbcommon)
+  python python-yaml python-mako ccache mesa libdrm wayland libxkbcommon
+  gstreamer gst-plugins-base-libs gst-plugins-base gst-plugin-pipewire pipewire-libcamera)
 
 build() {
   "$DROIDLOOM_PACKAGE_TOOL" compile --source "$DROIDLOOM_SOURCE" \
@@ -19,7 +20,8 @@ build() {
 
 package_droidloom-runtime() {
   depends=("droidloom-image=$pkgver-$pkgrel" glibc gcc-libs mesa libdrm wayland
-    libxkbcommon systemd polkit util-linux e2fsprogs iproute2 nftables iptables)
+    libxkbcommon systemd polkit util-linux e2fsprogs iproute2 nftables iptables
+    gstreamer gst-plugins-base-libs gst-plugins-base gst-plugin-pipewire pipewire-libcamera)
   "$DROIDLOOM_PACKAGE_TOOL" install-tree --source "$srcdir/payload/runtime" --destination "$pkgdir"
 }
 

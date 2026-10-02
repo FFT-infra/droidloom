@@ -1801,8 +1801,8 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         bind_mount(&text_socket, &target, false)?;
     }
     // Optional host-session endpoints next to the presenter socket: desktop
-    // clipboard and notification transfer, and the audio bridge's PCM playback and capture.
-    for name in ["clipboard", "notifications", "audio", "audio_in"] {
+    // clipboard, notifications, and the audio/camera bridges.
+    for name in ["clipboard", "notifications", "audio", "audio_in", "camera"] {
         let socket = spec.denial_socket.with_file_name(format!("{name}.sock"));
         if socket.exists() {
             if !fs::symlink_metadata(&socket)

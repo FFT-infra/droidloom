@@ -1,0 +1,46 @@
+cc_binary {
+    name: "droidloom-camera-producer",
+    srcs: ["producer.cpp"],
+    cpp_std: "c++17",
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    static_libs: ["virtual_camera_service_aidl-ndk"],
+    shared_libs: [
+        "libbinder_ndk",
+        "liblog",
+        "libnativewindow",
+    ],
+}
+
+cc_test {
+    name: "droidloom-camera-protocol-tests",
+    srcs: ["protocol_test.cpp"],
+    host_supported: true,
+    gtest: false,
+    cpp_std: "c++17",
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+}
+
+cc_binary {
+    name: "droidloom-camera-layout-probe",
+    srcs: ["layout_probe.cpp"],
+    cpp_std: "c++17",
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    shared_libs: ["libnativewindow"],
+}
+
+android_app {
+    name: "DroidloomCameraProbe",
+    manifest: "probe/AndroidManifest.xml",
+    srcs: ["probe/src/**/*.java"],
+    platform_apis: true,
+    certificate: "testkey",
+    privileged: false,
+    min_sdk_version: "29",
+    target_sdk_version: "35",
+    optimize: {
+        enabled: false,
+    },
+    dex_preopt: {
+        enabled: false,
+    },
+}

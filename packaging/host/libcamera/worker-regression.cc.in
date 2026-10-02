@@ -1,0 +1,199 @@
+#include <atomic>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <vector>
+
+#include <libcamera/base/object.h>
+#include <libcamera/base/signal.h>
+#include <libcamera/base/thread.h>
+
+using namespace libcamera;
+
+// Lifetime markers stand in for buffers; no image memory or device is used.
+struct FrameMetadata {
+    enum Status { FrameSuccess, FrameCancelled };
+    Status status = FrameSuccess;
+};
+struct FrameBuffer {
+    FrameBuffer *_d() { return this; }
+    FrameMetadata &metadata() { return metadata_; }
+    std::atomic<bool> alive{true};
+    FrameMetadata metadata_;
+};
+
+class Debayer : public Object {
+public:
+    int start() { running_ = true; return 0; }
+    void stop() { running_ = false; }
+    void process(uint32_t frame, FrameBuffer *input, FrameBuffer *output)
+    {
+        if (!running_) ++beforeStart;
+        if (!input->alive || !output->alive) {
+            ++expired;
+            std::cout << "worker replayed expired frame=" << frame << '\n';
+        }
+        outputBufferReady.emit(output);
+        inputBufferReady.emit(input);
+    }
+    Signal<FrameBuffer *> inputBufferReady;
+    Signal<FrameBuffer *> outputBufferReady;
+    unsigned int expired = 0;
+    unsigned int beforeStart = 0;
+private:
+    bool running_ = false;
+};
+
+struct IPA {
+    void stop() { if (dispatchCapture) dispatchCapture(); }
+    std::function<void()> dispatchCapture;
+};
+
+class SoftwareIsp : public Object {
+public:
+    SoftwareIsp() : ispWorkerThread_("SWIspProbe"), ipa_(std::make_unique<IPA>())
+    {
+        debayer_ = std::make_unique<Debayer>();
+        debayer_->inputBufferReady.connect(this, &SoftwareIsp::inputReady);
+        debayer_->outputBufferReady.connect(this, &SoftwareIsp::outputReady);
+        debayer_->moveToThread(&ispWorkerThread_);
+    }
+    ~SoftwareIsp() { debayer_.reset(); }
+    void start()
+    {
+        ispWorkerThread_.start();
+        debayer_->invokeMethod(&Debayer::start, ConnectionTypeBlocking);
+    }
+    void queue(uint32_t frame, FrameBuffer *input, FrameBuffer *output)
+    {
+        queuedInputBuffers_.push_back(input);
+        queuedOutputBuffers_.push_back(output);
+        debayer_->invokeMethod(&Debayer::process, ConnectionTypeQueued,
+                              frame, input, output);
+    }
+    void stop();
+    void inputReady(FrameBuffer *frame)
+    {
+        if (!frame->alive) ++expiredCallbacks;
+        if (queuedInputBuffers_.empty()) ++untrackedCallbacks;
+        else queuedInputBuffers_.pop_front();
+        ++delivered;
+        inputBufferReady.emit(frame);
+    }
+    void outputReady(FrameBuffer *frame)
+    {
+        if (!frame->alive) ++expiredCallbacks;
+        if (queuedOutputBuffers_.empty()) ++untrackedCallbacks;
+        else queuedOutputBuffers_.pop_front();
+        ++delivered;
+        outputBufferReady.emit(frame);
+    }
+    Signal<FrameBuffer *> inputBufferReady;
+    Signal<FrameBuffer *> outputBufferReady;
+    std::unique_ptr<Debayer> debayer_;
+    Thread ispWorkerThread_;
+    std::unique_ptr<IPA> ipa_;
+    std::deque<FrameBuffer *> queuedInputBuffers_, queuedOutputBuffers_;
+    unsigned int delivered = 0;
+    unsigned int expiredCallbacks = 0;
+    unsigned int untrackedCallbacks = 0;
+};
+
+@ISP_STOP@
+
+struct SignalStub {
+    template<class... Args> void disconnect(Args...) {}
+};
+struct DelayedControls { void applyControls() {} };
+struct V4L2Subdevice {
+    void setFrameStartEnabled(bool) {}
+    SignalStub frameStart;
+};
+struct V4L2VideoDevice {
+    void streamOff() { stopped = true; }
+    void releaseBuffers() { released = true; }
+    Signal<FrameBuffer *> bufferReady;
+    bool stopped = false;
+    bool released = false;
+};
+struct Converter { void stop() {} };
+struct FrameInfo { void clear() {} };
+struct Camera {};
+struct OwnedBuffers {
+    void clear()
+    {
+        for (FrameBuffer *buffer : buffers)
+            buffer->alive = false;
+        buffers.clear();
+    }
+    std::vector<FrameBuffer *> buffers;
+};
+
+// SimpleCameraData is not an Object: this receiver must remain direct.
+struct SimpleCameraData {
+    void imageBufferReady(FrameBuffer *input)
+    {
+        ++lateCaptures;
+        swIsp_->queue(60, input, output);
+    }
+    void clearIncompleteRequests() {}
+    V4L2VideoDevice *video_ = nullptr;
+    V4L2Subdevice *frameStartEmitter_ = nullptr;
+    std::unique_ptr<DelayedControls> delayedCtrls_;
+    bool useConversion_ = true;
+    Converter *converter_ = nullptr;
+    SoftwareIsp *swIsp_ = nullptr;
+    FrameInfo frameInfo_;
+    OwnedBuffers conversionBuffers_;
+    FrameBuffer *output = nullptr;
+    unsigned int lateCaptures = 0;
+};
+class SimplePipelineHandler {
+public:
+    void stopDevice(Camera *camera);
+    SimpleCameraData *cameraData(Camera *) { return data; }
+    void releasePipeline(SimpleCameraData *) { released = true; }
+    SimpleCameraData *data = nullptr;
+    bool released = false;
+};
+
+@PIPELINE_STOP@
+
+int main()
+{
+    FrameBuffer priorInput, priorOutput, lateInput, lateOutput;
+    SoftwareIsp isp;
+    SimpleCameraData data;
+    V4L2VideoDevice video;
+    SimplePipelineHandler pipeline;
+    Camera camera;
+    data.video_ = &video;
+    data.swIsp_ = &isp;
+    data.output = &lateOutput;
+    data.conversionBuffers_.buffers = { &priorInput, &lateInput };
+    pipeline.data = &data;
+    video.bufferReady.connect(&data, &SimpleCameraData::imageBufferReady);
+    isp.start();
+    isp.queue(59, &priorInput, &priorOutput);
+    // Isolated IPA stop dispatches this event after the worker has exited.
+    isp.ipa_->dispatchCapture = [&] { video.bufferReady.emit(&lateInput); };
+    pipeline.stopDevice(&camera);
+    const unsigned int drainedBeforeFree = isp.delivered;
+    priorOutput.alive = lateOutput.alive = false;
+    isp.ipa_->dispatchCapture = {};
+    isp.start();
+    Thread::current()->dispatchMessages(Message::InvokeMessage, &isp);
+    isp.stop();
+    std::cout << "callbacks_drained_before_free=" << drainedBeforeFree
+              << " late_captures=" << data.lateCaptures
+              << " expired_worker_frames=" << isp.debayer_->expired
+              << " process_before_start=" << isp.debayer_->beforeStart
+              << " expired_owner_callbacks=" << isp.expiredCallbacks
+              << " untracked_owner_callbacks=" << isp.untrackedCallbacks << '\n';
+    return drainedBeforeFree == 2 && data.lateCaptures == 0 &&
+           isp.debayer_->expired == 0 && isp.debayer_->beforeStart == 0 &&
+           isp.expiredCallbacks == 0 && isp.untrackedCallbacks == 0 &&
+           video.stopped && video.released && pipeline.released ? 0 : 1;
+}

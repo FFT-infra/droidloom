@@ -152,6 +152,13 @@ install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-applications.service
     /usr/lib/systemd/user/droidloom-applications.service
 install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-audio.service" \
     /usr/lib/systemd/user/droidloom-audio.service
+if [[ -f "$payload/usr/bin/droidloom-camera" ]]; then
+    install -m 0755 "$payload/usr/bin/droidloom-camera" /usr/bin/droidloom-camera
+    install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-camera.service" \
+        /usr/lib/systemd/user/droidloom-camera.service
+    install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-camera.socket" \
+        /usr/lib/systemd/user/droidloom-camera.socket
+fi
 install -D -m 0644 "$payload/usr/lib/environment.d/60-droidloom.conf" \
     /usr/lib/environment.d/60-droidloom.conf
 

@@ -398,13 +398,20 @@ fn stop_runtime(spec: Option<&Value>) -> Result<()> {
         .and_then(|v| u32::try_from(v).ok())
     {
         if Path::new(&format!("/run/user/{uid}/bus")).exists() {
-            run(user_command(uid, "/usr/bin/systemctl")?.args([
+            let mut command = user_command(uid, "/usr/bin/systemctl")?;
+            command.args([
                 "--user",
                 "stop",
                 "droidloom.service",
                 "droidloom-applications.service",
                 "droidloom-audio.service",
-            ]))?;
+            ]);
+            for unit in ["droidloom-camera.service", "droidloom-camera.socket"] {
+                if Path::new("/usr/lib/systemd/user").join(unit).exists() {
+                    command.arg(unit);
+                }
+            }
+            run(&mut command)?;
         }
     }
     run(Command::new("/usr/bin/systemctl").args(["stop", "droidloomd.service"]))?;

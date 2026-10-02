@@ -43,9 +43,51 @@ class BundleTests(unittest.TestCase):
         with zipfile.ZipFile(path, 'w') as z:
             z.writestr('classes.dex', f'DROIDLOOM_INPUT_ABI={version};')
 
+    def camera(self):
+        for path in bundle.CAMERA_EXECUTABLES:
+            self.put(path, elf())
+            (self.root / path).chmod(0o755)
+        for path in bundle.CAMERA_DATA:
+            self.put(path, b'camera fixture\n')
+
     def test_matching_bundle(self):
         bundle.seal(self.root)
         self.assertEqual(bundle.verify(self.root)['input_protocol'], 5)
+
+    def test_complete_camera_closure_is_accepted(self):
+        self.camera()
+        bundle.seal(self.root)
+        self.assertEqual(bundle.verify(self.root)['input_protocol'], 5)
+
+    def test_camera_closure_rejects_each_missing_component(self):
+        for path in bundle.CAMERA_EXECUTABLES + bundle.CAMERA_DATA:
+            with self.subTest(path=path):
+                self.camera()
+                (self.root / path).unlink()
+                with self.assertRaisesRegex(ValueError, 'missing camera'):
+                    bundle.seal(self.root)
+
+    def test_camera_binary_mode_and_architecture_are_checked(self):
+        for path in bundle.CAMERA_EXECUTABLES:
+            with self.subTest(path=path):
+                self.camera()
+                (self.root / path).chmod(0o644)
+                with self.assertRaisesRegex(ValueError, 'inaccessible'):
+                    bundle.seal(self.root)
+                (self.root / path).chmod(0o755)
+                self.put(path, elf(machine=183))
+                with self.assertRaisesRegex(ValueError, 'architectures'):
+                    bundle.seal(self.root)
+
+    def test_camera_data_must_be_readable_and_not_writable_by_others(self):
+        for path in bundle.CAMERA_DATA:
+            for mode in [0o600, 0o666]:
+                with self.subTest(path=path, mode=mode):
+                    self.camera()
+                    (self.root / path).chmod(mode)
+                    with self.assertRaisesRegex(ValueError, 'inaccessible or writable'):
+                        bundle.seal(self.root)
+                    (self.root / path).chmod(0o644)
 
     def test_exact_reported_regression_old_sender_new_bridge(self):
         self.put(bundle.COMPOSER, elf(4))

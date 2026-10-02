@@ -1,0 +1,19 @@
+service droidloom-virtual-camera /droidloom/camera/bin/virtual_camera
+    class core
+    user system
+    group system
+    interface aidl virtual_camera
+    interface aidl android.hardware.camera.provider.ICameraProvider/virtual/0
+    disabled
+
+service droidloom-camera-producer /droidloom/camera/bin/droidloom-camera-producer
+    class core
+    user system
+    group system
+    disabled
+    # A producer restart must not leave cameras registered with dead callback tokens.
+    onrestart restart droidloom-virtual-camera
+
+on property:sys.boot_completed=1
+    start droidloom-virtual-camera
+    start droidloom-camera-producer
