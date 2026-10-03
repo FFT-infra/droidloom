@@ -47,7 +47,7 @@ PRODUCT_PACKAGES += \
     android.hardware.security.keymint-service.nonsecure \
     android.hardware.health-service.example \
     android.hardware.power-service.example \
-    android.hardware.sensors@2.1-service.multihal \
+    android.hardware.sensors-service.multihal \
     sensors.dynamic_sensor_hal \
     com.android.hardware.audio.droidloom \
     DroidloomFrameworkDisplayOverlay \
