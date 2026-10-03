@@ -59,15 +59,14 @@ pub const TARGETS: &[&str] = &[
 /// the adaptation has to run here, after property loading and before any
 /// keystore client.
 ///
-/// Boot state: the pinned kernel command line reports a verified-boot state
-/// but no vbmeta device state. The keymint HAL reads both into the RKP boot
-/// info, and an unset device state means "unlocked", which contradicts a
-/// verified state; the provisioning service then rejects the certificate
-/// request as inconsistent. State the matching locked value.
+/// Preserve boot identity: the nonsecure KeyMint binds its root-of-trust
+/// properties into encrypted key blobs. Adding a locked vbmeta device state
+/// changes that identity and makes existing keys unreadable, including the
+/// synthetic-password key required to boot system_server. RKP fallback must
+/// not rewrite boot identity to obtain a different attestation result.
 const CELL_BOOT_ADAPTATIONS: &str = concat!(
     "on early-init\n",
     "    setprop remote_provisioning.tee.rkp_only 0\n",
-    "    setprop ro.boot.vbmeta.device_state locked\n",
 );
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
@@ -899,6 +898,36 @@ mod tests {
 #[cfg(test)]
 mod patch_tests {
     use super::*;
+
+    #[test]
+    fn cell_boot_adaptations_preserve_existing_keymint_boot_identity() {
+        // KeyMint binds these boot properties into existing encrypted key blobs.
+        // Changing even an absent device-state property invalidates user keys.
+        for device_state in [None, Some("unlocked"), Some("locked")] {
+            let mut properties = std::collections::BTreeMap::from([
+                ("ro.boot.verifiedbootstate", "green"),
+                ("ro.boot.vbmeta.public_key_digest", "00"),
+            ]);
+            if let Some(value) = device_state {
+                properties.insert("ro.boot.vbmeta.device_state", value);
+            }
+            let original = properties.clone();
+            for line in CELL_BOOT_ADAPTATIONS.lines() {
+                let words = line.split_whitespace().collect::<Vec<_>>();
+                if words.first() == Some(&"setprop") {
+                    assert_eq!(words.len(), 3);
+                    properties.insert(words[1], words[2]);
+                }
+            }
+            let boot_identity = properties
+                .iter()
+                .filter(|(key, _)| key.starts_with("ro.boot."))
+                .map(|(key, value)| (*key, *value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(boot_identity, original, "boot identity must survive an update");
+            assert_eq!(properties.get("remote_provisioning.tee.rkp_only"), Some(&"0"));
+        }
+    }
 
     #[test]
     fn sheng_codec2_patch_set_is_reproducible_and_excludes_diagnostics() {
