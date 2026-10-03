@@ -48,6 +48,16 @@ pub const TARGETS: &[&str] = &[
     "services",
     "vendorimage",
 ];
+/// The pinned product image enables RKP-only attestation because it expects
+/// Google's provisioning service and a secure keymint. Cells run the
+/// nonsecure keymint, whose certificate request that service rejects
+/// (HTTP 400), and in RKP-only mode keystore treats the failure as fatal
+/// instead of falling back to the keymint-provided attestation key.
+/// The property is read per key request, and product build.prop outranks
+/// every other partition, so the adaptation has to run here, after property
+/// loading and before any keystore client.
+const ATTESTATION_ADAPTATION: &str =
+    "on init\n    setprop remote_provisioning.tee.rkp_only 0\n";
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
 // The intermediate variant directory follows the Android target architecture.
@@ -730,7 +740,11 @@ pub fn build_targets(
         .arg(repo.join("android/apex-compat/0001-droidloom-classpath-projection.patch")))?;
     write(
         &work.join("init.rc"),
-        format!("import /droidloom/camera/producer.rc\n{}", fs::read_to_string(init.path().join("rootdir/init.rc"))?),
+        format!(
+            "import /droidloom/camera/producer.rc\n{}{}",
+            ATTESTATION_ADAPTATION,
+            fs::read_to_string(init.path().join("rootdir/init.rc"))?
+        ),
     )?;
     p.stabilize_all()?;
     bootstrap(source, out)?;
