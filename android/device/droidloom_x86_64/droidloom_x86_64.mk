@@ -34,6 +34,12 @@ PRODUCT_BUILD_SUPER_EMPTY_IMAGE := false
 
 PRODUCT_SHIPPING_API_LEVEL := $(PLATFORM_SDK_VERSION)
 
+# keymint builds its RKP device info from the OS and vendor patch levels; an
+# empty ro.vendor.build.security_patch makes SetHalInfo fail and blocks every
+# RKP-backed key request (Douyin's face verification is the measured case).
+# Keep in step with the security_patch in android/manifest/source-lock.json.
+VENDOR_SECURITY_PATCH := 2026-06-05
+
 PRODUCT_PACKAGES += \
     vendor_compatibility_matrix.xml \
     selinux_policy_vendor \
