@@ -67,6 +67,7 @@ PRODUCT_PACKAGES += \
 # while BUS endpoints select its timing-correct stub streams and never open a
 # host ALSA device.
 PRODUCT_COPY_FILES += \
+    vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_camera.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_camera.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_input.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_input.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.activities_on_secondary_displays.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.activities_on_secondary_displays.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.app_widgets.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.app_widgets.xml \

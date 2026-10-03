@@ -556,8 +556,11 @@ not correct the display's input configuration. After updating these boot-time
 capabilities, restart the cell and refresh Play Store's cache. Successful account
 sign-in does not guarantee that Google has refreshed its device profile or that
 every app is compatible. Only declare capabilities the runtime implements;
-Google certification and missing camera, microphone or sensor integration are
-not repaired by adding feature names.
+Google certification is not repaired by adding feature names. The ARM64
+products declare the virtual camera (`android.hardware.camera` with the `any`,
+`back` and `front` variants) because the droidloom-camera bridge serves it;
+sensors, Bluetooth, GNSS and telephony remain undeclared until the runtime
+implements them.
 
 The product class follows the display the product presents. A product that
 presents one large landscape display derives its `product.img` with

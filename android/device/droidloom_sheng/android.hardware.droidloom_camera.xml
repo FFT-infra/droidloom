@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <!--
+      Droidloom presents the host's cameras through the virtual camera HAL:
+      one back and one front Camera2 device, served by the droidloom-camera
+      bridge. Applications that ask PackageManager for a camera before they
+      touch CameraService need the capability declared; the face-verification
+      SDK inside Douyin's certificate plugin is the measured case. The HAL
+      reports no autofocus (AF_MODE_OFF only) and no flash, so those
+      capabilities stay undeclared.
+    -->
+    <feature name="android.hardware.camera" />
+    <feature name="android.hardware.camera.any" />
+    <feature name="android.hardware.camera.back" />
+    <feature name="android.hardware.camera.front" />
+</permissions>
