@@ -52,8 +52,7 @@ PRODUCT_PACKAGES += \
     android.hardware.security.keymint-service.nonsecure \
     android.hardware.health-service.example \
     android.hardware.power-service.example \
-    android.hardware.sensors-service.multihal \
-    sensors.dynamic_sensor_hal \
+    android.hardware.sensors-service.example \
     com.android.hardware.audio.droidloom \
     DroidloomFrameworkDisplayOverlay \
     DroidloomConnectivityOverlay \
@@ -87,7 +86,7 @@ PRODUCT_COPY_FILES += \
     frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
     frameworks/av/services/audiopolicy/config/default_volume_tables.xml:$(TARGET_COPY_OUT_VENDOR)/etc/default_volume_tables.xml \
     frameworks/av/services/audiopolicy/config/surround_sound_configuration_5_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/surround_sound_configuration_5_0.xml \
-    vendor/droidloom/android/device/droidloom_sheng/sensors-hals.conf:$(TARGET_COPY_OUT_VENDOR)/etc/sensors/hals.conf
+    frameworks/native/data/etc/android.hardware.sensor.accelerometer.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.accelerometer.xml
 
 # Android's loaders derive these exact filenames from the properties:
 # lib{EGL,GLESv1_CM,GLESv2}_mesa.so and vulkan.freedreno.so.
@@ -125,10 +124,8 @@ PRODUCT_COPY_FILES += \
 # artd selects dex2oat32, every dexopt aborts, and all applications stay on the
 # interpreter.
 PRODUCT_VENDOR_PROPERTIES += dalvik.vm.dex2oat64.enabled=true
-# The dynamic sensors sub-HAL publishes its mock accelerometer for a file
-# matching dummy_accel_file[0-9] in this directory; the cell's init
-# creates one so liveness SDKs that require an accelerometer work.
-PRODUCT_VENDOR_PROPERTIES += vendor.dynamic_sensor.mock.file=/data/misc/sensors
+# The AIDL example HAL is restricted to one static virtual accelerometer.
+# It reports stationary gravity with UNRELIABLE accuracy; no host motion is measured.
 
 # The Iris decoders pass the AVC/HEVC/VP9/AV1 qualifier matrix. It is the
 # standard hardware decode path on sheng.

@@ -64,21 +64,10 @@ pub const TARGETS: &[&str] = &[
 /// info, and an unset device state means "unlocked", which contradicts a
 /// verified state; the provisioning service then rejects the certificate
 /// request as inconsistent. State the matching locked value.
-///
-/// Sensors: the dynamic sensors sub-HAL publishes its mock accelerometer for
-/// every file matching `dummy_accel_file[0-9]` in the directory named by
-/// `vendor.dynamic_sensor.mock.file`, and scans that directory when it
-/// starts. Create one so SensorManager has an accelerometer; the certificate
-/// SDK refuses to start its liveness capture without one.
 const CELL_BOOT_ADAPTATIONS: &str = concat!(
     "on early-init\n",
     "    setprop remote_provisioning.tee.rkp_only 0\n",
     "    setprop ro.boot.vbmeta.device_state locked\n",
-    "on post-fs-data\n",
-    "    mkdir /data/misc/sensors 0775 system system\n",
-    "    exec -- /system/bin/toybox touch /data/misc/sensors/dummy_accel_file0\n",
-    "    exec -- /system/bin/toybox chown system:system /data/misc/sensors/dummy_accel_file0\n",
-    "    exec -- /system/bin/toybox chmod 0664 /data/misc/sensors/dummy_accel_file0\n",
 );
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
@@ -256,8 +245,8 @@ const PATCHES: &[(&str, &str)] = &[
         "android/framework/0003-droidloom-launch-resolution.patch",
     ),
     (
-        "hardware/libhardware",
-        "android/aosp-patches/0032-dynamic-sensor-accel-onfirstref.patch",
+        "hardware/interfaces",
+        "android/aosp-patches/0033-static-virtual-accelerometer.patch",
     ),
 ];
 #[derive(Serialize, Deserialize)]
