@@ -3,8 +3,10 @@
 //! Linux remains the network implementation. This module only creates a veth
 //! pair, assigns the host gateway, installs narrowly named nftables rules for
 //! outbound forwarding/NAT, and adds exact-match accept rules to host firewall
-//! chains that forward traffic ahead of their own drop policy. Android owns
-//! `eth0` and its normal networking services inside the private namespace.
+//! chains that forward traffic ahead of their own drop policy. The host input
+//! chain admits the cell's replies to an `adb connect` the host started, and
+//! nothing else. Android owns `eth0` and its normal networking services inside
+//! the private namespace.
 
 use std::ffi::OsString;
 use std::fs;
@@ -23,6 +25,10 @@ const IPV4_FORWARD_STATE_FILE: &str = "host-ipv4-forward.before";
 /// here and never edits the owning program's configuration.
 const UFW_FORWARD_CHAIN: &str = "ufw-user-forward";
 const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
+/// The port adbd listens on inside the cell (`persist.adb.tcp.port` in the
+/// Android product). The host admits only the cell's replies to a connection
+/// the host itself opened to this port.
+const ADB_TCP_PORT: &str = "5555";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NetworkNames {
@@ -222,6 +228,7 @@ impl DevelopmentNetwork {
                 "}",
             ],
         )?;
+        run("nft", adb_reply_rule_arguments(&self.names))?;
         run(
             "nft",
             [
@@ -476,6 +483,34 @@ impl DevelopmentNetwork {
         // starts, so this recovery record is not exposed to the Android cell.
         self.runtime_dir.join(IPV4_FORWARD_STATE_FILE)
     }
+}
+
+/// Accept the cell's replies to an `adb connect` the host started. The input
+/// chain drops everything arriving from the cell interface, which would also
+/// discard the SYN-ACK of a host-initiated connection and leave `adb connect`
+/// hanging while adbd is listening inside the cell. The match stays on the
+/// adb port and on established flows, so the cell never opens the host this
+/// way by itself.
+fn adb_reply_rule_arguments<'a>(names: &'a NetworkNames) -> [&'a str; 17] {
+    [
+        "add",
+        "rule",
+        "inet",
+        &names.filter_table,
+        "input",
+        "iifname",
+        &names.host_interface,
+        "ip",
+        "saddr",
+        CELL_IPV4_CIDR,
+        "tcp",
+        "sport",
+        ADB_TCP_PORT,
+        "ct",
+        "state",
+        "established,related",
+        "accept",
+    ]
 }
 
 fn ufw_rule_arguments<'a>(operation: &'a str, names: &'a NetworkNames) -> [&'a str; 13] {
@@ -749,6 +784,23 @@ mod tests {
                 "{arguments:?} is missing {flag} {value}"
             );
         }
+    }
+
+    #[test]
+    fn adb_reply_rule_admits_only_established_traffic_from_the_adb_port() {
+        let names = NetworkNames::for_spec(&spec(1000));
+        let rule = adb_reply_rule_arguments(&names);
+        assert_eq!(rule[..5], ["add", "rule", "inet", "droidloom_u1000", "input"]);
+        assert_arguments_contain(
+            &rule,
+            &[
+                ("iifname", "dlh1000"),
+                ("saddr", CELL_IPV4_CIDR),
+                ("sport", ADB_TCP_PORT),
+                ("state", "established,related"),
+            ],
+        );
+        assert_eq!(rule[16], "accept");
     }
 
     #[test]

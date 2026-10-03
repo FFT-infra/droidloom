@@ -214,6 +214,22 @@ The native-resolution launch produced 2536x1392 game buffers inside the desktop'
 2542x1397 decorated work area; fullscreen removes that work-area constraint.
 This is an NTE-specific setup, separate from the general `--resolution` option.
 
+## Debug with adb
+
+The cell runs adbd with TCP enabled, and Droidloom admits the host's own
+connection to it. From the host:
+
+```console
+adb connect 10.177.0.2:5555
+adb -s 10.177.0.2:5555 shell
+```
+
+`10.177.0.2` is the cell end of Droidloom's private veth pair (the host side is
+`dlh<uid>`). The host input chain accepts only the cell's replies to a
+connection the host started, on the adbd port, so the cell cannot open the host
+through this path. From another machine, forward the port over SSH
+(`ssh -L 5555:10.177.0.2:5555 <host>`) and connect to `localhost:5555`.
+
 ## Stop, restart, upgrade and remove
 
 ```console
