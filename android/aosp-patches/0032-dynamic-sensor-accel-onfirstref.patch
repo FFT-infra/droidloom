@@ -1,0 +1,40 @@
+diff --git a/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.cpp b/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.cpp
+index 10771e3..473363a 100644
+--- a/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.cpp
++++ b/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.cpp
+@@ -96,13 +96,21 @@ DummyDynamicAccelDaemon::DummySensor::DummySensor(const std::string &name)
+         { NULL, NULL }
+     };
+     mRunLock.lock();
++}
++
++void DummyDynamicAccelDaemon::DummySensor::onFirstRef() {
+     run("DummySensor");
+ }
+ 
+ DummyDynamicAccelDaemon::DummySensor::~DummySensor() {
++    {
++        std::lock_guard<std::mutex> lk(mLock);
++        if (!mRunState) {
++            mRunLock.unlock();
++            mRunState = true;
++        }
++    }
+     requestExitAndWait();
+-    // unlock mRunLock so thread can be unblocked
+-    mRunLock.unlock();
+ }
+ 
+ const sensor_t* DummyDynamicAccelDaemon::DummySensor::getSensor() const {
+diff --git a/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.h b/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.h
+index 95a5730..7e8ea1d 100644
+--- a/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.h
++++ b/modules/sensors/dynamic_sensor/DummyDynamicAccelDaemon.h
+@@ -43,6 +43,7 @@ private:
+     public:
+         DummySensor(const std::string &name);
+         ~DummySensor();
++        virtual void onFirstRef() override;
+         virtual const sensor_t* getSensor() const;
+         virtual void getUuid(uint8_t* uuid) const;
+         virtual int enable(bool enable);

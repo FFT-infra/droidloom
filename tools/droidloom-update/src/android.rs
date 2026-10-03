@@ -75,8 +75,10 @@ const CELL_BOOT_ADAPTATIONS: &str = concat!(
     "    setprop remote_provisioning.tee.rkp_only 0\n",
     "    setprop ro.boot.vbmeta.device_state locked\n",
     "on post-fs-data\n",
-    "    exec -- /system/bin/toybox mkdir -p /data/misc/sensors\n",
+    "    mkdir /data/misc/sensors 0775 system system\n",
     "    exec -- /system/bin/toybox touch /data/misc/sensors/dummy_accel_file0\n",
+    "    exec -- /system/bin/toybox chown system:system /data/misc/sensors/dummy_accel_file0\n",
+    "    exec -- /system/bin/toybox chmod 0664 /data/misc/sensors/dummy_accel_file0\n",
 );
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
@@ -252,6 +254,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/base",
         "android/framework/0003-droidloom-launch-resolution.patch",
+    ),
+    (
+        "hardware/libhardware",
+        "android/aosp-patches/0032-dynamic-sensor-accel-onfirstref.patch",
     ),
 ];
 #[derive(Serialize, Deserialize)]
