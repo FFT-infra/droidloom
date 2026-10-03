@@ -48,16 +48,27 @@ pub const TARGETS: &[&str] = &[
     "services",
     "vendorimage",
 ];
-/// The pinned product image enables RKP-only attestation because it expects
-/// Google's provisioning service and a secure keymint. Cells run the
-/// nonsecure keymint, whose certificate request that service rejects
-/// (HTTP 400), and in RKP-only mode keystore treats the failure as fatal
-/// instead of falling back to the keymint-provided attestation key.
-/// The property is read per key request, and product build.prop outranks
-/// every other partition, so the adaptation has to run here, after property
-/// loading and before any keystore client.
-const ATTESTATION_ADAPTATION: &str =
-    "on init\n    setprop remote_provisioning.tee.rkp_only 0\n";
+/// Cell-local boot adaptations for the pinned product image.
+///
+/// Attestation: the image enables RKP-only mode because it expects Google's
+/// provisioning service and a secure keymint. Cells run the nonsecure
+/// keymint, whose certificate request that service rejects (HTTP 400), and
+/// in RKP-only mode keystore treats the failure as fatal instead of falling
+/// back to the keymint-provided attestation key. The property is read per
+/// key request, and product build.prop outranks every other partition, so
+/// the adaptation has to run here, after property loading and before any
+/// keystore client.
+///
+/// Boot state: the pinned kernel command line reports a verified-boot state
+/// but no vbmeta device state. The keymint HAL reads both into the RKP boot
+/// info, and an unset device state means "unlocked", which contradicts a
+/// verified state; the provisioning service then rejects the certificate
+/// request as inconsistent. State the matching locked value.
+const CELL_BOOT_ADAPTATIONS: &str = concat!(
+    "on early-init\n",
+    "    setprop remote_provisioning.tee.rkp_only 0\n",
+    "    setprop ro.boot.vbmeta.device_state locked\n",
+);
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
 // The intermediate variant directory follows the Android target architecture.
@@ -742,7 +753,7 @@ pub fn build_targets(
         &work.join("init.rc"),
         format!(
             "import /droidloom/camera/producer.rc\n{}{}",
-            ATTESTATION_ADAPTATION,
+            CELL_BOOT_ADAPTATIONS,
             fs::read_to_string(init.path().join("rootdir/init.rc"))?
         ),
     )?;
