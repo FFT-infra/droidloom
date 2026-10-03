@@ -81,6 +81,12 @@ enum Command {
     },
     /// Report whether the cell is running.
     Status,
+    /// Connect the host's adb client to the running cell's adbd.
+    Adb {
+        /// Disconnect instead of connecting.
+        #[arg(long)]
+        disconnect: bool,
+    },
     /// Wait for Android boot, showing progress and a deadline without restarting it.
     Wait,
     /// Show recent Android logs, optionally filtered by an installed app's UID.
@@ -235,6 +241,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
+            Command::Adb { disconnect } => {
+                return adb_connection(droidloom_supervisor::CELL_ADB_ENDPOINT, disconnect);
+            }
             Command::Start { spec, .. } => ControlRequest::Start { spec },
             Command::Stop => ControlRequest::Stop,
             Command::Restart { spec, .. } => ControlRequest::Restart { spec },
@@ -354,6 +363,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err(response.message.into())
     }
+}
+
+/// Connect or disconnect the host's adb client, the equivalent of Waydroid's
+/// `waydroid adb`. The host client is the only one admitted to the cell's
+/// adbd; the supervisor's input filter accepts no other cell traffic. adb
+/// itself reports the outcome, including a refused connection.
+fn adb_connection(endpoint: &str, disconnect: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if disconnect {
+        let status = droidloom_cpu_placement::command("adb")
+            .args(["disconnect", endpoint])
+            .status()?;
+        if !status.success() {
+            return Err(format!("adb disconnect failed: {status}").into());
+        }
+        return Ok(());
+    }
+    let status = droidloom_cpu_placement::command("adb").arg("start-server").status()?;
+    if !status.success() {
+        return Err(format!("adb start-server failed: {status}").into());
+    }
+    let status = droidloom_cpu_placement::command("adb")
+        .args(["connect", endpoint])
+        .status()?;
+    if !status.success() {
+        return Err(format!("adb connect failed: {status}").into());
+    }
+    Ok(())
 }
 
 fn session_service_active() -> Result<bool, Box<dyn std::error::Error>> {

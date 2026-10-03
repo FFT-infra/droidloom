@@ -10,6 +10,8 @@ pub mod control;
 mod cpu_placement;
 pub mod development;
 mod development_network;
+
+pub use development_network::CELL_ADB_ENDPOINT;
 pub mod gapps;
 pub mod linux_plan;
 mod package_cache;

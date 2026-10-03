@@ -217,18 +217,22 @@ This is an NTE-specific setup, separate from the general `--resolution` option.
 ## Debug with adb
 
 The cell runs adbd with TCP enabled, and Droidloom admits the host's own
-connection to it. From the host:
+connection to it. With the host's `adb` client installed:
 
 ```console
-adb connect 10.177.0.2:5555
+droidloomctl adb
 adb -s 10.177.0.2:5555 shell
+droidloomctl adb --disconnect
 ```
 
-`10.177.0.2` is the cell end of Droidloom's private veth pair (the host side is
-`dlh<uid>`). The host input chain accepts only the cell's replies to a
-connection the host started, on the adbd port, so the cell cannot open the host
-through this path. From another machine, forward the port over SSH
-(`ssh -L 5555:10.177.0.2:5555 <host>`) and connect to `localhost:5555`.
+`droidloomctl adb` warms the host's adb server and connects it to the cell's
+fixed veth address (`10.177.0.2:5555`), the same connection `adb connect
+10.177.0.2:5555` makes by hand; `10.177.0.2` is the cell end of Droidloom's
+private veth pair (the host side is `dlh<uid>`). The host input chain accepts
+only the cell's replies to a connection the host started, on the adbd port, so
+the cell cannot open the host through this path. From another machine, forward
+the port over SSH (`ssh -L 5555:10.177.0.2:5555 <host>`) and connect to
+`localhost:5555`.
 
 ## Stop, restart, upgrade and remove
 

@@ -29,6 +29,10 @@ const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
 /// Android product). The host admits only the cell's replies to a connection
 /// the host itself opened to this port.
 const ADB_TCP_PORT: &str = "5555";
+/// Where `droidloomctl adb` connects the host's adb client. The veth address
+/// is fixed for every cell, so this is not per-user; the port is
+/// [`ADB_TCP_PORT`].
+pub const CELL_ADB_ENDPOINT: &str = "10.177.0.2:5555";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NetworkNames {
