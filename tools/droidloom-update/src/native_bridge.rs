@@ -280,6 +280,42 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
 ///
 /// The symlink is created dangling when the tree has no APEX copy; it publishes
 /// the path the resolver checks, and the target appears with the APEX mount.
+/// Drop the AVF (protected-VM) APEX from the derived system image.
+///
+/// Nothing in a Droidloom cell can serve that APEX: the shared host kernel
+/// runs no microdroid VMs, and the classpath projection already replaces the
+/// APEX's javalib under `/apex/com.android.virt` before `derive_classpath`
+/// runs. Its VINTF manifest is what remains, and it still declares
+/// `IRemotelyProvisionedComponent/avf`; `rkpdapp` picks that declaration up
+/// and asks servicemanager for a service whose binary the projection hides,
+/// so init fails the lazy start once per second for the whole cell lifetime.
+/// Without the APEX the declaration disappears with it and `rkpdapp` keeps
+/// only the `/default` instance.
+fn remove_avf_apex(tree: &Path) -> Result<()> {
+    let apex_dir = tree.join("system/apex");
+    let modified = fs::metadata(&apex_dir)?.modified()?;
+    let mut removed = false;
+    for name in ["com.android.virt.apex", "com.android.virt.capex"] {
+        let candidate = apex_dir.join(name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(&candidate)?;
+                removed = true;
+            }
+            Ok(_) => return fail(format!("{name} is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !removed {
+        return fail("the base system image carries no AVF APEX to remove");
+    }
+    // Removing a directory entry only changes that directory's own mtime, and
+    // the inventory comparison below covers directories too.
+    fs::File::open(&apex_dir)?.set_modified(modified)?;
+    Ok(())
+}
+
 /// Publish the cell's virtual camera HAL at its platform path.
 ///
 /// The HAL links the camera service client, whose closure needs
@@ -350,6 +386,7 @@ pub fn derive_image(
         .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
     let tree = work.path().join("tree");
     crate::image_policy::extract(image, &tree)?;
+    remove_avf_apex(&tree)?;
     let properties = tree.join("system/build.prop");
     // The translator merge below only exists for ARM64 guests on x86_64
     // hosts. ARM64 cells execute natively: keep the base ABI contract and
@@ -567,6 +604,41 @@ mod tests {
                 .unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn avf_apex_removal_takes_either_packaging_and_keeps_its_siblings() {
+        let tree = tempfile::tempdir().unwrap();
+        let apex_dir = tree.path().join("system/apex");
+        fs::create_dir_all(&apex_dir).unwrap();
+        fs::write(apex_dir.join("com.android.virt.apex"), b"apex").unwrap();
+        fs::write(apex_dir.join("com.android.adbd.apex"), b"keep").unwrap();
+        let modified = fs::metadata(&apex_dir).unwrap().modified().unwrap();
+
+        remove_avf_apex(tree.path()).unwrap();
+
+        assert!(!apex_dir.join("com.android.virt.apex").exists());
+        assert!(apex_dir.join("com.android.adbd.apex").exists());
+        assert_eq!(fs::metadata(&apex_dir).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn avf_apex_removal_accepts_the_compressed_packaging() {
+        let tree = tempfile::tempdir().unwrap();
+        let apex_dir = tree.path().join("system/apex");
+        fs::create_dir_all(&apex_dir).unwrap();
+        fs::write(apex_dir.join("com.android.virt.capex"), b"capex").unwrap();
+
+        remove_avf_apex(tree.path()).unwrap();
+
+        assert!(!apex_dir.join("com.android.virt.capex").exists());
+    }
+
+    #[test]
+    fn avf_apex_removal_rejects_a_tree_without_the_apex() {
+        let tree = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("system/apex")).unwrap();
+        assert!(remove_avf_apex(tree.path()).is_err());
     }
 
     /// Journal corruption is not observed by this worktree's mutation sites, and
