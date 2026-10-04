@@ -20,9 +20,11 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
+/// Wire version introducing task activation.
+pub const ACTIVATION_PROTOCOL_MINOR: u16 = 4;
 /// Fixed wire-header size.
 pub const HEADER_BYTES: usize = 32;
 /// Maximum complete sequenced packet, including its header.
@@ -62,6 +64,8 @@ pub mod capability {
     pub const DROIDLOOM_COMPOSITION: u64 = 1 << 7;
     /// The host accepts task activation requests under its own focus policy.
     pub const TASK_ACTIVATION: u64 = 1 << 8;
+    /// The host publishes whether any physical display is powered on.
+    pub const DISPLAY_POWER: u64 = 1 << 9;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -70,7 +74,8 @@ pub mod capability {
         | PRESENTATION_TIMING
         | INPUT
         | HOST_RENDER_TARGETS
-        | DROIDLOOM_COMPOSITION;
+        | DROIDLOOM_COMPOSITION
+        | DISPLAY_POWER;
 }
 
 /// Per-connection object naming one native Denial task window.
@@ -254,6 +259,11 @@ pub enum DenialMessage {
         max_buffers_per_task: u32,
         /// Maximum damage rectangles per present.
         max_damage_rects: u32,
+    },
+    /// Publish whether the host currently has any powered physical display.
+    DisplayPower {
+        /// True while at least one host output is powered on.
+        powered: bool,
     },
     /// Replace the authoritative DMA-BUF import feedback generation.
     FormatFeedback {
@@ -1151,6 +1161,7 @@ const OP_ERROR: u16 = 0x800a;
 const OP_PING: u16 = 0x800b;
 const OP_REGISTER_RENDER_TARGET: u16 = 0x800c;
 const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
+const OP_DISPLAY_POWER: u16 = 0x800e;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1275,7 +1286,11 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             }
             (OP_PRESENT, valid_object(*object)?, Vec::new())
         }
-        AndroidMessage::BindLayerStream { object } => (OP_BIND_LAYER_STREAM, valid_object(*object)?, vec![DescriptorKind::LayerStream; 2]),
+        AndroidMessage::BindLayerStream { object } => (
+            OP_BIND_LAYER_STREAM,
+            valid_object(*object)?,
+            vec![DescriptorKind::LayerStream; 2],
+        ),
         AndroidMessage::SetContentState { object, flags } => {
             known_bits(
                 "content state",
@@ -1294,8 +1309,9 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             payload.u32(*millihz);
             (OP_SET_FRAME_RATE, valid_object(*object)?, Vec::new())
         }
-        AndroidMessage::RequestActivation { object } =>
-            (OP_REQUEST_ACTIVATION, valid_object(*object)?, Vec::new()),
+        AndroidMessage::RequestActivation { object } => {
+            (OP_REQUEST_ACTIVATION, valid_object(*object)?, Vec::new())
+        }
         AndroidMessage::Pong { cookie } => {
             payload.u64(*cookie);
             (OP_PONG, 0, Vec::new())
@@ -1448,7 +1464,10 @@ pub fn decode_android(
         }
         OP_BIND_LAYER_STREAM => {
             valid_object(object)?;
-            (AndroidMessage::BindLayerStream { object }, vec![DescriptorKind::LayerStream; 2])
+            (
+                AndroidMessage::BindLayerStream { object },
+                vec![DescriptorKind::LayerStream; 2],
+            )
         }
         OP_SET_CONTENT_STATE => {
             valid_object(object)?;
@@ -1531,6 +1550,10 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
             payload.u32(*max_buffers_per_task);
             payload.u32(*max_damage_rects);
             (OP_SERVER_HELLO, 0)
+        }
+        DenialMessage::DisplayPower { powered } => {
+            payload.u8(u8::from(*powered));
+            (OP_DISPLAY_POWER, 0)
         }
         DenialMessage::FormatFeedback {
             object,
@@ -1751,6 +1774,12 @@ pub fn decode_denial(
                 max_task_objects,
                 max_buffers_per_task,
                 max_damage_rects,
+            }
+        }
+        OP_DISPLAY_POWER => {
+            require_connection(header.object)?;
+            DenialMessage::DisplayPower {
+                powered: decode_bool(payload.u8()?, "display power")?,
             }
         }
         OP_FORMAT_FEEDBACK => {
@@ -2053,8 +2082,12 @@ fn finish_packet(
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
     // Existing peers reject a header newer than their implementation before
-    // reading capabilities. Only the negotiated new opcode needs minor 4.
-    let minor = if opcode == OP_REQUEST_ACTIVATION { PROTOCOL_MINOR } else { BASE_PROTOCOL_MINOR };
+    // reading capabilities. Only each negotiated new opcode raises the header.
+    let minor = match opcode {
+        OP_REQUEST_ACTIVATION => ACTIVATION_PROTOCOL_MINOR,
+        OP_DISPLAY_POWER => PROTOCOL_MINOR,
+        _ => BASE_PROTOCOL_MINOR,
+    };
     bytes.extend_from_slice(&minor.to_le_bytes());
     bytes.extend_from_slice(&opcode.to_le_bytes());
     bytes.extend_from_slice(&fd_count.to_le_bytes());
@@ -2459,19 +2492,27 @@ mod tests {
     #[test]
     fn activation_does_not_raise_the_wire_version_of_legacy_handshakes() {
         let hello = encode_android(&AndroidMessage::ClientHello {
-            min_major: 1, max_major: 1,
+            min_major: 1,
+            max_major: 1,
             capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION,
-        }).unwrap();
+        })
+        .unwrap();
         let create = encode_android(&AndroidMessage::CreateTask {
-            object: OBJECT, display: AndroidDisplayId(9), package: "org.example.app".into(),
-        }).unwrap();
+            object: OBJECT,
+            display: AndroidDisplayId(9),
+            package: "org.example.app".into(),
+        })
+        .unwrap();
         for legacy in [hello, create] {
             assert_eq!(&legacy.bytes[6..8], &3_u16.to_le_bytes());
         }
-        let activation = encode_android(&AndroidMessage::RequestActivation { object: OBJECT }).unwrap();
+        let activation =
+            encode_android(&AndroidMessage::RequestActivation { object: OBJECT }).unwrap();
         assert_eq!(&activation.bytes[6..8], &4_u16.to_le_bytes());
         assert!(activation.descriptors.is_empty());
         assert_eq!(activation.bytes.len(), HEADER_BYTES);
+        let display_power = encode_denial(&DenialMessage::DisplayPower { powered: true }).unwrap();
+        assert_eq!(&display_power.bytes[6..8], &5_u16.to_le_bytes());
     }
 
     #[test]
@@ -2602,6 +2643,7 @@ mod tests {
                 max_buffers_per_task: MAX_BUFFERS_PER_TASK,
                 max_damage_rects: u32::try_from(MAX_DAMAGE_RECTS).unwrap(),
             },
+            DenialMessage::DisplayPower { powered: false },
             DenialMessage::Configure {
                 object: OBJECT,
                 serial: 5,

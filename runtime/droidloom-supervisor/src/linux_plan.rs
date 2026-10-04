@@ -392,8 +392,12 @@ pub fn build_linux_plan(spec: &CellSpec) -> Result<LinuxCellPlan, SpecError> {
         teardown: backend.teardown.clone(),
         invariants: PlanInvariants {
             render_nodes: vec![spec.render_node.clone()],
-            auxiliary_graphics_devices: spec.graphics_backend.auxiliary_devices()
-                .iter().map(PathBuf::from).collect(),
+            auxiliary_graphics_devices: spec
+                .graphics_backend
+                .auxiliary_devices()
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             drm_card_nodes: false,
             physical_input_nodes: false,
             private_binderfs: true,
@@ -543,11 +547,16 @@ fn mount_operations(spec: &CellSpec) -> Vec<LinuxOperation> {
         target: "/dev/dri/renderD128".into(),
         mode: 0o666,
     });
-    operations.extend(spec.graphics_backend.auxiliary_devices().iter().map(|path| {
-        LinuxOperation::CreateGraphicsDevice {
-            source: path.into(), target: path.into(), mode: 0o666,
-        }
-    }));
+    operations.extend(
+        spec.graphics_backend
+            .auxiliary_devices()
+            .iter()
+            .map(|path| LinuxOperation::CreateGraphicsDevice {
+                source: path.into(),
+                target: path.into(),
+                mode: 0o666,
+            }),
+    );
     operations.push(mount(
         MountKind::FileBind,
         Some(spec.denial_socket.clone()),
@@ -787,9 +796,7 @@ fn teardown_operations(spec: &CellSpec, step: LifecycleStep) -> Vec<LinuxOperati
             if spec.android_init.is_some() {
                 targets.push(PathBuf::from("/system/bin/init"));
             }
-            targets.extend([
-                PathBuf::from("/dev/socket/droidloom/denial"),
-            ]);
+            targets.extend([PathBuf::from("/dev/socket/droidloom/denial")]);
             targets.extend(
                 spec.shared_storage_directories
                     .iter()
@@ -895,7 +902,10 @@ mod tests {
         for operation in &addon[1..3] {
             assert!(matches!(
                 operation,
-                LinuxOperation::Mount { kind: MountKind::ReadOnlyAndroidImage, .. }
+                LinuxOperation::Mount {
+                    kind: MountKind::ReadOnlyAndroidImage,
+                    ..
+                }
             ));
         }
         let encoded = serde_json::to_string(&addon).unwrap();
@@ -1157,21 +1167,25 @@ mod tests {
             .collect();
         assert_eq!(binder_names, ["binder", "hwbinder", "vndbinder"]);
 
-        let partitions: Vec<_> = operations
-            .iter()
-            .filter_map(|operation| match operation {
-                LinuxOperation::Mount {
-                    kind: MountKind::ErofsImage | MountKind::Ext4Image | MountKind::ReadOnlyAndroidImage,
-                    target,
-                    read_only,
-                    ..
-                } => {
-                    assert!(*read_only);
-                    Some(target.as_path())
-                }
-                _ => None,
-            })
-            .collect();
+        let partitions: Vec<_> =
+            operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    LinuxOperation::Mount {
+                        kind:
+                            MountKind::ErofsImage
+                            | MountKind::Ext4Image
+                            | MountKind::ReadOnlyAndroidImage,
+                        target,
+                        read_only,
+                        ..
+                    } => {
+                        assert!(*read_only);
+                        Some(target.as_path())
+                    }
+                    _ => None,
+                })
+                .collect();
         assert_eq!(
             partitions,
             [

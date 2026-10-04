@@ -81,6 +81,9 @@ and `droidloomd` remain trusted computing base.
   version switch. Never execute hooks from an untrusted image.
 - Network: host policy owns NAT/routing. Prevent spoofing outside the assigned
   veth and tear policy down by stable cell identity.
+- Power supply: expose only a fixed allowlist of battery and charger status
+  files through read-only mounts. Exclude identifiers, controls, device links,
+  and unrecognized supply types.
 - Resource exhaustion: cap processes, memory, CPU, file descriptors, Binder
   allocations, surfaces, buffers, and queued messages at the host cgroup and
   protocol layers.

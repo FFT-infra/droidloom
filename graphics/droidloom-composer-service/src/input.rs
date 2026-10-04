@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use droidloom_denial_ipc::SeqPacket;
 use droidloom_denial_protocol::{InputEvent, TouchAction};
 use droidloom_input_protocol::{
-    encode_key, encode_task_bounds, encode_task_close, encode_task_focus, encode_touch,
-    MAX_POINTER_ID,
+    encode_display_power, encode_key, encode_task_bounds, encode_task_close, encode_task_focus,
+    encode_touch, MAX_POINTER_ID,
 };
 
 #[derive(Default)]
@@ -196,6 +196,16 @@ impl InputBridge {
     /// Ask Android to finish and remove one host-closed task.
     pub(super) fn send_task_close(&self, task: u64) -> Result<(), String> {
         let record = encode_task_close(task).map_err(|error| error.to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Android framework bridge state lock is poisoned".to_owned())?;
+        self.send_record(&mut state, &record)
+    }
+
+    /// Mirror the physical host display-power state into Android's power manager.
+    pub(super) fn send_display_power(&self, powered: bool) -> Result<(), String> {
+        let record = encode_display_power(powered);
         let mut state = self
             .state
             .lock()

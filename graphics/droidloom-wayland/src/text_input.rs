@@ -148,16 +148,19 @@ impl TextInput {
     }
 
     pub fn fds(&self) -> impl Iterator<Item = (RawFd, i16)> + '_ {
-        std::iter::once((self.listener.as_fd().as_raw_fd(), libc::POLLIN))
-            .chain(self.client.iter().map(|client| (
-                client.as_fd().as_raw_fd(),
-                libc::POLLIN
-                    | if self.outgoing.is_empty() {
-                        0
-                    } else {
-                        libc::POLLOUT
-                    },
-            )))
+        std::iter::once((self.listener.as_fd().as_raw_fd(), libc::POLLIN)).chain(
+            self.client.iter().map(|client| {
+                (
+                    client.as_fd().as_raw_fd(),
+                    libc::POLLIN
+                        | if self.outgoing.is_empty() {
+                            0
+                        } else {
+                            libc::POLLOUT
+                        },
+                )
+            }),
+        )
     }
 
     pub fn note_touch(&mut self) {

@@ -7,7 +7,7 @@ import re
 
 repo = pathlib.Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--source', type=pathlib.Path, default=repo / '.work/aosp-m2-source')
+parser.add_argument('--source', type=pathlib.Path, default=repo / '.work/arch/build/aosp-source')
 parser.add_argument('--check', action='store_true')
 args = parser.parse_args()
 for interface, path, adapter in [

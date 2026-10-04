@@ -4,7 +4,7 @@
 - [Build packages](BUILDING.md): prerequisites, Rust builder and package checks.
 - [Known issues](KNOWN_ISSUES.md): preview limitations and workarounds.
 
-- [Architecture](architecture.md): Android cell, graphics path and source boundaries.
+- [Architecture](architecture.md): Android cell, graphics path and source boundaries; [proposed Linux host integration](architecture.md#host-service-integration-direction) for SMS, calls and audio.
 - [Desktop integration](desktop-integration.md): windows, clipboard, notifications and diagnostics.
 - Integration proposals: [audio](audio-integration-proposal.md) and [SMS](sms-integration-proposal.md).
 - [Security requirements](threat-model-v1.md): trust boundaries and isolation limitations.

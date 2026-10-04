@@ -115,6 +115,16 @@ InputFlinger constrains normal dispatch to that token. The bridge never changes
 task focus or stacking. The input integration leaves boot `framework.jar`,
 public AIDL, and all stock Binder transaction numbers unchanged.
 
+The Wayland presenter also subscribes to the compositor's standard
+`zwlr_output_power_management_v1` state. Once every physical output has reported
+an initial state, it sends the aggregate state through the versioned Denial and
+input protocols. The privileged bridge mirrors transitions into Android's
+PowerManager with `goToSleep` and `wakeUp`; repeated states are no-ops. This
+keeps Android lifecycle, idle policy, clocks, and regulator votes aligned with
+the real display without polling, timers, or a device-specific power daemon.
+The presenter, Composer service, protocol libraries, and input bridge must be
+updated together when this record changes.
+
 The same package contains the one-shot `ApplicationCatalog` framework adapter.
 It lets Android's package manager and resource stack resolve enabled launcher
 activities, localized labels, and adaptive icons for the unprivileged host
@@ -128,3 +138,9 @@ WindowMetrics. It is enabled
 only by Droidloom's existing read-only task-window product marker. See
 [`navigation-insets.md`](../../docs/contracts/navigation-insets.md) for the API,
 explicit services build, packaging and validation contract.
+
+Android auto-power modes are enabled by the vendor framework overlay. The cell
+does not require a motion sensor to enter Doze: host display state drives Android
+interactivity, while Linux owns whole-host suspend and notification recovery
+windows. Android Doze remains an app scheduling/network policy, not the host
+suspend controller. Verify push delivery across host wake windows when changing it.

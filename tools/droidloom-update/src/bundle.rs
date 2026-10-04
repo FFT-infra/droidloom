@@ -74,7 +74,8 @@ fn architecture(data: &[u8]) -> Result<&'static str> {
 fn compatibility(root: &Path) -> Result<(String, u16)> {
     let runtime = root.join("usr/lib/droidloom/runtime");
     let home = dex(&runtime.join("ime/DroidloomHome.apk"))?;
-    if !home.windows(b"Lcom/android/droidloom/home/HomeActivity;".len())
+    if !home
+        .windows(b"Lcom/android/droidloom/home/HomeActivity;".len())
         .any(|w| w == b"Lcom/android/droidloom/home/HomeActivity;")
     {
         return fail("DroidloomHome.apk lacks compiled HOME activity");
@@ -83,16 +84,22 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
         return fail("missing HOME provisioning script");
     }
     let systemui = dex(&runtime.join("systemui/SystemUI.apk"))?;
-    if !systemui.windows(b"DROIDLOOM_SYSTEMUI_ABI=1;".len())
+    if !systemui
+        .windows(b"DROIDLOOM_SYSTEMUI_ABI=1;".len())
         .any(|w| w == b"DROIDLOOM_SYSTEMUI_ABI=1;")
     {
         return fail("SystemUI.apk is not the Droidloom minimal implementation");
     }
-    if !systemui.windows(b"DROIDLOOM_CLIPBOARD_ABI=1;".len())
-        .any(|w| w == b"DROIDLOOM_CLIPBOARD_ABI=1;") {
+    if !systemui
+        .windows(b"DROIDLOOM_CLIPBOARD_ABI=1;".len())
+        .any(|w| w == b"DROIDLOOM_CLIPBOARD_ABI=1;")
+    {
         return fail("SystemUI.apk lacks the clipboard adapter");
     }
-    if !systemui.windows(b"DROIDLOOM_NOTIFICATIONS_ABI=1;".len()).any(|w| w == b"DROIDLOOM_NOTIFICATIONS_ABI=1;") {
+    if !systemui
+        .windows(b"DROIDLOOM_NOTIFICATIONS_ABI=1;".len())
+        .any(|w| w == b"DROIDLOOM_NOTIFICATIONS_ABI=1;")
+    {
         return fail("SystemUI.apk lacks the notification adapter");
     }
     let launcher = runtime.join("ime/droidloom-input-bridge");
@@ -127,11 +134,16 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
             .is_some_and(|n| n == "droidloom-input-bridge.jar")
         {
             let data = dex(&path)?;
-            if !data.windows(b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;".len())
-                .any(|w| w == b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;") {
+            if !data
+                .windows(b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;".len())
+                .any(|w| w == b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;")
+            {
                 return fail("Android input bridge lacks the clipboard relay");
             }
-            if !data.windows(b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;".len()).any(|w| w == b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;") {
+            if !data
+                .windows(b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;".len())
+                .any(|w| w == b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;")
+            {
                 return fail("Android input bridge lacks the notification relay");
             }
             let receiver = input_abi(&data)?;
@@ -303,13 +315,29 @@ mod artifact_tests {
             &root.join("usr/lib/droidloom/runtime/framework/services.jar"),
         )
         .unwrap();
-        copy(&jar, &root.join("usr/lib/droidloom/runtime/ime/DroidloomHome.apk")).unwrap();
-        copy(&jar, &root.join("usr/lib/droidloom/runtime/systemui/SystemUI.apk")).unwrap();
-        write(&root.join("usr/lib/droidloom/runtime/ime/home-setup"), b"#!/system/bin/sh\n").unwrap();
+        copy(
+            &jar,
+            &root.join("usr/lib/droidloom/runtime/ime/DroidloomHome.apk"),
+        )
+        .unwrap();
+        copy(
+            &jar,
+            &root.join("usr/lib/droidloom/runtime/systemui/SystemUI.apk"),
+        )
+        .unwrap();
+        write(
+            &root.join("usr/lib/droidloom/runtime/ime/home-setup"),
+            b"#!/system/bin/sh\n",
+        )
+        .unwrap();
     }
     #[test]
     fn refuses_bundle_without_minimal_system_apps() {
-        for relative in ["ime/DroidloomHome.apk", "ime/home-setup", "systemui/SystemUI.apk"] {
+        for relative in [
+            "ime/DroidloomHome.apk",
+            "ime/home-setup",
+            "systemui/SystemUI.apk",
+        ] {
             let d = tempfile::tempdir().unwrap();
             fixture(d.path(), 5, 5);
             fs::remove_file(d.path().join("usr/lib/droidloom/runtime").join(relative)).unwrap();

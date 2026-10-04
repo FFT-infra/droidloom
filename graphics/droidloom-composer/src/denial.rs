@@ -430,6 +430,7 @@ impl DenialTaskBinding {
                 event: *event,
             }),
             DenialMessage::ServerHello { .. }
+            | DenialMessage::DisplayPower { .. }
             | DenialMessage::Error { .. }
             | DenialMessage::Ping { .. }
             | DenialMessage::RegisterRenderTarget { .. }
@@ -453,7 +454,9 @@ fn message_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Presented { object, .. }
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
-        DenialMessage::ServerHello { .. } | DenialMessage::Ping { .. } => None,
+        DenialMessage::ServerHello { .. }
+        | DenialMessage::DisplayPower { .. }
+        | DenialMessage::Ping { .. } => None,
     }
 }
 

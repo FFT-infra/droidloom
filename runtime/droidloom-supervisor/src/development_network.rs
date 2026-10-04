@@ -208,6 +208,28 @@ impl DevelopmentNetwork {
                 "input",
                 "iifname",
                 &self.names.host_interface,
+                "ip",
+                "saddr",
+                CELL_IPV4_CIDR,
+                "tcp",
+                "sport",
+                "5555",
+                "ct",
+                "state",
+                "established",
+                "accept",
+            ],
+        )?;
+        run(
+            "nft",
+            [
+                "add",
+                "rule",
+                "inet",
+                &self.names.filter_table,
+                "input",
+                "iifname",
+                &self.names.host_interface,
                 "drop",
             ],
         )

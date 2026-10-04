@@ -2,10 +2,10 @@
 use std::{fs, path::Path, process::Command};
 
 #[test]
-#[ignore = "requires .work/aosp-m2-source and host libdrm development headers"]
+#[ignore = "requires .work/arch/build/aosp-source and host libdrm development headers"]
 fn dma_heap_video_planes_satisfy_gpu_and_android_layouts() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source = repo.join(".work/aosp-m2-source/external/minigbm");
+    let source = repo.join(".work/arch/build/aosp-source/external/minigbm");
     let temp = tempfile::tempdir().unwrap();
     let pristine = Command::new("git")
         .current_dir(&source)

@@ -54,7 +54,7 @@ enum Action {
         /// Use an existing package build workspace (containing aosp-source).
         #[arg(long)]
         work: Option<PathBuf>,
-    /// Also build Teto's ARM64 host regression suite.
+        /// Also build Teto's ARM64 host regression suite.
         #[arg(long)]
         tests: bool,
     },
@@ -182,20 +182,19 @@ fn execute(args: Args) -> Result<()> {
         return fail("the source builder currently requires an x86_64 Linux build host");
     }
     let product = "droidloom_x86_64";
-    let package_work = match &args.command {
+    let prepared_work = match &args.command {
         Some(Action::NativeBridgeBuild {
             work: Some(work), ..
         }) => Some(work.canonicalize()?),
         _ => None,
     };
-    let work = package_work
+    // Keep every local build mode in the package builder's persistent cache.
+    // A caller may still select an explicitly prepared workspace for a focused
+    // native-bridge build (for example, /build inside the package container).
+    let work = prepared_work
         .clone()
-        .unwrap_or_else(|| repo.join(".work/update"));
-    let source = if package_work.is_some() {
-        work.join("aosp-source")
-    } else {
-        repo.join(".work/aosp-m2-source")
-    };
+        .unwrap_or_else(|| repo.join(".work/arch/build"));
+    let source = work.join("aosp-source");
     let out = work.join("android-out");
     let cargo = work.join("cargo");
     if matches!(args.command, Some(Action::Plan)) {
@@ -220,19 +219,11 @@ fn execute(args: Args) -> Result<()> {
     if jobs == 0 {
         return fail("jobs must be positive");
     }
-    let _lock = Lock::acquire(&work.join(if package_work.is_some() {
-        "package-build.lock"
-    } else {
-        "update.lock"
-    }))?;
-    let _source_lock = Lock::acquire(&if package_work.is_some() {
-        work.join("aosp-source-update.lock")
-    } else {
-        repo.join(".work/aosp-source-update.lock")
-    })?;
+    let _lock = Lock::acquire(&work.join("package-build.lock"))?;
+    let _source_lock = Lock::acquire(&work.join("aosp-source-update.lock"))?;
     // A prepared package workspace runs inside the rootless builder, which
     // supplies build tools and does not run host systemd or install services.
-    if package_work.is_none() {
+    if prepared_work.is_none() {
         dependencies::ensure()?;
     }
     if work.join("source-projection.json").exists() {

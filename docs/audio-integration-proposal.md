@@ -1,5 +1,7 @@
 # Audio integration proposal
 
+See [Host service integration](architecture.md#host-service-integration-direction) for the shared SMS/call/audio ownership model, Linux-generic backend boundaries and implementation milestones.
+
 Status: proposed; the current audio HAL provides silent stub streams.
 
 Implement an Android AIDL audio HAL adapter backed by the host PipeWire service.

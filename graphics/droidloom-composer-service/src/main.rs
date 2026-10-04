@@ -225,6 +225,7 @@ fn event_loop(
             DenialMessage::ServerHello { .. } => {
                 return Err("repeated Denial ServerHello".to_owned());
             }
+            DenialMessage::DisplayPower { powered } => input.send_display_power(powered)?,
             DenialMessage::RegisterRenderTarget {
                 object,
                 configure_serial,
@@ -427,6 +428,8 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Presented { object, .. }
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
-        DenialMessage::ServerHello { .. } | DenialMessage::Ping { .. } => None,
+        DenialMessage::ServerHello { .. }
+        | DenialMessage::DisplayPower { .. }
+        | DenialMessage::Ping { .. } => None,
     }
 }

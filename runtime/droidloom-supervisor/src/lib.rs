@@ -6,10 +6,11 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod adb;
 pub mod control;
+mod cpu_placement;
 pub mod development;
 mod development_network;
-mod cpu_placement;
 pub mod gapps;
 pub mod linux_plan;
 mod package_cache;
@@ -704,8 +705,10 @@ mod tests {
         assert!(decoded.graphics_backend.auxiliary_devices().is_empty());
         json["graphics_backend"] = serde_json::json!("kgsl_dma_heap");
         let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(decoded.graphics_backend.auxiliary_devices(),
-                   &["/dev/kgsl-3d0", "/dev/dma_heap/system"]);
+        assert_eq!(
+            decoded.graphics_backend.auxiliary_devices(),
+            &["/dev/kgsl-3d0", "/dev/dma_heap/system"]
+        );
         json["graphics_backend"] = serde_json::json!("/dev/dri/card0");
         assert!(serde_json::from_value::<CellSpec>(json).is_err());
     }

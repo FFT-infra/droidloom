@@ -12,7 +12,7 @@ use core::fmt;
 /// Marker at the start of every input record.
 pub const MAGIC: [u8; 4] = *b"DLIN";
 /// Wire protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 5;
+pub const PROTOCOL_MAJOR: u16 = 6;
 
 /// Build metadata retained by the native sender for offline package verification.
 pub const BUILD_COMPATIBILITY: [u8; 26] = compatibility_marker(PROTOCOL_MAJOR);
@@ -43,6 +43,8 @@ pub const KIND_TASK_BOUNDS: u8 = 3;
 pub const KIND_TASK_FOCUS: u8 = 4;
 /// Record kind for a request to remove one Android task.
 pub const KIND_TASK_CLOSE: u8 = 5;
+/// Record kind for the aggregate host display-power state.
+pub const KIND_DISPLAY_POWER: u8 = 6;
 /// Highest pointer identity accepted by Android `MotionEvent`.
 pub const MAX_POINTER_ID: u32 = 31;
 /// Highest key identity defined by Linux's evdev input ABI.
@@ -286,6 +288,16 @@ pub fn encode_task_close(task_id: u64) -> Result<[u8; RECORD_BYTES], InputProtoc
     Ok(record)
 }
 
+/// Encode whether any physical host display is powered on.
+pub fn encode_display_power(powered: bool) -> [u8; RECORD_BYTES] {
+    let mut record = [0_u8; RECORD_BYTES];
+    record[0..4].copy_from_slice(&MAGIC);
+    record[4..6].copy_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
+    record[6] = KIND_DISPLAY_POWER;
+    record[7] = u8::from(powered);
+    record
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +317,16 @@ mod tests {
             assert_eq!(decoded, version);
         }
         assert_eq!(BUILD_COMPATIBILITY, compatibility_marker(PROTOCOL_MAJOR));
+    }
+
+    #[test]
+    fn display_power_record_has_stable_layout() {
+        let record = encode_display_power(true);
+        assert_eq!(&record[0..4], b"DLIN");
+        assert_eq!(&record[4..6], &PROTOCOL_MAJOR.to_le_bytes());
+        assert_eq!(record[6], KIND_DISPLAY_POWER);
+        assert_eq!(record[7], 1);
+        assert!(record[8..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

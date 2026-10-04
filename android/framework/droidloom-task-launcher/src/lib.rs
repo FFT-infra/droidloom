@@ -648,7 +648,8 @@ fn normalized_component(component: &str) -> Option<String> {
 // task ownership, user, display, visibility and ambiguity checks still apply.
 fn is_play_store_sign_in(package: &str, component: &str) -> bool {
     package == "com.android.vending"
-        && component == "com.google.android.gms/com.google.android.gms.auth.uiflows.minutemaid.MinuteMaidActivity"
+        && component
+            == "com.google.android.gms/com.google.android.gms.auth.uiflows.minutemaid.MinuteMaidActivity"
 }
 
 fn is_pending_display_error(error: &LaunchError, android_display: u64) -> bool {
@@ -679,7 +680,9 @@ fn command_as_android_shell(path: &Path) -> Command {
 fn validate_request(request: &LaunchRequest) -> Result<(), LaunchError> {
     if let Some((width, height)) = request.resolution {
         if !(1..=16_384).contains(&width) || !(1..=16_384).contains(&height) {
-            return Err(LaunchError::InvalidRequest("resolution dimensions must be in 1..=16384".into()));
+            return Err(LaunchError::InvalidRequest(
+                "resolution dimensions must be in 1..=16384".into(),
+            ));
         }
     }
     if request.package.is_empty()
@@ -801,10 +804,13 @@ fn matching_launch_tasks(
             &request.package,
             Some(request.user),
             true,
-            |top| top.is_some_and(|top| {
-                is_play_store_sign_in(&request.package, top)
-                    || top.split_once('/').map(|(owner, _)| owner) == Some(request.package.as_str())
-            }),
+            |top| {
+                top.is_some_and(|top| {
+                    is_play_store_sign_in(&request.package, top)
+                        || top.split_once('/').map(|(owner, _)| owner)
+                            == Some(request.package.as_str())
+                })
+            },
         );
     }
     matching_tasks_with(
@@ -1070,7 +1076,11 @@ mod tests {
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut request = contacts_request();
         start_activity(&request, &command, 0, None).unwrap();
-        assert!(!std::fs::read_to_string(&log).unwrap().contains("--droidloom-resolution"));
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("--droidloom-resolution")
+        );
         request.resolution = Some((2560, 1440));
         start_activity(&request, &command, 0, None).unwrap();
         let arguments = std::fs::read_to_string(&log).unwrap();
@@ -1292,24 +1302,50 @@ RootTask id=5 bounds=[0,0][900,1600] displayId=42 userId=0
     fn play_store_sign_in_stays_in_its_visible_owned_task() {
         let store = "com.android.vending/com.android.vending.AssetBrowserActivity";
         let auth = "com.google.android.gms/com.google.android.gms.auth.uiflows.minutemaid.MinuteMaidActivity";
-        let request = LaunchRequest { package: "com.android.vending".into(), component: None, resolution: None, user: 0 };
-        let task = |id, owner, top, visible, display, user| format!(
-            "RootTask id={id} displayId={display} userId={user}\n  taskId={id}: {owner}/.Main userId={user} visible={visible} topActivity=ComponentInfo{{{top}}}\n"
-        );
-        let discover = |listing: &str, completed: &str| discover_launch_candidates(
-            listing, 0, &request, completed, None, None, &BTreeSet::from([9])
-        ).unwrap();
+        let request = LaunchRequest {
+            package: "com.android.vending".into(),
+            component: None,
+            resolution: None,
+            user: 0,
+        };
+        let task = |id, owner, top, visible, display, user| {
+            format!(
+                "RootTask id={id} displayId={display} userId={user}\n  taskId={id}: {owner}/.Main userId={user} visible={visible} topActivity=ComponentInfo{{{top}}}\n"
+            )
+        };
+        let discover = |listing: &str, completed: &str| {
+            discover_launch_candidates(
+                listing,
+                0,
+                &request,
+                completed,
+                None,
+                None,
+                &BTreeSet::from([9]),
+            )
+            .unwrap()
+        };
         let own = task(9, "com.android.vending", auth, true, 0, 0);
         assert_eq!(discover(&own, store), vec![9]);
         assert_eq!(discover(&own, auth), vec![9]);
-        assert_eq!(discover(&task(9, "com.android.vending", store, true, 0, 0), auth), vec![9]);
+        assert_eq!(
+            discover(&task(9, "com.android.vending", store, true, 0, 0), auth),
+            vec![9]
+        );
         for listing in [
             task(9, "com.google.android.gms", auth, true, 0, 0),
             task(9, "com.android.vending.extra", auth, true, 0, 0),
             task(9, "com.android.vending", auth, false, 0, 0),
             task(9, "com.android.vending", auth, true, 1, 0),
             task(9, "com.android.vending", auth, true, 0, 10),
-            task(9, "com.android.vending", "com.google.android.gms/.OtherActivity", true, 0, 0),
+            task(
+                9,
+                "com.android.vending",
+                "com.google.android.gms/.OtherActivity",
+                true,
+                0,
+                0,
+            ),
             own.replace("userId=0", ""),
         ] {
             assert!(discover(&listing, store).is_empty(), "{listing}");
@@ -1319,7 +1355,10 @@ RootTask id=5 bounds=[0,0][900,1600] displayId=42 userId=0
             + &task(11, "com.android.vending", auth, true, 0, 0);
         assert_eq!(discover(&ambiguous, store), vec![10, 11]);
         let output = format!("Status: ok\nActivity: {auth}\nComplete\n");
-        assert_eq!(completed_launch_activity(&output, "com.android.vending", None).unwrap(), auth);
+        assert_eq!(
+            completed_launch_activity(&output, "com.android.vending", None).unwrap(),
+            auth
+        );
         assert!(completed_launch_activity(&output, "org.example.other", None).is_err());
     }
 

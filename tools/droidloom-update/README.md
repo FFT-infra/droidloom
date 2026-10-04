@@ -31,7 +31,7 @@ for system package installation when necessary and for the final activation.
 droidloom-update plan
 droidloom-update --build-only
 droidloomctl update --clean
-droidloom-update verify .work/update/release-<build-id>
+droidloom-update verify .work/arch/build/release-<build-id>
 ```
 
 Compilation leaves two logical CPUs outside the compiler process affinity,

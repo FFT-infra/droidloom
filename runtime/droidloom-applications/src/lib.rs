@@ -13,8 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use droidloom_supervisor::control::{
-    AndroidApplication, ControlRequest, DEFAULT_CONTROL_SOCKET, request,
-    parse_launch_resolution,
+    AndroidApplication, ControlRequest, DEFAULT_CONTROL_SOCKET, parse_launch_resolution, request,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -351,24 +350,28 @@ pub fn remove_managed(paths: &CatalogPaths) -> Result<usize, CatalogError> {
     let manifest = read_manifest(&paths.manifest)?;
     for (id, entry) in &manifest.applications {
         if *id != application_id(manifest.android_user, &entry.component) {
-            return Err(CatalogError::InvalidApplication("catalog entry has an invalid managed identity".into()));
+            return Err(CatalogError::InvalidApplication(
+                "catalog entry has an invalid managed identity".into(),
+            ));
         }
     }
     let mut removed = 0;
     for (id, entry) in &manifest.applications {
         let mut files = vec![paths.applications.join(format!("droidloom-{id}.desktop"))];
-        if entry.has_icon { files.push(paths.icons.join(format!("droidloom-{id}.png"))); }
+        if entry.has_icon {
+            files.push(paths.icons.join(format!("droidloom-{id}.png")));
+        }
         for path in files {
             match fs::remove_file(&path) {
                 Ok(()) => removed += 1,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io_error("remove managed catalog entry", error)),
             }
         }
     }
     match fs::remove_file(&paths.manifest) {
-        Ok(()) => {},
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(io_error("remove catalog manifest", error)),
     }
     Ok(removed)
@@ -523,22 +526,31 @@ fn preserved_resolution(path: &Path) -> Result<Option<String>, CatalogError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error("inspect desktop resolution", error)),
         Ok(metadata) if !metadata.is_file() || metadata.len() > 1024 * 1024 => {
-            return Err(CatalogError::InvalidApplication("unsafe desktop entry for launch resolution".into()));
+            return Err(CatalogError::InvalidApplication(
+                "unsafe desktop entry for launch resolution".into(),
+            ));
         }
         Ok(_) => {}
     }
-    let content = fs::read_to_string(path).map_err(|error| io_error("read desktop resolution", error))?;
+    let content =
+        fs::read_to_string(path).map_err(|error| io_error("read desktop resolution", error))?;
     let mut in_entry = false;
     let mut resolution = None;
     for line in content.lines() {
-        if line.starts_with('[') { in_entry = line == "[Desktop Entry]"; }
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+        }
         if in_entry {
             if let Some(value) = line.strip_prefix("X-Droidloom-Resolution=") {
                 if resolution.is_some() {
-                    return Err(CatalogError::InvalidApplication("duplicate desktop launch resolution".into()));
+                    return Err(CatalogError::InvalidApplication(
+                        "duplicate desktop launch resolution".into(),
+                    ));
                 }
-                resolution = Some(parse_launch_resolution(value)
-                    .map_err(|error| CatalogError::InvalidApplication(error.to_string()))?);
+                resolution = Some(
+                    parse_launch_resolution(value)
+                        .map_err(|error| CatalogError::InvalidApplication(error.to_string()))?,
+                );
             }
         }
     }
@@ -770,7 +782,12 @@ mod tests {
         let paths = fixture_paths(temp.path());
         let mut source = FixtureSource {
             user: 0,
-            applications: vec![application("Example", "org.example.app", "org.example.app/.Main", "one")],
+            applications: vec![application(
+                "Example",
+                "org.example.app",
+                "org.example.app/.Main",
+                "one",
+            )],
             icon_requests: 0,
         };
         reconcile(&paths, &mut source).unwrap();
@@ -788,13 +805,20 @@ mod tests {
         let paths = fixture_paths(temp.path());
         let mut source = FixtureSource {
             user: 0,
-            applications: vec![application("Example", "org.example.app", "org.example.app/.Main", "one")],
+            applications: vec![application(
+                "Example",
+                "org.example.app",
+                "org.example.app/.Main",
+                "one",
+            )],
             icon_requests: 0,
         };
         reconcile(&paths, &mut source).unwrap();
         let mut manifest = read_manifest(&paths.manifest).unwrap();
         let entry = manifest.applications.values().next().unwrap().clone();
-        manifest.applications.insert("../../unrelated".into(), entry);
+        manifest
+            .applications
+            .insert("../../unrelated".into(), entry);
         fs::write(&paths.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(remove_managed(&paths).is_err());
         assert_eq!(fs::read_dir(&paths.applications).unwrap().count(), 1);
@@ -864,11 +888,19 @@ mod tests {
         let paths = fixture_paths(temporary.path());
         let mut source = FixtureSource {
             user: 0,
-            applications: vec![application("Game", "org.example.game", "org.example.game/.Main", "one")],
+            applications: vec![application(
+                "Game",
+                "org.example.game",
+                "org.example.game/.Main",
+                "one",
+            )],
             icon_requests: 0,
         };
         reconcile(&paths, &mut source).unwrap();
-        let path = paths.applications.join(format!("droidloom-{}.desktop", application_id(0, "org.example.game/.Main")));
+        let path = paths.applications.join(format!(
+            "droidloom-{}.desktop",
+            application_id(0, "org.example.game/.Main")
+        ));
         let mut desktop = fs::read_to_string(&path).unwrap();
         desktop.push_str("X-Droidloom-Resolution=2560x1440\n");
         fs::write(&path, desktop).unwrap();
@@ -879,7 +911,11 @@ mod tests {
         assert!(desktop.contains("--user 0 --resolution 2560x1440\n"));
         assert_eq!(desktop.matches("X-Droidloom-Resolution=").count(), 1);
         assert_eq!(reconcile(&paths, &mut source).unwrap().launchers_updated, 0);
-        fs::write(&path, "[Desktop Entry]\nX-Droidloom-Resolution=2560x1440 --other\n").unwrap();
+        fs::write(
+            &path,
+            "[Desktop Entry]\nX-Droidloom-Resolution=2560x1440 --other\n",
+        )
+        .unwrap();
         assert!(preserved_resolution(&path).is_err());
     }
 

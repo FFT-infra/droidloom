@@ -302,6 +302,12 @@ pub struct DenialEndpoint {
 }
 
 impl DenialEndpoint {
+    /// Whether version and capability negotiation has completed.
+    #[must_use]
+    pub const fn ready(&self) -> bool {
+        self.ready
+    }
+
     /// Construct an endpoint after the listener authenticates the peer with
     /// `SO_PEERCRED`. The first accepted record must still be `ClientHello`.
     pub fn new(socket: ProtocolSocket, device: SyncobjDevice) -> Self {
@@ -318,7 +324,10 @@ impl DenialEndpoint {
     /// Opt in only when the host implements activation under its focus policy.
     #[must_use]
     pub fn with_activation_requests(mut self) -> Self {
-        assert!(!self.ready, "activation must be configured before handshake");
+        assert!(
+            !self.ready,
+            "activation must be configured before handshake"
+        );
         self.activation_requests = true;
         self
     }
@@ -387,7 +396,10 @@ impl DenialEndpoint {
             ),
             AndroidMessage::BindLayerStream { object } => {
                 self.task(object)?;
-                Ok(EndpointAction::BindLayerStream { object, sockets: received.descriptors.into_iter().map(|d| d.fd).collect() })
+                Ok(EndpointAction::BindLayerStream {
+                    object,
+                    sockets: received.descriptors.into_iter().map(|d| d.fd).collect(),
+                })
             }
             AndroidMessage::SetContentState { object, flags } => {
                 self.task(object)?;
@@ -398,7 +410,9 @@ impl DenialEndpoint {
                 Ok(EndpointAction::SetFrameRate { object, millihz })
             }
             AndroidMessage::RequestActivation { object } => {
-                if !self.activation_requests { return Err(EndpointError::IncompatibleClient); }
+                if !self.activation_requests {
+                    return Err(EndpointError::IncompatibleClient);
+                }
                 if self.task(object)?.task.is_none() {
                     return Err(EndpointError::UnknownObject(object));
                 }
@@ -538,6 +552,17 @@ impl DenialEndpoint {
             visibility,
             focused,
         })?;
+        Ok(())
+    }
+
+    /// Publish the aggregate power state of the host's physical outputs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates codec or socket failure.
+    pub fn send_display_power(&self, powered: bool) -> Result<(), EndpointError> {
+        self.socket
+            .send_denial(&DenialMessage::DisplayPower { powered })?;
         Ok(())
     }
 
@@ -763,9 +788,13 @@ impl DenialEndpoint {
         self.activation_requests &= capabilities & capability::TASK_ACTIVATION != 0;
         self.socket.send_denial(&DenialMessage::ServerHello {
             major: PROTOCOL_MAJOR,
-            minor: if self.activation_requests { PROTOCOL_MINOR } else { droidloom_denial_protocol::BASE_PROTOCOL_MINOR },
+            minor: PROTOCOL_MINOR,
             capabilities: capability::REQUIRED_V1
-                | if self.activation_requests { capability::TASK_ACTIVATION } else { 0 },
+                | if self.activation_requests {
+                    capability::TASK_ACTIVATION
+                } else {
+                    0
+                },
             max_task_objects: MAX_TASK_OBJECTS,
             max_buffers_per_task: MAX_BUFFERS_PER_TASK,
             max_damage_rects: u32::try_from(MAX_DAMAGE_RECTS).unwrap_or(u32::MAX),
@@ -943,8 +972,19 @@ impl DenialEndpoint {
         };
         task.pending.insert(frame, accepted.clone());
         if let Some(begin) = trace_begin {
-            droidloom_syncobj::frame_trace::event("host_receive", object.0, frame.0, buffer.0,
-                &[("receive_ns", begin), ("fence_exported_ns", droidloom_syncobj::frame_trace::now_ns())]);
+            droidloom_syncobj::frame_trace::event(
+                "host_receive",
+                object.0,
+                frame.0,
+                buffer.0,
+                &[
+                    ("receive_ns", begin),
+                    (
+                        "fence_exported_ns",
+                        droidloom_syncobj::frame_trace::now_ns(),
+                    ),
+                ],
+            );
         }
         Ok(EndpointAction::Present {
             frame: accepted,
@@ -998,7 +1038,8 @@ mod tests {
 
     use droidloom_denial_ipc::{ProtocolSocket, SeqPacket};
     use droidloom_denial_protocol::{
-        AndroidDisplayId, AndroidMessage, AndroidTaskId, DenialMessage, TaskObjectId, capability,
+        AndroidDisplayId, AndroidMessage, AndroidTaskId, DenialMessage, PROTOCOL_MINOR,
+        TaskObjectId, capability,
     };
     use droidloom_syncobj::SyncobjDevice;
 
@@ -1148,29 +1189,85 @@ mod tests {
     fn activation_requires_mutual_support_and_a_bound_live_task() {
         for (host_support, client_support) in [(false, true), (true, false), (true, true)] {
             let (android, endpoint) = pair();
-            let mut denial = if host_support { endpoint.with_activation_requests() } else { endpoint };
-            android.send_android(&AndroidMessage::ClientHello { min_major: 1, max_major: 1,
-                capabilities: capability::REQUIRED_V1 | if client_support { capability::TASK_ACTIVATION } else { 0 } }, &[]).unwrap();
+            let mut denial = if host_support {
+                endpoint.with_activation_requests()
+            } else {
+                endpoint
+            };
+            android
+                .send_android(
+                    &AndroidMessage::ClientHello {
+                        min_major: 1,
+                        max_major: 1,
+                        capabilities: capability::REQUIRED_V1
+                            | if client_support {
+                                capability::TASK_ACTIVATION
+                            } else {
+                                0
+                            },
+                    },
+                    &[],
+                )
+                .unwrap();
             denial.receive_action().unwrap();
-            let DenialMessage::ServerHello { capabilities, minor, .. } = android.receive_denial().unwrap().message else { panic!("missing hello") };
+            let DenialMessage::ServerHello {
+                capabilities,
+                minor,
+                ..
+            } = android.receive_denial().unwrap().message
+            else {
+                panic!("missing hello")
+            };
             let supported = host_support && client_support;
             assert_eq!(capabilities & capability::TASK_ACTIVATION != 0, supported);
-            assert_eq!(minor, if supported { 4 } else { 3 });
+            assert_eq!(minor, PROTOCOL_MINOR);
             let object = TaskObjectId(1);
-            android.send_android(&AndroidMessage::RequestActivation { object }, &[]).unwrap();
+            android
+                .send_android(&AndroidMessage::RequestActivation { object }, &[])
+                .unwrap();
             assert!(denial.receive_action().is_err()); // Unknown task, even with the capability.
-            android.send_android(&AndroidMessage::CreateTask { object, display: AndroidDisplayId(1), package: "org.example.app".into() }, &[]).unwrap();
+            android
+                .send_android(
+                    &AndroidMessage::CreateTask {
+                        object,
+                        display: AndroidDisplayId(1),
+                        package: "org.example.app".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
             denial.receive_action().unwrap();
-            android.send_android(&AndroidMessage::RequestActivation { object }, &[]).unwrap();
+            android
+                .send_android(&AndroidMessage::RequestActivation { object }, &[])
+                .unwrap();
             assert!(denial.receive_action().is_err()); // A reserved display is not a bound task.
-            android.send_android(&AndroidMessage::BindTask { object, task: AndroidTaskId(26) }, &[]).unwrap();
+            android
+                .send_android(
+                    &AndroidMessage::BindTask {
+                        object,
+                        task: AndroidTaskId(26),
+                    },
+                    &[],
+                )
+                .unwrap();
             denial.receive_action().unwrap();
-            for _ in 0..2 { // Reopening requests activation of the same object, never a second window.
-                android.send_android(&AndroidMessage::RequestActivation { object }, &[]).unwrap();
+            for _ in 0..2 {
+                // Reopening requests activation of the same object, never a second window.
+                android
+                    .send_android(&AndroidMessage::RequestActivation { object }, &[])
+                    .unwrap();
                 if supported {
-                    assert!(matches!(denial.receive_action().unwrap(), EndpointAction::RequestActivation { object: TaskObjectId(1) }));
+                    assert!(matches!(
+                        denial.receive_action().unwrap(),
+                        EndpointAction::RequestActivation {
+                            object: TaskObjectId(1)
+                        }
+                    ));
                 } else {
-                    assert!(matches!(denial.receive_action(), Err(EndpointError::IncompatibleClient)));
+                    assert!(matches!(
+                        denial.receive_action(),
+                        Err(EndpointError::IncompatibleClient)
+                    ));
                 }
             }
         }

@@ -19,7 +19,7 @@ build() {
 
 package_droidloom-runtime() {
   depends=("droidloom-image=$pkgver-$pkgrel" glibc gcc-libs mesa libdrm wayland
-    libxkbcommon systemd polkit util-linux e2fsprogs iproute2 nftables iptables)
+    libxkbcommon systemd polkit util-linux e2fsprogs iproute2 nftables iptables android-tools)
   "$DROIDLOOM_PACKAGE_TOOL" install-tree --source "$srcdir/payload/runtime" --destination "$pkgdir"
 }
 

@@ -9,8 +9,12 @@ For development boot only, Droidloom extracts and verifies the module's
 `etc/classpaths/bootclasspath.pb` and `javalib/framework-virtualization.jar`,
 projects them read-only below `/droidloom`, and runs the Rust
 `droidloom-classpath-wrapper` in place of the ordinary `derive_classpath`
-one-shot. The wrapper bind-mounts the projection at `/apex/com.android.virt`
-and can apply explicitly listed, regular-file overrides from the same
+one-shot. The wrapper bind-mounts the projection at `/apex/com.android.virt` and its
+existing numeric version aliases. This also hides the original APEX VINTF
+fragments: a classpath-only projection must not advertise AVF provisioning
+services whose executables are absent. It refreshes the APEX info-list timestamp
+after projection so libvintf invalidates any manifest cached before the mounts. It
+can also apply explicitly listed, regular-file overrides from the same
 read-only `/droidloom` projection to existing paths below `/apex`. The
 first-pixels configuration uses that bounded mechanism for the patched
 `netbpfload` binary that tolerates unrelated BPF IDs in the shared host kernel

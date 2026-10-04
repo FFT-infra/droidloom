@@ -295,9 +295,11 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"PK\x03\x04test payload").unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
-        let output =
-            diagnostics::capture_with_stdin(&mut droidloom_cpu_placement::command("/usr/bin/cat"), Stdio::from(file))
-                .unwrap();
+        let output = diagnostics::capture_with_stdin(
+            &mut droidloom_cpu_placement::command("/usr/bin/cat"),
+            Stdio::from(file),
+        )
+        .unwrap();
         assert_eq!(output.as_bytes(), b"PK\x03\x04test payload");
     }
 }

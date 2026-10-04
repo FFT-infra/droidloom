@@ -193,7 +193,9 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
         }),
         opcode::PRESENT_WITH_CONTENT if payload.len() == 24 && descriptor_count <= 1 => {
             let flags = read_u32(payload, 16)?;
-            if flags & !1 != 0 || read_u32(payload, 20)? != 0 { return Err(WireError::Field); }
+            if flags & !1 != 0 || read_u32(payload, 20)? != 0 {
+                return Err(WireError::Field);
+            }
             Ok(Request::Present {
                 display: read_u64(payload, 0)?,
                 buffer: nonzero(read_u64(payload, 8)?)?,
@@ -209,7 +211,8 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
                 width: read_u32(payload, 32)?,
                 height: read_u32(payload, 36)?,
             };
-            if flags & !1 != 0 || read_u32(payload, 20)? != 0
+            if flags & !1 != 0
+                || read_u32(payload, 20)? != 0
                 || (damage.width == 0) != (damage.height == 0)
                 || damage.x.checked_add(damage.width).is_none()
                 || damage.y.checked_add(damage.height).is_none()
@@ -223,7 +226,11 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
                 damage: Some(damage),
             })
         }
-        opcode::OPEN_LAYERS if payload.len() == 8 && descriptor_count == 0 => Ok(Request::OpenLayers { display: read_u64(payload, 0)? }),
+        opcode::OPEN_LAYERS if payload.len() == 8 && descriptor_count == 0 => {
+            Ok(Request::OpenLayers {
+                display: read_u64(payload, 0)?,
+            })
+        }
         opcode::CANCEL if payload.len() == 16 && descriptor_count == 0 => Ok(Request::Cancel {
             display: read_u64(payload, 0)?,
             buffer: nonzero(read_u64(payload, 8)?)?,
@@ -436,16 +443,35 @@ mod tests {
             push_u32(&mut payload, flags);
             push_u32(&mut payload, 0);
             for descriptors in [0, 1] {
-                assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, descriptors), descriptors),
-                    Ok(Request::Present { display: 7, buffer: 9, opaque, damage: None }));
+                assert_eq!(
+                    decode_request(
+                        &request(opcode::PRESENT_WITH_CONTENT, &payload, descriptors),
+                        descriptors
+                    ),
+                    Ok(Request::Present {
+                        display: 7,
+                        buffer: 9,
+                        opaque,
+                        damage: None
+                    })
+                );
             }
             payload[20] = 1;
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0), Err(WireError::Field));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0),
+                Err(WireError::Field)
+            );
             payload[20] = 0;
             payload[16] = 2;
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0), Err(WireError::Field));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0),
+                Err(WireError::Field)
+            );
             payload.truncate(16);
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0), Err(WireError::Length));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0),
+                Err(WireError::Length)
+            );
         }
     }
 
@@ -460,27 +486,48 @@ mod tests {
             }
             for descriptors in [0, 1] {
                 assert_eq!(
-                    decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, descriptors), descriptors),
+                    decode_request(
+                        &request(opcode::PRESENT_WITH_DAMAGE, &payload, descriptors),
+                        descriptors
+                    ),
                     Ok(Request::Present {
-                        display: 7, buffer: 9, opaque: true,
-                        damage: Some(DamageRect { x: 10, y: 20, width, height }),
+                        display: 7,
+                        buffer: 9,
+                        opaque: true,
+                        damage: Some(DamageRect {
+                            x: 10,
+                            y: 20,
+                            width,
+                            height
+                        }),
                     })
                 );
             }
             for offset in [16, 20] {
                 let mut bad = payload.clone();
                 bad[offset] = 2;
-                assert_eq!(decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &bad, 0), 0), Err(WireError::Field));
+                assert_eq!(
+                    decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &bad, 0), 0),
+                    Err(WireError::Field)
+                );
             }
             payload.pop();
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0), Err(WireError::Length));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0),
+                Err(WireError::Length)
+            );
         }
         for values in [[0, 0, 0, 1], [u32::MAX, 0, 1, 1], [0, u32::MAX, 1, 1]] {
             let mut payload = Vec::new();
             push_u64(&mut payload, 7);
             push_u64(&mut payload, 9);
-            for value in [0, 0].into_iter().chain(values) { push_u32(&mut payload, value); }
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0), Err(WireError::Field));
+            for value in [0, 0].into_iter().chain(values) {
+                push_u32(&mut payload, value);
+            }
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0),
+                Err(WireError::Field)
+            );
         }
     }
 

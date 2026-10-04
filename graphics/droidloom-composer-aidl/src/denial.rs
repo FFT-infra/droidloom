@@ -882,7 +882,9 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Presented { object, .. }
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
-        DenialMessage::ServerHello { .. } | DenialMessage::Ping { .. } => None,
+        DenialMessage::ServerHello { .. }
+        | DenialMessage::DisplayPower { .. }
+        | DenialMessage::Ping { .. } => None,
     }
 }
 

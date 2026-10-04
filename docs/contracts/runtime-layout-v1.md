@@ -90,7 +90,11 @@ ashmem only if an AOSP compatibility audit still requires it, the three private
 Binder devices, and exactly one configured DRM render node. No `card*`, KMS,
 physical input, framebuffer, camera, media, USB, Bluetooth, modem, block, raw
 memory, or host control node is allowed. The synthetic sysfs exposes the
-otherwise-empty fusectl mount point but no host FUSE connections.
+otherwise-empty fusectl mount point but no host FUSE connections. It also
+projects a read-only allowlist of battery and charger status attributes from
+host power-supply sysfs. This lets Android schedule charging-only maintenance
+against the real power source without exposing power-supply controls or device
+links.
 
 ## Host paths
 
@@ -139,6 +143,36 @@ Each cell owns a network namespace and one veth peer. Host policy assigns its
 address, forwarding, DNS broker, anti-spoofing, and NAT/firewall objects under
 a stable cell tag. Android `netd` may operate only inside the cell namespace.
 Teardown removes every tagged host object even if Android is unresponsive.
+
+The executable preview starts authenticated `adbd` on the cell's private
+`10.177.0.2:5555` endpoint. Its host input rule permits only established IPv4
+TCP replies from that endpoint before dropping other cell-originated host
+traffic; inbound forwarding to the cell remains blocked. No host LAN listener
+or forwarding exception is created for ADB.
+
+The lifecycle owner runs `/usr/bin/adb` with the configured host user's UID,
+primary GID, that user's supplementary groups and passwd home directory. It
+never retains inherited daemon/root groups or starts a root ADB server. It starts
+that user's default local ADB server through a separate transient user service,
+so the server never belongs to the Droidloom lifecycle daemon's cgroup. It reuses
+an existing server without replacing it, derives the public key without reading
+user-selected paths as root, and projects the public key read-only at
+`/adb_keys`. The private key stays in the user's `~/.android/adbkey`.
+Runtime-generated read-only product properties enforce `ro.adb.secure=1` and
+the `Droidloom` model / `droidloom` device identity. Boot parameters supply
+`ro.serialno=droidloom`. The generated init policy starts the existing AOSP
+adbd service independently of USB configuration and retains the previously
+projected classpath and CPU policy. Persistent Android data is preserved.
+
+A connection worker uses bounded requests to the standard ADB host protocol
+to retry registration with the user's server, including after server restarts.
+Host requests cannot implicitly fork a server into the lifecycle daemon's
+cgroup or replace a server with a different client version.
+Teardown joins the worker and disconnects
+only this transport before removing its route and generated configuration.
+Missing host ADB or an unusable user home disables automatic ADB without
+preventing Android boot. TCP transport serials remain address-based; the
+stable ADB selector is `device:droidloom`.
 
 ## Construction transaction
 

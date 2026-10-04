@@ -109,14 +109,24 @@ pub(super) struct Clipboard {
 impl Clipboard {
     #[cfg(test)]
     pub fn test_text(&self) -> Option<&str> {
-        self.current.as_ref().and_then(|c|c.description.text.as_deref())
+        self.current
+            .as_ref()
+            .and_then(|c| c.description.text.as_deref())
     }
     #[cfg(test)]
     pub fn test_publish(&mut self, text: &str) {
-        self.current=Some(Arc::new(Clip { description: Description {
-            id: "test-export".into(), text: Some(text.into()), ..Default::default()
-        }, files: vec![] }));
-        self.publish_pending=true; self.focused=true; self.serial=Some(42); self.ready=true;
+        self.current = Some(Arc::new(Clip {
+            description: Description {
+                id: "test-export".into(),
+                text: Some(text.into()),
+                ..Default::default()
+            },
+            files: vec![],
+        }));
+        self.publish_pending = true;
+        self.focused = true;
+        self.serial = Some(42);
+        self.ready = true;
     }
 
     pub fn new(path: PathBuf, globals: &GlobalList, qh: &QueueHandle<App>) -> io::Result<Self> {
@@ -191,7 +201,8 @@ impl Clipboard {
     }
     pub fn unblock_deadline(&self) -> Option<Instant> {
         self.peer.as_ref()?;
-        self.pending_since.map(|since| since + Duration::from_secs(10))
+        self.pending_since
+            .map(|since| since + Duration::from_secs(10))
     }
     pub fn fds(&self) -> [(RawFd, i16); 2] {
         [
@@ -807,9 +818,10 @@ mod tests {
     }
 }
 
-
 fn spawn_background<F>(name: &str, work: F) -> std::thread::JoinHandle<()>
-where F: FnOnce() + Send + 'static {
+where
+    F: FnOnce() + Send + 'static,
+{
     droidloom_cpu_placement::spawn(name, droidloom_cpu_placement::Role::Background, work)
         .expect("spawn clipboard worker")
 }

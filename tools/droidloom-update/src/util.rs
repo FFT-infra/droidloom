@@ -20,7 +20,9 @@ pub fn run(command: &mut Command) -> Result<()> {
 }
 /// Bound the complete compiler process tree, including nested Ninja and JVM workers.
 pub fn run_build(command: &mut Command) -> Result<()> {
-    if std::env::var_os("DROIDLOOM_COMPILER_CPUS_RESERVED").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if std::env::var_os("DROIDLOOM_COMPILER_CPUS_RESERVED").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
         return run(command);
     }
     use std::os::unix::process::CommandExt;

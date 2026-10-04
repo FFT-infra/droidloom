@@ -13,6 +13,7 @@ import android.os.IBinder;
 import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.InputEvent;
@@ -47,7 +48,7 @@ public final class InputBridge {
     private static final boolean INPUT_TRACE = "1".equals(System.getenv("DROIDLOOM_INPUT_TRACE"));
     private static final String SOCKET_ENV = "ANDROID_SOCKET_droidloom_input";
     private static final int RECORD_BYTES = 40;
-    private static final int PROTOCOL_MAJOR = 5;
+    private static final int PROTOCOL_MAJOR = 6;
     private static final String BUILD_COMPATIBILITY =
             "DROIDLOOM_INPUT_ABI=" + PROTOCOL_MAJOR + ";";
     private static final int KIND_TOUCH = 1;
@@ -55,6 +56,7 @@ public final class InputBridge {
     private static final int KIND_TASK_BOUNDS = 3;
     private static final int KIND_TASK_FOCUS = 4;
     private static final int KIND_TASK_CLOSE = 5;
+    private static final int KIND_DISPLAY_POWER = 6;
     private static final int TOUCH_ACTION_DOWN = 0;
     private static final int TOUCH_ACTION_MOTION = 1;
     private static final int TOUCH_ACTION_UP = 2;
@@ -73,6 +75,7 @@ public final class InputBridge {
     private static final String SURFACE_FLINGER_SERVICE = "SurfaceFlinger";
     private static final String SURFACE_FLINGER_DESCRIPTOR = "android.ui.ISurfaceComposer";
     private static final String ACTIVITY_TASK_SERVICE = "activity_task";
+    private static final String POWER_SERVICE = "power";
     private static final String INPUT_SERVICE = "inputflinger";
     private static final String INPUT_DESCRIPTOR = "android.os.IInputFlinger";
 
@@ -84,6 +87,7 @@ public final class InputBridge {
             Executors.newSingleThreadScheduledExecutor();
     private final Method mSetDisplayId;
     private final Method mGetSystemService;
+    private final Method mWaitForSystemService;
     private final Method mAsActivityTaskManagerInterface;
     private final Method mSetTaskResizeable;
     private final Method mGetTaskBounds;
@@ -91,6 +95,10 @@ public final class InputBridge {
     private final Method mRemoveTask;
     private final Method mGetTasks;
     private final Method mResizeTask;
+    private final Method mAsPowerManagerInterface;
+    private final Method mIsInteractive;
+    private final Method mGoToSleep;
+    private final Method mWakeUp;
     private final Field mTaskId;
     private final Field mTaskDisplayId;
 
@@ -102,6 +110,7 @@ public final class InputBridge {
         // leaving the boot framework and its Binder ABI untouched.
         final Class<?> serviceManagerClass = Class.forName("android.os.ServiceManager");
         mGetSystemService = serviceManagerClass.getMethod("getService", String.class);
+        mWaitForSystemService = serviceManagerClass.getMethod("waitForService", String.class);
         mSetDisplayId = InputEvent.class.getDeclaredMethod("setDisplayId", int.class);
         mSetDisplayId.setAccessible(true);
 
@@ -120,6 +129,15 @@ public final class InputBridge {
                 "getTasks", int.class, boolean.class, boolean.class, int.class);
         mResizeTask = activityTaskManagerInterface.getMethod(
                 "resizeTask", int.class, Rect.class, int.class);
+
+        final Class<?> powerManagerInterface = Class.forName("android.os.IPowerManager");
+        final Class<?> powerManagerStub = Class.forName("android.os.IPowerManager$Stub");
+        mAsPowerManagerInterface = powerManagerStub.getMethod("asInterface", IBinder.class);
+        mIsInteractive = powerManagerInterface.getMethod("isInteractive");
+        mGoToSleep = powerManagerInterface.getMethod(
+                "goToSleep", long.class, int.class, int.class);
+        mWakeUp = powerManagerInterface.getMethod(
+                "wakeUp", long.class, int.class, String.class, String.class);
 
         final Class<?> taskInfoClass = Class.forName("android.app.TaskInfo");
         mTaskId = taskInfoClass.getField("taskId");
@@ -219,6 +237,17 @@ public final class InputBridge {
         }
         final int kind = Byte.toUnsignedInt(record.get());
         final int action = Byte.toUnsignedInt(record.get());
+        if (kind == KIND_DISPLAY_POWER) {
+            if (action > 1) {
+                throw new IllegalArgumentException("invalid display-power state");
+            }
+            while (record.hasRemaining()) {
+                if (record.get() != 0) {
+                    throw new IllegalArgumentException("invalid display-power reserved field");
+                }
+            }
+            return new DisplayPowerRecord(action != 0);
+        }
         if (kind == KIND_TASK_BOUNDS) {
             final int taskId = record.getInt();
             final int width = record.getInt();
@@ -321,8 +350,32 @@ public final class InputBridge {
             focusTask((TaskFocusRecord) record);
         } else if (record instanceof TaskCloseRecord) {
             closeTask((TaskCloseRecord) record);
+        } else if (record instanceof DisplayPowerRecord) {
+            setDisplayPower((DisplayPowerRecord) record);
         } else {
             throw new IllegalArgumentException("unsupported decoded input record");
+        }
+    }
+
+    private void setDisplayPower(DisplayPowerRecord record) {
+        try {
+            final Object powerManager = powerManager();
+            final boolean interactive = (Boolean) mIsInteractive.invoke(powerManager);
+            if (interactive == record.powered) {
+                return;
+            }
+            resetTransientInputState();
+            final long now = SystemClock.uptimeMillis();
+            if (record.powered) {
+                mWakeUp.invoke(
+                        powerManager, now, 1, "droidloom:host-display", "android");
+            } else {
+                mGoToSleep.invoke(powerManager, now, 4, 0);
+            }
+            Log.i(TAG, "Android display power follows host: "
+                    + (record.powered ? "on" : "off"));
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("Android power-manager API failed", error);
         }
     }
 
@@ -709,6 +762,20 @@ public final class InputBridge {
         return activityTaskManager;
     }
 
+    private Object powerManager() throws ReflectiveOperationException {
+        // The bridge is started before system_server. Preserve the first host
+        // display state by waiting here instead of dropping it during boot.
+        final IBinder binder = (IBinder) mWaitForSystemService.invoke(null, POWER_SERVICE);
+        if (binder == null) {
+            throw new IllegalStateException("PowerManager is not ready");
+        }
+        final Object powerManager = mAsPowerManagerInterface.invoke(null, binder);
+        if (powerManager == null) {
+            throw new IllegalStateException("PowerManager is not ready");
+        }
+        return powerManager;
+    }
+
     private static long taskIdentity(int displayId, int taskId) {
         return ((long) displayId << 32) | Integer.toUnsignedLong(taskId);
     }
@@ -807,6 +874,14 @@ public final class InputBridge {
     }
 
     private interface RoutedRecord {}
+
+    private static final class DisplayPowerRecord implements RoutedRecord {
+        final boolean powered;
+
+        DisplayPowerRecord(boolean powered) {
+            this.powered = powered;
+        }
+    }
 
     private static final class Gesture {
         final long downTimeMillis;

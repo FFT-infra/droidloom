@@ -200,7 +200,6 @@ fn host_presentation_is_ordinary_wayland_without_plugin_artifacts() {
     assert!(android_catalog.contains("Bitmap.CompressFormat.PNG"));
 }
 
-
 #[test]
 fn shared_kernel_vintf_reports_the_real_kernel_policy_version() {
     let root = repository_root();
@@ -304,13 +303,42 @@ fn native_targeted_input_keeps_the_boot_framework_abi_untouched() {
 }
 
 #[test]
+fn host_display_power_reaches_android_power_manager_through_versioned_protocols() {
+    let root = repository_root();
+    let presenter = fs::read_to_string(root.join("graphics/droidloom-wayland/src/main.rs"))
+        .expect("read Wayland presenter");
+    let denial_protocol = fs::read_to_string(
+        root.join("graphics/droidloom-denial-protocol/src/lib.rs"),
+    )
+    .expect("read Denial protocol");
+    let input_protocol = fs::read_to_string(
+        root.join("graphics/droidloom-input-protocol/src/lib.rs"),
+    )
+    .expect("read input protocol");
+    let bridge = fs::read_to_string(root.join(
+        "android/framework/droidloom-input-bridge/src/com/android/droidloom/input/InputBridge.java",
+    ))
+    .expect("read Droidloom input bridge");
+
+    assert!(presenter.contains("ZwlrOutputPowerManagerV1"));
+    assert!(presenter.contains("aggregate_display_power"));
+    assert!(denial_protocol.contains("DisplayPower"));
+    assert!(input_protocol.contains("encode_display_power"));
+    assert!(bridge.contains("mGoToSleep.invoke"));
+    assert!(bridge.contains("mWakeUp.invoke"));
+    assert!(bridge.contains("waitForService"));
+}
+
+#[test]
 fn android_task_geometry_does_not_conflate_density_with_wayland_scale() {
     let root = repository_root();
     let bridge = fs::read_to_string(root.join(
         "android/framework/droidloom-input-bridge/src/com/android/droidloom/input/InputBridge.java",
     ))
     .expect("read Droidloom input bridge");
-    assert!(bridge.contains("mResizeTask.invoke(activityTaskManager, record.taskId, requestedBounds,"));
+    assert!(
+        bridge.contains("mResizeTask.invoke(activityTaskManager, record.taskId, requestedBounds,")
+    );
     assert!(!bridge.contains("setDensityDpi"));
     assert!(!bridge.contains("scaledDensity"));
 
@@ -398,6 +426,10 @@ fn packaged_artifact_compatibility_regressions() {
         .current_dir(root)
         .output()
         .expect("python3 is required for package contract tests");
-    assert!(output.status.success(), "{}{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -441,11 +441,18 @@ mod tests {
         });
         assert_eq!(state.latest_configure().unwrap().refresh_millihz, 143_973);
         assert_eq!(state.in_flight_count(), 1);
-        let damage = vec![Damage { x: 10, y: 20, width: 30, height: 40 }];
+        let damage = vec![Damage {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        }];
         let second = state.submit(buffer(12), damage.clone(), true).unwrap();
         assert_eq!(second.damage, damage);
-        assert_eq!(state.submit(buffer(11), full_damage(), true),
-            Err(TransportError::BufferInFlight(BufferId(11))));
+        assert_eq!(
+            state.submit(buffer(11), full_damage(), true),
+            Err(TransportError::BufferInFlight(BufferId(11)))
+        );
         state.release(first.frame_id, true).unwrap();
         let unchanged = state.submit(buffer(11), Vec::new(), true).unwrap();
         assert!(unchanged.damage.is_empty());
