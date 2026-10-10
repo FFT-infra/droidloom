@@ -6,37 +6,36 @@
 -->
 <!--
   Android requires a primary module while bootstrapping AudioFlinger. Both
-  endpoints use BUS devices so AOSP's example AIDL implementation selects its
-  timed stub stream. The audio-service patch recognizes AIDL IN_BUS/OUT_BUS
-  device types as well as the older BUS connection string.
+  endpoints use BUS devices to select the private host PipeWire bridge.
+  Missing host endpoints and denied capture retain the timed silence fallback.
 -->
 <module name="default" halVersion="3.0">
     <attachedDevices>
-        <item>Droidloom Silent Output</item>
-        <item>Droidloom Silent Input</item>
+        <item>Droidloom Host Output</item>
+        <item>Droidloom Host Input</item>
     </attachedDevices>
-    <defaultOutputDevice>Droidloom Silent Output</defaultOutputDevice>
+    <defaultOutputDevice>Droidloom Host Output</defaultOutputDevice>
     <mixPorts>
-        <mixPort name="droidloom silent output" role="source"
+        <mixPort name="droidloom host output" role="source"
             flags="AUDIO_OUTPUT_FLAG_PRIMARY">
             <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
                 samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
         </mixPort>
-        <mixPort name="droidloom silent input" role="sink">
+        <mixPort name="droidloom host input" role="sink">
             <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
                 samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_MONO"/>
         </mixPort>
     </mixPorts>
     <devicePorts>
-        <devicePort tagName="Droidloom Silent Output" type="AUDIO_DEVICE_OUT_BUS"
-            role="sink" address="droidloom-silent-output"/>
-        <devicePort tagName="Droidloom Silent Input" type="AUDIO_DEVICE_IN_BUS"
-            role="source" address="droidloom-silent-input"/>
+        <devicePort tagName="Droidloom Host Output" type="AUDIO_DEVICE_OUT_BUS"
+            role="sink" address="droidloom-host-output"/>
+        <devicePort tagName="Droidloom Host Input" type="AUDIO_DEVICE_IN_BUS"
+            role="source" address="droidloom-host-input"/>
     </devicePorts>
     <routes>
-        <route type="mix" sink="Droidloom Silent Output"
-            sources="droidloom silent output"/>
-        <route type="mix" sink="droidloom silent input"
-            sources="Droidloom Silent Input"/>
+        <route type="mix" sink="Droidloom Host Output"
+            sources="droidloom host output"/>
+        <route type="mix" sink="droidloom host input"
+            sources="Droidloom Host Input"/>
     </routes>
 </module>

@@ -49,6 +49,7 @@ pub fn ensure() -> Result<()> {
         ("gbm", "mesa"),
         ("libdrm", "libdrm"),
         ("wayland-client", "wayland"),
+        ("libpipewire-0.3", "libpipewire"),
         ("LLVMSPIRVLib", "spirv-llvm-translator"),
     ] {
         if !available("pkg-config")

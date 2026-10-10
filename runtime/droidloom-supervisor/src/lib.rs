@@ -116,6 +116,8 @@ pub enum GraphicsBackend {
     /// Native DRM rendering and allocation; retains existing cell behavior.
     #[default]
     Drm,
+    /// Native DRM rendering with portable linear system DMA-heap images.
+    DrmDmaHeap,
     /// Turnip KGSL rendering, Zink GLES and linear system DMA-heap images.
     KgslDmaHeap,
 }
@@ -125,6 +127,7 @@ impl GraphicsBackend {
     pub fn auxiliary_devices(self) -> &'static [&'static str] {
         match self {
             Self::Drm => &[],
+            Self::DrmDmaHeap => &["/dev/dma_heap/system"],
             Self::KgslDmaHeap => &["/dev/kgsl-3d0", "/dev/dma_heap/system"],
         }
     }
@@ -703,6 +706,13 @@ mod tests {
         let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(decoded.graphics_backend, GraphicsBackend::Drm);
         assert!(decoded.graphics_backend.auxiliary_devices().is_empty());
+        json["graphics_backend"] = serde_json::json!("drm_dma_heap");
+        let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.graphics_backend, GraphicsBackend::DrmDmaHeap);
+        assert_eq!(
+            decoded.graphics_backend.auxiliary_devices(),
+            &["/dev/dma_heap/system"]
+        );
         json["graphics_backend"] = serde_json::json!("kgsl_dma_heap");
         let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(

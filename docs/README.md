@@ -6,8 +6,9 @@
 
 - [Architecture](architecture.md): Android cell, graphics path and source boundaries; [proposed Linux host integration](architecture.md#host-service-integration-direction) for SMS, calls and audio.
 - [Desktop integration](desktop-integration.md): windows, clipboard, notifications and diagnostics.
-- Integration proposals: [audio](audio-integration-proposal.md) and [SMS](sms-integration-proposal.md).
-- [Security requirements](threat-model-v1.md): trust boundaries and isolation limitations.
+- [Native application integration proposal](native-app-integration.md): system-service backends and ordinary Linux application behavior.
+- [Audio bridge and remaining work](audio-integration-proposal.md); [SMS proposal](sms-integration-proposal.md).
+- [Security requirements](threat-model-v2.md): trust boundaries and isolation limitations.
 
 ## Integration contracts
 

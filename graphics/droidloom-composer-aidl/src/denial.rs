@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use binder::ParcelFileDescriptor;
 use droidloom_composer::denial::{
-    AppliedDenialEvent, DenialBridgeError, DenialTaskBinding, PreparedPresent,
+    AppliedDenialEvent, DenialBridgeError, DenialTaskBinding, PreparedPresent, RenderTargetDemand,
 };
 use droidloom_composer::{
     ClientTarget, ComposerError, DisplayId, ReservedTaskWindowSpec, TaskId, hwc3::ErrorCode,
@@ -112,6 +112,7 @@ pub struct DenialPresentationSink {
     tasks: Arc<Mutex<BTreeMap<DisplayId, TaskChannel>>>,
     compositor: Arc<Mutex<Option<LayerCompositor>>>,
     activation_requests: bool,
+    lazy_render_targets: bool,
 }
 
 impl DenialPresentationSink {
@@ -123,6 +124,7 @@ impl DenialPresentationSink {
             tasks: Arc::new(Mutex::new(BTreeMap::new())),
             compositor: Arc::new(Mutex::new(None)),
             activation_requests: false,
+            lazy_render_targets: false,
         }
     }
 
@@ -130,6 +132,13 @@ impl DenialPresentationSink {
     #[must_use]
     pub fn with_activation_requests(mut self, enabled: bool) -> Self {
         self.activation_requests = enabled;
+        self
+    }
+
+    /// Record whether this host allocates fallback targets on demand.
+    #[must_use]
+    pub fn with_lazy_render_targets(mut self, enabled: bool) -> Self {
+        self.lazy_render_targets = enabled;
         self
     }
 
@@ -201,7 +210,9 @@ impl DenialPresentationSink {
                 trace_fences: BTreeMap::new(),
                 content_opaque: None,
                 surfaceflinger_present_fence: None,
+                headless_completion: None,
                 android_display_extent: None,
+                target_demand: RenderTargetDemand::default(),
             },
         );
         Ok(())
@@ -234,22 +245,28 @@ impl DenialPresentationSink {
         Ok(())
     }
 
-    /// Destroy one task after the safe Composer core confirms it has no
-    /// in-flight buffers.
+    /// Ask the host to release its displayed frame, keeping the binding alive
+    /// so the event pump can route the resulting buffer releases. Retry safely.
     ///
     /// # Errors
     ///
-    /// Rejects an unknown display. Local state remains available for retry if
-    /// the destroy record cannot be sent.
+    /// Rejects an unknown display and preserves state on transport failure.
+    pub fn request_task_removal(&self, display: DisplayId) -> Result<(), DenialSinkError> {
+        let mut tasks = self.lock_tasks()?;
+        let task = tasks.get_mut(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
+        task.binding.request_destroy(|message| self.socket.send_android(&message, &[]))?;
+        Ok(())
+    }
+
+    /// Forget a destroyed binding after the Composer core has drained releases.
+    ///
+    /// # Errors
+    /// Rejects premature removal or a poisoned task map.
     pub fn unregister_task(&self, display: DisplayId) -> Result<(), DenialSinkError> {
         let mut tasks = self.lock_tasks()?;
-        let object = tasks
-            .get(&display)
-            .ok_or(DenialSinkError::UnknownDisplay(display))?
-            .binding
-            .object();
-        self.socket
-            .send_android(&AndroidMessage::DestroyTask { object }, &[])?;
+        if tasks.get(&display).is_some_and(|task| !task.binding.destroy_requested()) {
+            return Err(DenialBridgeError::UnexpectedMessage.into());
+        }
         tasks.remove(&display);
         Ok(())
     }
@@ -294,8 +311,9 @@ impl DenialPresentationSink {
             .find(|task| task.binding.object() == object)
             .ok_or(DenialSinkError::UnknownObject(object))?;
         let event = task.binding.apply_event(session, message)?;
-        if let AppliedDenialEvent::Configure { width, height, .. } = &event {
+        if let AppliedDenialEvent::Configure { width, height, serial, .. } = &event {
             pin_android_display_extent(&mut task.android_display_extent, *width, *height)?;
+            task.target_demand.configure(*serial);
         }
         if let DenialMessage::BufferReleased { frame, buffer, .. } = message {
             let tracked = task
@@ -415,12 +433,11 @@ impl DenialPresentationSink {
         let task = tasks
             .get_mut(&display)
             .ok_or(DenialSinkError::UnknownDisplay(display))?;
-        let newest_serial = task
-            .render_targets
-            .values()
-            .filter(|target| !target.revoked)
-            .map(|target| target.configure_serial)
-            .max()
+        if task.binding.destroy_requested() {
+            return Err(DenialSinkError::NoRenderTarget(display));
+        }
+        self.ensure_render_targets(task)?;
+        let newest_serial = task.target_demand.serial()
             .ok_or(DenialSinkError::NoRenderTarget(display))?;
         let target = task
             .render_targets
@@ -454,6 +471,47 @@ impl DenialPresentationSink {
     /// Return a target reservation that SurfaceFlinger did not submit.
     pub fn cancel_surfaceflinger_target(&self, display: DisplayId, target: ImportedRenderTarget) {
         self.cancel_reserved_target(display, target.metadata.id);
+    }
+
+    /// Preserve the real GPU completion fence for a bufferless bootstrap frame.
+    /// No render target, host present, or task timeline point is consumed.
+    ///
+    /// # Errors
+    /// Rejects unknown or retiring displays and propagates sync-file creation
+    /// or duplication errors. The broker restricts this operation to task zero.
+    pub fn complete_headless_frame(
+        &self,
+        display: DisplayId,
+        ready: Option<std::os::fd::OwnedFd>,
+    ) -> Result<(), DenialSinkError> {
+        let mut tasks = self.lock_tasks()?;
+        let task = tasks
+            .get_mut(&display)
+            .ok_or(DenialSinkError::NoRenderTarget(display))?;
+        if task.binding.destroy_requested() {
+            return Err(DenialSinkError::NoRenderTarget(display));
+        }
+        let fence = crate::headless_fence::ready_fence(ready, || {
+            // NO_FENCE means task work is already complete. Reuse the DRM
+            // objects, but signal/export a fresh point for each frame: reusing
+            // one signalled sync-file would reuse its old completion timestamp.
+            if task.headless_completion.is_none() {
+                task.headless_completion = Some((
+                    AndroidTaskTimelines::create(&self.device).map_err(std::io::Error::other)?,
+                    0_u64,
+                ));
+            }
+            let (timelines, point) = task.headless_completion.as_mut().unwrap();
+            let next = point
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("headless completion timeline exhausted"))?;
+            timelines.signal_acquire(next).map_err(std::io::Error::other)?;
+            *point = next; // A failed export must not reuse the signalled point.
+            timelines.export_acquire_fence(next).map_err(std::io::Error::other)
+        })
+        .map_err(|error| DenialSinkError::Graphics(format!("headless present fence: {error}")))?;
+        task.surfaceflinger_present_fence = Some(fence);
+        Ok(())
     }
 
     /// Import SurfaceFlinger's ready fence and present its already-composed
@@ -519,6 +577,9 @@ impl DenialPresentationSink {
     pub fn bind_layer_stream(&self, display: DisplayId, sockets: &[std::os::fd::BorrowedFd<'_>]) -> Result<(), DenialSinkError> {
         let tasks = self.lock_tasks()?;
         let task = tasks.get(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
+        if task.binding.destroy_requested() {
+            return Err(DenialBridgeError::UnexpectedMessage.into());
+        }
         self.socket.send_android(&AndroidMessage::BindLayerStream { object: task.binding.object() }, sockets)?;
         Ok(())
     }
@@ -644,6 +705,11 @@ impl DenialPresentationSink {
         let task = tasks
             .get_mut(&display)
             .ok_or(DenialSinkError::UnknownDisplay(display))?;
+        // A target reserved before destruction may finish rendering afterward.
+        // Reject it before sending any metadata to the already closed window.
+        if task.binding.destroy_requested() {
+            return Err(DenialBridgeError::UnexpectedMessage.into());
+        }
         let host_target = task
             .render_targets
             .get(&frame.buffer.id)
@@ -768,18 +834,32 @@ impl DenialPresentationSink {
     ) -> Result<MutexGuard<'_, BTreeMap<DisplayId, TaskChannel>>, DenialSinkError> {
         self.tasks.lock().map_err(|_| DenialSinkError::Poisoned)
     }
+
+    // Called only from an actual composition dequeue, never from direct-layer
+    // export. Busy targets already exist and must wait for real GPU release.
+    fn ensure_render_targets(&self, task: &mut TaskChannel) -> Result<(), DenialSinkError> {
+        let Some(serial) = task.target_demand.serial() else { return Ok(()); };
+        let has_pool = task.render_targets.values()
+            .any(|target| !target.revoked && target.configure_serial == serial);
+        if let Some(serial) = task.target_demand.request(self.lazy_render_targets, has_pool) {
+            self.socket.send_android(&AndroidMessage::RequestRenderTargets {
+                object: task.binding.object(), configure_serial: serial,
+            }, &[])?;
+            task.target_demand.sent(serial);
+        }
+        Ok(())
+    }
 }
 
 impl PresentationSink for DenialPresentationSink {
     fn acquire_target(&mut self, display: DisplayId) -> Result<ImportedRenderTarget, ErrorCode> {
         let mut tasks = self.lock_tasks().map_err(|error| error.error_code())?;
         let task = tasks.get_mut(&display).ok_or(ErrorCode::BadDisplay)?;
-        let newest_serial = task
-            .render_targets
-            .values()
-            .filter(|target| !target.revoked)
-            .map(|target| target.configure_serial)
-            .max()
+        if task.binding.destroy_requested() {
+            return Err(ErrorCode::NoResources);
+        }
+        self.ensure_render_targets(task).map_err(|error| error.error_code())?;
+        let newest_serial = task.target_demand.serial()
             .ok_or(ErrorCode::NoResources)?;
         let target = task
             .render_targets
@@ -843,10 +923,14 @@ struct TaskChannel {
     content_opaque: Option<bool>,
     /// SurfaceFlinger's GPU completion fence awaiting Composer3 present reply.
     surfaceflinger_present_fence: Option<std::os::fd::OwnedFd>,
+    /// Dedicated completion timeline and last point for frames without GPU work.
+    headless_completion: Option<(AndroidTaskTimelines, u64)>,
     /// SurfaceFlinger display space pinned by the first hotplug configure.
     /// Denial may resize or scale the target independently, while Android
     /// layer frames remain in this stable coordinate space.
     android_display_extent: Option<(u32, u32)>,
+    /// Latest geometry generation and its one outstanding allocation request.
+    target_demand: RenderTargetDemand,
 }
 
 #[derive(Debug)]
@@ -883,6 +967,7 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
         DenialMessage::ServerHello { .. }
+        | DenialMessage::RequestInputChannel { .. }
         | DenialMessage::DisplayPower { .. }
         | DenialMessage::Ping { .. } => None,
     }

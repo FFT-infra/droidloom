@@ -7,6 +7,11 @@ is manual. The catalog exports Android launcher activities, labels and icons as
 XDG desktop applications. `droidloomctl applications` lists the catalog; launches
 require a running cell.
 
+The catalog subscribes to framework package/user/locale events. It snapshots on
+connection and changes, fetches missing icons in batches, and blocks while idle.
+Launch/setup/density requests call the existing system_server through native RPC,
+without a task-launcher executable or per-request command/ART startup.
+
 Desktop mode starts with a 480×800 logical window, constrained to available space,
 and remembers app sizes. `droidloomctl start --mode mobile` fills current bounds.
 Compositor sizes take precedence; restart preserves the mode. `window-mode`
@@ -33,7 +38,9 @@ and urgency are mapped where supported. Default clicks and supported actions
 invoke Android PendingIntents. Explicit desktop dismissals cancel dismissible
 Android notifications; popup expiry does not cancel them.
 
-Reconnects reconcile active notifications. No extra persistent host daemon or
+Reconnects reconcile active notifications with a full snapshot. Subsequent
+updates send only changed posts and versioned removals, avoiding repeated icon
+encoding for unchanged entries. No extra persistent host daemon or
 compositor extension is needed. Inline replies and custom Android layouts are
 outside the current mapping.
 
@@ -66,9 +73,10 @@ creating namespaces, mounting filesystems or changing host state. Exit status is
 0 for satisfied prerequisites, 2 for missing or unproven requirements, and 1 for
 a tool failure. It does not prove that an app will render correctly.
 
-Launch diagnostics include `droidloom-launch-timing` from the Android launcher
-and `droidloom-launch-host-timing` from the supervisor. They measure preparation,
-activity discovery and registration, not click-to-first-frame latency. Android
+Launch diagnostics include `droidloom-launch-host-timing` from the supervisor.
+This measures readiness and the framework launch/publication request, rather
+than click-to-first-frame latency. Task identity comes directly from
+ActivityTaskManager; launcher discovery timing is removed. Android
 policy setup is cached per user and framework process lifetime; framework
 restart, PID reuse or incomplete setup invalidates the cache.
 
@@ -82,4 +90,4 @@ For apps needing explicit activity selection, use
 `droidloomctl launch PACKAGE --component PACKAGE/ACTIVITY`.
 Clipboard support depends on compositor and receiving-app capabilities; text
 input does not export surrounding text or cursor geometry. Shared-kernel
-isolation is described in the [security requirements](threat-model-v1.md).
+isolation is described in the [security requirements](threat-model-v2.md).

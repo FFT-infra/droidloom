@@ -1,0 +1,70 @@
+diff --git a/services/inputflinger/Android.bp b/services/inputflinger/Android.bp
+index 987ce1e..699602d 100644
+--- a/services/inputflinger/Android.bp
++++ b/services/inputflinger/Android.bp
+@@ -197,6 +197,10 @@ cc_library_shared {
+     target: {
+         android: {
+             header_libs: ["jni_headers"],
++            include_dirs: [
++                "vendor/droidloom/android/framework/droidloom-window-policy/jni",
++                "frameworks/native/services/inputflinger",
++            ],
+             srcs: [":droidloom-task-jni-sources"],
+             whole_static_libs: ["libdroidloom_window_policy"],
+         },
+diff --git a/services/inputflinger/InputManager.cpp b/services/inputflinger/InputManager.cpp
+index 66a8481..598a49c 100644
+--- a/services/inputflinger/InputManager.cpp
++++ b/services/inputflinger/InputManager.cpp
+@@ -25,6 +25,10 @@
+ #include <vector>
+ 
+ #include "InputManager.h"
++#if !defined(__ANDROID_HOST__)
++#include "DroidloomInput.h"
++#include <android-base/properties.h>
++#endif
+ #include "InputReader.h"
+ #include "InputTracingThreadedBackend.h"
+ #include "InteractionReporter.h"
+@@ -227,14 +231,29 @@ InputManager::InputManager(const sp<InputReaderPolicyInterface>& readerPolicy,
+ 
+     mReader = std::make_unique<InputReader>(std::make_unique<EventHub>(), readerPolicy,
+                                             *mTracingStages.back(), vm, tracingBackend);
++#if !defined(__ANDROID_HOST__)
++    if (base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++        DroidloomInput::registerManager(this,
++                *static_cast<inputdispatcher::InputDispatcher*>(mDispatcher.get()), vm);
++    }
++#endif
+ }
+ 
+ InputManager::~InputManager() {
+     stop();
++#if !defined(__ANDROID_HOST__)
++    DroidloomInput::unregisterManager(this);
++#endif
+ }
+ 
+ status_t InputManager::onTransact(uint32_t code, const Parcel& data, Parcel* reply,
+                                   uint32_t flags) {
++#if !defined(__ANDROID_HOST__)
++    if (code >= 0x00444c03 && code <= 0x00444c05) {
++        auto input = DroidloomInput::forManager(this);
++        return input == nullptr ? INVALID_OPERATION : input->transact(code, data, reply);
++    }
++#endif
+     static constexpr uint32_t kDroidloomInjectToApplicationTransaction = 0x00444c02;
+     if (code != kDroidloomInjectToApplicationTransaction) {
+         return BnInputFlinger::onTransact(code, data, reply, flags);
+@@ -308,6 +327,9 @@ status_t InputManager::start() {
+ }
+ 
+ status_t InputManager::stop() {
++#if !defined(__ANDROID_HOST__)
++    if (auto input = DroidloomInput::forManager(this)) input->stop();
++#endif
+     status_t status = OK;
+ 
+     status_t result = mReader->stop();

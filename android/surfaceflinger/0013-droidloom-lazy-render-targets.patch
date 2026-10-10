@@ -1,0 +1,315 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+index d1d289d..9e7311f 100644
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -248,12 +248,12 @@ bool configurationEvent(ConfigCache& cache, const std::vector<uint32_t>& words,
+     if (changed && repaint) repaint();
+     return true;
+ }
+-bool configuration(int socket, ConfigCache& cache, bool& subscribed, uint32_t width,
+-                   uint32_t height, std::array<uint32_t, 4>* config) {
++bool configurationSnapshot(int socket, ConfigCache& cache, bool& subscribed,
++                           std::array<uint32_t, 4>* config) {
+     if (!subscribed) {
+         std::vector<uint32_t> words;
+         if (!send(socket, 1, {}) || !receive(socket, 0x8002, &words) || words.size() != 4 ||
+-            (words[0] & 3) != 3) return false;
++            words[1] == 0 || words[2] == 0 || words[3] == 0) return false;
+         if (words[0] & 8) {
+             if (!send(socket, 8, {}) || !receive(socket, 0x8005, &words) ||
+                 !cache.update(words)) return false;
+@@ -263,7 +263,13 @@ bool configuration(int socket, ConfigCache& cache, bool& subscribed, uint32_t wi
+         }
+     }
+     if (subscribed) *config = cache.snapshot();
+-    return ((*config)[0] & 3) == 3 && (*config)[2] == width && (*config)[3] == height;
++    return (*config)[1] != 0 && (*config)[2] != 0 && (*config)[3] != 0 &&
++            (*config)[2] <= 16384 && (*config)[3] <= 16384;
++}
++bool configuration(int socket, ConfigCache& cache, bool& subscribed, uint32_t width,
++                   uint32_t height, std::array<uint32_t, 4>* config) {
++    return configurationSnapshot(socket, cache, subscribed, config) &&
++            ((*config)[0] & 3) == 3 && (*config)[2] == width && (*config)[3] == height;
+ }
+ // Exact ABI of the pinned minigbm mapper; never pass its metadata FD as an image plane.
+ struct CrosHandle : native_handle_t {
+@@ -497,6 +503,13 @@ bool DroidloomLayers::transact(uint32_t opcode, const std::vector<uint8_t>& payl
+         return false;
+     return reply[0] == 0;
+ }
++bool DroidloomLayers::getSize(ui::Size* size) {
++    std::array<uint32_t, 4> config{};
++    if (!configurationSnapshot(mRequests.get(), mState->config, mSubscribed, &config)) return false;
++    *size = ui::Size(config[2], config[3]);
++    return true;
++}
++
+ bool DroidloomLayers::present(compositionengine::Output& output, uint32_t width, uint32_t height) {
+     const bool accepted = presentFrame(output, width, height);
+     if (!accepted) invalidate();
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+index 9dc4ec8..e5f3151 100644
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -3,6 +3,7 @@
+ #include <android-base/unique_fd.h>
+ #include <gui/ITransactionCompletedListener.h>
+ #include <ui/GraphicBuffer.h>
++#include <ui/Size.h>
+ #include "DroidloomReleaseQueue.h"
+ 
+ #include <memory>
+@@ -30,6 +31,7 @@ class DroidloomLayers {
+     DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint);
+     ~DroidloomLayers();
+     void invalidate();
++    bool getSize(ui::Size* size);
+     bool present(compositionengine::Output& output, uint32_t width, uint32_t height);
+ 
+    private:
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+index 9e4fd99..df866db 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -347,9 +347,7 @@ status_t DroidloomNativeWindow::initialize() {
+     return NO_ERROR;
+ }
+ 
+-bool DroidloomNativeWindow::presentLayers(compositionengine::Output& output,
+-                                                uint32_t width, uint32_t height, SurfaceFlinger& flinger) {
+-    std::lock_guard lock(mMutex);
++bool DroidloomNativeWindow::ensureLayers(SurfaceFlinger& flinger) {
+     if (!mLayersAttempted) {
+         mLayersAttempted = true;
+         std::vector<uint8_t> payload;
+@@ -364,7 +362,23 @@ bool DroidloomNativeWindow::presentLayers(compositionengine::Output& output,
+                     if (auto owner = weak.promote()) owner->scheduleComposite(SurfaceFlinger::FrameHint::kNone);
+                 });
+     }
+-    return mLayers && mLayers->present(output, width, height);
++    return mLayers != nullptr;
++}
++
++ui::Size DroidloomNativeWindow::getTargetSize(SurfaceFlinger& flinger) {
++    std::lock_guard lock(mMutex);
++    ui::Size size(mWidth, mHeight);
++    if (ensureLayers(flinger) && mLayers->getSize(&size)) {
++        mWidth = static_cast<uint32_t>(size.width);
++        mHeight = static_cast<uint32_t>(size.height);
++    }
++    return size;
++}
++
++bool DroidloomNativeWindow::presentLayers(compositionengine::Output& output,
++                                        uint32_t width, uint32_t height, SurfaceFlinger& flinger) {
++    std::lock_guard lock(mMutex);
++    return ensureLayers(flinger) && mLayers->present(output, width, height);
+ }
+ 
+ void DroidloomNativeWindow::setContentOpaque(bool opaque) {
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+index a7214de..3466c07 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.h
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -40,6 +40,7 @@ public:
+ 
+     DroidloomNativeWindow(uint64_t task, uint32_t expectedWidth, uint32_t expectedHeight);
+     ~DroidloomNativeWindow() override;
++    ui::Size getTargetSize(SurfaceFlinger& flinger);
+     void setContentOpaque(bool opaque);
+     void setContentDamage(const Rect& damage);
+     bool presentLayers(compositionengine::Output& output, uint32_t width, uint32_t height, SurfaceFlinger& flinger);
+@@ -72,6 +73,7 @@ private:
+ 
+     std::unique_ptr<DroidloomLayers> mLayers;
+     bool mLayersAttempted = false;
++    bool ensureLayers(SurfaceFlinger& flinger); // Caller holds mMutex.
+     const uint64_t mTask;
+     const uint32_t mExpectedWidth;
+     const uint32_t mExpectedHeight;
+diff --git a/services/surfaceflinger/ScreenCaptureOutput.cpp b/services/surfaceflinger/ScreenCaptureOutput.cpp
+index 53f755c..54c0207 100644
+--- a/services/surfaceflinger/ScreenCaptureOutput.cpp
++++ b/services/surfaceflinger/ScreenCaptureOutput.cpp
+@@ -21,6 +21,7 @@
+ #include "ui/Rotation.h"
+ 
+ #include <cmath>
++#include <log/log.h>
+ #include <compositionengine/CompositionEngine.h>
+ #include <compositionengine/OutputLayer.h>
+ #include <compositionengine/LayerFECompositionState.h>
+@@ -43,11 +44,14 @@ std::shared_ptr<ScreenCaptureOutput> createScreenCaptureOutput(ScreenCaptureOutp
+                                     args.dimInGammaSpaceForEnhancedScreenshots,
+                                     args.enableLocalTonemapping);
+     output->editState().isSecure = args.isSecure;
+-    output->editState().isProtected = args.buffer->getUsage() & GRALLOC_USAGE_PROTECTED;
++    LOG_ALWAYS_FATAL_IF(!args.buffer && !args.droidloomGeometryOnly,
++                        "Capture output requires a buffer");
++    output->editState().isProtected = args.buffer &&
++            (args.buffer->getUsage() & GRALLOC_USAGE_PROTECTED);
+     output->setCompositionEnabled(true);
+     output->setLayerFilter(
+             {.layerStack = args.layerStack, .toInternalDisplay = false, .skipScreenshot = true});
+-    output->setRenderSurface(std::make_unique<ScreenCaptureRenderSurface>(std::move(args.buffer)));
++    output->setRenderSurface(std::make_unique<ScreenCaptureRenderSurface>(std::move(args.buffer), args.reqBufferSize));
+     output->setDisplayBrightness(args.sdrWhitePointNits, args.displayBrightnessNits);
+     output->editState().clientTargetBrightness = args.targetBrightness;
+     output->editState().treat170mAsSrgb = args.treat170mAsSrgb;
+diff --git a/services/surfaceflinger/ScreenCaptureOutput.h b/services/surfaceflinger/ScreenCaptureOutput.h
+index 67292f3..a335a97 100644
+--- a/services/surfaceflinger/ScreenCaptureOutput.h
++++ b/services/surfaceflinger/ScreenCaptureOutput.h
+@@ -43,6 +43,8 @@ struct ScreenCaptureOutputArgs {
+     bool isSecure = false;
+     bool enableLocalTonemapping = false;
+     std::string debugName;
++    // Only direct-layer geometry preparation may omit a composition target.
++    bool droidloomGeometryOnly = false;
+ };
+ 
+ // ScreenCaptureOutput is used to compose a set of layers into a preallocated buffer.
+diff --git a/services/surfaceflinger/ScreenCaptureRenderSurface.h b/services/surfaceflinger/ScreenCaptureRenderSurface.h
+index 8c7db91..ee4f68a 100644
+--- a/services/surfaceflinger/ScreenCaptureRenderSurface.h
++++ b/services/surfaceflinger/ScreenCaptureRenderSurface.h
+@@ -29,8 +29,9 @@ namespace android {
+ // ScreenCaptureOutput.
+ class ScreenCaptureRenderSurface : public compositionengine::RenderSurface {
+ public:
+-    ScreenCaptureRenderSurface(std::shared_ptr<renderengine::ExternalTexture> buffer)
+-          : mBuffer(std::move(buffer)){};
++    ScreenCaptureRenderSurface(std::shared_ptr<renderengine::ExternalTexture> buffer,
++                               ui::Size size = {})
++          : mBuffer(std::move(buffer)), mSize(size) {}
+ 
+     // Droidloom rotates host targets without rebuilding the output/layer state.
+     void setBuffer(std::shared_ptr<renderengine::ExternalTexture> buffer) {
+@@ -57,7 +58,7 @@ public:
+ 
+     const ui::Size& getSize() const override { return mSize; }
+ 
+-    bool isProtected() const override { return mBuffer->getUsage() & GRALLOC_USAGE_PROTECTED; }
++    bool isProtected() const override { return mBuffer && (mBuffer->getUsage() & GRALLOC_USAGE_PROTECTED); }
+ 
+     void setDisplaySize(const ui::Size&) override {}
+ 
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 980d71c..160afef 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3637,30 +3637,12 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 ALOGI("Created Denial-native output for Android task %d", task);
+             }
+ 
+-            ANativeWindow* nativeWindow = taskOutput.window.get();
+-            ANativeWindowBuffer* nativeBuffer = nullptr;
+-            int acquireFence = -1;
+-            status_t status = nativeWindow->dequeueBuffer(nativeWindow, &nativeBuffer,
+-                                                           &acquireFence);
+-            base::unique_fd targetAcquireFence(acquireFence);
+-            if (status != NO_ERROR || nativeBuffer == nullptr) {
+-                if (status == WOULD_BLOCK) {
+-                    // Retry on the scheduler's next frame, outside this task's
+-                    // dequeue. Never spin or sleep on the shared SF thread.
+-                    scheduleComposite(FrameHint::kNone);
+-                } else {
+-                    ALOGE("Failed to acquire target for Android task %d: %d", task, status);
+-                }
+-                taskOutput.invalidated = true;
+-                continue;
+-            }
+-
+             if (!taskOutput.engine) {
+                 taskOutput.engine = mFactory.createCompositionEngine();
+                 taskOutput.engine->setRenderEngine(mRenderEngine.get());
+                 taskOutput.engine->setHwComposer(mHWComposer.get());
+             }
+-            const ui::Size targetSize{nativeBuffer->width, nativeBuffer->height};
++            const ui::Size targetSize = taskOutput.window->getTargetSize(*this);
+             const Rect compositionCrop{
+                     frame.sourceCrop.left,
+                     frame.sourceCrop.top,
+@@ -3675,13 +3657,6 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                     taskOutput.output->getState().layerFilter.layerStack != layerStack ||
+                     taskOutput.pacesetter != pacesetterId;
+             if (taskOutput.targetSize != targetSize) taskOutput.textures.clear();
+-            sp<GraphicBuffer> graphicBuffer = GraphicBuffer::from(nativeBuffer);
+-            auto& texture = taskOutput.textures[graphicBuffer->getId()];
+-            if (!texture) {
+-                texture = std::make_shared<renderengine::impl::ExternalTexture>(
+-                        graphicBuffer, getRenderEngine(),
+-                        renderengine::impl::ExternalTexture::Usage::WRITEABLE);
+-            }
+             if (resetOutput) {
+                 taskOutput.pacesetter = pacesetterId;
+                 taskOutput.compositionCrop = compositionCrop;
+@@ -3695,7 +3670,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                                             // never hide a producer-size mismatch by scaling the
+                                             // last frame into a differently sized target.
+                                             .sourceCrop = compositionCrop,
+-                                            .buffer = texture,
++                                            .buffer = nullptr,
+                                             .displayIdVariant = DisplayIdVariant{pacesetterId},
+                                             .reqBufferSize = targetSize,
+                                             .sdrWhitePointNits = 500.0f,
+@@ -3712,10 +3687,11 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                                             .isSecure = true,
+                                             .enableLocalTonemapping = false,
+                                             .debugName = base::StringPrintf(
+-                                                    "Droidloom task %d", task)});
++                                                    "Droidloom task %d", task),
++                                            .droidloomGeometryOnly = true});
+             }
+             auto& output = taskOutput.output;
+-            output->setDroidloomTarget(texture);
++            output->setDroidloomTarget(nullptr);
+             const bool forceGeometry = resetOutput || layersChanged || taskOutput.invalidated;
+             std::vector<sp<compositionengine::LayerFE>> taskLayers;
+             taskLayers.reserve(frame.layers.size());
+@@ -3738,11 +3714,44 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 output->updateColorProfile(taskRefresh);
+                 output->updateCompositionState(taskRefresh);
+                 if (taskOutput.window->presentLayers(*output, targetSize.width, targetSize.height, *this)) {
+-                    nativeWindow->cancelBuffer(nativeWindow, nativeBuffer, targetAcquireFence.release());
+                     taskOutput.invalidated = false;
+                     continue;
+                 }
+             }
++            ANativeWindow* nativeWindow = taskOutput.window.get();
++            ANativeWindowBuffer* nativeBuffer = nullptr;
++            int acquireFence = -1;
++            status_t status = nativeWindow->dequeueBuffer(nativeWindow, &nativeBuffer,
++                                                           &acquireFence);
++            base::unique_fd targetAcquireFence(acquireFence);
++            if (status != NO_ERROR || nativeBuffer == nullptr) {
++                if (status == WOULD_BLOCK) {
++                    // Retry on the scheduler's next frame, outside this task's
++                    // dequeue. Never spin or sleep on the shared SF thread.
++                    scheduleComposite(FrameHint::kNone);
++                } else {
++                    ALOGE("Failed to acquire target for Android task %d: %d", task, status);
++                }
++                taskOutput.invalidated = true;
++                continue;
++            }
++
++            // A resize can win between the geometry snapshot and dequeue.
++            // Keep the previous image and rebuild geometry on the next frame.
++            if (nativeBuffer->width != targetSize.width || nativeBuffer->height != targetSize.height) {
++                nativeWindow->cancelBuffer(nativeWindow, nativeBuffer, targetAcquireFence.release());
++                taskOutput.invalidated = true;
++                scheduleComposite(FrameHint::kNone);
++                continue;
++            }
++            sp<GraphicBuffer> graphicBuffer = GraphicBuffer::from(nativeBuffer);
++            auto& texture = taskOutput.textures[graphicBuffer->getId()];
++            if (!texture) {
++                texture = std::make_shared<renderengine::impl::ExternalTexture>(
++                        graphicBuffer, getRenderEngine(),
++                        renderengine::impl::ExternalTexture::Usage::WRITEABLE);
++            }
++            output->setDroidloomTarget(texture);
+             taskOutput.engine->present(taskRefresh);
+             // Every rotated target is still fully rendered. Damage describes
+             // differences from the last submitted frame, not target buffer age.

@@ -8,13 +8,28 @@ use crate::{Plane, WireError, read_u32, read_u64};
 pub const MAX_LAYERS: usize = 64;
 /// Maximum cached source allocations in a task.
 pub const MAX_BUFFERS: usize = 128;
+/// Maximum imports awaiting compositor confirmation per task.
+pub const MAX_IMPORTS: usize = 16;
 /// Stream supports synchronized subsurfaces, alpha, and release sync-files.
 /// Requiring both bits makes older peers select normal composition fallback.
-pub const SUPPORTED: u32 = 3 | ASYNC_STAGE | CONFIG_EVENTS;
+pub const SUPPORTED: u32 =
+    3 | ASYNC_STAGE | CONFIG_EVENTS | ASYNC_COMMIT | ASYNC_IMPORT | SCENE_BATCH;
+/// Bounded chunks; the final chunk and commit share one packet.
+pub const SCENE_BATCH: u32 = 1 << 6;
+/// Maximum layers in one scene chunk; the transport still permits only four FDs.
+pub const MAX_BATCH_LAYERS: usize = 16;
+/// Header, commit fields and sixteen indexed layer records.
+pub const MAX_LAYER_PACKET: usize = 16 + 28 + MAX_BATCH_LAYERS * 76;
 /// `StageAsync` records have no reply; Commit reports the complete scene result.
 pub const ASYNC_STAGE: u32 = 1 << 2;
 /// Subscribe to revisioned configuration updates on the completion socket.
 pub const CONFIG_EVENTS: u32 = 1 << 3;
+/// Scene-ID commits report acceptance on the event socket, independently of
+/// source release fences. Senders allow at most one unacknowledged scene.
+pub const ASYNC_COMMIT: u32 = 1 << 4;
+/// Allocation import results arrive on the event socket, identified by attempt
+/// and allocation. Scenes may reference only successfully imported sources.
+pub const ASYNC_IMPORT: u32 = 1 << 5;
 
 /// Last published task configuration. Revision also orders changes to visibility
 /// and capabilities that do not increment Android's configure serial.
@@ -157,12 +172,37 @@ pub enum Request {
     SubscribeConfig,
     /// Register image planes once.
     Register(Buffer),
+    /// Pipeline registration without a request-socket reply. Requires
+    /// `ASYNC_IMPORT`; at most `MAX_IMPORTS` attempts may await a result.
+    RegisterAsync {
+        /// Strictly increasing nonzero import attempt, scoped to this stream.
+        attempt: u64,
+        /// Allocation metadata and image planes.
+        buffer: Buffer,
+    },
     /// Retire an idle cached allocation.
     Unregister(u64),
     /// Append one layer to an invisible pending transaction.
     Stage(Layer),
     /// Append a layer without a reply; requires the `ASYNC_STAGE` capability.
     StageAsync(Layer),
+    /// Append a bounded invisible chunk, without a reply.
+    StageBatch(Vec<BatchLayer>),
+    /// Append the last chunk and atomically commit the complete scene.
+    CommitBatch {
+        /// Strictly increasing, nonzero stream identity.
+        scene: u64,
+        /// Current configure serial.
+        serial: u32,
+        /// Physical task width.
+        width: u32,
+        /// Physical task height.
+        height: u32,
+        /// Total count including preceding chunks.
+        count: u32,
+        /// Last invisible chunk.
+        layers: Vec<BatchLayer>,
+    },
     /// Publish all staged layers under one current configure.
     Commit {
         /// Configure serial obtained from Config.
@@ -174,8 +214,93 @@ pub enum Request {
         /// Exact staged layer count.
         count: u32,
     },
+    /// Same validation as Commit; completion uses event 0x8006, never a
+    /// request-socket reply. Requires the `ASYNC_COMMIT` capability.
+    CommitAsync {
+        /// Strictly increasing, nonzero identity scoped to this stream.
+        scene: u64,
+        /// Current configure serial.
+        serial: u32,
+        /// Physical task width.
+        width: u32,
+        /// Physical task height.
+        height: u32,
+        /// Exact staged layer count.
+        count: u32,
+    },
     /// Discard staged metadata without changing visible content.
     Abort,
+}
+
+/// Layer metadata with an optional descriptor index scoped to this packet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchLayer {
+    /// The unchanged layer wire semantics.
+    pub layer: Layer,
+    /// Each attached descriptor belongs to exactly one layer.
+    pub fence_index: Option<usize>,
+}
+
+fn decode_layer(p: &[u8], fenced: bool) -> Result<Layer, WireError> {
+    let flags = read_u32(p, 64)?;
+    let layer = Layer {
+        id: read_u64(p, 0)?,
+        buffer: read_u64(p, 8)?,
+        ticket: read_u64(p, 16)?,
+        destination: [
+            read_u32(p, 24)? as i32,
+            read_u32(p, 28)? as i32,
+            read_u32(p, 32)? as i32,
+            read_u32(p, 36)? as i32,
+        ],
+        source: [
+            read_u32(p, 40)?,
+            read_u32(p, 44)?,
+            read_u32(p, 48)?,
+            read_u32(p, 52)?,
+        ],
+        transform: read_u32(p, 56)?,
+        alpha: read_u32(p, 60)?,
+        opaque: flags == 1,
+        color: read_u32(p, 68)?,
+    };
+    if flags > 1 || (layer.buffer == 0 && fenced) {
+        return Err(WireError::Field);
+    }
+    Ok(layer)
+}
+
+fn decode_batch(p: &[u8], descriptors: usize) -> Result<Vec<BatchLayer>, WireError> {
+    let count = read_u32(p, 0)? as usize;
+    if count == 0 || count > MAX_BATCH_LAYERS || p.len() != 4 + count * 76 {
+        return Err(WireError::Length);
+    }
+    if descriptors > 4 {
+        return Err(WireError::Descriptors);
+    }
+    let mut used = [false; 4];
+    let mut layers = Vec::with_capacity(count);
+    for p in p[4..].chunks_exact(76) {
+        let index = read_u32(p, 72)?;
+        let fence_index = if index == u32::MAX {
+            None
+        } else {
+            let index = index as usize;
+            if index >= descriptors || used[index] {
+                return Err(WireError::Descriptors);
+            }
+            used[index] = true;
+            Some(index)
+        };
+        layers.push(BatchLayer {
+            layer: decode_layer(p, fence_index.is_some())?,
+            fence_index,
+        });
+    }
+    if used[..descriptors].iter().any(|v| !v) {
+        return Err(WireError::Descriptors);
+    }
+    Ok(layers)
 }
 
 /// Bounded scene staging. Overflow invalidates the whole transaction, including
@@ -291,7 +416,7 @@ pub fn validate_scene<'a>(
 /// Decode a complete record with exact ancillary descriptor accounting.
 pub fn decode(bytes: &[u8], descriptors: usize) -> Result<Request, WireError> {
     if bytes.len() < 16
-        || bytes.len() > 128
+        || bytes.len() > MAX_LAYER_PACKET
         || &bytes[..4] != b"DLL1"
         || read_u32(bytes, 8)? as usize != bytes.len() - 16
         || read_u32(bytes, 12)? as usize != descriptors
@@ -302,7 +427,19 @@ pub fn decode(bytes: &[u8], descriptors: usize) -> Result<Request, WireError> {
     match read_u32(bytes, 4)? {
         1 if p.is_empty() && descriptors == 0 => Ok(Request::Config),
         8 if p.is_empty() && descriptors == 0 => Ok(Request::SubscribeConfig),
-        2 if p.len() >= 40 => {
+        opcode @ (2 | 10) => {
+            let (attempt, p) = if opcode == 10 {
+                let attempt = read_u64(p, 0)?;
+                if attempt == 0 {
+                    return Err(WireError::Field);
+                }
+                (Some(attempt), &p[8..])
+            } else {
+                (None, p)
+            };
+            if p.len() < 40 {
+                return Err(WireError::Length);
+            }
             let n = read_u32(p, 36)? as usize;
             if n == 0 || n > 4 || n != descriptors || p.len() != 40 + n * 8 {
                 return Err(WireError::Descriptors);
@@ -335,47 +472,45 @@ pub fn decode(bytes: &[u8], descriptors: usize) -> Result<Request, WireError> {
             {
                 return Err(WireError::Field);
             }
-            Ok(Request::Register(b))
+            Ok(if let Some(attempt) = attempt {
+                Request::RegisterAsync { attempt, buffer: b }
+            } else {
+                Request::Register(b)
+            })
         }
         3 if p.len() == 8 && descriptors == 0 => Ok(Request::Unregister(read_u64(p, 0)?)),
         opcode @ (4 | 7) if p.len() == 72 && descriptors <= 1 => {
-            let flags = read_u32(p, 64)?;
-            let l = Layer {
-                id: read_u64(p, 0)?,
-                buffer: read_u64(p, 8)?,
-                ticket: read_u64(p, 16)?,
-                destination: [
-                    read_u32(p, 24)? as i32,
-                    read_u32(p, 28)? as i32,
-                    read_u32(p, 32)? as i32,
-                    read_u32(p, 36)? as i32,
-                ],
-                source: [
-                    read_u32(p, 40)?,
-                    read_u32(p, 44)?,
-                    read_u32(p, 48)?,
-                    read_u32(p, 52)?,
-                ],
-                transform: read_u32(p, 56)?,
-                alpha: read_u32(p, 60)?,
-                opaque: flags == 1,
-                color: read_u32(p, 68)?,
-            };
-            if flags > 1 || (l.buffer == 0 && descriptors != 0) {
-                return Err(WireError::Field);
-            }
+            let l = decode_layer(p, descriptors != 0)?;
             Ok(if opcode == 7 {
                 Request::StageAsync(l)
             } else {
                 Request::Stage(l)
             })
         }
+        11 => Ok(Request::StageBatch(decode_batch(p, descriptors)?)),
+        12 if p.len() >= 28 && read_u64(p, 0)? != 0 => Ok(Request::CommitBatch {
+            scene: read_u64(p, 0)?,
+            serial: read_u32(p, 8)?,
+            width: read_u32(p, 12)?,
+            height: read_u32(p, 16)?,
+            count: read_u32(p, 20)?,
+            layers: decode_batch(&p[24..], descriptors)?,
+        }),
         5 if p.len() == 16 && descriptors == 0 => Ok(Request::Commit {
             serial: read_u32(p, 0)?,
             width: read_u32(p, 4)?,
             height: read_u32(p, 8)?,
             count: read_u32(p, 12)?,
         }),
+        9 if p.len() == 24 && descriptors == 0 && read_u64(p, 0)? != 0 => {
+            Ok(Request::CommitAsync {
+                scene: read_u64(p, 0)?,
+                serial: read_u32(p, 8)?,
+                width: read_u32(p, 12)?,
+                height: read_u32(p, 16)?,
+                count: read_u32(p, 20)?,
+            })
+        }
         6 if p.is_empty() && descriptors == 0 => Ok(Request::Abort),
         _ => Err(WireError::Length),
     }
@@ -401,8 +536,191 @@ pub fn release_fence(ticket: u64) -> Vec<u8> {
     bytes
 }
 
+/// Scene acceptance is metadata, and must never imply producer buffer release.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Split ID and signed wire status.
+pub fn commit_result(scene: u64, code: i32) -> Vec<u8> {
+    response(0x8006, &[scene as u32, (scene >> 32) as u32, code as u32])
+}
+
+/// Import confirmation reports allocation usability, never GPU completion.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Split IDs and signed wire status.
+pub fn import_result(attempt: u64, buffer: u64, code: i32) -> Vec<u8> {
+    response(
+        0x8007,
+        &[
+            attempt as u32,
+            (attempt >> 32) as u32,
+            buffer as u32,
+            (buffer >> 32) as u32,
+            code as u32,
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batched_scene_validates_fence_ownership_and_bounded_chunks() {
+        use super::*;
+        fn packet(op: u32, indices: &[u32], fds: u32) -> Vec<u8> {
+            let mut words = if op == 12 {
+                vec![7, 0, 9, 800, 600, 64]
+            } else {
+                Vec::new()
+            };
+            words.push(indices.len() as u32);
+            for (i, index) in indices.iter().enumerate() {
+                words.extend_from_slice(&[
+                    i as u32 + 1,
+                    0,
+                    5,
+                    0,
+                    i as u32 + 1,
+                    0,
+                    0,
+                    0,
+                    800,
+                    600,
+                    0,
+                    0,
+                    800 * 256,
+                    600 * 256,
+                    0,
+                    u32::MAX,
+                    1,
+                    0,
+                    *index,
+                ]);
+            }
+            let mut bytes = response(op, &words);
+            bytes[12..16].copy_from_slice(&fds.to_le_bytes());
+            bytes
+        }
+        let bytes = packet(12, &[u32::MAX, 1, 0, u32::MAX], 2);
+        let Request::CommitBatch {
+            scene,
+            count,
+            layers,
+            ..
+        } = decode(&bytes, 2).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((scene, count), (7, 64));
+        assert_eq!(
+            layers.iter().map(|l| l.fence_index).collect::<Vec<_>>(),
+            [None, Some(1), Some(0), None]
+        );
+        // Duplicate, out-of-range, unreferenced and excess descriptors all fail.
+        for (indices, fds) in [
+            (vec![0, 0], 1),
+            (vec![1], 1),
+            (vec![u32::MAX], 1),
+            (vec![0, 1, 2, 3, 4], 5),
+        ] {
+            assert!(decode(&packet(11, &indices, fds), fds as usize).is_err());
+        }
+        assert!(decode(&bytes[..bytes.len() - 1], 2).is_err());
+        assert!(decode(&packet(11, &[], 0), 0).is_err());
+        assert!(decode(&packet(11, &[u32::MAX; 17], 0), 0).is_err());
+        let mut solid_fence = packet(11, &[0], 1);
+        solid_fence[28..36].fill(0); // Buffer ID at header + count + id.
+        assert!(decode(&solid_fence, 1).is_err());
+        let mut staging = Staging::<()>::default();
+        for _ in 0..4 {
+            let Request::StageBatch(layers) = decode(&packet(11, &[u32::MAX; 16], 0), 0).unwrap()
+            else {
+                panic!()
+            };
+            for layer in layers {
+                assert!(staging.push(layer.layer, None));
+            }
+        }
+        assert_eq!(staging.layers().len(), MAX_LAYERS);
+        assert!(!staging.failed());
+        assert!(!staging.push(layer(), None));
+        assert!(staging.failed()); // A valid prefix cannot be committed.
+    }
+
+    #[test]
+    fn async_import_preserves_allocation_metadata_and_descriptor_validation() {
+        use super::*;
+        let b = buffer();
+        let words = [
+            b.id as u32,
+            0,
+            b.width,
+            b.height,
+            b.fourcc,
+            0,
+            b.modifier as u32,
+            (b.modifier >> 32) as u32,
+            0,
+            1,
+            b.planes[0].offset,
+            b.planes[0].stride,
+        ];
+        for (opcode, attempt) in [(2, None), (10, Some(0x1234_5678_0000_0001))] {
+            let mut payload = Vec::new();
+            if attempt.is_some() {
+                payload.extend([1, 0x1234_5678]);
+            }
+            payload.extend(words);
+            let mut packet = response(opcode, &payload);
+            packet[12..16].copy_from_slice(&1_u32.to_le_bytes());
+            let expected = attempt.map_or(Request::Register(b.clone()), |attempt| {
+                Request::RegisterAsync {
+                    attempt,
+                    buffer: b.clone(),
+                }
+            });
+            assert_eq!(decode(&packet, 1), Ok(expected));
+            assert!(decode(&packet, 0).is_err());
+            assert!(decode(&packet, 2).is_err());
+            if opcode == 10 {
+                packet[16..24].fill(0);
+                assert!(decode(&packet, 1).is_err());
+            }
+        }
+        for length in 0..48 {
+            let mut packet = response(10, &[]);
+            packet.resize(16 + length, 0);
+            packet[8..12].copy_from_slice(&(length as u32).to_le_bytes());
+            assert!(decode(&packet, 0).is_err());
+        }
+        assert_eq!(
+            import_result(0x1234_5678_0000_0001, 0x9876_5432_0000_0002, -95),
+            response(0x8007, &[1, 0x1234_5678, 2, 0x9876_5432, (-95_i32) as u32])
+        );
+        assert_eq!(SUPPORTED & ASYNC_IMPORT, ASYNC_IMPORT);
+    }
+
+    #[test]
+    fn async_commit_keeps_scene_identity_separate_from_release_tickets() {
+        use super::{Request, commit_result, decode, response};
+        let scene = 0x1234_5678_0000_0001;
+        assert_eq!(
+            decode(&response(9, &[1, 0x1234_5678, 17, 800, 600, 2]), 0),
+            Ok(Request::CommitAsync {
+                scene,
+                serial: 17,
+                width: 800,
+                height: 600,
+                count: 2
+            })
+        );
+        assert!(decode(&response(9, &[0, 0, 17, 800, 600, 2]), 0).is_err());
+        assert!(decode(&response(9, &[1, 0, 17, 800, 600]), 0).is_err());
+        assert!(decode(&response(9, &[1, 0, 17, 800, 600, 2]), 1).is_err());
+        assert_eq!(
+            commit_result(scene, -95),
+            response(0x8006, &[1, 0x1234_5678, (-95_i32) as u32])
+        );
+        assert_ne!(
+            &commit_result(scene, 0)[4..8],
+            &super::release_fence(scene)[4..8]
+        );
+    }
     #[test]
     fn configuration_subscription_orders_changes_and_leaves_legacy_peers_silent() {
         let mut publisher = super::ConfigPublisher::default();
@@ -565,6 +883,38 @@ mod tests {
             opaque: true,
             color: 0,
         }
+    }
+    #[test]
+    fn pending_and_failed_imports_cannot_be_used_in_a_scene() {
+        let b = buffer();
+        let l = layer();
+        for imported in [false, true] {
+            assert_eq!(
+                validate_scene(
+                    [(&l, false)].into_iter(),
+                    1,
+                    800,
+                    600,
+                    0,
+                    |id| (id == b.id).then_some(SourceState {
+                        buffer: &b,
+                        imported,
+                        ticket: None
+                    }),
+                    |_| None,
+                ),
+                imported,
+            );
+        }
+        assert!(!validate_scene(
+            [(&l, false)].into_iter(),
+            1,
+            800,
+            600,
+            0,
+            |_| None,
+            |_| None
+        ));
     }
     #[test]
     fn geometry_checks_rotated_sources_and_bounds() {

@@ -43,6 +43,31 @@ scans are never lifecycle authority.
 | `/dev/pts` | private devpts | nosuid, noexec, newinstance |
 | `/dev/binderfs` | private binderfs | three named devices only |
 
+The Droidloom system-server policy is a paired file override:
+`/system/framework/services.jar` supplies the Java `WindowManagerPolicy` adapter,
+and `/system/lib64/libinputflinger.so` includes its in-process Rust engine alongside
+the existing Droidloom native input integration.
+Both replace existing regular partition files through the normal override
+mechanism. No new file is created in the immutable system image. The package
+must contain window-policy ABI 1 metadata in both compiled artifacts; native
+architecture must match the cell, and JNI checks the ABI again before WMS starts.
+The framework task backend additionally requires task-backend ABI 2 metadata
+in services, InputFlinger and Composer. Native input ABI 2
+pairs services, InputFlinger and Composer; host channels ABI 1 pairs services,
+SystemUI, IME and the presenter. The standalone input support process and its
+artifacts are retired. The catalog adapter lives in services.jar; the separate
+task launcher, its shared library and application-catalog JAR are also retired.
+Task discovery and host focus/resize/close run inside
+ActivityTaskManager/WindowManager. A dedicated command subscription reuses the
+existing privileged Composer endpoint; object and task-incarnation validation
+prevents stale commands from affecting a reused task ID.
+
+The audio client override at `/system/lib64/libaudiobase.so` keeps the minimum
+playback queue at two mixer periods when `ro.hardware=droidloom`. PipeWire owns
+device buffering; duplicating its latency in each app queue adds avoidable delay.
+This changes no native ABI, output-latency reports or presentation timestamps.
+Explicitly requested larger app buffers are preserved.
+
 An optional `gapps_dir` in the root-owned cell specification selects a derived
 `product`/`system_ext` image pair before Android init starts. `system` and `vendor`
 retain their normal sources. The add-on manifest binds all three base partitions
@@ -137,6 +162,35 @@ disabled. These projections may contain executable compatibility helpers, but
 they are not Android-writable storage and cannot target `/system`, `/vendor`,
 `/data`, or another Android namespace.
 
+## Private audio endpoint (DLAUD001)
+
+The user `droidloom-audio.socket` unit owns `%t/droidloom/audio.sock` under a
+mode-0700 runtime directory. The supervisor may bind only that socket inode at
+`/dev/socket/droidloom/audio`. The broker runs as the host user, independently
+of rendering; it authenticates audioserver's kernel-mapped UID (1041 in the
+preview). A broker restart preserves the listener inode and replaces all stream
+generations. Stopping Droidloom stops the broker and listener through `PartOf`.
+
+Each connection negotiates PCM16 little-endian, 48 kHz, one or two channels,
+and four fixed-size sample allocations. Control records are exactly 64 bytes,
+carry `DLAUD001`, a strictly increasing nonzero request ID, a random generation
+and five bounded fields. The host alone sends sample FDs; clients cannot register
+memory or supply graph metadata. A single acquired credit governs slot, byte
+offset and frame count until submit. Short capture reads retain the remainder.
+Malformed or stale commands and backend failure close that generation.
+The PipeWire callback performs no socket I/O, allocation or PCM copy.
+
+Capture requires an explicit host-user grant in addition to Android app
+permissions. Revocation by removing the grant and restarting the broker stops
+new sampling and closes old connections. It cannot erase delivered samples.
+Dedicated memfds have immutable sizes; capture gets read-only descriptors.
+Neither ALSA devices nor the unrestricted PipeWire socket/session bus enters
+Android. Missing endpoint or denied capture uses timed silence; failure of an
+already live transport is reported to Android rather than fabricating progress.
+Production mapped identity, route/capability notifications and per-app host
+attribution remain unfinished. See [audio implementation](../audio-integration-proposal.md)
+and [threat model v2](../threat-model-v2.md).
+
 ## Network
 
 Each cell owns a network namespace and one veth peer. Host policy assigns its
@@ -190,11 +244,14 @@ releases the cgroup. Repeating teardown must be safe.
 ## Lifecycle readiness and progress
 
 `running` means the namespace owner is alive. Android readiness additionally
-requires `sys.boot_completed=1`, a running `droidloom-input-bridge`, the task
-launcher executable, and the task-control socket. Public `droidloomctl start`
+requires `sys.boot_completed=1`, `sys.droidloom.framework_ready=1`, the native
+framework RPC endpoint, and the task-control socket. Public `droidloomctl start`
 and `restart` wait for readiness; `--no-wait` and internal `--cell` orchestration
 retain service/cell-only startup. `droidloomctl wait` observes readiness without
 starting or restarting the cell. `status` reports the current observed stage.
+The framework sets its readiness property only after native listener setup and
+authenticated descriptor delegation are available; policy initialization and
+zygote restart/stop clear it.
 
 Legacy lifecycle requests remain bare JSON objects with a single JSON response.
 Interactive clients opt into progress with `{"request": <control request>}`.
@@ -204,10 +261,20 @@ byte and are accepted only for installation. UID authorization is unchanged;
 boot observations are emitted only after authorizing the cell owner.
 
 Boot waiting is bounded at 120 seconds, with short timeouts on readiness probes.
-Task-launcher retries share a 120-second execution deadline; application catalog
-and package-manager commands use 110 seconds. Timed-out subprocess groups receive
+Native framework replies have a 120-second deadline. Package-manager commands
+use 110 seconds. Timed-out subprocess groups receive
 a forced kill after a short grace period. Clients enforce a 250-second wall-clock
 request deadline, including queue time, even if progress or partial bytes keep
 arriving. Socket writes are bounded, and a full accept queue fails promptly.
 Client disconnection does not tear down Android. A timed-out client's operation
 may still complete, so its error advises checking the result before retrying.
+
+The lifecycle daemon connects directly through the owned Android init's root
+to private system-owned framework sockets and authenticates UID 1000. The
+framework accepts root peers only. RPC uses a 12-byte DLFC/ABI/opcode/length
+header, with 16 KiB requests and 8 MiB replies. Catalog event descriptors carry
+big-endian u64 generations; connection always emits an initial generation.
+Only the authorized cell owner receives a descriptor. Healthy subscriptions
+block on events; reconnects resnapshot. Framework ABI 1 binds services,
+InputFlinger, the daemon and catalog. Notification ABI 2 binds SystemUI and
+presenter and requires a snapshot before accepting versioned deltas.

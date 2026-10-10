@@ -9,10 +9,35 @@ license {
     license_text: ["LICENSE", "LICENSES/GPL-3.0-or-later.txt"],
 }
 
+// system_server keeps its Java WindowManagerPolicy interface; all native policy
+// decisions execute synchronously in Rust, without another Binder/socket hop.
+filegroup {
+    name: "droidloom-window-policy-sources",
+    srcs: ["android/framework/droidloom-window-policy/java/**/*.java"],
+    visibility: ["//frameworks/base/services:__subpackages__"],
+}
+
+rust_ffi_static {
+    name: "libdroidloom_window_policy",
+    crate_name: "droidloom_window_policy",
+    crate_root: "android/framework/droidloom-window-policy/src/lib.rs",
+    edition: "2021",
+    prefer_rlib: true,
+    visibility: ["//frameworks/native/services/inputflinger"],
+    rustlibs: ["libdroidloom_denial_ipc", "libdroidloom_task_control", "libdroidloom_input_protocol", "liblibc"],
+}
+
+filegroup {
+    name: "droidloom-task-jni-sources",
+    srcs: ["android/framework/droidloom-window-policy/jni/*.cpp"],
+    visibility: ["//frameworks/native/services/inputflinger"],
+}
+
 android_app {
     name: "DroidloomIME",
     manifest: "android/framework/droidloom-ime/AndroidManifest.xml",
-    srcs: ["android/framework/droidloom-ime/src/**/*.java"],
+    srcs: ["android/framework/droidloom-ime/src/**/*.java",
+        "android/framework/host-channels/src/**/*.java"],
     resource_dirs: ["android/framework/droidloom-ime/res"],
     sdk_version: "37",
     min_sdk_version: "31",
@@ -40,6 +65,7 @@ android_app {
     name: "DroidloomSystemUI",
     manifest: "android/framework/droidloom-systemui/AndroidManifest.xml",
     srcs: ["android/framework/droidloom-systemui/src/**/*.java",
+        "android/framework/host-channels/src/**/*.java",
         "android/framework/cpu-placement/src/com/android/droidloom/runtime/CpuPlacement.java"],
     resource_dirs: [],
     platform_apis: true,
@@ -59,6 +85,8 @@ java_library {
         "android/framework/droidloom-systemui/src/com/android/systemui/Unsupported.java",
         "android/framework/droidloom-systemui/src/com/android/systemui/compat/*.java",
         "android/framework/droidloom-systemui/tests/CallbacksProbe.java",
+        "android/framework/droidloom-systemui/tests/ChannelsProbe.java",
+        "android/framework/host-channels/src/**/*.java",
     ],
     installable: true,
     dex_preopt: { enabled: false },
@@ -71,10 +99,11 @@ java_library {
 // and builds its own vendor partition.
 rust_library {
     name: "libdroidloom_transport",
+    apex_available: ["//apex_available:platform", "com.android.hardware.audio.droidloom"],
     crate_name: "droidloom_transport",
     crate_root: "graphics/droidloom-transport/src/lib.rs",
     edition: "2021",
-    vendor: true,
+    vendor_available: true,
     rustlibs: [
         "libserde",
         "libthiserror",
@@ -115,34 +144,19 @@ rust_library {
     crate_name: "droidloom_input_protocol",
     crate_root: "graphics/droidloom-input-protocol/src/lib.rs",
     edition: "2021",
-    vendor: true,
-    // The record codec is tiny and has a single Android consumer. Linking it
-    // directly avoids adding a new vendor partition ABI/runtime file.
+    vendor_available: true,
+    // Link the codec directly into the Composer sender and InputFlinger receiver
+    // rather than introducing another partition ABI/runtime file.
     prefer_rlib: true,
     no_stdlibs: true,
 }
 
-// The routing, gesture identity, and policy remain in Rust. This framework
-// bridge contains the long-running input adapter plus a one-shot application
-// metadata adapter; Android remains authoritative for MotionEvents, launcher
-// intent resolution, localized labels, and adaptive icons.
-java_binary {
-    name: "droidloom-input-bridge",
+prebuilt_etc {
+    name: "droidloom-framework-init",
+    src: "android/framework/droidloom-window-policy/droidloom-framework.rc",
+    filename: "droidloom-framework.rc",
+    sub_dir: "init",
     vendor: true,
-    srcs: ["android/framework/droidloom-input-bridge/src/**/*.java",
-        "android/framework/cpu-placement/src/com/android/droidloom/runtime/CpuPlacement.java"],
-    wrapper: "android/framework/droidloom-input-bridge/droidloom-input-bridge",
-    init_rc: ["android/framework/droidloom-input-bridge/droidloom-input-bridge.rc"],
-    // TaskStackListener is a pinned platform API. The root bridge observes
-    // Android launches without intercepting or reconstructing their intents.
-    sdk_version: "core_platform",
-    libs: ["framework"],
-    // This privileged platform adapter is built from plain Java and is covered
-    // by the focused runtime tests. Avoid pulling Android's global app-lint
-    // plugin graph into the intentionally sparse Droidloom source checkout.
-    lint: {
-        enabled: false,
-    },
 }
 
 // Low-frequency privileged lifecycle protocol. This reserves/configures a
@@ -152,35 +166,10 @@ rust_library {
     crate_name: "droidloom_task_control",
     crate_root: "graphics/droidloom-task-control/src/lib.rs",
     edition: "2021",
-    vendor: true,
+    vendor_available: true,
     rustlibs: [
         "libthiserror",
     ],
-}
-
-// Privileged one-shot primitive invoked by the host supervisor inside the
-// Android cell. It uses Android's own activity command service, discovers the
-// resulting leaf task on the newly reserved display, and commits the real task
-// ID through the two-phase control protocol.
-rust_library {
-    name: "libdroidloom_task_launcher",
-    crate_name: "droidloom_task_launcher",
-    crate_root: "android/framework/droidloom-task-launcher/src/lib.rs",
-    edition: "2021",
-    vendor: true,
-    rustlibs: [
-        "libdroidloom_denial_ipc",
-        "libdroidloom_task_control",
-    ],
-}
-
-rust_binary {
-    name: "droidloom-task-launcher",
-    crate_name: "droidloom_task_launcher_bin",
-    crate_root: "android/framework/droidloom-task-launcher/src/main.rs",
-    edition: "2021",
-    vendor: true,
-    rustlibs: ["libdroidloom_task_launcher"],
 }
 
 // Development-only LMKD protocol endpoint. The Android cell's memory budget
@@ -212,10 +201,11 @@ rust_binary {
 // descriptor role before either side mutates compositor state.
 rust_library {
     name: "libdroidloom_denial_protocol",
+    apex_available: ["//apex_available:platform", "com.android.hardware.audio.droidloom"],
     crate_name: "droidloom_denial_protocol",
     crate_root: "graphics/droidloom-denial-protocol/src/lib.rs",
     edition: "2021",
-    vendor: true,
+    vendor_available: true,
     rustlibs: [
         "libdroidloom_transport",
         "libthiserror",
@@ -227,15 +217,41 @@ rust_library {
 // received FD and pairs it with a role from the safe protocol codec.
 rust_library {
     name: "libdroidloom_denial_ipc",
+    apex_available: ["//apex_available:platform", "com.android.hardware.audio.droidloom"],
     crate_name: "droidloom_denial_ipc",
     crate_root: "graphics/droidloom-denial-ipc/src/lib.rs",
     edition: "2021",
-    vendor: true,
+    vendor_available: true,
     rustlibs: [
         "libdroidloom_denial_protocol",
         "liblibc",
         "libthiserror",
     ],
+}
+
+// Audio shares sealed sample pools with a separate host-user PipeWire broker.
+// The HAL links this client statically; PipeWire is never linked into Android.
+rust_library {
+    name: "libdroidloom_audio_protocol",
+    crate_name: "droidloom_audio_protocol",
+    crate_root: "runtime/droidloom-audio-protocol/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    prefer_rlib: true,
+    apex_available: ["//apex_available:platform", "com.android.hardware.audio.droidloom"],
+    rustlibs: ["libdroidloom_denial_ipc", "liblibc"],
+}
+
+rust_ffi_static {
+    name: "libdroidloom_audio_client",
+    prefer_rlib: true,
+    crate_name: "droidloom_audio_client",
+    crate_root: "android/audio/droidloom-audio-client/src/lib.rs",
+    edition: "2021",
+    vendor: true,
+    apex_available: ["//apex_available:platform", "com.android.hardware.audio.droidloom"],
+    export_include_dirs: ["android/audio/droidloom-audio-client/include"],
+    rustlibs: ["libdroidloom_audio_protocol", "liblibc"],
 }
 
 // Shared DRM syncobj timeline operations for the Android Composer and Denial
@@ -256,12 +272,33 @@ rust_library {
     crate_root: "graphics/droidloom-syncobj/src/lib.rs",
     edition: "2021",
     vendor: true,
-    rlibs: ["libdroidloom_cpu_placement"],
+    rlibs: ["libdroidloom_cpu_placement", "libdroidloom_timing"],
     rustlibs: [
         "libdrm_rust",
         "liblibc",
         "libthiserror",
     ],
+}
+
+rust_library {
+    name: "libdroidloom_timing",
+    crate_name: "droidloom_timing",
+    crate_root: "runtime/droidloom-timing/src/lib.rs",
+    edition: "2024",
+    vendor_available: true,
+    rlibs: ["libdroidloom_cpu_placement"],
+    // The Android timing adapter calls bionic directly. It must not embed a
+    // libc Rust rlib alongside syncobj/drm's existing libc Rust dylib.
+    shared_libs: ["liblog"],
+}
+
+rust_ffi_static {
+    name: "libdroidloom_frame_timing",
+    crate_name: "droidloom_frame_timing",
+    crate_root: "runtime/droidloom-timing/src/lib.rs",
+    edition: "2024",
+    rlibs: ["libdroidloom_cpu_placement"],
+    shared_libs: ["liblog"],
 }
 
 // Fixed-record, cell-private handoff used when SurfaceFlinger renders the

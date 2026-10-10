@@ -2,7 +2,8 @@
 Description=Droidloom Android application runtime
 PartOf=graphical-session.target
 After=graphical-session-pre.target wayland-session-waitenv.service
-Wants=droidloom-applications.service
+Wants=droidloom-applications.service droidloom-audio.socket
+After=droidloom-audio.socket
 ConditionPathExists=/etc/droidloom/cell.json
 
 [Service]

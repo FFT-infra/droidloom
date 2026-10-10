@@ -12,7 +12,7 @@ use core::fmt;
 /// Marker at the start of every input record.
 pub const MAGIC: [u8; 4] = *b"DLIN";
 /// Wire protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 6;
+pub const PROTOCOL_MAJOR: u16 = 7;
 
 /// Build metadata retained by the native sender for offline package verification.
 pub const BUILD_COMPATIBILITY: [u8; 26] = compatibility_marker(PROTOCOL_MAJOR);
@@ -32,7 +32,7 @@ const fn compatibility_marker(mut version: u16) -> [u8; 26] {
 }
 
 /// Exact size of one sequenced-packet record.
-pub const RECORD_BYTES: usize = 40;
+pub const RECORD_BYTES: usize = 48;
 /// Record kind for a touchscreen contact update.
 pub const KIND_TOUCH: u8 = 1;
 /// Record kind for one Linux input key transition.
@@ -69,6 +69,10 @@ pub enum InputProtocolError {
     TaskId,
     /// Task bounds must be non-zero signed 32-bit dimensions.
     TaskExtent,
+    /// A framework incarnation must be positive and fit a Java long.
+    Incarnation,
+    /// Record length, version, reserved fields or kind is invalid.
+    Record,
 }
 
 impl fmt::Display for InputProtocolError {
@@ -82,6 +86,8 @@ impl fmt::Display for InputProtocolError {
             Self::Coordinate => "scaled touch coordinate exceeds the signed 16.16 wire range",
             Self::TaskId => "Android task ID is outside the positive framework range",
             Self::TaskExtent => "Android task bounds are outside the framework range",
+            Self::Incarnation => "input requires a positive framework task incarnation",
+            Self::Record => "invalid routed input record",
         })
     }
 }
@@ -121,7 +127,11 @@ pub fn encode_touch(
     x_fixed: i32,
     y_fixed: i32,
     pressure: u16,
+    incarnation: u64,
 ) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if incarnation == 0 || incarnation > i64::MAX as u64 {
+        return Err(InputProtocolError::Incarnation);
+    }
     if android_display > i32::MAX as u32 {
         return Err(InputProtocolError::AndroidDisplay);
     }
@@ -149,6 +159,7 @@ pub fn encode_touch(
     record[32..34].copy_from_slice(&pressure.to_le_bytes());
     // Bytes 34..36 are reserved and remain zero.
     record[36..40].copy_from_slice(&task_id.to_le_bytes());
+    record[40..48].copy_from_slice(&incarnation.to_le_bytes());
     Ok(record)
 }
 
@@ -162,6 +173,7 @@ pub fn encode_touch(
 ///
 /// Rejects display IDs, key identities, and actions outside their platform
 /// ranges.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_key(
     android_display: u32,
     task_id: u64,
@@ -170,7 +182,11 @@ pub fn encode_key(
     keycode: u32,
     repeat: u16,
     route_serial: u64,
+    incarnation: u64,
 ) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if incarnation == 0 || incarnation > i64::MAX as u64 {
+        return Err(InputProtocolError::Incarnation);
+    }
     if android_display > i32::MAX as u32 {
         return Err(InputProtocolError::AndroidDisplay);
     }
@@ -197,6 +213,7 @@ pub fn encode_key(
     // Bytes 26..28 are reserved and remain zero.
     record[28..36].copy_from_slice(&route_serial.to_le_bytes());
     record[36..40].copy_from_slice(&task_id.to_le_bytes());
+    record[40..48].copy_from_slice(&incarnation.to_le_bytes());
     Ok(record)
 }
 
@@ -298,9 +315,161 @@ pub fn encode_display_power(powered: bool) -> [u8; RECORD_BYTES] {
     record
 }
 
+/// Validated sample addressed to one framework task incarnation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sample {
+    /// Android logical display selected by the framework.
+    pub display: i32,
+    /// Attached Android leaf task.
+    pub task: i32,
+    /// Framework lifetime identity, preventing task ID reuse.
+    pub incarnation: u64,
+    /// Monotonic nanoseconds from the host input source.
+    pub timestamp: u64,
+    /// Wire touch or key action.
+    pub action: u8,
+    /// Pointer ID or evdev scan code.
+    pub code: u32,
+    /// Kind-specific validated data.
+    pub payload: Payload,
+}
+
+/// Kind-specific input data.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Payload {
+    /// Task-local physical pixel coordinates and normalized pressure.
+    Touch {
+        /// Horizontal task-local coordinate.
+        x: f32,
+        /// Vertical task-local coordinate.
+        y: f32,
+        /// Normalized contact pressure.
+        pressure: f32,
+    },
+    /// Keyboard state and end-to-end trace identity.
+    Key {
+        /// Host-generated repeat count.
+        repeat: u16,
+        /// Host route sequence number.
+        serial: u64,
+    },
+}
+
+/// One validated native input receiver record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Record {
+    /// Task-scoped touch or key sample.
+    Input(Sample),
+    /// Whether any physical host output is powered.
+    DisplayPower(bool),
+}
+
+/// Decode exactly one descriptor-free packet. Retired task-control kinds are rejected.
+///
+/// # Errors
+/// Rejects malformed, incompatible or out-of-range records.
+// Exact length is checked before the fixed offsets; Android represents native
+// MotionEvent coordinates as f32, including the 16.16 conversion's rounding.
+#[allow(clippy::missing_panics_doc, clippy::cast_precision_loss)]
+pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
+    if bytes.len() != RECORD_BYTES
+        || bytes[..4] != MAGIC
+        || bytes[4..6] != PROTOCOL_MAJOR.to_le_bytes()
+    {
+        return Err(InputProtocolError::Record);
+    }
+    if bytes[6] == KIND_DISPLAY_POWER {
+        if bytes[7] > 1 || bytes[8..].iter().any(|byte| *byte != 0) {
+            return Err(InputProtocolError::Record);
+        }
+        return Ok(Record::DisplayPower(bytes[7] != 0));
+    }
+    let word = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let wide = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let display = i32::try_from(word(8)).map_err(|_| InputProtocolError::AndroidDisplay)?;
+    let task = i32::try_from(word(36)).map_err(|_| InputProtocolError::TaskId)?;
+    if task <= 0 {
+        return Err(InputProtocolError::TaskId);
+    }
+    let incarnation = wide(40);
+    if incarnation == 0 || incarnation > i64::MAX as u64 {
+        return Err(InputProtocolError::Incarnation);
+    }
+    let timestamp = wide(16);
+    if timestamp == 0 || timestamp > i64::MAX as u64 {
+        return Err(InputProtocolError::Record);
+    }
+    let action = bytes[7];
+    let code = word(12);
+    let payload = match bytes[6] {
+        KIND_TOUCH if action <= 3 && code <= MAX_POINTER_ID && bytes[34..36] == [0, 0] => {
+            Payload::Touch {
+                x: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as f32 / 65536.0,
+                y: i32::from_le_bytes(bytes[28..32].try_into().unwrap()) as f32 / 65536.0,
+                pressure: f32::from(u16::from_le_bytes(bytes[32..34].try_into().unwrap()))
+                    / 65535.0,
+            }
+        }
+        KIND_KEY if action <= 1 && code <= MAX_EVDEV_KEYCODE && bytes[26..28] == [0, 0] => {
+            Payload::Key {
+                repeat: u16::from_le_bytes(bytes[24..26].try_into().unwrap()),
+                serial: wide(28),
+            }
+        }
+        _ => return Err(InputProtocolError::Record),
+    };
+    Ok(Record::Input(Sample {
+        display,
+        task,
+        incarnation,
+        timestamp,
+        action,
+        code,
+        payload,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_preserves_incarnation_and_rejects_malformed_packets() {
+        let record = encode_touch(0, 42, 100, 0, 2, 5 << 16, -(3 << 16), u16::MAX, 7).unwrap();
+        let Record::Input(sample) = decode(&record).unwrap() else {
+            panic!("input expected")
+        };
+        assert_eq!(sample.incarnation, 7);
+        assert_eq!(
+            sample.payload,
+            Payload::Touch {
+                x: 5.0,
+                y: -3.0,
+                pressure: 1.0
+            }
+        );
+        assert!(decode(&record[..40]).is_err());
+        for (offset, value) in [(4, 6), (6, 3), (7, 4), (12, 32), (34, 1), (40, 0)] {
+            let mut malformed = record;
+            malformed[offset] = value;
+            assert!(decode(&malformed).is_err(), "offset {offset}");
+        }
+        let key = encode_key(0, 42, 100, 0, 30, 2, 15, 7).unwrap();
+        let Record::Input(sample) = decode(&key).unwrap() else {
+            panic!("key expected")
+        };
+        assert_eq!(
+            sample.payload,
+            Payload::Key {
+                repeat: 2,
+                serial: 15
+            }
+        );
+        assert_eq!(
+            decode(&encode_display_power(false)),
+            Ok(Record::DisplayPower(false))
+        );
+    }
 
     #[test]
     fn embedded_compatibility_tracks_the_encoder_version() {
@@ -340,6 +509,7 @@ mod tests {
             0x0012_8000,
             0x0034_4000,
             32_768,
+            42,
         )
         .unwrap();
 
@@ -360,19 +530,19 @@ mod tests {
     #[test]
     fn unrepresentable_android_ids_fail_closed() {
         assert_eq!(
-            encode_touch(i32::MAX as u32 + 1, 29, 1, 0, 0, 0, 0, u16::MAX,),
+            encode_touch(i32::MAX as u32 + 1, 29, 1, 0, 0, 0, 0, u16::MAX, 42),
             Err(InputProtocolError::AndroidDisplay)
         );
         assert_eq!(
-            encode_touch(0, 29, 1, 0, 32, 0, 0, u16::MAX),
+            encode_touch(0, 29, 1, 0, 32, 0, 0, u16::MAX, 42),
             Err(InputProtocolError::PointerId)
         );
         assert_eq!(
-            encode_touch(0, 29, 1, 4, 0, 0, 0, u16::MAX),
+            encode_touch(0, 29, 1, 4, 0, 0, 0, u16::MAX, 42),
             Err(InputProtocolError::Action)
         );
         assert_eq!(
-            encode_touch(0, 0, 1, 0, 0, 0, 0, u16::MAX),
+            encode_touch(0, 0, 1, 0, 0, 0, 0, u16::MAX, 42),
             Err(InputProtocolError::TaskId)
         );
     }
@@ -387,6 +557,7 @@ mod tests {
             30,
             7,
             0x1112_1314_1516_1718,
+            42,
         )
         .unwrap();
 
@@ -406,19 +577,19 @@ mod tests {
     #[test]
     fn invalid_key_records_fail_closed() {
         assert_eq!(
-            encode_key(i32::MAX as u32 + 1, 29, 1, 0, 30, 0, 1),
+            encode_key(i32::MAX as u32 + 1, 29, 1, 0, 30, 0, 1, 42),
             Err(InputProtocolError::AndroidDisplay)
         );
         assert_eq!(
-            encode_key(0, 29, 1, 0, MAX_EVDEV_KEYCODE + 1, 0, 1),
+            encode_key(0, 29, 1, 0, MAX_EVDEV_KEYCODE + 1, 0, 1, 42),
             Err(InputProtocolError::KeyCode)
         );
         assert_eq!(
-            encode_key(0, 29, 1, 2, 30, 0, 1),
+            encode_key(0, 29, 1, 2, 30, 0, 1, 42),
             Err(InputProtocolError::Action)
         );
         assert_eq!(
-            encode_key(0, 0, 1, 0, 30, 0, 1),
+            encode_key(0, 0, 1, 0, 30, 0, 1, 42),
             Err(InputProtocolError::TaskId)
         );
     }

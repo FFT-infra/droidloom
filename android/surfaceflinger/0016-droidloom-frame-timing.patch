@@ -1,0 +1,310 @@
+diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
+--- a/services/surfaceflinger/Android.bp
++++ b/services/surfaceflinger/Android.bp
+@@ -33,6 +33,7 @@
+ 
+ cc_defaults {
+     name: "surfaceflinger_defaults",
++    static_libs: ["libdroidloom_frame_timing"],
+     defaults: [
+         "no_bti",
+     ],
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
+@@ -109,6 +109,8 @@
+     // A null display leaves normal and screen-capture outputs unchanged.
+     std::optional<PhysicalDisplayId> droidloomHeadlessDisplay;
+     sp<Fence> droidloomHeadlessFence;
++    // Diagnostic sample identity only; never affects presentation/release policy.
++    uint64_t droidloomTimingFrame = 0;
+ };
+ 
+ } // namespace android::compositionengine
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+@@ -202,6 +202,7 @@
+ 
+     // Null disables the headless path; Fence::NO_FENCE is a valid empty frame.
+     sp<Fence> mDroidloomHeadlessFence;
++    uint64_t mDroidloomTimingFrame = 0;
+ 
+     bool mPredictCompositionStrategy = false;
+     bool mOffloadPresent = false;
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -26,6 +26,7 @@
+ #include <compositionengine/RenderSurface.h>
+ #include <compositionengine/impl/HwcAsyncWorker.h>
+ #include <compositionengine/impl/Output.h>
++#include "DroidloomTiming.h"
+ #include <compositionengine/impl/OutputCompositionState.h>
+ #include <compositionengine/impl/OutputLayer.h>
+ #include <compositionengine/impl/OutputLayerCompositionState.h>
+@@ -455,6 +456,10 @@
+         *physicalId == *refreshArgs.droidloomHeadlessDisplay) {
+         mDroidloomHeadlessFence = refreshArgs.droidloomHeadlessFence;
+     }
++    mDroidloomTimingFrame = refreshArgs.droidloomTimingFrame;
++    DroidloomTimingSpan bootstrapTiming(DroidloomTimingStage::BootstrapPresent,
++                                       mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0,
++                                       0, getOutputLayerCount());
+     std::optional<panopticon::ExclusiveToken> exclusive;
+     if (auto displayId = getDisplayId(); displayId) {
+         exclusive.emplace(panopticon::exclusive(std::to_string(displayId->value)));
+@@ -485,13 +490,20 @@
+                        stringifyExpectedPresentTime().c_str());
+     }
+     ALOGV(__FUNCTION__);
++    const uint64_t timingFrame = mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0;
++    DroidloomTimingSpan stateTiming(DroidloomTimingStage::BootstrapState,
++                                   timingFrame, 0, getOutputLayerCount());
+     updateColorProfile(refreshArgs);
+     updateCompositionState(refreshArgs);
+     planComposition();
+     writeCompositionState(refreshArgs);
+     setColorTransform(refreshArgs);
++    stateTiming.stop();
++    DroidloomTimingSpan beginTiming(DroidloomTimingStage::BootstrapBegin, timingFrame);
+     beginFrame();
++    beginTiming.stop();
+ 
++    DroidloomTimingSpan prepareTiming(DroidloomTimingStage::BootstrapPrepare, timingFrame);
+     if (isPowerHintSessionEnabled()) {
+         // always reset the flag before the composition prediction
+         setHintSessionRequiresRenderEngine(false);
+@@ -503,9 +515,12 @@
+     } else {
+         prepareFrame();
+     }
++    prepareTiming.stop();
+ 
+     devOptRepaintFlash(refreshArgs);
++    DroidloomTimingSpan finishTiming(DroidloomTimingStage::BootstrapFinish, timingFrame);
+     finishFrame(std::move(result));
++    finishTiming.stop();
+     ftl::Future<std::monostate> future;
+     const bool flushEvenWhenDisabled = !refreshArgs.bufferIdsToUncache.empty();
+     if (mOffloadPresent) {
+@@ -520,6 +535,7 @@
+         presentFrameAndReleaseLayers(flushEvenWhenDisabled);
+         future = ftl::yield<std::monostate>({});
+     }
++    DroidloomTimingSpan cacheTiming(DroidloomTimingStage::BootstrapCache, timingFrame);
+     renderCachedSets(refreshArgs);
+     return future;
+ }
+@@ -1351,6 +1367,8 @@
+                 std::make_unique<FenceTime>(sp<Fence>::make(dup(optReadyFence->get()))));
+     }
+     // swap buffers (presentation)
++    DroidloomTimingSpan queueTiming(DroidloomTimingStage::BootstrapQueue,
++                                   mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0);
+     mRenderSurface->queueBuffer(std::move(*optReadyFence), getHdrSdrRatio(buffer));
+ }
+ 
+@@ -1382,8 +1400,11 @@
+     // flipClientTarget request for this frame on this output, we still need to
+     // dequeue a buffer.
+     if (outputState.usesClientComposition || outputState.flipClientTarget) {
++        DroidloomTimingSpan dequeueTiming(DroidloomTimingStage::BootstrapDequeue,
++                                         mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0);
+         *tex = mRenderSurface->dequeueBuffer(bufferFence);
+         if (*tex == nullptr) {
++            dequeueTiming.outcome(false);
+             ALOGW("Dequeuing buffer for display [%s] failed, bailing out of "
+                   "client composition for this frame",
+                   mName.c_str());
+@@ -1419,6 +1440,9 @@
+ 
+     ALOGV("hasClientComposition");
+ 
++    DroidloomTimingSpan requestsTiming(DroidloomTimingStage::BootstrapRequests,
++                                      mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0,
++                                      0, getOutputLayerCount());
+     renderengine::DisplaySettings clientCompositionDisplay =
+             generateClientCompositionDisplaySettings(tex);
+ 
+@@ -1431,6 +1455,7 @@
+                                               clientCompositionDisplay.outputDataspace,
+                                               clientCompositionLayersFE);
+     appendRegionFlashRequests(debugRegion, clientCompositionLayers);
++    requestsTiming.stop();
+ 
+     if (mDroidloomHeadlessFence) {
+         // The bootstrap target is discarded by the host. Preserve all normal
+@@ -1772,10 +1797,17 @@
+     auto& outputState = editState();
+     outputState.dirtyRegion.clear();
+ 
++    const uint64_t timingFrame = mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0;
++    DroidloomTimingSpan hwcTiming(DroidloomTimingStage::BootstrapHwcPresent, timingFrame);
+     auto frame = presentFrame();
++    hwcTiming.stop();
+ 
++    DroidloomTimingSpan completeTiming(DroidloomTimingStage::BootstrapComplete, timingFrame);
+     mRenderSurface->onPresentDisplayCompleted();
++    completeTiming.stop();
+ 
++    DroidloomTimingSpan releaseTiming(DroidloomTimingStage::BootstrapRelease,
++                                     timingFrame, 0, getOutputLayerCount());
+     const bool force_slower_follower_gpu_composition =
+             FlagManager::getInstance().force_slower_follower_gpu_composition_combined();
+     for (auto* layer : getOutputLayersOrderedByZ()) {
+diff --git a/services/surfaceflinger/DroidloomTiming.h b/services/surfaceflinger/DroidloomTiming.h
+new file mode 100644
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomTiming.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <cstdint>
++
++namespace android {
++struct DroidloomTimingStamp { uint64_t wall_ns, cpu_ns; };
++extern "C" DroidloomTimingStamp droidloom_timing_start(uint64_t frame);
++extern "C" void droidloom_timing_finish(uint32_t stage, uint64_t object, uint64_t frame,
++                                       uint64_t layers, uint64_t outcome, DroidloomTimingStamp start);
++// Numeric IDs are paired with runtime/droidloom-timing/src/lib.rs.
++enum class DroidloomTimingStage : uint32_t {
++    Composite, TaskScan, SnapshotCopy, DirectPrepare, DirectPublish,
++    FallbackRender, BootstrapPresent, BootstrapRequests,
++    BootstrapState, BootstrapBegin, BootstrapPrepare, BootstrapFinish,
++    BootstrapDequeue, BootstrapQueue, BootstrapHwcPresent, BootstrapComplete,
++    BootstrapRelease, BootstrapCache,
++};
++class DroidloomTimingSpan {
++    DroidloomTimingStage mStage;
++    uint64_t mFrame, mObject, mLayers, mOutcome = 1;
++    DroidloomTimingStamp mStart{};
++public:
++    DroidloomTimingSpan(DroidloomTimingStage stage, uint64_t frame,
++                       uint64_t object = 0, uint64_t layers = 0)
++          : mStage(stage), mFrame(frame), mObject(object), mLayers(layers) {
++        if (frame % 8 == 1) mStart = droidloom_timing_start(frame);
++    }
++    DroidloomTimingSpan(const DroidloomTimingSpan&) = delete;
++    DroidloomTimingSpan& operator=(const DroidloomTimingSpan&) = delete;
++    ~DroidloomTimingSpan() { stop(); }
++    void layers(uint64_t value) { mLayers = value; }
++    void outcome(bool success) { mOutcome = success ? 1 : 0; }
++    void stop() {
++        if (mStart.wall_ns == 0) return;
++        droidloom_timing_finish(static_cast<uint32_t>(mStage), mObject, mFrame,
++                               mLayers, mOutcome, mStart);
++        mStart = {};
++    }
++};
++} // namespace android
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -140,6 +140,7 @@
+ #include "DisplayDevice.h"
+ #include "DroidloomNativeWindow.h"
+ #include "DroidloomTaskWork.h"
++#include "DroidloomTiming.h"
+ #include "DisplayHardware/ComposerHal.h"
+ #include "DisplayHardware/FramebufferSurface.h"
+ #include "DisplayHardware/Hal.h"
+@@ -3333,6 +3334,9 @@
+ 
+ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         PhysicalDisplayId pacesetterId, const scheduler::FrameTargeters& frameTargeters) {
++    static uint64_t timingSequence = 0;
++    const uint64_t timingFrame = ++timingSequence;
++    DroidloomTimingSpan compositeTiming(DroidloomTimingStage::Composite, timingFrame);
+     SFTRACE_ASYNC_FOR_TRACK_BEGIN(WorkloadTracer::TRACK_NAME, "Composition",
+                                   WorkloadTracer::COMPOSITION_TRACE_COOKIE);
+ 
+@@ -3346,6 +3350,7 @@
+     SFTRACE_NAME(ftl::Concat(__func__, ' ', ftl::to_underlying(vsyncId)).c_str());
+ 
+     compositionengine::CompositionRefreshArgs refreshArgs;
++    refreshArgs.droidloomTimingFrame = timingFrame;
+     // adpf load up hint
+     refreshArgs.powerCallback = this;
+     refreshArgs.outputs.reserve(displays.size());
+@@ -3395,6 +3400,7 @@
+             ? copyMergedSnapshots(refreshArgs)
+             : addLayerSnapshotsToCompositionArgs(refreshArgs, kCursorOnly);
+     prepareLayersForComposition(refreshArgs, kCursorOnly, layers);
++    compositeTiming.layers(layers.size());
+ 
+     for (auto& [layer, layerFE] : layers) {
+         validateForReadback(layerFE);
+@@ -3492,6 +3498,7 @@
+         std::unordered_map<int32_t, DirectTaskFrame> taskFrames;
+         std::unordered_map<int32_t, bool> liveTasks;
+ 
++        DroidloomTimingSpan scanTiming(DroidloomTimingStage::TaskScan, timingFrame, 0, layers.size());
+         Rect displayBounds;
+         for (const auto& output : refreshArgs.outputs) {
+             if (output->getDisplayIdVariant().and_then(asPhysicalDisplayId) == pacesetterId) {
+@@ -3546,6 +3553,7 @@
+             frame.layers.emplace_back(owner, sp<LayerFE>::fromExisting(layerFE));
+         }
+ 
++        scanTiming.stop();
+         std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
+         for (const auto& [task, frame] : taskFrames) {
+             if (frame.applicationToken != nullptr) {
+@@ -3669,6 +3677,8 @@
+             }
+             if (!needsWork) { ++skippedTasks; continue; }
+             ++preparedTasks;
++            DroidloomTimingSpan copyTiming(DroidloomTimingStage::SnapshotCopy, timingFrame,
++                                          task, frame.layers.size());
+             std::vector<uint32_t> layerOrder;
+             layerOrder.reserve(frame.layers.size());
+             for (auto& [owner, layer] : frame.layers) {
+@@ -3684,6 +3694,7 @@
+                 layer = copy;
+                 ++copiedSnapshots;
+             }
++            copyTiming.stop();
+             const bool layersChanged = layerOrder != taskOutput.layerOrder;
+             if (layersChanged) {
+                 taskOutput.layerOrder = std::move(layerOrder);
+@@ -3739,17 +3750,27 @@
+                             forceGeometry || refreshArgs.updatingOutputGeometryThisFrame,
+                     .updatingGeometryThisFrame =
+                             forceGeometry || refreshArgs.updatingGeometryThisFrame,
++                    .droidloomTimingFrame = timingFrame,
+             };
+             // Resolve the same occlusion, clipping and HWC geometry used by
+             // normal composition, but export the original producer buffers
+             // before invoking RenderEngine. This policy is application-neutral.
+             if (directLayers &&
+                 droidloomAsyncReleasesEnabled()) {
++                DroidloomTimingSpan prepareTiming(DroidloomTimingStage::DirectPrepare,
++                                                 timingFrame, task, frame.layers.size());
+                 compositionengine::LayerFESet snapshots;
+                 output->prepare(taskRefresh, snapshots);
+                 output->updateColorProfile(taskRefresh);
+                 output->updateCompositionState(taskRefresh);
+-                if (taskOutput.window->presentLayers(*output, targetSize.width, targetSize.height, *this)) {
++                prepareTiming.stop();
++                DroidloomTimingSpan publishTiming(DroidloomTimingStage::DirectPublish,
++                                                 timingFrame, task, frame.layers.size());
++                const bool accepted = taskOutput.window->presentLayers(*output, targetSize.width,
++                                                                       targetSize.height, *this);
++                publishTiming.outcome(accepted);
++                publishTiming.stop();
++                if (accepted) {
+                     taskOutput.invalidated = false;
+                     taskOutput.work.accept(workRevision);
+                     continue;
+@@ -3789,7 +3810,10 @@
+                         renderengine::impl::ExternalTexture::Usage::WRITEABLE);
+             }
+             output->setDroidloomTarget(texture);
++            DroidloomTimingSpan renderTiming(DroidloomTimingStage::FallbackRender,
++                                             timingFrame, task, frame.layers.size());
+             taskOutput.engine->present(taskRefresh);
++            renderTiming.stop();
+             // Every rotated target is still fully rendered. Damage describes
+             // differences from the last submitted frame, not target buffer age.
+             const bool fullDamage = forceGeometry || refreshArgs.updatingGeometryThisFrame;

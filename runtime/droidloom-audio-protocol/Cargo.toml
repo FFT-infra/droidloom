@@ -1,0 +1,20 @@
+[package]
+name = "droidloom-audio-protocol"
+description = "Bounded private audio control and shared sample buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+droidloom-denial-ipc = { path = "../../graphics/droidloom-denial-ipc" }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

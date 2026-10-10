@@ -61,7 +61,7 @@ pub fn stage(repo: &Path, work: &Path, destination: &Path, clean: bool, jobs: us
     run_build(&mut host)?;
     let base = assemble::prepare_package_inputs(repo, &work, "x86_64")?;
     python::prepare(repo, &work)?;
-    assemble::mesa_tools(&work, jobs)?;
+    assemble::mesa_tools(&work, jobs, false)?;
     android::build(repo, &source, &out, &work, "droidloom_x86_64", jobs)?;
     if !source_ready.exists() {
         write(

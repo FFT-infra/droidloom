@@ -93,6 +93,22 @@ pub trait ApplicationSource {
     ///
     /// Returns a transport, runtime, component, or image-encoding error.
     fn icon(&mut self, component: &str, size: u32) -> Result<Vec<u8>, CatalogError>;
+
+    /// Render a bounded icon batch; omitted entries are retried after transient failures.
+    fn icons(
+        &mut self,
+        components: &[String],
+        size: u32,
+    ) -> Result<BTreeMap<String, Vec<u8>>, CatalogError> {
+        Ok(components
+            .iter()
+            .filter_map(|component| {
+                self.icon(component, size)
+                    .ok()
+                    .map(|bytes| (component.clone(), bytes))
+            })
+            .collect())
+    }
 }
 
 /// Catalog source backed by the local Droidloom lifecycle socket.
@@ -150,11 +166,37 @@ impl ApplicationSource for ControlCatalog {
             .ok_or(CatalogError::MissingResponseData("application icon"))?;
         decode_base64(&encoded)
     }
+
+    fn icons(
+        &mut self,
+        components: &[String],
+        size: u32,
+    ) -> Result<BTreeMap<String, Vec<u8>>, CatalogError> {
+        let response = request(
+            &self.socket,
+            &ControlRequest::ApplicationIcons {
+                components: components.to_vec(),
+                user: self.user,
+                size,
+            },
+        )?;
+        if !response.ok {
+            return Err(CatalogError::Control(response.message));
+        }
+        response
+            .application_icons
+            .ok_or(CatalogError::MissingResponseData("application icon batch"))?
+            .into_iter()
+            .map(|(name, png)| decode_base64(&png).map(|bytes| (name, bytes)))
+            .collect()
+    }
 }
 
 /// Result of one catalog reconciliation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileSummary {
+    /// Retry this pass after a transport/rendering failure; normal idle needs no timer.
+    pub retry_needed: bool,
     /// Number of exported Android launcher activities.
     pub applications: usize,
     /// Desktop files whose content changed.
@@ -269,6 +311,31 @@ pub fn reconcile(
     let mut live_desktops = BTreeSet::new();
     let mut live_icons = BTreeSet::new();
 
+    let needed: Vec<String> = applications
+        .iter()
+        .filter(|application| {
+            let id = application_id(source.user(), &application.component);
+            let path = paths.icons.join(format!("droidloom-{id}.png"));
+            !previous.applications.get(&id).is_some_and(|entry| {
+                entry.component == application.component
+                    && entry.has_icon
+                    && entry.icon_key == application.icon_key
+                    && path.is_file()
+            })
+        })
+        .map(|application| application.component.clone())
+        .collect();
+    let mut icons = BTreeMap::new();
+    for components in needed.chunks(32) {
+        match source.icons(components, ICON_SIZE) {
+            Ok(batch) => icons.extend(batch),
+            Err(error) => {
+                summary.retry_needed = true;
+                eprintln!("droidloom-applications: icon batch deferred: {error}");
+            }
+        }
+    }
+
     for application in &applications {
         let id = application_id(source.user(), &application.component);
         let desktop_name = format!("droidloom-{id}.desktop");
@@ -284,17 +351,18 @@ pub fn reconcile(
         let mut stored_icon_key = application.icon_key.clone();
 
         if !has_icon {
-            match source.icon(&application.component, ICON_SIZE) {
-                Ok(icon) => {
+            match icons.remove(&application.component) {
+                Some(icon) => {
                     validate_icon(&icon)?;
                     if write_if_changed(&icon_path, &icon)? {
                         summary.icons_updated += 1;
                     }
                     has_icon = true;
                 }
-                Err(error) => {
+                None => {
+                    summary.retry_needed = true;
                     eprintln!(
-                        "droidloom-applications: icon for {} deferred: {error}",
+                        "droidloom-applications: icon for {} deferred",
                         application.component
                     );
                     // Keep presenting a previous valid icon, but retain its old
@@ -774,6 +842,95 @@ mod tests {
             root.join("data/icons/hicolor/128x128/apps"),
             root.join("state/droidloom/application-catalog-v1.json"),
         )
+    }
+
+    #[test]
+    fn icon_batches_are_bounded_cached_and_retry_only_missing_entries() {
+        struct BatchSource {
+            applications: Vec<AndroidApplication>,
+            batches: Vec<Vec<String>>,
+            missing: bool,
+        }
+        impl ApplicationSource for BatchSource {
+            fn user(&self) -> u32 {
+                0
+            }
+            fn applications(&mut self) -> Result<Vec<AndroidApplication>, CatalogError> {
+                Ok(self.applications.clone())
+            }
+            fn icon(&mut self, _: &str, _: u32) -> Result<Vec<u8>, CatalogError> {
+                panic!("batch path must be used")
+            }
+            fn icons(
+                &mut self,
+                components: &[String],
+                size: u32,
+            ) -> Result<BTreeMap<String, Vec<u8>>, CatalogError> {
+                assert_eq!(size, ICON_SIZE);
+                self.batches.push(components.to_vec());
+                Ok(components
+                    .iter()
+                    .filter(|component| !self.missing || *component != "org.example.app0/.Main")
+                    .map(|component| (component.clone(), PNG.to_vec()))
+                    .collect())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = fixture_paths(dir.path());
+        let mut source = BatchSource {
+            applications: (0..40)
+                .map(|n| {
+                    application(
+                        &format!("App {n:02}"),
+                        &format!("org.example.app{n}"),
+                        &format!("org.example.app{n}/.Main"),
+                        "one",
+                    )
+                })
+                .collect(),
+            batches: Vec::new(),
+            missing: true,
+        };
+        let first = reconcile(&paths, &mut source).unwrap();
+        assert_eq!(first.launchers_updated, 40);
+        assert_eq!(first.icons_updated, 39);
+        assert!(first.retry_needed);
+        assert_eq!(
+            source.batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![32, 8]
+        );
+        source.batches.clear();
+        source.missing = false;
+        let next = reconcile(&paths, &mut source).unwrap();
+        assert!(!next.retry_needed);
+        assert_eq!(
+            source.batches,
+            vec![vec!["org.example.app0/.Main".to_owned()]]
+        );
+        source.batches.clear();
+        assert!(!reconcile(&paths, &mut source).unwrap().changed());
+        assert!(source.batches.is_empty());
+        // An update that races removal keeps the previous valid icon and its old key.
+        source.applications[0].icon_key = "two".into();
+        source.missing = true;
+        assert!(reconcile(&paths, &mut source).unwrap().retry_needed);
+        let old = read_manifest(&paths.manifest).unwrap();
+        let entry = old
+            .applications
+            .get(&application_id(0, "org.example.app0/.Main"))
+            .unwrap();
+        assert!(entry.has_icon);
+        assert_eq!(entry.icon_key, "one");
+        source.missing = false;
+        assert!(!reconcile(&paths, &mut source).unwrap().retry_needed);
+        let next = read_manifest(&paths.manifest).unwrap();
+        assert_eq!(
+            next.applications
+                .get(&application_id(0, "org.example.app0/.Main"))
+                .unwrap()
+                .icon_key,
+            "two"
+        );
     }
 
     #[test]

@@ -8,12 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+droidloom-timing = { path = "../../runtime/droidloom-timing" }
 droidloom-cpu-placement = { path = "../../runtime/droidloom-cpu-placement" }
 droidloom-surface-bridge = { path = "../droidloom-surface-bridge" }
 drm-fourcc.workspace = true
 droidloom-denial-endpoint = { path = "../droidloom-denial-endpoint" }
 droidloom-denial-ipc = { path = "../droidloom-denial-ipc" }
 droidloom-denial-protocol = { path = "../droidloom-denial-protocol" }
+droidloom-input-protocol = { path = "../droidloom-input-protocol" }
 droidloom-syncobj = { path = "../droidloom-syncobj" }
 droidloom-window-policy = { path = "../../runtime/droidloom-window-policy" }
 gbm.workspace = true

@@ -1,0 +1,147 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+index 5e5bb74..653a3a0 100644
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -48,7 +48,7 @@ void put64(std::vector<uint8_t>& p, uint64_t v) {
+ }
+ bool send(int socket, uint32_t op, const std::vector<uint8_t>& payload,
+           const std::vector<int>& fds = {}) {
+-    if (fds.size() > 4 || payload.size() > 112) return false;
++    if (fds.size() > 4 || payload.size() > 28 + 16 * 76) return false;
+     std::array<uint8_t, 16> header{'D', 'L', 'L', '1'};
+     const uint32_t words[] = {op, static_cast<uint32_t>(payload.size()), static_cast<uint32_t>(fds.size())};
+     for (size_t i = 0; i < 3; ++i)
+@@ -113,6 +113,49 @@ bool stage(int socket, bool pipelined, const std::vector<uint8_t>& payload,
+             reply.size() == 1 && reply[0] == 0;
+ }
+ 
++// One packet for ordinary scenes. Large scenes use invisible chunks, retaining
++// the four-descriptor bound and one asynchronous acceptance for the whole scene.
++// Storage is retained across frames; descriptor integers remain borrowed until
++// sendmsg duplicates them. A failed prefix is discarded through normal Abort.
++class SceneBatch {
++    std::vector<uint8_t> mLayers, mPacket;
++    std::vector<int> mFds;
++    uint32_t mCount = 0;
++    void entries() {
++        put32(mPacket, mCount);
++        mPacket.insert(mPacket.end(), mLayers.begin(), mLayers.end());
++    }
++    bool flush(int socket) {
++        mPacket.clear();
++        entries();
++        if (!send(socket, 11, mPacket, mFds)) return false;
++        begin();
++        return true;
++    }
++public:
++    SceneBatch() { mLayers.reserve(16 * 76); mPacket.reserve(28 + 16 * 76); mFds.reserve(4); }
++    void begin() { mLayers.clear(); mFds.clear(); mCount = 0; }
++    bool add(int socket, const std::vector<uint8_t>& layer, const std::vector<int>& fds) {
++        if (layer.size() != 72 || fds.size() > 1) return false;
++        if (mCount == 16 || (!fds.empty() && mFds.size() == 4)) {
++            if (!flush(socket)) return false;
++        }
++        mLayers.insert(mLayers.end(), layer.begin(), layer.end());
++        put32(mLayers, fds.empty() ? UINT32_MAX : static_cast<uint32_t>(mFds.size()));
++        mFds.insert(mFds.end(), fds.begin(), fds.end());
++        ++mCount;
++        return true;
++    }
++    bool commit(int socket, uint64_t scene, const std::vector<uint8_t>& commit) {
++        if (!mCount || commit.size() != 16) return false;
++        mPacket.clear();
++        put64(mPacket, scene);
++        mPacket.insert(mPacket.end(), commit.begin(), commit.end());
++        entries();
++        return send(socket, 12, mPacket, mFds);
++    }
++};
++
+ // One outstanding scene bounds queued descriptors and avoids speculative read
+ // reuse. Caller holds State::mutex; no callback runs while that lock is held.
+ class CommitQueue {
+@@ -382,6 +425,7 @@ std::optional<Export> prepare(const compositionengine::OutputLayer& layer, uint3
+     return e;
+ }
+ }  // namespace
++struct DroidloomLayers::Batch : SceneBatch {};
+ struct DroidloomLayers::State {
+     std::mutex mutex;
+     std::condition_variable completed;
+@@ -422,7 +466,7 @@ sp<Fence> mergeDroidloomReleaseFence(const ReleaseCallbackId& id, sp<Fence> fenc
+     return fence;
+ }
+ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint)
+-    : mState(std::make_shared<State>()), mRequests(std::move(requests)) {
++    : mState(std::make_shared<State>()), mRequests(std::move(requests)), mBatch(std::make_unique<Batch>()) {
+     std::thread([state = mState, events = std::move(events), repaint = std::move(repaint)] {
+         const auto wakeWork = [&] {
+             state->workRevision.fetch_add(1, std::memory_order_release);
+@@ -677,6 +721,12 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+         }
+         return false;
+     };
++    const bool batched = (config[0] & (4 | 8 | 16 | 64)) == (4 | 8 | 16 | 64);
++    mBatch->begin();
++    std::vector<uint8_t> layerPacket;
++    layerPacket.reserve(72);
++    std::vector<int> layerFds;
++    layerFds.reserve(1);
+     for (const auto& e : exports) {
+         const uint64_t buffer = e.buffer ? e.buffer->getId() : 0;
+         uint64_t ticket = 0;
+@@ -696,7 +746,8 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+             }
+             next.emplace(e.id, Last{buffer, e.frame, ticket});
+         }
+-        std::vector<uint8_t> p;
++        auto& p = layerPacket;
++        p.clear();
+         put64(p, e.id);
+         put64(p, buffer);
+         put64(p, ticket);
+@@ -709,9 +760,11 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+         put32(p, e.alpha);
+         put32(p, e.opaque ? 1 : 0);
+         put32(p, e.color);
+-        std::vector<int> fds;
++        auto& fds = layerFds;
++        fds.clear();
+         if (buffer && !reuse && e.acquire && e.acquire->isValid()) fds.push_back(e.acquire->get());
+-        if (!stage(mRequests.get(), (config[0] & 4) != 0, p, fds)) return reject();
++        if (!(batched ? mBatch->add(mRequests.get(), p, fds)
++                      : stage(mRequests.get(), (config[0] & 4) != 0, p, fds))) return reject();
+     }
+     std::vector<uint8_t> p;
+     put32(p, config[1]);
+@@ -727,13 +780,15 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+             id = mState->commits.begin(std::move(tickets));
+         }
+         if (!id) return reject();
+-        if (!commitAsync(mRequests.get(), id, p)) {
++        if (!(batched ? mBatch->commit(mRequests.get(), id, p)
++                      : commitAsync(mRequests.get(), id, p))) {
+             std::lock_guard lock(mState->mutex);
+             mState->live = false;
+             mState->completed.notify_all();
+             return false; // Ambiguous transport loss never releases reads.
+         }
+         if (id == 1) ALOGI("Droidloom asynchronous layer commits enabled (one scene in flight)");
++        if (id == 1 && batched) ALOGI("Droidloom scene batches enabled (16 layers / 4 fences per packet)");
+         mLayers = std::move(next);
+         mScene = std::move(scene);
+         return true;
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+index bb90397..baf692b 100644
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -41,6 +41,8 @@ class DroidloomLayers {
+     struct State;
+     std::shared_ptr<State> mState;
+     base::unique_fd mRequests;
++    struct Batch;
++    std::unique_ptr<Batch> mBatch;
+     struct Cached {
+         sp<GraphicBuffer> buffer;
+         uint32_t format;

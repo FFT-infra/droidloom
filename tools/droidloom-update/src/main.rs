@@ -38,6 +38,47 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Seal already cross-built outputs for a remote host, without activation.
+    BundleStage {
+        #[arg(long)]
+        work: PathBuf,
+        #[arg(long)]
+        host: PathBuf,
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long, value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        product: String,
+        #[arg(long)]
+        cell_spec: PathBuf,
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    /// Cross-build the complete Android userspace closure, including the vendor image.
+    AndroidBuild {
+        #[arg(long)]
+        work: PathBuf,
+        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        product: String,
+    },
+    /// Compile system_server and its Rust policy in a prepared Android workspace.
+    FrameworkBuild {
+        #[arg(long)]
+        work: Option<PathBuf>,
+        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        product: String,
+        /// Rebuild task, graphics and input peers alongside the framework pair.
+        #[arg(long)]
+        tasks: bool,
+    },
+    /// Compile the audio HAL APEX and client library in a prepared Android workspace.
+    AudioBuild {
+        #[arg(long)]
+        work: Option<PathBuf>,
+        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        product: String,
+    },
     #[command(hide = true)]
     NativeBridgeImage {
         #[arg(long)]
@@ -88,6 +129,9 @@ enum Action {
         payload: PathBuf,
         #[arg(long)]
         uid: u32,
+        /// Install the verified release while leaving Android stopped.
+        #[arg(long)]
+        no_start: bool,
     },
     #[command(hide = true)]
     Recover {
@@ -125,6 +169,28 @@ fn repository(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 fn execute(args: Args) -> Result<()> {
     match &args.command {
+        Some(Action::BundleStage {
+            work,
+            host,
+            base,
+            product,
+            cell_spec,
+            user,
+            destination,
+        }) => {
+            return assemble::stage_cross(
+                &repository(args.source.clone())?,
+                work,
+                host,
+                base,
+                assemble::CrossTarget {
+                    product,
+                    cell_spec,
+                    user,
+                },
+                destination,
+            );
+        }
         Some(Action::NativeBridgeImage {
             image,
             destination,
@@ -155,8 +221,12 @@ fn execute(args: Args) -> Result<()> {
             );
         }
         Some(Action::Recover { uid }) => return install::recover(*uid),
-        Some(Action::Apply { payload, uid }) => {
-            return install::apply(&payload.canonicalize()?, *uid);
+        Some(Action::Apply {
+            payload,
+            uid,
+            no_start,
+        }) => {
+            return install::apply(&payload.canonicalize()?, *uid, !no_start);
         }
         Some(Action::Verify { payload }) => {
             let m = bundle::verify(payload)?;
@@ -181,9 +251,21 @@ fn execute(args: Args) -> Result<()> {
     if arch != "x86_64" {
         return fail("the source builder currently requires an x86_64 Linux build host");
     }
-    let product = "droidloom_x86_64";
+    let product = match &args.command {
+        Some(Action::AndroidBuild { product, .. })
+        | Some(Action::AudioBuild { product, .. })
+        | Some(Action::FrameworkBuild { product, .. }) => product.as_str(),
+        _ => "droidloom_x86_64",
+    };
     let prepared_work = match &args.command {
+        Some(Action::AndroidBuild { work, .. }) => Some(work.canonicalize()?),
         Some(Action::NativeBridgeBuild {
+            work: Some(work), ..
+        })
+        | Some(Action::AudioBuild {
+            work: Some(work), ..
+        })
+        | Some(Action::FrameworkBuild {
             work: Some(work), ..
         }) => Some(work.canonicalize()?),
         _ => None,
@@ -197,6 +279,14 @@ fn execute(args: Args) -> Result<()> {
     let source = work.join("aosp-source");
     let out = work.join("android-out");
     let cargo = work.join("cargo");
+    if matches!(args.command, Some(Action::AudioBuild { .. })) && !source.is_dir() {
+        return fail("audio-build requires an already prepared workspace containing aosp-source");
+    }
+    if matches!(args.command, Some(Action::FrameworkBuild { .. })) && !source.is_dir() {
+        return fail(
+            "framework-build requires an already prepared workspace containing aosp-source",
+        );
+    }
     if matches!(args.command, Some(Action::Plan)) {
         println!(
             "Source: {}\nCache: {}\nAndroid product: {product}\nHost: supervisor, ctl, daemon, Wayland, applications, doctor, updater\nAndroid: {}\nPinned inputs: system, system_ext, product, Mesa\nActivation: verify -> stage -> stop Droidloom -> switch complete release -> start -> check Android catalog\nFailure: restore previous release\nBoot autostart: disabled",
@@ -223,11 +313,44 @@ fn execute(args: Args) -> Result<()> {
     let _source_lock = Lock::acquire(&work.join("aosp-source-update.lock"))?;
     // A prepared package workspace runs inside the rootless builder, which
     // supplies build tools and does not run host systemd or install services.
-    if prepared_work.is_none() {
+    if prepared_work.is_none()
+        && !matches!(
+            args.command,
+            Some(Action::AudioBuild { .. } | Action::FrameworkBuild { .. })
+        )
+    {
         dependencies::ensure()?;
     }
     if work.join("source-projection.json").exists() {
         android::recover(&work.join("source-projection.json"), &source)?;
+    }
+    if matches!(args.command, Some(Action::AndroidBuild { .. })) {
+        if product == "droidloom_arm64" {
+            assemble::mesa_tools(&work, jobs, true)?;
+        }
+        return android::build(&repo, &source, &out, &work, product, jobs);
+    }
+    if matches!(args.command, Some(Action::FrameworkBuild { .. })) {
+        let targets: &[&str] = if matches!(
+            args.command,
+            Some(Action::FrameworkBuild { tasks: true, .. })
+        ) {
+            android::TASK_BACKEND_TARGETS
+        } else {
+            &["services", "libinputflinger"]
+        };
+        return android::build_targets(&repo, &source, &out, &work, product, jobs, targets);
+    }
+    if matches!(args.command, Some(Action::AudioBuild { .. })) {
+        return android::build_targets(
+            &repo,
+            &source,
+            &out,
+            &work,
+            product,
+            jobs,
+            android::AUDIO_TARGETS,
+        );
     }
     if let Some(Action::NativeBridgeBuild { tests, .. }) = args.command {
         return android::build_targets(
@@ -293,7 +416,7 @@ fn execute(args: Args) -> Result<()> {
     }
     let base = assemble::prepare_inputs(&repo, &work, arch)?;
     python::prepare(&repo, &work)?;
-    assemble::mesa_tools(&work, jobs)?;
+    assemble::mesa_tools(&work, jobs, false)?;
     android::build(&repo, &source, &out, &work, product, jobs)?;
     let staging = tempfile::Builder::new()
         .prefix("bundle-")

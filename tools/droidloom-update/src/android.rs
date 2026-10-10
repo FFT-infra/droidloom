@@ -9,8 +9,7 @@ use std::{
 pub const TARGETS: &[&str] = &[
     "droidloom-native-bridge",
     "android.hardware.graphics.composer3-service.droidloom",
-    "droidloom-task-launcher",
-    "droidloom-input-bridge",
+    "droidloom-framework-init",
     "DroidloomIME",
     "DroidloomHome",
     "DroidloomSystemUI",
@@ -24,10 +23,10 @@ pub const TARGETS: &[&str] = &[
     "servicemanager",
     "libmeminfo",
     "libinputflinger",
+    "libaudiobase",
     "surfaceflinger",
     "libdroidloom_surface_bridge",
     "libdroidloom_task_control",
-    "libdroidloom_task_launcher",
     "libdroidloom_selinux_compat",
     "libdroidloom_composer_aidl",
     "libdroidloom_composer",
@@ -36,6 +35,7 @@ pub const TARGETS: &[&str] = &[
     "libdroidloom_denial_ipc",
     "libdroidloom_denial_protocol",
     "libdroidloom_transport",
+    "libdroidloom_audio_client",
     "android.hardware.graphics.allocator-service.minigbm",
     "mapper.minigbm",
     "libandroid_net_connectivity_com_android_net_module_util_jni",
@@ -43,6 +43,27 @@ pub const TARGETS: &[&str] = &[
     "libnetd_updatable",
     "services",
     "vendorimage",
+];
+pub const AUDIO_TARGETS: &[&str] = &["com.android.hardware.audio.droidloom", "libaudiobase"];
+pub const TASK_BACKEND_TARGETS: &[&str] = &[
+    "services",
+    "libinputflinger",
+    "surfaceflinger",
+    "DroidloomIME",
+    "DroidloomSystemUI",
+    "android.hardware.graphics.composer3-service.droidloom",
+    "DroidloomSystemUIProbe",
+    // Rust dylibs are separate installable outputs. Building only executables
+    // can leave their stripped/staged dependencies at the previous ABI.
+    "libdroidloom_task_control",
+    "libdroidloom_surface_bridge",
+    "libdroidloom_composer_aidl",
+    "libdroidloom_syncobj",
+    "libdroidloom_denial_ipc",
+    "libdroidloom_composer",
+    "libdroidloom_minigbm",
+    "libdroidloom_denial_protocol",
+    "libdroidloom_transport",
 ];
 // These APEX components are installed by Droidloom's compatibility projection.
 // Request their compiled outputs, without asking AOSP to install them into system.
@@ -60,7 +81,21 @@ pub fn apex_output(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+pub fn apex_output_for_product(name: &str, product: &str) -> Option<PathBuf> {
+    let path = apex_output(name)?;
+    match product {
+        "droidloom_x86_64" => Some(PathBuf::from(path)),
+        "droidloom_arm64" => Some(PathBuf::from(
+            path.replace("android_x86_64", "android_arm64_armv8-a"),
+        )),
+        _ => None,
+    }
+}
 const PATCHES: &[(&str, &str)] = &[
+    (
+        "external/libdrm",
+        "android/aosp-patches/0015-libdrm-empty-version-strings.patch",
+    ),
     (
         "frameworks/native",
         "android/surfaceflinger/0009-droidloom-cpu-placement.patch",
@@ -88,6 +123,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "hardware/interfaces",
         "android/aosp-patches/0002-audio-default-only-service.patch",
+    ),
+    (
+        "frameworks/av",
+        "android/audio/0001-host-buffered-playback.patch",
     ),
     (
         "system/memory/libmeminfo",
@@ -143,11 +182,47 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "frameworks/native",
+        "android/surfaceflinger/0011-droidloom-async-layer-commits.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0012-droidloom-async-imports.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0013-droidloom-lazy-render-targets.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0014-droidloom-task-work-gate.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0015-droidloom-scene-batches.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0016-droidloom-frame-timing.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0017-droidloom-bufferless-bootstrap.patch",
+    ),
+    (
+        "frameworks/native",
         "android/inputflinger/0001-application-token-targeted-injection.patch",
     ),
     (
         "frameworks/native",
         "android/inputflinger/0002-droidloom-targeted-injection-binder.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/inputflinger/0003-droidloom-window-policy.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/inputflinger/0004-droidloom-native-input.patch",
     ),
     (
         "",
@@ -172,6 +247,18 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/base",
         "android/framework/0003-droidloom-launch-resolution.patch",
+    ),
+    (
+        "frameworks/base",
+        "android/framework/0004-droidloom-window-policy.patch",
+    ),
+    (
+        "frameworks/base",
+        "android/framework/0005-droidloom-authoritative-tasks.patch",
+    ),
+    (
+        "frameworks/base",
+        "android/framework/0006-droidloom-direct-host-channels.patch",
     ),
 ];
 #[derive(Serialize, Deserialize)]
@@ -486,6 +573,18 @@ fn bootstrap(source: &Path, out: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn preserve_input_manager_layout(original: &str, patched: &str) -> Result<()> {
+    // This existing Binder override replaces an inherited virtual method and
+    // changes neither allocation size nor the inherited vtable slots.
+    const BINDER_OVERRIDE: &str = "    status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply,\n                        uint32_t flags) override;\n";
+    if patched != original && patched.replacen(BINDER_OVERRIDE, "", 1) != original {
+        return fail(
+            "InputManager layout changed but prebuilt libandroid_servers is retained; preserve the allocation/layout ABI",
+        );
+    }
+    Ok(())
+}
+
 pub fn build(
     repo: &Path,
     source: &Path,
@@ -494,7 +593,15 @@ pub fn build(
     product: &str,
     jobs: usize,
 ) -> Result<()> {
-    build_targets(repo, source, out, work, product, jobs, TARGETS)
+    let targets = full_targets(product);
+    build_targets(repo, source, out, work, product, jobs, &targets)
+}
+fn full_targets(product: &str) -> Vec<&'static str> {
+    TARGETS
+        .iter()
+        .copied()
+        .filter(|name| product != "droidloom_arm64" || *name != "droidloom-native-bridge")
+        .collect()
 }
 pub fn build_targets(
     repo: &Path,
@@ -513,7 +620,19 @@ pub fn build_targets(
         droidloom_source::reconcile(&lock, &source_lock, source)?;
     }
     droidloom_source::verify_materialized(&lock, &source_lock, source)?;
-    let native_bridge_source = crate::native_bridge::prepare_source(repo, source)?;
+    // Focused audio/framework builds neither rebuild nor record a translator
+    // artifact. Keep existing translator development provenance intact.
+    let framework_only =
+        targets == ["services", "libinputflinger"] || targets == TASK_BACKEND_TARGETS;
+    let audio_only = targets == AUDIO_TARGETS;
+    if !audio_only {
+        remove_retired_input_support(&out.join("target/product").join(product))?;
+    }
+    let native_bridge_source = if audio_only || framework_only || product == "droidloom_arm64" {
+        None
+    } else {
+        Some(crate::native_bridge::prepare_source(repo, source)?)
+    };
     for (aidl, adapter) in [
         ("statusbar/IStatusBar.aidl", "EmptyStatusBar"),
         ("policy/IKeyguardService.aidl", "EmptyKeyguard"),
@@ -536,9 +655,18 @@ pub fn build_targets(
         }
     }
     let mut p = Projection::new(work.join("source-projection.json"))?;
+    // The prebuilt system JNI library allocates InputManager itself. Preserve
+    // its C++ layout unless that consumer is rebuilt and shipped together.
+    let input_manager_header =
+        source.join("frameworks/native/services/inputflinger/InputManager.h");
+    let input_manager_layout = fs::read_to_string(&input_manager_header)?;
     for (cwd, patch) in PATCHES {
         p.patch(source, cwd, &repo.join(patch))?;
     }
+    preserve_input_manager_layout(
+        &input_manager_layout,
+        &fs::read_to_string(&input_manager_header)?,
+    )?;
     project_blueprints(&mut p, source)?;
     for relative in [
         "frameworks/base/tools/aapt2/integration-tests",
@@ -552,6 +680,10 @@ pub fn build_targets(
         "packages/modules/Connectivity/Tethering/common/TetheringLib",
         "frameworks/base/services/tests",
         "frameworks/base/services/robotests",
+        // Vendor metadata enumerates HIDL interfaces globally. These upstream
+        // test fixtures reference test-only HALs omitted from the sparse tree.
+        "system/tools/hidl/test",
+        "system/tools/hidl/hidl2aidl/test",
     ] {
         p.put(&source.join(relative).join(".find-ignore"), b"")?;
     }
@@ -564,6 +696,9 @@ pub fn build_targets(
         "LICENSES",
         "graphics",
         "runtime/droidloom-cpu-placement",
+        "runtime/droidloom-timing",
+        "runtime/droidloom-audio-protocol",
+        "android/audio",
         "android/framework",
         "android/lmkd-compat",
         "android/runtime",
@@ -575,13 +710,9 @@ pub fn build_targets(
     ] {
         let destination = vendor.join(relative);
         if repo.join(relative).is_dir() {
-            fs::create_dir_all(&destination)?;
-            run(Command::new("rsync")
-                .args(["-a", "--delete"])
-                .arg(format!("{}/", repo.join(relative).display()))
-                .arg(&destination))?;
+            mirror_directory(&repo.join(relative), &destination)?;
         } else {
-            copy(&repo.join(relative), &destination)?;
+            write(&destination, fs::read(repo.join(relative))?)?;
         }
     }
     crate::native_bridge::prepare_build(source, &vendor, work, &mut p)?;
@@ -628,21 +759,35 @@ pub fn build_targets(
         &vendor.join("android/prebuilts/framework-res.apk"),
         fs::read(work.join("framework-res.apk"))?,
     )?;
-    let board = vendor.join("android/device/droidloom_x86_64/BoardConfig.mk");
+    let board = vendor.join(format!("android/device/{product}/BoardConfig.mk"));
     let native = work.join("mesa-native.ini");
-    write(
-        &native,
-        format!(
-            "[binaries]\nmesa_clc = {}\nvtn_bindgen2 = {}\n",
-            meson_string(&work.join("mesa-tools/src/compiler/clc/mesa_clc"))?,
-            meson_string(&work.join("mesa-tools/src/compiler/spirv/vtn_bindgen2"))?
-        ),
-    )?;
+    let mesa_tools = work.join(if product == "droidloom_arm64" {
+        "mesa-panfrost-tools"
+    } else {
+        "mesa-tools"
+    });
+    let mut native_tools = format!(
+        "[binaries]\nmesa_clc = {}\nvtn_bindgen2 = {}\n",
+        meson_string(&mesa_tools.join("src/compiler/clc/mesa_clc"))?,
+        meson_string(&mesa_tools.join("src/compiler/spirv/vtn_bindgen2"))?
+    );
+    if product == "droidloom_arm64" {
+        native_tools += &format!(
+            "panfrost_compile = {}\n",
+            meson_string(&mesa_tools.join("src/panfrost/clc/panfrost_compile"))?
+        );
+    }
+    write(&native, native_tools)?;
     p.put(
         &board,
         fs::read_to_string(&board)?
             + &format!(
-                "\nBOARD_MESA3D_MESON_ARGS += -Dmesa-clc=system --native-file {}\n",
+                "\nBOARD_MESA3D_MESON_ARGS += -Dmesa-clc=system {}--native-file {}\n",
+                if product == "droidloom_arm64" {
+                    "-Dprecomp-compiler=system "
+                } else {
+                    ""
+                },
                 native.display()
             ),
     )?;
@@ -674,8 +819,8 @@ pub fn build_targets(
             "PATH",
             format!(
                 "{}:{}:{}",
-                work.join("mesa-tools/src/compiler/clc").display(),
-                work.join("mesa-tools/src/compiler/spirv").display(),
+                mesa_tools.join("src/compiler/clc").display(),
+                mesa_tools.join("src/compiler/spirv").display(),
                 std::env::var("PATH")?
             ),
         )
@@ -690,21 +835,262 @@ pub fn build_targets(
         .arg("--make-mode")
         .arg(format!("-j{jobs}"))
         .args(targets.iter().map(|name| {
-            apex_output(name).map_or_else(|| PathBuf::from(name), |path| out.join(path))
+            if framework_only {
+                out.join(framework_output(name, product).expect("known framework target"))
+            } else {
+                apex_output_for_product(name, product)
+                    .map_or_else(|| PathBuf::from(name), |path| out.join(path))
+            }
         }));
+    if framework_only {
+        cmd.env("SOONG_ONLY", "true");
+    }
     let result = run_build(&mut cmd);
     p.restore()?;
     result?;
-    write(
-        &out.join("target/product")
-            .join(product)
-            .join("droidloom-native-bridge-source.json"),
-        serde_json::to_vec_pretty(&native_bridge_source)?,
-    )
+    if framework_only {
+        for name in targets {
+            let destination = match *name {
+                name if name.starts_with("libdroidloom_") => {
+                    format!("vendor/lib64/{name}.dylib.so")
+                }
+                name => match name {
+                    "services" => "system/framework/services.jar",
+                    "libinputflinger" => "system/lib64/libinputflinger.so",
+                    "surfaceflinger" => "system/bin/surfaceflinger",
+                    "DroidloomIME" => "system/app/DroidloomIME/DroidloomIME.apk",
+                    "DroidloomSystemUIProbe" => "system/framework/DroidloomSystemUIProbe.jar",
+                    "DroidloomSystemUI" => {
+                        "system/system_ext/priv-app/DroidloomSystemUI/DroidloomSystemUI.apk"
+                    }
+                    "android.hardware.graphics.composer3-service.droidloom" => {
+                        "vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom"
+                    }
+                    _ => unreachable!(),
+                }
+                .to_owned(),
+            };
+            copy(
+                &out.join(framework_output(name, product).expect("known framework target")),
+                &out.join("target/product").join(product).join(destination),
+            )?;
+        }
+    }
+    if let Some(native_bridge_source) = native_bridge_source {
+        write(
+            &out.join("target/product")
+                .join(product)
+                .join("droidloom-native-bridge-source.json"),
+            serde_json::to_vec_pretty(&native_bridge_source)?,
+        )?;
+    }
+    Ok(())
+}
+// Compile outputs directly for the focused framework check, avoiding Make's
+// unrelated installation closure and retaining the normal product staging paths.
+fn framework_output(name: &str, product: &str) -> Option<PathBuf> {
+    match name {
+        name if name.starts_with("libdroidloom_") && TASK_BACKEND_TARGETS.contains(&name) => {
+            let arch = match product {
+                "droidloom_x86_64" => "x86_64",
+                "droidloom_arm64" => "arm64_armv8-a",
+                _ => return None,
+            };
+            Some(PathBuf::from(format!(
+                "soong/.intermediates/vendor/droidloom/{name}/android_vendor_{arch}_dylib/{name}.dylib.so"
+            )))
+        }
+        "services" => Some(PathBuf::from(
+            "soong/.intermediates/frameworks/base/services/services/android_common/aligned/services.jar",
+        )),
+        "surfaceflinger" => {
+            let arch = match product {
+                "droidloom_x86_64" => "x86_64",
+                "droidloom_arm64" => "arm64_armv8-a",
+                _ => return None,
+            };
+            Some(PathBuf::from(format!(
+                "soong/.intermediates/frameworks/native/services/surfaceflinger/surfaceflinger/android_{arch}/surfaceflinger"
+            )))
+        }
+        "libinputflinger" => {
+            let variant = match product {
+                "droidloom_x86_64" => "android_x86_64_shared",
+                "droidloom_arm64" => "android_arm64_armv8-a_shared",
+                _ => return None,
+            };
+            Some(PathBuf::from(format!(
+                "soong/.intermediates/frameworks/native/services/inputflinger/libinputflinger/{variant}/libinputflinger.so"
+            )))
+        }
+        "DroidloomIME" | "DroidloomSystemUI" => Some(PathBuf::from(format!(
+            "soong/.intermediates/vendor/droidloom/{name}/android_common/{name}.apk"
+        ))),
+        "DroidloomSystemUIProbe" => Some(PathBuf::from(
+            "soong/.intermediates/vendor/droidloom/DroidloomSystemUIProbe/android_common/dex/DroidloomSystemUIProbe.jar",
+        )),
+        "android.hardware.graphics.composer3-service.droidloom" => {
+            let arch = match product {
+                "droidloom_x86_64" => "x86_64",
+                "droidloom_arm64" => "arm64_armv8-a",
+                _ => return None,
+            };
+            Some(PathBuf::from(format!(
+                "soong/.intermediates/vendor/droidloom/{name}/android_vendor_{arch}/{name}"
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn remove_retired_input_support(product: &Path) -> Result<()> {
+    // Incremental product trees can retain files from a module removed from
+    // PRODUCT_PACKAGES. Never let its old init service enter a new vendor image.
+    for relative in [
+        "vendor/bin/droidloom-input-bridge",
+        "vendor/framework/droidloom-input-bridge.jar",
+        "vendor/etc/init/droidloom-input-bridge.rc",
+        "vendor/bin/droidloom-task-launcher",
+        "vendor/lib64/libdroidloom_task_launcher.dylib.so",
+        "vendor/framework/droidloom-application-catalog.jar",
+    ] {
+        match fs::remove_file(product.join(relative)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn mirror_directory(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    // A source can change while a preceding build compiles its older mirror.
+    // Retaining that source's earlier mtime makes Ninja miss the new contents.
+    // Compare contents and timestamp changed copies at projection time instead.
+    run(Command::new("rsync")
+        .args(["-a", "--checksum", "--no-times", "--delete"])
+        .arg(format!("{}/", source.display()))
+        .arg(destination))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_arm_build_omits_the_x86_isa_translator() {
+        let arm = full_targets("droidloom_arm64");
+        assert!(!arm.contains(&"droidloom-native-bridge"));
+        assert!(arm.contains(&"vendorimage"));
+        assert!(arm.contains(&"surfaceflinger"));
+        assert!(full_targets("droidloom_x86_64").contains(&"droidloom-native-bridge"));
+        for target in ["netbpfload", "libservice-connectivity", "libnetd_updatable"] {
+            let path = apex_output_for_product(target, "droidloom_arm64").unwrap();
+            assert!(path.to_str().unwrap().contains("android_arm64_armv8-a"));
+            assert!(!path.to_str().unwrap().contains("x86_64"));
+            assert_eq!(
+                apex_output_for_product(target, "droidloom_x86_64").unwrap(),
+                PathBuf::from(apex_output(target).unwrap())
+            );
+        }
+        assert!(apex_output_for_product("netbpfload", "unknown").is_none());
+    }
+
+    #[test]
+    fn retired_service_is_pruned_from_incremental_products_without_removing_neighbors() {
+        let root = tempfile::tempdir().unwrap();
+        let retired = [
+            "vendor/bin/droidloom-input-bridge",
+            "vendor/framework/droidloom-input-bridge.jar",
+            "vendor/etc/init/droidloom-input-bridge.rc",
+            "vendor/bin/droidloom-task-launcher",
+            "vendor/lib64/libdroidloom_task_launcher.dylib.so",
+            "vendor/framework/droidloom-application-catalog.jar",
+        ];
+        for relative in retired {
+            write(&root.path().join(relative), b"retired").unwrap();
+        }
+        let neighbor = root.path().join("vendor/etc/init/droidloom-composer.rc");
+        write(&neighbor, b"preserve").unwrap();
+        remove_retired_input_support(root.path()).unwrap();
+        remove_retired_input_support(root.path()).unwrap();
+        assert!(retired.iter().all(|path| !root.path().join(path).exists()));
+        assert!(
+            !root
+                .path()
+                .join("vendor/etc/init/droidloom-input-bridge.rc")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("vendor/bin/droidloom-input-bridge")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("vendor/framework/droidloom-input-bridge.jar")
+                .exists()
+        );
+        assert_eq!(fs::read(neighbor).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn focused_task_targets_have_outputs_for_each_product() {
+        for product in ["droidloom_x86_64", "droidloom_arm64"] {
+            for target in TASK_BACKEND_TARGETS {
+                assert!(
+                    framework_output(target, product).is_some(),
+                    "{product}: {target}"
+                );
+            }
+        }
+        assert!(TASK_BACKEND_TARGETS.contains(&"surfaceflinger"));
+        assert!(framework_output("surfaceflinger", "unknown").is_none());
+    }
+
+    #[test]
+    fn prebuilt_input_manager_allocator_rejects_added_fields_and_virtual_slots() {
+        let original = "class InputManager {\nprivate:\n    void* reader;\n};\n";
+        assert!(super::preserve_input_manager_layout(original, original).is_ok());
+        let overridden = original.replace("private:", "    status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply,\n                        uint32_t flags) override;\nprivate:");
+        assert!(super::preserve_input_manager_layout(original, &overridden).is_ok());
+        for added in ["    void* nativeInput;\n", "    virtual void newSlot();\n"] {
+            let incompatible = overridden.replace("private:", &format!("{added}private:"));
+            assert!(super::preserve_input_manager_layout(original, &incompatible).is_err());
+        }
+    }
+
+    #[test]
+    fn mirrored_edits_older_than_build_outputs_still_invalidate_ninja_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("mirror");
+        fs::create_dir(&source).unwrap();
+        let input = source.join("input.rs");
+        fs::write(&input, b"old contents").unwrap();
+        mirror_directory(&source, &destination).unwrap();
+        let mirrored = destination.join("input.rs");
+        let previous = fs::metadata(&mirrored).unwrap().modified().unwrap();
+        fs::write(&input, b"new contents").unwrap();
+        fs::File::open(&input)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        mirror_directory(&source, &destination).unwrap();
+        assert_eq!(fs::read(&mirrored).unwrap(), b"new contents");
+        let updated = fs::metadata(&mirrored).unwrap().modified().unwrap();
+        assert!(updated > previous);
+        mirror_directory(&source, &destination).unwrap();
+        assert_eq!(
+            fs::metadata(&mirrored).unwrap().modified().unwrap(),
+            updated
+        );
+        fs::remove_file(input).unwrap();
+        mirror_directory(&source, &destination).unwrap();
+        assert!(!mirrored.exists());
+    }
     #[test]
     fn repeated_projection_keeps_ninja_outputs_until_content_changes() {
         let d = tempfile::tempdir().unwrap();
@@ -766,7 +1152,7 @@ mod tests {
     fn complete_target_set_contains_both_wire_peers_and_framework() {
         for name in [
             "android.hardware.graphics.composer3-service.droidloom",
-            "droidloom-input-bridge",
+            "droidloom-framework-init",
             "surfaceflinger",
             "libinputflinger",
             "services",

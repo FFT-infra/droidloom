@@ -10,8 +10,20 @@ in `tools/droidloom-update/src/android.rs` mirrors that tree into its temporary
 AOSP projection, applies the runtime patches below, and restores projected
 sources after building. The cached ARM64 build uses the same projection.
 
-The ARM64 product builds Gallium Freedreno and Zink, Vulkan Freedreno (Turnip),
-and both MSM and KGSL kernel interfaces. Native DRM remains the cell default.
+`patches/0005-panfrost-v11-support.patch` backports the GLES portion of
+[Mesa MR 41803](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/41803)
+(ending at `73210bf69dfa4cfb5d5c5b3b7c6c91a05209e2b6`) to the pinned release.
+It retains the tablet's working `c35c76d76250cd089baa9f52f79d1ad2a45468e1`
+v11 XML so the shared decoder and format fields match this release. It adds
+the v11 hardware descriptions, compiled architecture
+dispatch and Mali-G615/G715 model entries. The tablet's native Mesa already
+uses an earlier revision of this series. `0006-panfrost-v11-cs-decode.patch`
+retains its two command-stream diagnostic dispatch fixes. The changes apply
+to the prepared source used by both native shader tools and Android libraries.
+
+The ARM64 product builds Gallium Freedreno, Panfrost and Zink, Vulkan Freedreno
+(Turnip), and both MSM and KGSL kernel interfaces. Native DRM remains the cell
+default. Droidloom's product does not enable the Mali Vulkan driver.
 Explicit `graphics_backend: "kgsl_dma_heap"` selects Zink over Turnip and the
 portable minigbm allocator; see `docs/architecture.md` for the device boundary.
 No software renderer is included.
@@ -35,6 +47,11 @@ Runtime patches under `android/aosp-patches/`:
   while copying only the valid source span, excluding trailing row/layer
   padding. Prevents guard-page overreads during Skia glyph-atlas uploads on
   the Zink render-pass path; keeps threading and GPU buffer-to-image copies.
+- `0015-libdrm-empty-version-strings.patch`: preserve empty kernel driver
+  version strings as owned empty strings. Panthor advertises an empty date;
+  the pinned libdrm otherwise passes its NULL kernel pointer to `strdup` and
+  crashes SurfaceFlinger during EGL initialization. This applies to libdrm,
+  retaining the real driver name and version without changing the kernel.
 
 Validate a new host using real Android allocations, raw DMA-BUF and native
 Android EGL imports, GPU rendering/readback, native fences and synchronized CPU
@@ -47,11 +64,19 @@ actual allocator and minigbm layout helpers without hardware:
 
 ```sh
 cargo test --locked -j 1 -p droidloom-update --test dma_heap_layout -- --ignored
+cargo test --locked -j 1 -p droidloom-update --test libdrm_version -- --ignored
+cargo test --locked -j 1 -p droidloom-update --test panfrost_model -- --ignored
 ```
 
 This covers the reported 576x1024 YV12 import failure, even widths through
 4096, plane alignment/overlap, Android stride requirements, and unchanged
 RGB/NV12/P010 layouts. GPU import and app behavior require device validation.
+The libdrm test compiles its actual pinned implementation with the patch and
+injects DRM version replies covering Panthor's empty date, an empty description,
+all-empty strings and ordinary nonempty strings. It opens no device.
+The model test compiles the prepared Mesa lookup and checks the tablet's exact
+G615 ID and variant, G715, an existing G610, and rejection of unknown variants
+and models. The full cross-build separately compiles the v11 rendering paths.
 
 `tests/yv12_import.rs` is an offscreen Android diagnostic for actual
 AHardwareBuffer allocation and native EGL import, including 576x1024 YV12.

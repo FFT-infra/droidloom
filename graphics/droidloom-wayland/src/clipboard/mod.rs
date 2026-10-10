@@ -138,7 +138,9 @@ impl Clipboard {
         }
         eprintln!("{BUILD_COMPATIBILITY}");
         let listener = UnixListener::bind(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        // Private host parent and system-only guest mount provide path access;
+        // system_server delegates connected FDs after authenticating SystemUI.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
         listener.set_nonblocking(true)?;
         let directory = Arc::new(
             tempfile::Builder::new()
@@ -343,7 +345,7 @@ impl Clipboard {
         }
         self.ready = false;
         while let Ok((socket, _)) = self.listener.accept() {
-            if !root_peer(&socket).unwrap_or(false) {
+            if !framework_peer(&socket).unwrap_or(false) {
                 continue;
             }
             self.peer = None;
@@ -505,7 +507,7 @@ fn pipe() -> io::Result<(File, File)> {
     // SAFETY: successful pipe2 produced two fresh descriptors.
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
-fn root_peer(s: &UnixStream) -> io::Result<bool> {
+fn framework_peer(s: &UnixStream) -> io::Result<bool> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: !0,
@@ -525,7 +527,7 @@ fn root_peer(s: &UnixStream) -> io::Result<bool> {
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(cred.uid == 0)
+    Ok(cred.uid == 1000)
 }
 fn read_native(
     mut desc: Description,

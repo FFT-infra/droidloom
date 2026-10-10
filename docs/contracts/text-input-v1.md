@@ -17,10 +17,14 @@ preserve dismissal even if `EditorInfo.inputType` remains editable. An explicit
 show request or a genuinely new editor can re-enable it. `EditorVisibilityTest`
 covers hide-then-restart behavior on the host JVM.
 
-The privileged framework bridge authenticates the IME's Unix peer UID against
-PackageManager, resolves its focused Android task, and relays bounded JSON
-records to the presenter's private `text-input.sock`. The supervisor exposes
-only that socket inside the cell. The host accepts only UID 0 bridge peers.
+IMMS annotates EditorInfo with the task ID of its validated editor window;
+WMS checks that window's owner UID and resolves the exact task without enumeration.
+The IME authenticates system_server's setup socket, and system_server checks the
+IME's installed PackageManager UID before delegating a connected host descriptor.
+Bounded JSON records then travel directly between the IME and presenter.
+The host accepts Android system UID 1000 peers. The host socket's parent is 0700;
+the supervisor exposes it only below a system-owned 0700 guest directory, allowing
+host owners other than UID 1000 without granting ordinary Android apps path access.
 Neither connection logs editor contents. Editor state contains only session,
 task, input type, enablement, and a monotonically increasing show-request counter;
 surrounding text is not exported. Show requests do not create a new editor
@@ -42,24 +46,20 @@ metadata; full prediction/context and precise IME candidate placement remain
 future work. Physical key delivery remains on the existing routed-key path.
 
 The [Rust package builder](../../packaging/arch/README.md) builds the IME,
-framework bridge, task launcher and Composer endpoint together. Task registration
+framework services, IME, SystemUI, task launcher and Composer endpoint together. Task registration
 is idempotent for restored and newly created activities.
 
 ## Activity routing
 
-Activity discovery canonicalizes launcher aliases through PackageManager's
-`ActivityInfo.targetActivity`, and accepts an alias only when its target matches
-the completed `start-activity -W` result. This matters for both Settings and
-Firefox; treating a real activity and its launcher alias as different tasks
-strands the running app. No-display trampoline successors remain distinct.
-
-App-to-app launches also reach the host through the input bridge's platform
-task observer. It registers Android's resolved foreground task without replaying
-the intent or substituting a MAIN/LAUNCHER launch, preserving deep-link data and
-activity results. Reused tasks request host activation through the optional
+ActivityTaskManager publishes the real task selected by ActivityStarter and its
+launch completion callbacks. Launcher aliases and no-display trampoline
+successors do not require package-name matching or task-dump discovery.
+Android-originated launches are published from in-process lifecycle events,
+without replaying intents, preserving deep-link data, URI grants and activity
+results. Reused host launches request activation through the optional
 `TASK_ACTIVATION` capability; the host retains authority over window focus.
 See the [framework boundary](../../android/framework/README.md) for eligibility
-and regression checks.
+and runtime acceptance.
 
 Presenter activation logs include `touch_age_ms`; IME logs distinguish
 start/restart, finish, and show callbacks without logging editor text.

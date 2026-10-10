@@ -29,11 +29,12 @@ SOONG_CONFIG_NAMESPACES += minigbm
 SOONG_CONFIG_minigbm += platform
 SOONG_CONFIG_minigbm_platform := msm
 
-# Bionic hardware rendering supports both mainline MSM and downstream KGSL.
-# Native Freedreno remains the default; KGSL cells explicitly select Zink
+# Bionic hardware rendering supports MSM/KGSL and Mali Panfrost/Panthor hosts.
+# Native drivers follow the render node; KGSL cells explicitly select Zink
 # over Turnip. No software renderer is included.
 BOARD_MESA3D_USES_MESON_BUILD := true
-BOARD_MESA3D_GALLIUM_DRIVERS := freedreno zink
+BOARD_MESA3D_GALLIUM_DRIVERS := freedreno panfrost zink
 BOARD_MESA3D_VULKAN_DRIVERS := freedreno
 BOARD_MESA3D_BUILD_LIBGBM := false
-BOARD_MESA3D_MESON_ARGS := -Dfreedreno-kmds=msm,kgsl
+# Optional dependencies must not trigger unpinned downloads inside the builder.
+BOARD_MESA3D_MESON_ARGS := -Dfreedreno-kmds=msm,kgsl --wrap-mode=nofallback

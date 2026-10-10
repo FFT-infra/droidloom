@@ -13,7 +13,15 @@ MANIFEST = 'droidloom-bundle.json'
 MARKER = re.compile(rb'DROIDLOOM_INPUT_ABI=([0-9]{1,5});')
 RUNTIME = pathlib.Path('usr/lib/droidloom/runtime')
 COMPOSER = RUNTIME / 'bin/android.hardware.graphics.composer3-service.droidloom'
-BRIDGE = RUNTIME / 'framework/droidloom-input-bridge.jar'
+POLICY_JAR = RUNTIME / 'framework/services.jar'
+POLICY_NATIVE = RUNTIME / 'lib64/libinputflinger.so'
+POLICY_ABI = b'DROIDLOOM_WINDOW_POLICY_ABI=1;'
+TASK_ABI = b'DROIDLOOM_TASK_BACKEND_ABI=2;'
+NATIVE_INPUT_ABI = b'DROIDLOOM_NATIVE_INPUT_ABI=2;'
+CHANNELS_ABI = b'DROIDLOOM_HOST_CHANNELS_ABI=1;'
+DIRECT_INPUT_ABI = b'DROIDLOOM_DIRECT_INPUT_ABI=1;'
+FRAMEWORK_ABI = b'DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;'
+NOTIFICATIONS_ABI = b'DROIDLOOM_NOTIFICATIONS_ABI=2;'
 
 
 def abi(data, label):
@@ -21,6 +29,12 @@ def abi(data, label):
     if len(versions) != 1:
         raise ValueError(f'{label}: missing or ambiguous build compatibility metadata; rebuild this component')
     return versions.pop()
+
+
+def dex(path):
+    with zipfile.ZipFile(path) as archive:
+        return b''.join(archive.read(n) for n in archive.namelist()
+                        if n.startswith('classes') and n.endswith('.dex'))
 
 
 def compatibility(root):
@@ -32,18 +46,46 @@ def compatibility(root):
     if not arch:
         raise ValueError(f'unsupported Composer ELF architecture: {machine}')
     sender = abi(binary, str(COMPOSER))
-    jars = sorted((root / RUNTIME).rglob('droidloom-input-bridge.jar'))
-    if root / BRIDGE not in jars:
-        raise ValueError('missing primary Android input bridge')
-    for jar in jars:
-        with zipfile.ZipFile(jar) as archive:
-            dex = b''.join(archive.read(n) for n in archive.namelist()
-                           if n.startswith('classes') and n.endswith('.dex'))
-        receiver = abi(dex, str(jar.relative_to(root)))
-        if sender != receiver:
-            raise ValueError(f'input protocol mismatch: Composer v{sender}, {jar.relative_to(root)} v{receiver}')
+    if (DIRECT_INPUT_ABI not in binary or DIRECT_INPUT_ABI not in
+            (root / 'usr/bin/droidloom-wayland').read_bytes()):
+        raise ValueError('Composer and presenter lack paired direct input ABI 1')
+    with zipfile.ZipFile(root / POLICY_JAR) as archive:
+        policy_java = b''.join(archive.read(n) for n in archive.namelist()
+                               if n.startswith('classes') and n.endswith('.dex'))
+    policy_native = (root / POLICY_NATIVE).read_bytes()
+    if POLICY_ABI not in policy_java or POLICY_ABI not in policy_native:
+        raise ValueError('services.jar and libinputflinger.so lack paired Rust window policy ABI 1')
+    if (policy_native[:6] != b'\x7fELF\x02\x01'
+            or int.from_bytes(policy_native[18:20], 'little') != machine):
+        raise ValueError('wrong Rust window policy JNI architecture')
+    if TASK_ABI not in policy_java or TASK_ABI not in policy_native:
+        raise ValueError('framework pair lacks task backend ABI 2')
+    if TASK_ABI not in binary:
+        raise ValueError('Composer lacks task backend ABI 2')
+    if any(NATIVE_INPUT_ABI not in data for data in [policy_java, policy_native, binary]):
+        raise ValueError('framework pair lacks native input ABI 2')
+    native_input = abi(policy_native, str(POLICY_NATIVE))
+    if native_input != sender:
+        raise ValueError(f'input protocol mismatch: Composer v{sender}, InputFlinger v{native_input}')
+    if b'Lcom/android/server/wm/DroidloomApplicationCatalog;' not in policy_java:
+        raise ValueError('in-process application catalog class is missing')
+    if any(FRAMEWORK_ABI not in data for data in [policy_java, policy_native,
+            (root / 'usr/bin/droidloomd').read_bytes(), (root / 'usr/bin/droidloom-applications').read_bytes()]):
+        raise ValueError('framework/native/lifecycle/catalog peers lack framework control ABI 1')
+    if any(NOTIFICATIONS_ABI not in data for data in [dex(root / RUNTIME / 'systemui/SystemUI.apk'),
+            (root / 'usr/bin/droidloom-wayland').read_bytes()]):
+        raise ValueError('SystemUI/presenter lack notification delta ABI 2')
+    for artifact in [POLICY_JAR, RUNTIME / 'systemui/SystemUI.apk', RUNTIME / 'ime/DroidloomIME.apk']:
+        if CHANNELS_ABI not in dex(root / artifact):
+            raise ValueError(f'{artifact}: missing direct host channels ABI 1')
+    if CHANNELS_ABI not in (root / 'usr/bin/droidloom-wayland').read_bytes():
+        raise ValueError('presenter lacks direct host channels ABI 1')
+    for retired in ['droidloom-input-bridge', 'droidloom-input-bridge.jar', 'droidloom-input-bridge.rc',
+                    'droidloom-task-launcher', 'libdroidloom_task_launcher.dylib.so', 'droidloom-application-catalog.jar']:
+        if any((root / RUNTIME).rglob(retired)):
+            raise ValueError('retired support artifact remains in payload')
     for name in ['droidloomd', 'droidloomctl', 'droidloom-supervisor',
-                 'droidloom-wayland', 'droidloom-applications']:
+                 'droidloom-wayland', 'droidloom-applications', 'droidloom-audio']:
         with (root / 'usr/bin' / name).open('rb') as source:
             header = source.read(20)
         if header[:4] != b'\x7fELF' or header[5:6] != b'\x01' or int.from_bytes(header[18:20], 'little') != machine:

@@ -179,6 +179,10 @@ rsync -a --delete "$mesa_prepared/" "$source_tree/vendor/droidloom/mesa3d/"
     cd "$repo_root"
     rsync -aR \
         Android.bp \
+        ./runtime/droidloom-cpu-placement \
+        ./runtime/droidloom-timing \
+        ./runtime/droidloom-audio-protocol \
+        ./android/audio \
         ./graphics/droidloom-composer-aidl \
         ./graphics/droidloom-composer-service \
         ./graphics/droidloom-composer \
@@ -189,8 +193,7 @@ rsync -a --delete "$mesa_prepared/" "$source_tree/vendor/droidloom/mesa3d/"
         ./graphics/droidloom-syncobj \
         ./graphics/droidloom-task-control \
         ./graphics/droidloom-transport \
-        ./android/framework/droidloom-task-launcher \
-        ./android/framework/droidloom-input-bridge \
+        ./android/framework/host-channels \
         ./android/lmkd-compat \
         ./android/runtime/droidloom-classpath-wrapper \
         ./android/selinux-compat \

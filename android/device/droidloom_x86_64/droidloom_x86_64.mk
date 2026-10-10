@@ -46,8 +46,7 @@ PRODUCT_PACKAGES += \
     DroidloomConnectivityOverlay \
     android.hardware.ethernet.prebuilt.xml \
     android.hardware.graphics.composer3-service.droidloom \
-    droidloom-task-launcher \
-    droidloom-input-bridge \
+    droidloom-framework-init \
     droidloom-lmkd-compat \
     droidloom-classpath-wrapper \
     android.hardware.graphics.allocator-service.minigbm \
@@ -72,6 +71,7 @@ PRODUCT_COPY_FILES += \
     frameworks/av/services/audiopolicy/config/surround_sound_configuration_5_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/surround_sound_configuration_5_0.xml
 
 PRODUCT_VENDOR_PROPERTIES += \
+    persist.audio.normal_playback_period_ms=5 \
     ro.zygote=zygote64 \
     ro.vendor.droidloom.surfaceflinger_direct=true \
     ro.vendor.droidloom.surfaceflinger_tasks=true \

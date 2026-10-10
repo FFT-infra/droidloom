@@ -92,7 +92,9 @@ impl TextInput {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        // The host parent is 0700; the guest mounts this only in a system-owned
+        // 0700 directory. The host owner may differ from Android system UID 1000.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
@@ -170,7 +172,7 @@ impl TextInput {
     pub fn pump(&mut self) -> io::Result<()> {
         match self.listener.accept() {
             Ok((client, _)) => {
-                if !root_peer(&client)? {
+                if !framework_peer(&client)? {
                     return Ok(());
                 }
                 self.disconnect();
@@ -296,7 +298,7 @@ impl Drop for TextInput {
     }
 }
 
-fn root_peer(client: &UnixStream) -> io::Result<bool> {
+fn framework_peer(client: &UnixStream) -> io::Result<bool> {
     let mut credentials = libc::ucred {
         pid: 0,
         uid: u32::MAX,
@@ -317,7 +319,7 @@ fn root_peer(client: &UnixStream) -> io::Result<bool> {
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(credentials.uid == 0)
+    Ok(credentials.uid == 1000)
 }
 
 fn content_type(

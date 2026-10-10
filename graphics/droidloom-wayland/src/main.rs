@@ -5,10 +5,14 @@
 mod activation;
 mod clipboard;
 mod fence_wakeup;
+mod imports;
+mod input;
 mod insets;
 mod layers;
 mod notifications;
 mod presentation_audit;
+mod readiness;
+mod resize;
 mod text_input;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -205,13 +209,15 @@ struct TaskWindow {
     layers: Option<layers::Stream>,
     package: String,
     android_task: Option<u64>,
+    input_route: Option<input::Route>,
     window: Option<Window>,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
     logical_size: Option<(u32, u32)>,
     buffer_size: (u32, u32),
-    preferred_scale_120: u32,
+    applied_scale_120: u32,
+    resize: resize::Pending,
     configure_serial: u32,
     refresh_millihz: u32,
     entered_outputs: Vec<wl_output::WlOutput>,
@@ -291,6 +297,7 @@ struct App {
     window_policy: WindowPolicyStore,
     endpoint: Option<DenialEndpoint>,
     tasks: BTreeMap<TaskObjectId, TaskWindow>,
+    task_work: readiness::Tasks,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
@@ -299,6 +306,7 @@ struct App {
     touch_contacts: BTreeMap<i32, Contact>,
     next_buffer_id: u64,
     next_input_serial: u64,
+    direct_input: input::DirectInput,
     socket_path: PathBuf,
     fatal: Option<String>,
 }
@@ -333,7 +341,13 @@ impl App {
         let Some(endpoint) = self.endpoint.as_ref().filter(|endpoint| endpoint.ready()) else {
             return Ok(());
         };
-        endpoint.send_display_power(powered)?;
+        if endpoint.direct_input() {
+            if let Err(error) = self.direct_input.set_power(powered) {
+                eprintln!("Droidloom input power: {error}");
+            }
+        } else {
+            endpoint.send_display_power(powered)?;
+        }
         self.published_display_power = Some(powered);
         Ok(())
     }
@@ -398,7 +412,7 @@ impl App {
                 task.configure_serial,
                 task.buffer_size.0,
                 task.buffer_size.1,
-                task.preferred_scale_120,
+                task.applied_scale_120,
                 FRACTIONAL_SCALE_DENOMINATOR,
                 Transform::Normal,
                 refresh,
@@ -475,7 +489,15 @@ impl App {
         let Some((width, height)) = self.host_canvas_size() else {
             return Ok(());
         };
-        self.configure_task(qh, object, width, height)
+        self.configure_task(
+            qh,
+            object,
+            resize::Configure {
+                size: LogicalSize { width, height },
+                scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                remember: false,
+            },
+        )
     }
 
     fn selected_format(&self) -> Result<(DrmFourcc, Vec<Modifier>), PresenterError> {
@@ -564,13 +586,15 @@ impl App {
                 layers: None,
                 package: package.to_owned(),
                 android_task: None,
+                input_route: None,
                 window,
                 viewport,
                 fractional_scale,
                 sync_surface,
                 logical_size: None,
                 buffer_size: (0, 0),
-                preferred_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                applied_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                resize: resize::Pending::new(FRACTIONAL_SCALE_DENOMINATOR),
                 configure_serial: 0,
                 refresh_millihz: 60_000,
                 entered_outputs: Vec::new(),
@@ -603,7 +627,44 @@ impl App {
                 .ok_or(PresenterError::Configuration(
                     "Wayland output has no current pixel mode",
                 ))?;
-            self.configure_task(qh, object, width, height)?;
+            self.configure_task(
+                qh,
+                object,
+                resize::Configure {
+                    size: LogicalSize { width, height },
+                    scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                    remember: false,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_pending_resizes(&mut self, qh: &QueueHandle<Self>) -> Result<(), PresenterError> {
+        // Wayland callbacks only replace pending geometry. Apply the final
+        // size/scale before draining Android frames or publishing layer config.
+        while let Some(object) = self.task_work.pop(readiness::RESIZE) {
+            let Some(task) = self.tasks.get_mut(&object) else {
+                continue;
+            };
+            let Some(configure) = task.resize.take() else {
+                continue;
+            };
+            if !task.accepts_present() {
+                continue;
+            }
+            self.configure_task(qh, object, configure)?;
+            if configure.remember {
+                let package = &self
+                    .tasks
+                    .get(&object)
+                    .expect("configured task exists")
+                    .package;
+                if let Err(error) = self.window_policy.remember(package, configure.size) {
+                    // Persistence failure is non-fatal to an otherwise valid frame.
+                    eprintln!("Droidloom could not remember {package} window size: {error}");
+                }
+            }
         }
         Ok(())
     }
@@ -612,33 +673,23 @@ impl App {
         &mut self,
         qh: &QueueHandle<Self>,
         object: TaskObjectId,
-        width: u32,
-        height: u32,
+        configure: resize::Configure,
     ) -> Result<(), PresenterError> {
-        let width = width.max(1);
-        let height = height.max(1);
-        let (scale_120, buffer_width, buffer_height) = {
-            let task = self
-                .tasks
-                .get(&object)
-                .ok_or(PresenterError::UnknownTask(object))?;
-            let scale_120 = task.preferred_scale_120;
-            (
-                scale_120,
-                scale_dimension(width, scale_120)?,
-                scale_dimension(height, scale_120)?,
-            )
-        };
-        let needs_pool = {
+        let width = configure.size.width;
+        let height = configure.size.height;
+        let scale_120 = configure.scale_120;
+        let buffer_width = scale_dimension(width, scale_120)?;
+        let buffer_height = scale_dimension(height, scale_120)?;
+        let needs_configure = {
             let task = self
                 .tasks
                 .get(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.configure_serial == 0
-                || task.logical_size != Some((width, height))
+                || configure.changes_geometry(task.logical_size, task.applied_scale_120)
                 || task.buffer_size != (buffer_width, buffer_height)
         };
-        if !needs_pool {
+        if !needs_configure {
             return Ok(());
         }
 
@@ -648,29 +699,6 @@ impl App {
             .get(&object)
             .and_then(|task| task.configure_serial.checked_add(1))
             .ok_or(PresenterError::Configuration("configure serial exhausted"))?;
-        let mut targets: Vec<RenderTarget> = Vec::with_capacity(TARGET_POOL_LENGTH);
-        for _ in 0..TARGET_POOL_LENGTH {
-            let id = self.allocate_buffer_id()?;
-            let target = self.allocate_target(qh, id, buffer_width, buffer_height)?;
-            let planes = target.planes.iter().map(AsFd::as_fd).collect::<Vec<_>>();
-            let result = self
-                .endpoint
-                .as_mut()
-                .ok_or(PresenterError::Configuration("endpoint disappeared"))?
-                .register_render_target(object, serial, &target.metadata, &planes);
-            if let Err(error) = result {
-                for registered in &targets {
-                    let _ = self
-                        .endpoint
-                        .as_mut()
-                        .expect("endpoint existed during target registration")
-                        .unregister_render_target(object, registered.metadata.id);
-                }
-                return Err(error.into());
-            }
-            targets.push(target);
-        }
-
         let refresh = self.task_refresh_millihz(object);
         {
             let task = self
@@ -678,15 +706,11 @@ impl App {
                 .get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.logical_size = Some((width, height));
+            task.applied_scale_120 = scale_120;
             task.applied_opaque = None;
             task.buffer_size = (buffer_width, buffer_height);
             task.configure_serial = serial;
             task.refresh_millihz = refresh;
-            task.targets.extend(
-                targets
-                    .into_iter()
-                    .map(|target| (target.metadata.id, target)),
-            );
             if let Some(viewport) = task.viewport.as_ref() {
                 let destination_width = i32::try_from(width)
                     .map_err(|_| PresenterError::Configuration("logical width exceeds Wayland"))?;
@@ -708,7 +732,80 @@ impl App {
                 Transform::Normal,
                 refresh,
             )?;
+        self.task_work.mark(object, readiness::CONFIG);
+        // Only a peer that negotiated demand allocation may configure an
+        // empty pool. Bootstrap can request its targets through the same
+        // dequeue path if its normally elided composition is ever needed.
+        if !self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::lazy_render_targets)
+        {
+            self.ensure_render_targets(qh, object, serial)?;
+        }
         self.update_output_refreshes()
+    }
+
+    fn ensure_render_targets(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        object: TaskObjectId,
+        serial: u32,
+    ) -> Result<(), PresenterError> {
+        let task = self
+            .tasks
+            .get(&object)
+            .ok_or(PresenterError::UnknownTask(object))?;
+        // Requests race resizes and close on the other socket. Never allocate
+        // obsolete dimensions or resurrect a closing task's target pool.
+        if (!task.headless() && !task.accepts_present())
+            || task.closing
+            || task.unmap_requested
+            || task.configure_serial != serial
+            || task
+                .targets
+                .values()
+                .any(|target| target.host_owned && !target.retired)
+        {
+            return Ok(());
+        }
+        let (width, height) = task.buffer_size;
+        let mut targets: Vec<RenderTarget> = Vec::with_capacity(TARGET_POOL_LENGTH);
+        for _ in 0..TARGET_POOL_LENGTH {
+            let id = self.allocate_buffer_id()?;
+            let target = self.allocate_target(qh, id, width, height)?;
+            targets.push(target);
+        }
+        // Finish allocation before publishing any descriptors. A failed GBM
+        // allocation must not leave Android holding an incomplete pool.
+        for (index, target) in targets.iter().enumerate() {
+            let planes = target.planes.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+            let result = self
+                .endpoint
+                .as_mut()
+                .ok_or(PresenterError::Configuration("endpoint disappeared"))?
+                .register_render_target(object, serial, &target.metadata, &planes);
+            if let Err(error) = result {
+                for registered in &targets[..index] {
+                    let _ = self
+                        .endpoint
+                        .as_mut()
+                        .unwrap()
+                        .unregister_render_target(object, registered.metadata.id);
+                }
+                return Err(error.into());
+            }
+        }
+        self.tasks.get_mut(&object).unwrap().targets.extend(
+            targets
+                .into_iter()
+                .map(|target| (target.metadata.id, target)),
+        );
+        eprintln!(
+            "Droidloom composition targets: object={} configure={serial} size={width}x{height} buffers={TARGET_POOL_LENGTH}",
+            object.0
+        );
+        Ok(())
     }
 
     fn allocate_buffer_id(&mut self) -> Result<BufferId, PresenterError> {
@@ -1099,12 +1196,17 @@ impl App {
                 submitted_nanos,
             });
         }
+        self.task_work.frames.insert(object);
+        self.task_work.mark(object, readiness::FRAMES);
         Ok(())
     }
 
     fn release_ready_frames(&mut self) -> Result<(), PresenterError> {
         let mut ready = Vec::new();
-        for (object, task) in &mut self.tasks {
+        while let Some(object) = self.task_work.pop(readiness::FRAMES) {
+            let Some(task) = self.tasks.get_mut(&object) else {
+                continue;
+            };
             // Diagnostic observation only: retain the existing release policy.
             // Inspect sampled frames independently so FIFO head blocking is visible.
             for pending in &mut task.pending {
@@ -1145,7 +1247,20 @@ impl App {
                 if let Some(audit) = task.presentation_audit.as_mut() {
                     audit.released(pending.submitted_nanos, monotonic_timestamp_nanos()?);
                 }
-                ready.push((*object, pending));
+                ready.push((object, pending));
+            }
+            if task.pending.is_empty() {
+                self.task_work.frames.remove(&object);
+            }
+            let fallback = task.pending.iter().any(|pending| {
+                task.targets
+                    .get(&pending.buffer)
+                    .and_then(|target| target.sync.as_ref())
+                    .is_some_and(|sync| sync.release_wakeup.is_none())
+            });
+            self.task_work.frame_fallback(object, fallback);
+            if task.closing {
+                self.task_work.mark(object, readiness::CLEANUP);
             }
         }
         for (object, pending) in ready {
@@ -1187,23 +1302,20 @@ impl App {
                 }
             }
         }
-        let finished = self
-            .tasks
-            .iter()
-            .filter_map(|(object, task)| {
-                (task.closing
+        while let Some(object) = self.task_work.pop(readiness::CLEANUP) {
+            if self.tasks.get(&object).is_some_and(|task| {
+                task.closing
                     && task.pending.is_empty()
-                    && task.layers.as_ref().is_none_or(|s| !s.busy()))
-                .then_some(*object)
-            })
-            .collect::<Vec<_>>();
-        for object in finished {
-            self.remove_task(object);
+                    && task.layers.as_ref().is_none_or(|s| !s.busy())
+            }) {
+                self.remove_task(object);
+            }
         }
         Ok(())
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.task_work.remove(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             if let Some(fractional_scale) = task.fractional_scale.take() {
@@ -1242,6 +1354,7 @@ impl App {
             .tasks
             .get_mut(&object)
             .ok_or(PresenterError::UnknownTask(object))?;
+        task.resize.cancel();
         let Some(surface) = task.surface().cloned() else {
             return Ok(());
         };
@@ -1280,6 +1393,8 @@ impl App {
         }
         task.window.take();
         task.unmap_requested = false;
+        self.task_work
+            .mark(object, readiness::CONFIG | readiness::CLEANUP);
 
         if self.focused == Some(object) {
             self.focused = None;
@@ -1297,12 +1412,10 @@ impl App {
     }
 
     fn unmap_requested_tasks(&mut self) -> Result<(), PresenterError> {
-        let requested = self
-            .tasks
-            .iter()
-            .filter_map(|(object, task)| task.unmap_requested.then_some(*object))
-            .collect::<Vec<_>>();
-        for object in requested {
+        while let Some(object) = self.task_work.pop(readiness::UNMAP) {
+            if !self.tasks.contains_key(&object) {
+                continue;
+            }
             self.unmap_task_window(object)?;
             let finished = self.tasks.get(&object).is_some_and(|task| {
                 task.closing
@@ -1323,6 +1436,10 @@ impl App {
             .ok_or(PresenterError::UnknownTask(object))?;
         task.closing = true;
         task.unmap_requested = true;
+        self.task_work.mark(
+            object,
+            readiness::UNMAP | readiness::CONFIG | readiness::CLEANUP,
+        );
         Ok(())
     }
 
@@ -1332,6 +1449,39 @@ impl App {
         action: EndpointAction,
     ) -> Result<(), PresenterError> {
         match action {
+            EndpointAction::RequestRenderTargets {
+                object,
+                configure_serial,
+            } => {
+                self.ensure_render_targets(qh, object, configure_serial)?;
+            }
+            EndpointAction::BindInputChannel {
+                generation,
+                wire,
+                socket,
+            } => {
+                if self
+                    .direct_input
+                    .attach(generation, wire, socket)
+                    .map_err(PresenterError::Wayland)?
+                {
+                    eprintln!("Droidloom direct input: connected to InputFlinger, wire ABI {wire}");
+                }
+            }
+            EndpointAction::BindInputRoute {
+                object,
+                task,
+                display,
+                incarnation,
+            } => {
+                if let Some(window) = self.tasks.get_mut(&object) {
+                    window.input_route = Some(input::Route {
+                        task: task.0,
+                        display,
+                        incarnation,
+                    });
+                }
+            }
             EndpointAction::RequestActivation { object } => {
                 if self.focused != Some(object)
                     && let Some(task) = self
@@ -1345,7 +1495,17 @@ impl App {
             EndpointAction::BindLayerStream { object, sockets } => {
                 self.bind_layers(object, sockets)?
             }
-            EndpointAction::ClientReady => self.publish_display_power()?,
+            EndpointAction::ClientReady => {
+                if self
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(DenialEndpoint::lazy_render_targets)
+                {
+                    eprintln!("Droidloom graphics: fallback targets allocated on demand");
+                }
+                self.pump_direct_input()?;
+                self.publish_display_power()?;
+            }
             EndpointAction::TimelinesBound { .. }
             | EndpointAction::ConfigureAcknowledged { .. }
             | EndpointAction::SupersededPresentDiscarded { .. }
@@ -1404,6 +1564,7 @@ impl App {
                 } else {
                     endpoint
                 };
+                let endpoint = endpoint.with_direct_input().with_lazy_render_targets();
                 endpoint.socket().socket().set_nonblocking(true)?;
                 self.endpoint = Some(endpoint);
             }
@@ -1436,6 +1597,7 @@ impl App {
         self.activation.clear();
         self.text_input.disconnect();
         self.endpoint = None;
+        self.direct_input.disconnect();
         self.published_display_power = None;
         for object in self.tasks.keys().copied().collect::<Vec<_>>() {
             self.remove_task(object);
@@ -1473,10 +1635,56 @@ impl App {
                 self.next_input_serial, object.0
             );
         }
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input)
+        {
+            let window = self
+                .tasks
+                .get(&object)
+                .ok_or(PresenterError::UnknownTask(object))?;
+            if window.closing {
+                return Ok(());
+            }
+            let Some(route) = window.input_route else {
+                // The task binding and native route arrive in ordered records,
+                // but Wayland may dispatch input between their receipt.
+                return Ok(());
+            };
+            if let Err(error) = self.direct_input.send(
+                route,
+                (window.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR),
+                self.next_input_serial,
+                timestamp,
+                event,
+            ) {
+                // The native receiver cancels held input on EOF. Recover this
+                // connection without taking down unrelated app windows.
+                eprintln!("Droidloom direct input: {error}");
+            }
+            return Ok(());
+        }
         self.endpoint
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
             .send_input(object, self.next_input_serial, timestamp, event)?;
+        Ok(())
+    }
+
+    fn pump_direct_input(&mut self) -> Result<(), PresenterError> {
+        if let Err(error) = self.direct_input.flush() {
+            eprintln!("Droidloom input: {error}");
+        }
+        if let Some(endpoint) = self
+            .endpoint
+            .as_ref()
+            .filter(|endpoint| endpoint.direct_input())
+        {
+            if let Some(generation) = self.direct_input.next_request() {
+                endpoint.request_input_channel(generation)?;
+            }
+        }
         Ok(())
     }
 
@@ -1620,7 +1828,7 @@ impl Dispatch<WpFractionalScaleV1, TaskObjectId> for App {
         event: wp_fractional_scale_v1::Event,
         object: &TaskObjectId,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
     ) {
         let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
             return;
@@ -1632,18 +1840,8 @@ impl Dispatch<WpFractionalScaleV1, TaskObjectId> for App {
         let Some(task) = state.tasks.get_mut(object) else {
             return;
         };
-        if task.preferred_scale_120 == scale {
-            return;
-        }
-        task.preferred_scale_120 = scale;
-        let Some((width, height)) = task.logical_size else {
-            // Scale is part of resolving the first buffer extent. Do not
-            // allocate an observable provisional target before XDG configures
-            // the logical window.
-            return;
-        };
-        if let Err(error) = state.configure_task(qh, *object, width, height) {
-            state.fail(&error);
+        if task.accepts_present() && task.resize.preferred_scale(scale, task.logical_size) {
+            state.task_work.mark(*object, readiness::RESIZE);
         }
     }
 }
@@ -1663,6 +1861,8 @@ impl WindowHandler for App {
                 Ok(()) => {
                     if let Some(task) = self.tasks.get_mut(&object) {
                         task.unmap_requested = true;
+                        self.task_work
+                            .mark(object, readiness::UNMAP | readiness::CONFIG);
                     }
                 }
                 Err(error) => self.fail(&error),
@@ -1673,7 +1873,7 @@ impl WindowHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         window: &Window,
         configure: WindowConfigure,
         _serial: u32,
@@ -1687,10 +1887,12 @@ impl WindowHandler for App {
         let Some(object) = object else {
             return;
         };
-        let (package, previous, headless) = self.tasks.get(&object).map_or_else(
-            || (String::new(), None, false),
-            |task| (task.package.clone(), task.logical_size, task.headless()),
-        );
+        let task = self.tasks.get(&object).expect("surface has a task");
+        if !task.accepts_present() {
+            return;
+        }
+        let package = task.package.clone();
+        let previous = task.resize.logical_size(task.logical_size);
         let requested_width = configure.new_size.0.map(NonZeroU32::get);
         let requested_height = configure.new_size.1.map(NonZeroU32::get);
         let size = previous.map_or_else(
@@ -1706,23 +1908,21 @@ impl WindowHandler for App {
                     self.host_logical_canvas_size(),
                 )
             },
-            |(width, height)| LogicalSize {
-                width: requested_width.unwrap_or(width),
-                height: requested_height.unwrap_or(height),
+            |previous| LogicalSize {
+                width: requested_width.unwrap_or(previous.width),
+                height: requested_height.unwrap_or(previous.height),
             },
         );
-        if let Err(error) = self.configure_task(qh, object, size.width, size.height) {
-            self.fail(&error);
-        } else if !headless
-            && previous.is_some()
+        let remember = previous.is_some()
             && !configure.is_resizing()
             && !configure.is_maximized()
-            && !configure.is_fullscreen()
-            && let Err(error) = self.window_policy.remember(&package, size)
-        {
-            // Persistence failure is non-fatal to an otherwise valid frame.
-            eprintln!("Droidloom could not remember {package} window size: {error}");
-        }
+            && !configure.is_fullscreen();
+        self.tasks
+            .get_mut(&object)
+            .expect("surface has a task")
+            .resize
+            .configure(size, remember);
+        self.task_work.mark(object, readiness::RESIZE);
     }
 }
 
@@ -1757,10 +1957,7 @@ impl DmabufHandler for App {
         _qh: &QueueHandle<Self>,
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
     ) {
-        if self.layer_imported(params, None) {
-            return;
-        }
-        self.fail(&"compositor rejected a DMA-BUF import");
+        self.layer_imported(params, None);
     }
 
     fn released(
@@ -2475,6 +2672,8 @@ wayland_client::delegate_noop!(App: ignore WpViewport);
 wayland_client::delegate_noop!(App: ignore ZwlrOutputPowerManagerV1);
 
 fn main() {
+    eprintln!("DROIDLOOM_DIRECT_INPUT_ABI=1;");
+    eprintln!("DROIDLOOM_HOST_CHANNELS_ABI=1;");
     // SAFETY: the process is still single-threaded. Mesa consumes this optional
     // worker policy after its own full-affinity reset, before executing jobs.
     if let Some(groups) =
@@ -2595,6 +2794,7 @@ fn run() -> Result<(), PresenterError> {
         window_policy,
         endpoint: None,
         tasks: BTreeMap::new(),
+        task_work: readiness::Tasks::default(),
         keyboard: None,
         pointer: None,
         touch: None,
@@ -2603,6 +2803,7 @@ fn run() -> Result<(), PresenterError> {
         touch_contacts: BTreeMap::new(),
         next_buffer_id: 0,
         next_input_serial: 0,
+        direct_input: input::DirectInput::default(),
         socket_path,
         fatal: None,
     };
@@ -2623,28 +2824,40 @@ fn run_presenter_loop(
 ) -> Result<(), PresenterError> {
     let qh = event_queue.handle();
     let mut poll_descriptors = Vec::new();
+    let mut poll_owners = Vec::new();
     let mut layer_tasks = Vec::new();
     loop {
         event_queue.dispatch_pending(&mut app)?;
+        app.task_work.notify_fallback(Instant::now());
         app.unmap_requested_tasks()?;
         if let Some(error) = app.fatal.take() {
             return Err(PresenterError::Wayland(error));
         }
+        app.apply_pending_resizes(&qh)?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
+        app.pump_direct_input()?;
         app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();
         app.clipboard.pump(&qh);
         if !app.clipboard.blocked() {
             while let Some((object, input)) = app.clipboard_inputs.pop_front() {
                 if app.tasks.contains_key(&object) {
-                    app.send_input(object, input)?;
+                    if let Err(error) = app.send_input(object, input) {
+                        eprintln!("Droidloom queued input: {error}");
+                    }
                 }
             }
         }
         app.unmap_requested_tasks()?;
         app.release_ready_frames()?;
-        poll_sources(conn, &mut event_queue, &mut app, &mut poll_descriptors)?;
+        poll_sources(
+            conn,
+            &mut event_queue,
+            &mut app,
+            &mut poll_descriptors,
+            &mut poll_owners,
+        )?;
     }
 }
 
@@ -2668,16 +2881,17 @@ fn poll_sources(
     event_queue: &mut EventQueue<App>,
     app: &mut App,
     descriptors: &mut Vec<libc::pollfd>,
+    owners: &mut Vec<readiness::Source>,
 ) -> Result<(), PresenterError> {
     let write_blocked = match event_queue.flush() {
         Ok(()) => {
-            for pending in app
-                .tasks
-                .values_mut()
-                .flat_map(|task| task.pending.iter_mut())
-            {
-                if let Some(trace) = pending.trace.as_mut() {
-                    trace.flushed();
+            for object in &app.task_work.frames {
+                if let Some(task) = app.tasks.get_mut(object) {
+                    for pending in &mut task.pending {
+                        if let Some(trace) = pending.trace.as_mut() {
+                            trace.flushed();
+                        }
+                    }
                 }
             }
             false
@@ -2685,6 +2899,8 @@ fn poll_sources(
         Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => true,
         Err(error) => return Err(PresenterError::Wayland(error.to_string())),
     };
+    let now = Instant::now();
+    let fallback_deadline = app.task_work.deadline(now, RELEASE_POLL_FALLBACK);
     // Pending Wayland events must be dispatched before sleeping. The previous
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
@@ -2692,6 +2908,7 @@ fn poll_sources(
         return Ok(());
     };
     descriptors.clear();
+    owners.clear();
     descriptors.extend([
         libc::pollfd {
             fd: conn.as_fd().as_raw_fd(),
@@ -2718,23 +2935,39 @@ fn poll_sources(
             revents: 0,
         });
     }
-    for stream in app.tasks.values().filter_map(|t| t.layers.as_ref()) {
-        for (fd, events) in stream.fds() {
+    if let Some((fd, events)) = app.direct_input.fd() {
+        descriptors.push(libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        });
+    }
+    owners.resize(descriptors.len(), readiness::Source::Other);
+    for object in &app.task_work.streams {
+        let Some(stream) = app.tasks.get(object).and_then(|t| t.layers.as_ref()) else {
+            continue;
+        };
+        for (fd, work) in stream.fds() {
             descriptors.push(libc::pollfd {
                 fd,
-                events,
+                events: libc::POLLIN,
                 revents: 0,
+            });
+            owners.push(readiness::Source::Task {
+                object: *object,
+                work,
+                eventfd: work == readiness::RELEASES,
             });
         }
     }
-    let wakeups_start = descriptors.len();
-    let mut release_fallback = app
-        .tasks
-        .values()
-        .filter_map(|t| t.layers.as_ref())
-        .any(|s| s.poll_fallback());
-    for target in app.tasks.values().flat_map(|task| task.targets.values()) {
-        if target.busy {
+    for object in &app.task_work.frames {
+        let Some(task) = app.tasks.get(object) else {
+            continue;
+        };
+        for pending in &task.pending {
+            let Some(target) = task.targets.get(&pending.buffer) else {
+                continue;
+            };
             if let Some(event) = target
                 .sync
                 .as_ref()
@@ -2745,17 +2978,26 @@ fn poll_sources(
                     events: libc::POLLIN,
                     revents: 0,
                 });
-            } else {
-                // Only kernels without timeline eventfd support need periodic
-                // checks, and only while an actual release is outstanding.
-                release_fallback = true;
+                owners.push(readiness::Source::Task {
+                    object: *object,
+                    work: readiness::FRAMES,
+                    eventfd: true,
+                });
             }
         }
     }
     let clipboard_deadline = (!app.clipboard_inputs.is_empty())
         .then(|| app.clipboard.unblock_deadline())
         .flatten();
-    let timeout = poll_timeout_millis(release_fallback, clipboard_deadline, Instant::now());
+    let deadline = clipboard_deadline
+        .into_iter()
+        .chain(fallback_deadline)
+        .min();
+    let timeout = if app.task_work.pending() {
+        0 // Flush Wayland first, then service work queued during this turn.
+    } else {
+        poll_timeout_millis(deadline, now)
+    };
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
@@ -2772,8 +3014,10 @@ fn poll_sources(
         }
     }
     app.clipboard.notify_ready(descriptors);
-    for event in &descriptors[wakeups_start..] {
-        if event.revents & libc::POLLIN != 0 {
+    app.direct_input.notify_ready(descriptors);
+    app.task_work.notify_fallback(Instant::now());
+    for (event, owner) in descriptors.iter().zip(owners.iter().copied()) {
+        if owner.notify(&mut app.task_work, event.revents) {
             let mut count = 0_u64;
             // SAFETY: all entries in this slice borrow live nonblocking
             // eventfds; count is writable storage for the required eight bytes.
@@ -2809,15 +3053,8 @@ fn poll_sources(
     Ok(())
 }
 
-fn poll_timeout_millis(release_fallback: bool, deadline: Option<Instant>, now: Instant) -> i32 {
+fn poll_timeout_millis(deadline: Option<Instant>, now: Instant) -> i32 {
     let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
-    let timeout = if release_fallback {
-        Some(timeout.map_or(RELEASE_POLL_FALLBACK, |timeout| {
-            timeout.min(RELEASE_POLL_FALLBACK)
-        }))
-    } else {
-        timeout
-    };
     // Round up so sub-millisecond deadlines cannot turn into a busy loop.
     timeout.map_or(-1, |duration| {
         i32::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
@@ -3094,25 +3331,23 @@ mod tests {
     }
 
     #[test]
-    fn idle_wait_has_no_periodic_timer_but_release_fallback_remains_bounded() {
+    fn idle_wait_has_no_periodic_timer() {
         let now = Instant::now();
-        assert_eq!(poll_timeout_millis(false, None, now), -1);
-        assert_eq!(poll_timeout_millis(true, None, now), 4);
+        assert_eq!(poll_timeout_millis(None, now), -1);
         let deadline = Some(now + Duration::from_secs(10));
-        assert_eq!(poll_timeout_millis(false, deadline, now), 10_000);
-        assert_eq!(poll_timeout_millis(true, deadline, now), 4);
+        assert_eq!(poll_timeout_millis(deadline, now), 10_000);
     }
 
     #[test]
     fn clipboard_deadline_wakes_even_without_socket_traffic() {
         let now = Instant::now();
-        assert_eq!(poll_timeout_millis(false, Some(now), now), 0);
+        assert_eq!(poll_timeout_millis(Some(now), now), 0);
         assert_eq!(
-            poll_timeout_millis(true, Some(now + Duration::from_micros(50)), now),
+            poll_timeout_millis(Some(now + Duration::from_micros(50)), now),
             1
         );
         assert_eq!(
-            poll_timeout_millis(false, Some(now - Duration::from_millis(1)), now),
+            poll_timeout_millis(Some(now - Duration::from_millis(1)), now),
             0
         );
     }

@@ -14,6 +14,41 @@ use crate::{
     hwc3::Session,
 };
 
+/// Coalesce fallback allocation requests across retries and geometry changes.
+#[derive(Debug, Default)]
+pub struct RenderTargetDemand {
+    serial: Option<u32>,
+    requested: Option<u32>,
+}
+
+impl RenderTargetDemand {
+    /// Observe geometry; refresh-only updates keep the outstanding request.
+    pub fn configure(&mut self, serial: u32) {
+        if self.serial != Some(serial) {
+            self.serial = Some(serial);
+            self.requested = None;
+        }
+    }
+
+    /// Current target generation, independently of older in-flight buffers.
+    pub fn serial(&self) -> Option<u32> {
+        self.serial
+    }
+
+    /// Request a missing pool; a busy existing pool must wait for GPU release.
+    pub fn request(&self, enabled: bool, has_pool: bool) -> Option<u32> {
+        self.serial
+            .filter(|serial| enabled && !has_pool && self.requested != Some(*serial))
+    }
+
+    /// Record only a successfully sent request; transport failure is retryable.
+    pub fn sent(&mut self, serial: u32) {
+        if self.serial == Some(serial) {
+            self.requested = Some(serial);
+        }
+    }
+}
+
 /// Android-side binding of one Composer logical display to one Denial task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DenialTaskBinding {
@@ -24,6 +59,7 @@ pub struct DenialTaskBinding {
     acknowledged_configure: Option<u32>,
     next_timeline_point: u64,
     pending_release_points: BTreeMap<droidloom_transport::FrameId, u64>,
+    destroy_requested: bool,
 }
 
 /// One client-target present paired with its preallocated timeline points.
@@ -147,12 +183,36 @@ impl DenialTaskBinding {
             acknowledged_configure: None,
             next_timeline_point: 0,
             pending_release_points: BTreeMap::new(),
+            destroy_requested: false,
         })
     }
 
     /// Return the independent Denial task object.
     pub fn object(&self) -> TaskObjectId {
         self.object
+    }
+
+    /// Send destruction once, retaining this binding until all releases drain.
+    /// A failed send leaves the request retryable.
+    ///
+    /// # Errors
+    /// Propagates the sender's transport error.
+    pub fn request_destroy<E>(
+        &mut self,
+        send: impl FnOnce(AndroidMessage) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if !self.destroy_requested {
+            send(AndroidMessage::DestroyTask {
+                object: self.object,
+            })?;
+            self.destroy_requested = true;
+        }
+        Ok(())
+    }
+
+    /// Destruction forbids new frames while existing releases remain routable.
+    pub fn destroy_requested(&self) -> bool {
+        self.destroy_requested
     }
 
     /// Return the dedicated Android logical display.
@@ -253,7 +313,7 @@ impl DenialTaskBinding {
         display: DisplayId,
         frame: &AcceptedFrame,
     ) -> Result<PreparedPresent, DenialBridgeError> {
-        if display != self.display {
+        if self.destroy_requested || display != self.display {
             return Err(DenialBridgeError::UnexpectedMessage);
         }
         let configure_serial = self
@@ -430,6 +490,7 @@ impl DenialTaskBinding {
                 event: *event,
             }),
             DenialMessage::ServerHello { .. }
+            | DenialMessage::RequestInputChannel { .. }
             | DenialMessage::DisplayPower { .. }
             | DenialMessage::Error { .. }
             | DenialMessage::Ping { .. }
@@ -455,6 +516,7 @@ fn message_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
         DenialMessage::ServerHello { .. }
+        | DenialMessage::RequestInputChannel { .. }
         | DenialMessage::DisplayPower { .. }
         | DenialMessage::Ping { .. } => None,
     }
@@ -468,6 +530,27 @@ mod tests {
     use droidloom_transport::{BufferId, BufferMetadata, Damage, FormatModifier, PlaneMetadata};
 
     use super::*;
+
+    #[test]
+    fn target_demand_is_bounded_by_configuration_and_not_gpu_busyness() {
+        let mut demand = RenderTargetDemand::default();
+        assert_eq!(demand.request(true, false), None);
+        demand.configure(3);
+        assert_eq!(demand.request(false, false), None); // Legacy host stays eager.
+        assert_eq!(demand.request(true, false), Some(3));
+        assert_eq!(demand.request(true, false), Some(3)); // Failed send can retry.
+        demand.sent(3);
+        for _ in 0..1000 {
+            demand.configure(3); // A cadence update is not a new allocation.
+            assert_eq!(demand.request(true, false), None);
+        }
+        demand.configure(4);
+        demand.sent(3); // Late completion cannot suppress the new generation.
+        assert_eq!(demand.request(true, false), Some(4));
+        assert_eq!(demand.request(true, true), None); // Even if every target is busy.
+        demand.sent(4);
+        assert_eq!(demand.request(true, false), None);
+    }
     use crate::{
         ClientTarget, Composition, LayerId, LayerState, PowerMode, ReservedTaskWindowSpec,
         TaskWindowSpec,
@@ -655,6 +738,31 @@ mod tests {
     }
 
     #[test]
+    fn destroy_request_retries_failed_send_and_sends_success_only_once() {
+        let (_, mut binding) = setup();
+        assert_eq!(
+            binding.request_destroy(|_| Err("disconnected")),
+            Err("disconnected")
+        );
+        assert!(!binding.destroy_requested());
+        let mut messages = Vec::new();
+        for _ in 0..3 {
+            binding
+                .request_destroy(|message| {
+                    messages.push(message);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            messages,
+            vec![AndroidMessage::DestroyTask {
+                object: TaskObjectId(7)
+            }]
+        );
+    }
+
+    #[test]
     fn release_and_presentation_events_return_to_composer() {
         let (mut session, mut binding) = setup();
         configure(&mut session, &mut binding);
@@ -702,6 +810,12 @@ mod tests {
         let accepted = composer.present_display(DisplayId(9)).unwrap().frame;
         let frame = accepted.frame_id;
         binding.prepare_present(DisplayId(9), &accepted).unwrap();
+        binding.request_destroy(|_| Ok::<_, ()>(())).unwrap();
+        assert!(matches!(
+            session.windows_mut().remove_display(DisplayId(9)),
+            Err(TaskWindowError::DisplayBuffersInFlight { .. })
+        ));
+        assert!(binding.prepare_present(DisplayId(9), &accepted).is_err());
         assert!(matches!(
             binding
                 .apply_event(
@@ -740,5 +854,6 @@ mod tests {
                 .in_flight_count(),
             0
         );
+        assert!(session.windows_mut().remove_display(DisplayId(9)).is_ok());
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use droidloom_composer::task_control::{TaskControlRegistry, TaskRegistrationPhase};
 use droidloom_composer::{DisplayId, TaskId};
@@ -12,7 +12,7 @@ use droidloom_denial_ipc::{SeqPacket, SeqPacketListener};
 use droidloom_denial_protocol::TaskObjectId;
 use droidloom_task_control::{
     decode_request, encode_response, ControlErrorCode, ControlRequest, ControlResponse,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    CommandQueue, TaskAction, TaskCommand, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 const AID_ROOT: u32 = 0;
@@ -21,13 +21,19 @@ const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type ControlFailure = (ControlErrorCode, String);
 
+#[derive(Default)]
+struct Commands {
+    queue: CommandQueue,
+    generation: u64,
+}
+
 #[derive(Debug)]
 struct State {
     registry: TaskControlRegistry,
     retired: BTreeSet<TaskObjectId>,
-    input_scales: BTreeMap<TaskObjectId, (u32, u32)>,
     direct_tasks: BTreeMap<TaskId, TaskObjectId>,
     direct_android_displays: BTreeMap<TaskObjectId, u32>,
+    direct_incarnations: BTreeMap<TaskObjectId, u64>,
 }
 
 /// Cloneable coordinator shared by the control listener and Denial event pump.
@@ -38,6 +44,7 @@ pub struct TaskCoordinator {
     state: Arc<(Mutex<State>, Condvar)>,
     operation_gate: Arc<Mutex<()>>,
     direct_registration_gate: Arc<Mutex<()>>,
+    commands: Arc<(Mutex<Commands>, Condvar)>,
 }
 
 impl TaskCoordinator {
@@ -57,14 +64,15 @@ impl TaskCoordinator {
                     registry: TaskControlRegistry::with_first_ids(1, first_object)
                         .expect("wall-clock object seed is a positive signed 64-bit value"),
                     retired: BTreeSet::new(),
-                    input_scales: BTreeMap::new(),
                     direct_tasks: BTreeMap::new(),
                     direct_android_displays: BTreeMap::new(),
+                    direct_incarnations: BTreeMap::new(),
                 }),
                 Condvar::new(),
             )),
             operation_gate: Arc::new(Mutex::new(())),
             direct_registration_gate: Arc::new(Mutex::new(())),
+            commands: Arc::new((Mutex::new(Commands::default()), Condvar::new())),
         }
     }
 
@@ -108,32 +116,6 @@ impl TaskCoordinator {
         Ok(())
     }
 
-    /// Record the logical-to-buffer scale carried by the latest configure.
-    pub fn set_input_scale(
-        &self,
-        object: TaskObjectId,
-        numerator: u32,
-        denominator: u32,
-    ) -> Result<(), String> {
-        if numerator == 0 || denominator == 0 {
-            return Err(format!(
-                "Droidloom object {} received an invalid input scale {numerator}/{denominator}",
-                object.0
-            ));
-        }
-        let mut state = self
-            .state
-            .0
-            .lock()
-            .map_err(|_| "task-control state lock is poisoned".to_owned())?;
-        state
-            .registry
-            .get(object)
-            .map_err(|error| error.to_string())?;
-        state.input_scales.insert(object, (numerator, denominator));
-        Ok(())
-    }
-
     /// Return whether an object was intentionally removed, allowing the event
     /// pump to discard an already-queued final event without accepting random
     /// unknown object identities.
@@ -143,6 +125,15 @@ impl TaskCoordinator {
             .lock()
             .map(|state| state.retired.contains(&object))
             .unwrap_or(false)
+    }
+
+    /// Removal keeps only release events alive until the final host frame drains.
+    pub fn is_removing(&self, object: TaskObjectId) -> bool {
+        self.state.0.lock().is_ok_and(|state| {
+            state.registry.get(object).is_ok_and(|registration| {
+                registration.phase == TaskRegistrationPhase::Removing
+            })
+        })
     }
 
     /// Return whether this object is a SurfaceFlinger-owned task channel and
@@ -155,7 +146,7 @@ impl TaskCoordinator {
             .unwrap_or(false)
     }
 
-    /// Register one launcher- or observer-verified WindowManager task for direct export.
+    /// Register one framework-verified WindowManager task for direct export.
     /// The channel reuses safe Composer window state but intentionally skips
     /// Composer hotplug: it is not an Android display. This explicit registry
     /// is also the allowlist that excludes HOME and system organizer tasks.
@@ -164,15 +155,18 @@ impl TaskCoordinator {
         task: TaskId,
         package: String,
         android_display: u32,
+        incarnation: Option<u64>,
     ) -> Result<(TaskObjectId, DisplayId), String> {
-        // Explicit host launches and the Android task observer can discover
-        // the same task together. Wait for its complete binding before reuse.
-        let _registration = self.direct_registration_gate.lock()
+        // Concurrent privileged clients may publish the same task together.
+        // Wait for its complete binding before reuse.
+        let _registration = self
+            .direct_registration_gate
+            .lock()
             .map_err(|_| "direct registration lock is poisoned".to_owned())?;
         if task.0 == 0 || task.0 > i32::MAX as u64 {
             return Err(format!("invalid Android task identity {}", task.0));
         }
-        {
+        let superseded = {
             // Keep one guard for both lookups. An if-let scrutinee guard
             // lives through its body; locking again there deadlocks on reopen.
             let state = self
@@ -185,20 +179,36 @@ impl TaskCoordinator {
                     .registry
                     .get(existing)
                     .map_err(|error| error.to_string())?;
-                if registration.reservation.package != package
-                    || registration.android_display != Some(android_display)
+                if incarnation.is_some()
+                    && state.direct_incarnations.get(&existing).copied() != incarnation
                 {
-                    return Err(format!(
-                        "Android task {} is already registered with different ownership",
-                        task.0
-                    ));
+                    Some(existing)
+                } else {
+                    if registration.reservation.package != package
+                        || registration.android_display != Some(android_display)
+                    {
+                        return Err(format!(
+                            "Android task {} is already registered with different ownership",
+                            task.0
+                        ));
+                    }
+                    return Ok((existing, registration.reservation.display));
                 }
-                return Ok((existing, registration.reservation.display));
+            } else {
+                None
             }
+        };
+        if let Some(existing) = superseded {
+            let _operation = self
+                .operation_gate
+                .lock()
+                .map_err(|_| "task-control operation lock is poisoned".to_owned())?;
+            self.remove_internal(existing)
+                .map_err(|(_, message)| message)?;
         }
 
         let response = self
-            .reserve_with_kind(0, package, Some((task, android_display)))
+            .reserve_with_kind(0, package, Some((task, android_display, incarnation)))
             .map_err(|(code, message)| {
                 format!("direct task reserve failed ({code:?}): {message}")
             })?;
@@ -230,7 +240,6 @@ impl TaskCoordinator {
             .map_err(|error| error.to_string())?;
         Ok((object, display))
     }
-
     /// Resolve a previously authorized direct task without creating anything.
     /// SurfaceFlinger connections for HOME or other unsolicited tasks fail
     /// closed here and therefore never create a Denial window.
@@ -257,20 +266,20 @@ impl TaskCoordinator {
 
     /// Remove exactly one direct task after SurfaceFlinger observes that
     /// WindowManager destroyed its layer subtree.
-    pub fn retire_direct_task(&self, task: TaskId) -> Result<(), String> {
+    pub fn retire_direct_task(&self, task: TaskId, expected_display: DisplayId) -> Result<(), String> {
         let _operation = self
             .operation_gate
             .lock()
             .map_err(|_| "task-control operation lock is poisoned".to_owned())?;
-        let object = self
-            .state
-            .0
-            .lock()
-            .map_err(|_| "task-control state lock is poisoned".to_owned())?
-            .direct_tasks
-            .get(&task)
-            .copied()
-            .ok_or_else(|| format!("Android task {} is not authorized for export", task.0))?;
+        let object = {
+            let state = self.state.0.lock()
+                .map_err(|_| "task-control state lock is poisoned".to_owned())?;
+            let Some(object) = state.direct_tasks.get(&task).copied() else { return Ok(()); };
+            let registration = state.registry.get(object).map_err(|error| error.to_string())?;
+            // An old SF connection must never retire a reused numeric task ID.
+            if registration.reservation.display != expected_display { return Ok(()); }
+            object
+        };
         self.remove_internal(object)
             .map_err(|(code, message)| format!("retire direct task failed ({code:?}): {message}"))
     }
@@ -315,6 +324,11 @@ impl TaskCoordinator {
             }
             let request = decode_request(&record.bytes)
                 .map_err(|error| format!("decode task-control record: {error}"))?;
+            if let ControlRequest::Subscribe { request_id } = request {
+                if ready {
+                    return self.serve_commands(socket, request_id);
+                }
+            }
             let response = match request {
                 ControlRequest::Hello {
                     min_major,
@@ -354,6 +368,10 @@ impl TaskCoordinator {
 
     fn handle(&self, request: ControlRequest) -> Result<ControlResponse, ControlFailure> {
         match request {
+            ControlRequest::Subscribe { .. } | ControlRequest::Acknowledge { .. } => Err((
+                ControlErrorCode::Protocol,
+                "task command record requires a dedicated subscription".to_owned(),
+            )),
             ControlRequest::Reserve {
                 request_id,
                 package,
@@ -374,7 +392,43 @@ impl TaskCoordinator {
                 package,
                 task,
                 android_display,
-            } => self.register_direct(request_id, package, TaskId(task), android_display),
+            } => self.register_direct(
+                request_id,
+                package,
+                TaskId(task),
+                android_display,
+                None,
+                true,
+            ),
+            ControlRequest::PublishDirect {
+                request_id,
+                package,
+                task,
+                android_display,
+                activate,
+            } => self.register_direct(
+                request_id,
+                package,
+                TaskId(task),
+                android_display,
+                None,
+                activate,
+            ),
+            ControlRequest::PublishFramework {
+                request_id,
+                package,
+                task,
+                android_display,
+                incarnation,
+                activate,
+            } => self.register_direct(
+                request_id,
+                package,
+                TaskId(task),
+                android_display,
+                Some(incarnation),
+                activate,
+            ),
             ControlRequest::Remove { request_id, object } => {
                 self.remove(request_id, TaskObjectId(object))
             }
@@ -385,6 +439,109 @@ impl TaskCoordinator {
         }
     }
 
+    /// Enqueue without socket I/O on the shared Denial event pump.
+    pub fn queue_window_command(
+        &self,
+        object: TaskObjectId,
+        action: TaskAction,
+    ) -> Result<(), String> {
+        let (task, android_display, incarnation) = self.direct_task_route_for_object(object)?;
+        let mut commands = self
+            .commands
+            .0
+            .lock()
+            .map_err(|_| "task command queue lock is poisoned".to_owned())?;
+        commands
+            .queue
+            .push(
+                TaskCommand {
+                    object: object.0,
+                    task: task.0,
+                    incarnation,
+                    android_display,
+                    action,
+                },
+                Instant::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        self.commands.1.notify_all();
+        Ok(())
+    }
+
+    fn serve_commands(&self, socket: &SeqPacket, request_id: u64) -> Result<(), String> {
+        socket
+            .set_io_timeout(Duration::from_secs(6))
+            .map_err(|error| error.to_string())?;
+        let bytes = encode_response(&ControlResponse::Subscribed { request_id })
+            .map_err(|error| error.to_string())?;
+        socket
+            .send_record(&bytes, &[])
+            .map_err(|error| error.to_string())?;
+        let generation = {
+            let mut commands = self
+                .commands
+                .0
+                .lock()
+                .map_err(|_| "task command queue poisoned")?;
+            commands.generation = commands
+                .generation
+                .checked_add(1)
+                .ok_or("task command subscription generation exhausted")?;
+            self.commands.1.notify_all();
+            commands.generation
+        };
+        loop {
+            let pending = {
+                let (lock, changed) = &*self.commands;
+                let mut commands = lock.lock().map_err(|_| "task command queue poisoned")?;
+                loop {
+                    if commands.generation != generation {
+                        return Ok(());
+                    }
+                    let now = Instant::now();
+                    if let Some(pending) = commands.queue.ready(now) {
+                        break pending;
+                    }
+                    commands = if let Some(deadline) = commands.queue.deadline() {
+                        changed
+                            .wait_timeout(commands, deadline.saturating_duration_since(now))
+                            .map_err(|_| "task command queue poisoned")?
+                            .0
+                    } else {
+                        // Idle subscriptions sleep until an event or replacement receiver.
+                        changed
+                            .wait(commands)
+                            .map_err(|_| "task command queue poisoned")?
+                    };
+                }
+            };
+            let bytes = encode_response(&ControlResponse::TaskCommand {
+                request_id: pending.serial,
+                command: pending.command,
+            })
+            .map_err(|error| error.to_string())?;
+            // No queue or WMS locks are held during bounded socket operations.
+            socket
+                .send_record(&bytes, &[])
+                .map_err(|error| error.to_string())?;
+            let reply = socket.receive_record().map_err(|error| error.to_string())?;
+            if !reply.descriptors.is_empty()
+                || decode_request(&reply.bytes).map_err(|error| error.to_string())?
+                    != (ControlRequest::Acknowledge {
+                        request_id: pending.serial,
+                    })
+            {
+                return Err("invalid framework task command acknowledgement".to_owned());
+            }
+            // Until this point the command remains retryable after disconnect.
+            self.commands
+                .0
+                .lock()
+                .map_err(|_| "task command queue poisoned")?
+                .queue
+                .acknowledge(pending.serial);
+        }
+    }
     fn reserve(&self, request_id: u64, package: String) -> Result<ControlResponse, ControlFailure> {
         self.reserve_with_kind(request_id, package, None)
     }
@@ -395,6 +552,8 @@ impl TaskCoordinator {
         package: String,
         task: TaskId,
         android_display: u32,
+        incarnation: Option<u64>,
+        activate: bool,
     ) -> Result<ControlResponse, ControlFailure> {
         if android_display > i32::MAX as u32 {
             return Err((
@@ -403,9 +562,16 @@ impl TaskCoordinator {
             ));
         }
         let (object, display) = self
-            .register_direct_task(task, package, android_display)
+            .register_direct_task(task, package, android_display, incarnation)
             .map_err(backend)?;
-        self.sink.request_activation(display).map_err(|error| backend(error.to_string()))?;
+        if let Ok((_, input_display, input_incarnation)) = self.direct_task_route_for_object(object) {
+            self.sink.socket().send_android(&droidloom_denial_protocol::AndroidMessage::BindInputRoute {
+                object, display: input_display, incarnation: input_incarnation,
+            }, &[]).map_err(|error| backend(error.to_string()))?;
+        }
+        if activate {
+            self.sink.request_activation(display).map_err(|error| backend(error.to_string()))?;
+        }
         Ok(ControlResponse::Bound {
             request_id,
             object: object.0,
@@ -419,7 +585,7 @@ impl TaskCoordinator {
         &self,
         request_id: u64,
         package: String,
-        direct_task: Option<(TaskId, u32)>,
+        direct_task: Option<(TaskId, u32, Option<u64>)>,
     ) -> Result<ControlResponse, ControlFailure> {
         let registration = {
             let _operation = self
@@ -433,7 +599,7 @@ impl TaskCoordinator {
                     .lock()
                     .map_err(|_| backend("task-control state lock is poisoned"))?;
                 let registration = state.registry.reserve(package).map_err(control_error)?;
-                if let Some((task, android_display)) = direct_task {
+                if let Some((task, android_display, incarnation)) = direct_task {
                     if state.direct_tasks.contains_key(&task) {
                         let _ = state.registry.cancel_reservation(registration.object);
                         return Err((
@@ -445,6 +611,9 @@ impl TaskCoordinator {
                     state
                         .direct_android_displays
                         .insert(registration.object, android_display);
+                    if let Some(incarnation) = incarnation {
+                        state.direct_incarnations.insert(registration.object, incarnation);
+                    }
                 }
                 registration
             };
@@ -456,9 +625,10 @@ impl TaskCoordinator {
                     .lock()
                     .map_err(|_| backend("task-control state lock is poisoned"))?;
                 let _ = state.registry.cancel_reservation(registration.object);
-                if let Some((task, _)) = direct_task {
+                if let Some((task, _, _)) = direct_task {
                     state.direct_tasks.remove(&task);
                     state.direct_android_displays.remove(&registration.object);
+                    state.direct_incarnations.remove(&registration.object);
                 }
                 return Err(backend(format!("stage Composer display: {error:?}")));
             }
@@ -488,9 +658,10 @@ impl TaskCoordinator {
                 let _ = state.registry.begin_removal(registration.object);
                 let _ = state.registry.finish_removal(registration.object);
                 state.retired.insert(registration.object);
-                if let Some((task, _)) = direct_task {
+                if let Some((task, _, _)) = direct_task {
                     state.direct_tasks.remove(&task);
                     state.direct_android_displays.remove(&registration.object);
+                    state.direct_incarnations.remove(&registration.object);
                 }
                 return Err(backend(format!("stage Denial task: {error}")));
             }
@@ -604,47 +775,11 @@ impl TaskCoordinator {
         })
     }
 
-    /// Resolve the Android task, display, and logical-to-buffer scale for a live object.
-    pub fn input_route_for_object(
-        &self,
-        object: TaskObjectId,
-    ) -> Result<(TaskId, u32, u32, u32), String> {
-        let state = self
-            .state
-            .0
-            .lock()
-            .map_err(|_| "task-control state lock is poisoned".to_owned())?;
-        let registration = state
-            .registry
-            .get(object)
-            .map_err(|error| error.to_string())?;
-        let android_display = registration.android_display.ok_or_else(|| {
-            format!(
-                "Droidloom object {} has not been bound to an Android logical display",
-                object.0
-            )
-        })?;
-        let task = registration.task.ok_or_else(|| {
-            format!(
-                "Droidloom object {} has not been bound to an Android task",
-                object.0
-            )
-        })?;
-        let (numerator, denominator) =
-            state.input_scales.get(&object).copied().ok_or_else(|| {
-                format!(
-                    "Droidloom object {} has not received a configured input scale",
-                    object.0
-                )
-            })?;
-        Ok((task, android_display, numerator, denominator))
-    }
-
     /// Resolve the real Android task behind an explicitly authorized direct object.
     pub fn direct_task_route_for_object(
         &self,
         object: TaskObjectId,
-    ) -> Result<(TaskId, u32), String> {
+    ) -> Result<(TaskId, u32, u64), String> {
         let state = self
             .state
             .0
@@ -660,7 +795,17 @@ impl TaskCoordinator {
             .iter()
             .find_map(|(task, owned_object)| (*owned_object == object).then_some(*task))
             .ok_or_else(|| format!("Droidloom object {} has no Android task", object.0))?;
-        Ok((task, android_display))
+        let incarnation = state
+            .direct_incarnations
+            .get(&object)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "Droidloom object {} lacks a framework task incarnation",
+                    object.0
+                )
+            })?;
+        Ok((task, android_display, incarnation))
     }
 
     fn remove(
@@ -693,6 +838,8 @@ impl TaskCoordinator {
     }
 
     fn remove_internal(&self, object: TaskObjectId) -> Result<(), ControlFailure> {
+        self.commands.0.lock().map_err(|_| backend("task command queue poisoned"))?
+            .queue.discard(object.0);
         let registration = {
             let mut state = self
                 .state
@@ -705,7 +852,9 @@ impl TaskCoordinator {
                     .registry
                     .cancel_reservation(object)
                     .map_err(control_error)?;
-                state.input_scales.remove(&object);
+                state.direct_android_displays.remove(&object);
+                state.direct_incarnations.remove(&object);
+                state.direct_tasks.retain(|_, owned_object| *owned_object != object);
                 state.retired.insert(object);
                 return Ok(());
             }
@@ -719,11 +868,14 @@ impl TaskCoordinator {
         };
 
         self.sink
-            .unregister_task(registration.reservation.display)
+            .request_task_removal(registration.reservation.display)
             .map_err(|error| backend(format!("destroy Denial task: {error}")))?;
         self.lifecycle
             .remove_display(registration.reservation.display)
             .map_err(|error| backend(format!("remove Composer display: {error:?}")))?;
+        self.sink
+            .unregister_task(registration.reservation.display)
+            .map_err(|error| backend(format!("forget Denial task: {error}")))?;
         let mut state = self
             .state
             .0
@@ -733,8 +885,8 @@ impl TaskCoordinator {
             .registry
             .finish_removal(object)
             .map_err(control_error)?;
-        state.input_scales.remove(&object);
         if state.direct_android_displays.remove(&object).is_some() {
+            state.direct_incarnations.remove(&object);
             state
                 .direct_tasks
                 .retain(|_, owned_object| *owned_object != object);
@@ -748,9 +900,13 @@ impl TaskCoordinator {
 fn request_id(request: &ControlRequest) -> u64 {
     match request {
         ControlRequest::Hello { .. } => 0,
-        ControlRequest::Reserve { request_id, .. }
+        ControlRequest::Subscribe { request_id }
+        | ControlRequest::Acknowledge { request_id }
+        | ControlRequest::Reserve { request_id, .. }
         | ControlRequest::Bind { request_id, .. }
         | ControlRequest::RegisterDirect { request_id, .. }
+        | ControlRequest::PublishDirect { request_id, .. }
+        | ControlRequest::PublishFramework { request_id, .. }
         | ControlRequest::Remove { request_id, .. } => *request_id,
     }
 }

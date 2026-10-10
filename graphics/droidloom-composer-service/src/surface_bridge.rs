@@ -136,6 +136,23 @@ impl SurfaceBridge {
                         break Err("repeated SurfaceFlinger hello".to_owned());
                     }
                     _ if !ready => break Err("SurfaceFlinger hello is required".to_owned()),
+                    Request::CompleteHeadless { display } => {
+                        let display = require_display(selected_display, display)?;
+                        if selected_task != Some(0) || display != self.bootstrap_display
+                            || !reservations.is_empty()
+                        {
+                            send_response(socket, &Response::Error { code: -22 }, &[])?;
+                            continue;
+                        }
+                        let fence = record.descriptors.into_iter().next();
+                        match self.sink.complete_headless_frame(display, fence) {
+                            Ok(()) => send_response(socket, &Response::Ack, &[])?,
+                            Err(error) => {
+                                eprintln!("Droidloom bootstrap fence handoff failed: {error}");
+                                send_response(socket, &Response::Error { code: ERROR_IO }, &[])?;
+                            }
+                        }
+                    }
                     Request::Acquire { display } => {
                         if tracing && acquire_begin == 0 { acquire_begin = frame_trace::now_ns(); }
                         let display = require_display(selected_display, display)?;
@@ -272,7 +289,7 @@ impl SurfaceBridge {
                         for (_, target) in std::mem::take(&mut reservations) {
                             self.sink.cancel_surfaceflinger_target(display, target);
                         }
-                        self.coordinator.retire_direct_task(TaskId(task))?;
+                        self.coordinator.retire_direct_task(TaskId(task), display)?;
                         send_response(socket, &Response::Ack, &[])?;
                         eprintln!("Droidloom retired destroyed Android task {task}");
                         break Ok(());

@@ -10,6 +10,19 @@ use wayland_protocols::wp::alpha_modifier::v1::client::{
     wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
 };
 
+fn stage_batch(stream: &mut Stream, layers: Vec<wire::BatchLayer>, fds: Vec<OwnedFd>) {
+    let mut descriptors: [Option<OwnedFd>; 4] = [const { None }; 4];
+    for (slot, fd) in descriptors.iter_mut().zip(fds) {
+        *slot = Some(fd);
+    }
+    for entry in layers {
+        let fence = entry
+            .fence_index
+            .and_then(|index| descriptors[index].take());
+        stream.staged.push(entry.layer, fence);
+    }
+}
+
 pub(super) struct Globals {
     pub subcompositor: wl_subcompositor::WlSubcompositor,
     pub shm: wl_shm::WlShm,
@@ -28,9 +41,64 @@ struct View {
     viewport: WpViewport,
     alpha: WpAlphaModifierSurfaceV1,
     sync: Option<WpLinuxDrmSyncobjSurfaceV1>,
-    source: Option<(u64, u64)>,
+    content: Option<Content>,
     solid: Option<(u32, wl_buffer::WlBuffer)>,
     geometry: Option<Geometry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Content {
+    Buffer { id: u64, ticket: u64 },
+    Solid(u32),
+}
+
+impl Content {
+    fn new(layer: &Layer) -> Self {
+        if layer.buffer == 0 {
+            Self::Solid(layer.color)
+        } else {
+            Self::Buffer {
+                id: layer.buffer,
+                ticket: layer.ticket,
+            }
+        }
+    }
+}
+
+impl View {
+    fn source(&self) -> Option<(u64, u64)> {
+        match self.content {
+            Some(Content::Buffer { id, ticket }) => Some((id, ticket)),
+            _ => None,
+        }
+    }
+
+    fn update(
+        &mut self,
+        geometry: Geometry,
+        content: Content,
+        apply: impl FnOnce(&mut Self, bool) -> Result<(), PresenterError>,
+    ) -> Result<(), PresenterError> {
+        let geometry_changed = self.geometry != Some(geometry);
+        if !geometry_changed && self.content == Some(content) {
+            // Keep the synchronized child's current state and GPU read. The
+            // parent still commits the complete scene, including changed peers.
+            return Ok(());
+        }
+        apply(self, geometry_changed)?;
+        self.geometry = Some(geometry);
+        self.content = Some(content);
+        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        self.surface.commit();
+        Ok(())
+    }
+
+    fn hide(&mut self) {
+        if self.content.take().is_some() {
+            self.surface.attach(None, 0, 0);
+            self.surface.commit();
+        }
+    }
 }
 
 /// Persistent Wayland state, independent of the producer's rotating buffers.
@@ -99,21 +167,23 @@ pub(super) struct Stream {
     staged: wire::Staging<OwnedFd>,
     views: BTreeMap<u64, View>,
     reads: Vec<Read>,
-    importing: Option<(u64, zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1)>,
+    imports: imports::Imports<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1>,
     root: Option<((u32, u32), wl_buffer::WlBuffer)>,
     root_logical_size: Option<(u32, u32)>,
     active: bool,
     connected: bool,
     last_ticket: u64,
+    last_scene: u64,
+    last_import: u64,
     configuration: wire::ConfigPublisher,
 }
 impl Stream {
     pub fn busy(&self) -> bool {
         !self.reads.is_empty()
     }
-    pub fn fds(&self) -> impl Iterator<Item = (i32, i16)> + '_ {
-        self.connected
-            .then_some((self.requests.as_fd().as_raw_fd(), libc::POLLIN))
+    pub fn fds(&self) -> impl Iterator<Item = (i32, u8)> + '_ {
+        (self.connected && !self.imports.blocked())
+            .then_some((self.requests.as_fd().as_raw_fd(), readiness::REQUESTS))
             .into_iter()
             .chain(self.reads.iter().flat_map(|read| {
                 let source = self.buffers.get(&read.buffer);
@@ -126,7 +196,7 @@ impl Stream {
                 [available, released]
                     .into_iter()
                     .flatten()
-                    .map(|event| (event.as_raw_fd(), libc::POLLIN))
+                    .map(|event| (event.as_raw_fd(), readiness::RELEASES))
             }))
     }
     pub fn poll_fallback(&self) -> bool {
@@ -155,32 +225,14 @@ impl Stream {
             return false;
         }
         for view in self.views.values_mut() {
-            view.surface.attach(None, 0, 0);
-            view.surface.commit();
-            view.source = None;
+            view.hide();
         }
         self.active = false;
         true
     }
     fn release(&mut self) -> Result<(), PresenterError> {
-        // Idle cached imports cannot complete a read. Avoid a read(2) for every
-        // cached allocation on every presenter wakeup.
-        for source in self
-            .buffers
-            .values()
-            .filter(|source| source.ticket.is_some())
-        {
-            if let Some(event) = source.sync.release_wakeup.as_ref() {
-                let mut count = 0_u64;
-                // SAFETY: event is a live nonblocking eventfd; count is eight writable bytes.
-                let n = unsafe {
-                    libc::read(event.as_raw_fd(), std::ptr::from_mut(&mut count).cast(), 8)
-                };
-                if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock {
-                    return Err(io::Error::last_os_error().into());
-                }
-            }
-        }
+        // Poll drains only signalled eventfds. Readiness selects the task;
+        // the real timeline below still decides ownership and safe reuse.
         let mut index = 0;
         while index < self.reads.len() {
             let read = &mut self.reads[index];
@@ -222,8 +274,8 @@ impl Drop for Stream {
         if let Some((_, b)) = self.root.take() {
             b.destroy();
         }
-        if let Some((_, p)) = self.importing.take() {
-            p.destroy();
+        for pending in self.imports.drain() {
+            pending.params.destroy();
         }
     }
 }
@@ -286,7 +338,11 @@ impl App {
         let task = self.tasks.get(&object)?;
         let enabled = self.layer_globals.alpha.is_some() && task.accepts_present();
         Some([
-            if enabled { wire::SUPPORTED } else { 0 },
+            if enabled {
+                wire::SUPPORTED
+            } else {
+                wire::CONFIG_EVENTS
+            },
             task.configure_serial,
             task.buffer_size.0,
             task.buffer_size.1,
@@ -319,14 +375,19 @@ impl App {
             staged: wire::Staging::default(),
             views: BTreeMap::new(),
             reads: Vec::new(),
-            importing: None,
+            imports: imports::Imports::default(),
             root: None,
             root_logical_size: None,
             active: false,
             connected: true,
             last_ticket: 0,
+            last_scene: 0,
+            last_import: 0,
             configuration: wire::ConfigPublisher::default(),
         });
+        self.task_work.streams.insert(object);
+        self.task_work
+            .mark(object, readiness::REQUESTS | readiness::CONFIG);
         Ok(())
     }
     pub(super) fn drain_layers(
@@ -334,19 +395,25 @@ impl App {
         qh: &QueueHandle<Self>,
         objects: &mut Vec<TaskObjectId>,
     ) -> Result<(), PresenterError> {
-        let mut receive_buffer = [0; 128];
-        objects.clear();
-        objects.extend(self.tasks.keys().copied());
-        for object in objects.iter().copied() {
+        let mut receive_buffer = [0; droidloom_surface_bridge::layers::MAX_LAYER_PACKET];
+        while let Some(object) = self.task_work.pop(readiness::RELEASES) {
             if let Some(stream) = self.tasks.get_mut(&object).and_then(|t| t.layers.as_mut()) {
                 stream.release()?;
+                self.task_work
+                    .layer_fallback(object, stream.poll_fallback());
+                if self.tasks[&object].closing {
+                    self.task_work.mark(object, readiness::CLEANUP);
+                }
             }
+        }
+        self.task_work.take(readiness::REQUESTS, objects);
+        for object in objects.iter().copied() {
             for _ in 0..128 {
                 let Some(stream) = self.tasks.get_mut(&object).and_then(|t| t.layers.as_mut())
                 else {
                     break;
                 };
-                if !stream.connected || stream.importing.is_some() {
+                if !stream.connected || stream.imports.blocked() {
                     break;
                 }
                 let record = match stream.requests.receive_record_into(&mut receive_buffer) {
@@ -367,7 +434,11 @@ impl App {
                     .map_err(|_| PresenterError::Configuration("invalid layer stream record"))?;
                 if matches!(
                     request,
-                    Request::Commit { .. } | Request::Config | Request::SubscribeConfig
+                    Request::Commit { .. }
+                        | Request::CommitAsync { .. }
+                        | Request::CommitBatch { .. }
+                        | Request::Config
+                        | Request::SubscribeConfig
                 ) {
                     // A legacy target is sent on Composer's socket before SF
                     // receives its ack and can send this request. Drain that
@@ -385,10 +456,14 @@ impl App {
                 self.tasks.get_mut(&object).unwrap().layers = Some(stream);
                 result?;
             }
+            if let Some(stream) = self.tasks.get(&object).and_then(|t| t.layers.as_ref()) {
+                self.task_work
+                    .layer_fallback(object, stream.poll_fallback());
+            }
         }
         // A barrier above may drain endpoint changes for any task. Publish
         // after all barriers so no configuration waits for a future wakeup.
-        for object in objects.iter().copied() {
+        while let Some(object) = self.task_work.pop(readiness::CONFIG) {
             let Some(config) = self.layer_config(object) else {
                 continue;
             };
@@ -415,7 +490,61 @@ impl App {
         request: Request,
         fds: Vec<OwnedFd>,
     ) -> Result<(), PresenterError> {
+        let async_scene = if let Request::CommitAsync { scene, .. }
+        | Request::CommitBatch { scene, .. } = &request
+        {
+            if *scene <= stream.last_scene {
+                return Err(PresenterError::Configuration("layer scene identity reused"));
+            }
+            stream.last_scene = *scene;
+            Some(*scene)
+        } else {
+            None
+        };
+        let import_attempt = if let Request::RegisterAsync { attempt, .. } = &request {
+            if *attempt <= stream.last_import {
+                return Err(PresenterError::Configuration(
+                    "layer import identity reused",
+                ));
+            }
+            stream.last_import = *attempt;
+            Some(*attempt)
+        } else {
+            None
+        };
+        // Chunks stay invisible in the same bounded staging area as legacy
+        // records. Move each FD once; decoding proved unique, exhaustive indices.
+        let (request, fds) = match request {
+            Request::StageBatch(layers) => {
+                stage_batch(stream, layers, fds);
+                return Ok(());
+            }
+            Request::CommitBatch {
+                scene,
+                serial,
+                width,
+                height,
+                count,
+                layers,
+            } => {
+                stage_batch(stream, layers, fds);
+                (
+                    Request::CommitAsync {
+                        scene,
+                        serial,
+                        width,
+                        height,
+                        count,
+                    },
+                    Vec::new(),
+                )
+            }
+            request => (request, fds),
+        };
         match request {
+            Request::StageBatch(_) | Request::CommitBatch { .. } => {
+                unreachable!("normalized batch")
+            }
             Request::SubscribeConfig => {
                 let words = stream
                     .configuration
@@ -441,7 +570,10 @@ impl App {
                     &[],
                 )?;
             }
-            Request::Register(metadata) => {
+            Request::Register(metadata)
+            | Request::RegisterAsync {
+                buffer: metadata, ..
+            } => {
                 let supported = self.feedback.as_ref().is_some_and(|f| {
                     f.tranches()
                         .iter()
@@ -452,7 +584,14 @@ impl App {
                 if !supported
                     || stream.buffers.len() >= wire::MAX_BUFFERS
                     || stream.buffers.contains_key(&metadata.id)
+                    || stream.imports.full()
                 {
+                    if let Some(attempt) = import_attempt {
+                        stream
+                            .events
+                            .send_record(&wire::import_result(attempt, metadata.id, -95), &[])?;
+                        return Ok(());
+                    }
                     return stream.ack(-95);
                 }
                 let params = self.dmabuf_state.create_params(qh)?;
@@ -490,12 +629,18 @@ impl App {
                         availability_wakeup: crate::fence_wakeup::FenceWakeup::default(),
                     },
                 );
-                stream.importing = Some((id, params));
+                assert!(stream.imports.insert(imports::Pending {
+                    buffer: id,
+                    attempt: import_attempt,
+                    params
+                }));
                 // Ack only after the compositor confirms import. Failure is a
                 // normal capability fallback, never a fatal Wayland error.
             }
             Request::Unregister(id) => {
-                if stream.buffers.get(&id).is_none_or(|b| b.ticket.is_some()) {
+                if stream.imports.contains(id)
+                    || stream.buffers.get(&id).is_none_or(|b| b.ticket.is_some())
+                {
                     return stream.ack(-16);
                 }
                 if let Some(mut source) = stream.buffers.remove(&id) {
@@ -523,6 +668,13 @@ impl App {
                 width,
                 height,
                 count,
+            }
+            | Request::CommitAsync {
+                serial,
+                width,
+                height,
+                count,
+                ..
             } => {
                 let task = &self.tasks[&object];
                 let exact_geometry = stream.staged.layers().iter().all(|(l, _)| {
@@ -564,14 +716,26 @@ impl App {
                                 ticket: b.ticket,
                             })
                         },
-                        |id| stream.views.get(&id).and_then(|v| v.source),
+                        |id| stream.views.get(&id).and_then(View::source),
                     );
                 if !valid {
                     stream.staged.clear();
+                    if let Some(scene) = async_scene {
+                        stream
+                            .events
+                            .send_record(&wire::commit_result(scene, -95), &[])?;
+                        return Ok(());
+                    }
                     return stream.ack(-95);
                 }
                 self.commit_layers(qh, object, stream, width, height)?;
-                stream.ack(0)?;
+                if let Some(scene) = async_scene {
+                    stream
+                        .events
+                        .send_record(&wire::commit_result(scene, 0), &[])?;
+                } else {
+                    stream.ack(0)?;
+                }
             }
         }
         Ok(())
@@ -584,6 +748,12 @@ impl App {
         width: u32,
         height: u32,
     ) -> Result<(), PresenterError> {
+        let timing = droidloom_timing::Span::new(
+            "timing_presenter_commit",
+            object.0,
+            stream.last_scene,
+            stream.staged.layers().len() as u64,
+        );
         let task = self.tasks.get_mut(&object).unwrap();
         let root = task.surface().unwrap().clone();
         let (lw, lh) = task.logical_size.ok_or(PresenterError::Configuration(
@@ -607,9 +777,7 @@ impl App {
         let ids: BTreeSet<_> = staged.iter().map(|(l, _)| l.id).collect();
         for (id, v) in &mut stream.views {
             if !ids.contains(id) {
-                v.surface.attach(None, 0, 0);
-                v.surface.commit();
-                v.source = None;
+                v.hide();
             }
         }
         let mut previous = root.clone();
@@ -641,7 +809,7 @@ impl App {
                         viewport,
                         alpha,
                         sync,
-                        source: None,
+                        content: None,
                         solid: None,
                         geometry: None,
                     },
@@ -649,89 +817,87 @@ impl App {
             }
             let v = stream.views.get_mut(&l.id).unwrap();
             let geometry = Geometry::new(&l, previous_id, (lw, lh), (width, height));
-            if v.geometry != Some(geometry) {
-                v.role.place_above(&previous);
-                let [dx, dy, dw, dh] = geometry.destination;
-                v.role.set_position(dx, dy);
-                v.viewport.set_destination(dw, dh);
-                v.alpha.set_multiplier(geometry.alpha);
-                if geometry.opaque {
-                    let r = Region::new(&self.compositor)?;
-                    r.add(0, 0, dw, dh);
-                    v.surface.set_opaque_region(Some(r.wl_region()));
-                } else {
-                    v.surface.set_opaque_region(None);
+            v.update(geometry, Content::new(&l), |v, geometry_changed| {
+                if geometry_changed {
+                    v.role.place_above(&previous);
+                    let [dx, dy, dw, dh] = geometry.destination;
+                    v.role.set_position(dx, dy);
+                    v.viewport.set_destination(dw, dh);
+                    v.alpha.set_multiplier(geometry.alpha);
+                    if geometry.opaque {
+                        let r = Region::new(&self.compositor)?;
+                        r.add(0, 0, dw, dh);
+                        v.surface.set_opaque_region(Some(r.wl_region()));
+                    } else {
+                        v.surface.set_opaque_region(None);
+                    }
+                    v.surface.set_buffer_transform(
+                        wl_output::Transform::try_from(geometry.transform)
+                            .map_err(|_| PresenterError::Configuration("layer transform"))?,
+                    );
+                    v.viewport.set_source(
+                        f64::from(geometry.source[0]) / 256.0,
+                        f64::from(geometry.source[1]) / 256.0,
+                        f64::from(geometry.source[2]) / 256.0,
+                        f64::from(geometry.source[3]) / 256.0,
+                    );
                 }
-                v.surface.set_buffer_transform(
-                    wl_output::Transform::try_from(geometry.transform)
-                        .map_err(|_| PresenterError::Configuration("layer transform"))?,
-                );
-                v.viewport.set_source(
-                    f64::from(geometry.source[0]) / 256.0,
-                    f64::from(geometry.source[1]) / 256.0,
-                    f64::from(geometry.source[2]) / 256.0,
-                    f64::from(geometry.source[3]) / 256.0,
-                );
-                v.geometry = Some(geometry);
-            }
+                if l.buffer == 0 {
+                    if let Some(sync) = v.sync.take() {
+                        sync.destroy();
+                    }
+                    if v.solid.as_ref().is_none_or(|(color, _)| *color != l.color) {
+                        let b = pixel(&self.layer_globals, qh, l.color)?;
+                        if let Some((_, old)) = v.solid.replace((l.color, b)) {
+                            old.destroy();
+                        }
+                    }
+                    v.surface.attach(v.solid.as_ref().map(|(_, b)| b), 0, 0);
+                } else {
+                    let b = stream.buffers.get_mut(&l.buffer).unwrap();
+                    if b.ticket.is_none() {
+                        let acquire_point = b
+                            .sync
+                            .next_point
+                            .checked_add(1)
+                            .ok_or(PresenterError::Configuration("layer timeline exhausted"))?;
+                        let release = acquire_point
+                            .checked_add(1)
+                            .ok_or(PresenterError::Configuration("layer timeline exhausted"))?;
+                        if let Some(fd) = acquire {
+                            b.sync
+                                .timeline
+                                .import_acquire_fence(acquire_point, fd.as_fd())?;
+                        } else {
+                            b.sync.timeline.signal_acquire(acquire_point)?;
+                        }
+                        b.sync.next_point = release;
+                        b.sync.arm_release_wakeup(release)?;
+                        // Fence availability unblocks Android callbacks. Completion
+                        // separately permits this allocation/timeline to be reused.
+                        b.availability_wakeup.arm(&b.sync.timeline, release)?;
+                        let sync = v.sync.get_or_insert_with(|| {
+                            self.sync_manager.get_surface(&v.surface, qh, ())
+                        });
+                        let (hi, lo) = split_point(acquire_point);
+                        sync.set_acquire_point(&b.sync.proxy, hi, lo);
+                        let (hi, lo) = split_point(release);
+                        sync.set_release_point(&b.sync.proxy, hi, lo);
+                        v.surface.attach(b.buffer.as_ref(), 0, 0);
+                        b.ticket = Some(l.ticket);
+                        stream.last_ticket = stream.last_ticket.max(l.ticket);
+                        stream.reads.push(Read {
+                            buffer: l.buffer,
+                            ticket: l.ticket,
+                            point: release,
+                            fence_sent: false,
+                        });
+                    }
+                }
+                Ok(())
+            })?;
             previous = v.surface.clone();
             previous_id = Some(l.id);
-            if l.buffer == 0 {
-                if let Some(sync) = v.sync.take() {
-                    sync.destroy();
-                }
-                if v.solid.as_ref().is_none_or(|(color, _)| *color != l.color) {
-                    let b = pixel(&self.layer_globals, qh, l.color)?;
-                    if let Some((_, old)) = v.solid.replace((l.color, b)) {
-                        old.destroy();
-                    }
-                }
-                v.surface.attach(v.solid.as_ref().map(|(_, b)| b), 0, 0);
-                v.source = None;
-            } else {
-                let b = stream.buffers.get_mut(&l.buffer).unwrap();
-                if b.ticket.is_none() {
-                    let acquire_point = b
-                        .sync
-                        .next_point
-                        .checked_add(1)
-                        .ok_or(PresenterError::Configuration("layer timeline exhausted"))?;
-                    let release = acquire_point
-                        .checked_add(1)
-                        .ok_or(PresenterError::Configuration("layer timeline exhausted"))?;
-                    if let Some(fd) = acquire {
-                        b.sync
-                            .timeline
-                            .import_acquire_fence(acquire_point, fd.as_fd())?;
-                    } else {
-                        b.sync.timeline.signal_acquire(acquire_point)?;
-                    }
-                    b.sync.next_point = release;
-                    b.sync.arm_release_wakeup(release)?;
-                    // Fence availability unblocks Android callbacks. Completion
-                    // separately permits this allocation/timeline to be reused.
-                    b.availability_wakeup.arm(&b.sync.timeline, release)?;
-                    let sync = v
-                        .sync
-                        .get_or_insert_with(|| self.sync_manager.get_surface(&v.surface, qh, ()));
-                    let (hi, lo) = split_point(acquire_point);
-                    sync.set_acquire_point(&b.sync.proxy, hi, lo);
-                    let (hi, lo) = split_point(release);
-                    sync.set_release_point(&b.sync.proxy, hi, lo);
-                    v.surface.attach(b.buffer.as_ref(), 0, 0);
-                    b.ticket = Some(l.ticket);
-                    stream.last_ticket = stream.last_ticket.max(l.ticket);
-                    stream.reads.push(Read {
-                        buffer: l.buffer,
-                        ticket: l.ticket,
-                        point: release,
-                        fence_sent: false,
-                    });
-                }
-                v.source = Some((l.buffer, l.ticket));
-            }
-            v.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            v.surface.commit();
         }
         // Retain the bounded layer capacity across buffer-only frames.
         stream.staged.recycle(staged);
@@ -773,6 +939,7 @@ impl App {
         task.applied_opaque = Some(true);
         stream.active = true;
         stream.views.retain(|id, _| ids.contains(id));
+        timing.finish(1);
         Ok(())
     }
     pub(super) fn layer_imported(
@@ -780,15 +947,15 @@ impl App {
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         buffer: Option<wl_buffer::WlBuffer>,
     ) -> bool {
-        for task in self.tasks.values_mut() {
+        for (object, task) in &mut self.tasks {
             let Some(s) = task.layers.as_mut() else {
                 continue;
             };
-            if s.importing.as_ref().is_none_or(|(_, p)| p != params) {
+            let Some(pending) = s.imports.finish(params) else {
                 continue;
-            }
-            let (id, p) = s.importing.take().unwrap();
-            p.destroy();
+            };
+            let id = pending.buffer;
+            pending.params.destroy();
             let code = if let Some(buffer) = buffer {
                 s.buffers.get_mut(&id).unwrap().buffer = Some(buffer);
                 0
@@ -796,10 +963,29 @@ impl App {
                 s.buffers.remove(&id);
                 -95
             };
-            if let Err(e) = s.ack(code) {
-                self.fatal = Some(e.to_string());
+            if s.connected {
+                let result = if let Some(attempt) = pending.attempt {
+                    s.events
+                        .send_record(&wire::import_result(attempt, id, code), &[])
+                        .map_err(PresenterError::from)
+                } else {
+                    s.ack(code)
+                };
+                if let Err(e) = result {
+                    self.fatal = Some(e.to_string());
+                }
+            }
+            // Only legacy imports pause request polling. Resume any commands
+            // already queued without relying on another peer write.
+            if pending.attempt.is_none() {
+                self.task_work.mark(*object, readiness::REQUESTS);
             }
             return true;
+        }
+        // A window can retire while compositor import callbacks are queued.
+        // Such callbacks carry no read ownership and must not revive the task.
+        if let Some(buffer) = buffer {
+            buffer.destroy();
         }
         false
     }
@@ -811,6 +997,10 @@ wayland_client::delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
 wayland_client::delegate_noop!(App: ignore WpAlphaModifierV1);
 wayland_client::delegate_noop!(App: ignore WpAlphaModifierSurfaceV1);
+
+#[cfg(test)]
+#[path = "layer_updates_test.rs"]
+mod update_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,48 @@
+diff --git a/media/libaudioclient/AudioSystem.cpp b/media/libaudioclient/AudioSystem.cpp
+--- a/media/libaudioclient/AudioSystem.cpp
++++ b/media/libaudioclient/AudioSystem.cpp
+@@ -27,6 +27,7 @@
+ #include <binder/IServiceManager.h>
+ #include <binder/ProcessState.h>
+ #include <cutils/properties.h>
+ #include <math.h>
++#include <string.h>
+ #include <media/AidlConversion.h>
+ #include <media/AudioResamplerPublic.h>
+@@ -460,9 +461,19 @@
+ /* static */ size_t AudioSystem::calculateMinFrameCount(
+         uint32_t afLatencyMs, uint32_t afFrameCount, uint32_t afSampleRate,
+         uint32_t sampleRate, float speed /*, uint32_t notificationsPerBufferReq*/) {
++    static const bool hostBuffered = [] {
++        char hardware[PROPERTY_VALUE_MAX] = {};
++        property_get("ro.hardware", hardware, "");
++        return strcmp(hardware, "droidloom") == 0;
++    }();
+     // Ensure that buffer depth covers at least audio hardware latency
+-    uint32_t minBufCount = afLatencyMs / ((1000 * afFrameCount) / afSampleRate);
++    // Droidloom's PipeWire graph already buffers the physical device. Cover
++    // mixer scheduling with two periods, without duplicating Bluetooth/device
++    // latency in each app queue. Actual output latency and presentation
++    // timestamps remain unchanged; explicitly requested larger queues survive.
++    uint32_t minBufCount = hostBuffered ? 2
++            : afLatencyMs / ((1000 * afFrameCount) / afSampleRate);
+     if (minBufCount < 2) {
+         minBufCount = 2;
+     }
+ #if 0
+diff --git a/media/libaudioclient/Android.bp b/media/libaudioclient/Android.bp
+--- a/media/libaudioclient/Android.bp
++++ b/media/libaudioclient/Android.bp
+@@ -134,6 +134,12 @@
+ cc_library {
+     name: "libaudiobase",
+ 
++    // This library replaces the CFI-instrumented platform prebuilt. Keep its
++    // cross-DSO checks when the focused Droidloom product omits cfi-common.mk.
++    sanitize: {
++        cfi: true,
++    },
++
+     defaults: [
+         "libaudiobase_client_defaults",
+     ],

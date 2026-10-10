@@ -6,6 +6,87 @@ including source preparation, bundle verification, installation, and rollback,
 is implemented in Rust. It does not invoke Droidloom's Bash deployment scripts
 or its Python bundle verifier.
 
+To compile the audio HAL APEX and `libaudiobase.so` in a prepared workspace,
+without installing or restarting services, use:
+
+```console
+cargo run --locked -j 1 -p droidloom-update -- -j 4 audio-build --work .work/arch/build
+```
+
+Add `--product droidloom_arm64` for ARM64. The builder retains source locks,
+projection recovery, build exclusion and the two-CPU reserve. This focused
+operation leaves translator development sources and artifact provenance intact.
+
+To rebuild the paired `services.jar` and `libinputflinger.so` containing the
+Rust WindowManager policy in a prepared workspace, use:
+
+```console
+cargo run --locked -j 1 -p droidloom-update -- --jobs 1 framework-build --work .work/arch/build
+```
+
+Add `--product droidloom_arm64` for ARM64. This command uses the same source
+projection/recovery and CPU reserve, preserves translator development
+provenance, and performs no installation or runtime restart. Bundle verification
+requires matching compiled window-policy ABI metadata in both artifacts.
+Add `--tasks` to also compile and stage IME, SystemUI, Composer and SurfaceFlinger.
+The launch/catalog adapter is part of services; the standalone launcher and
+catalog JAR are retired. This validates authoritative ActivityTaskManager
+publication, direct framework focus/resize/close handling and layer commits
+without building images or installing anything. Their Droidloom shared-library
+dependencies are rebuilt and staged with them. All task-control peers
+(services, InputFlinger and Composer) must carry task-backend ABI 2.
+Services, InputFlinger and Composer also require native input ABI 2; services,
+SystemUI, IME and the presenter require host channels ABI 1. The standalone input
+bridge process, launcher and byte-copy relays are removed.
+Services, InputFlinger, the host daemon and catalog require framework control
+ABI 1; SystemUI and the presenter require notification ABI 2.
+SurfaceFlinger and the presenter negotiate asynchronous layer commits and bounded
+allocation imports separately.
+
+For a remote ARM64 host, cross-build the Linux programs with an AArch64 linker
+and a sysroot matching the target's native dependencies. Build the complete
+Android userspace closure on the x86_64 workstation with:
+
+```console
+cargo run --locked -j 1 -p droidloom-update -- --jobs 4 android-build \
+  --work .work/arch/build --product droidloom_arm64
+cargo run --locked -j 1 -p droidloom-update -- bundle-stage \
+  --work .work/arch/build --product droidloom_arm64 \
+  --host /path/to/aarch64-unknown-linux-gnu/release --base /path/to/pinned-base/images \
+  --cell-spec /path/to/target-cell.json --user target-user --destination /path/to/new-bundle
+```
+
+`bundle-stage` verifies pinned base-image hashes and the complete compiled ABI
+pairing without reading the workstation's device configuration or activating
+either machine. The ARM64 vendor includes Freedreno and Panfrost GLES; native
+ARM execution omits the x86 ISA translator. `graphics_backend=drm_dma_heap`
+selects linear DMA-heap images for DRM drivers without a native minigbm backend,
+while retaining Mesa's native render-node selection. Transfer bundles with
+resumable, sparse-aware rsync and verify them again on the target. Kernel and
+device activation still follow that target's workspace rules.
+Check the live compositor as well as `droidloom-doctor`: the presenter requires
+`wp_linux_drm_syncobj_manager_v1`, and Denial's Smithay integration requires
+`DRM_IOCTL_SYNCOBJ_EVENTFD` on its synchronization device. Timeline capability
+alone is insufficient. On split display/render systems, that device must support
+syncobjs; a display-only KMS device can report no support while the GPU render
+node supports timelines. TB373FU's initial `6.1.138-tb373fu-droidloom1` passed
+the basic host probe but lacked the eventfd ioctl; Denial also selected the
+display-only device for protocol initialization. Its matching
+`6.1.138-tb373fu-syncobj1` kernel release and Denial's render-node selection
+resolve those prerequisites. Installation can be staged with `--no-start`
+while independently managed graphics prerequisites are fixed; a successful
+basic probe does not establish graphical readiness. Panthor also exposes an
+empty driver date, covered by the pinned libdrm patch and regression test in
+`android/mesa/README.md`.
+The ARM build also prepares Panfrost's shader compiler as a native workstation
+tool and passes it explicitly to Meson; no target executable runs on the tablet
+during compilation. Optional Mesa dependencies do not trigger fallback downloads.
+The target-side activation worker also accepts `apply BUNDLE --uid UID --no-start`
+to install a verified release while leaving Android stopped, for example while
+a separately managed kernel update is pending. Its recorded readiness remains
+`not-started`; run the normal lifecycle and catalog checks after the target is
+ready. This mode still requires administrator access and never changes a kernel.
+
 Bootstrap from the checkout as the desktop user:
 
 ```console
@@ -39,7 +120,7 @@ including nested Ninja and JVM workers. Parallel jobs are also capped at
 `nproc - 2`, even if a larger `--jobs` value is requested.
 
 Every invocation requests all host programs and the complete Android target
-set, including Composer, the Java input bridge, IME, framework services, patched
+set, including Composer, IME, framework services and its in-process catalog, patched
 native platform services, Mesa and the vendor image. Cargo, Soong, Ninja and
 Meson determine which outputs need compilation. `--clean` deletes only this
 updater's build outputs and compiler cache. Pinned downloaded sources and base
@@ -52,16 +133,22 @@ the full component set. The Git revision is recorded for information; locally
 built files do not need to match predetermined checksums. Previously installed
 system, system_ext and product partitions can be reused when they match the
 pinned base download. Missing base images are downloaded and verified.
-Compatibility APEX files are extracted from that base.
+Compatibility APEX files are extracted from that base. A base vendor image with
+the retired input bridge init service must be rebuilt or have that service
+definition replaced as part of a matched development override.
 
-The prepared payload records required files and executable permissions. Both
-copies of the input bridge must declare the input ABI matching Composer; the
+The prepared payload records required files and executable permissions. The
+framework input receiver must declare the input ABI matching Composer; the
 framework services JAR must contain the compiled navigation policy, and ELF
 components must have the expected architecture. Missing or empty components
-and incompatible peers reject the update. The input launcher is collected from
-Android’s executable build output; a nonexecutable launcher rejects the bundle
-even if its recorded permissions agree. Compatible byte differences and
-additional files do not. Checksums remain for pinned third-party inputs.
+and incompatible peers reject the update. Retired bridge artifacts also reject
+the bundle. Services must contain the compiled application-catalog adapter class.
+Each DEX 035–040 member in `services.jar` and the Droidloom HOME, IME and SystemUI
+archives must have consistent header sizes and a valid Adler-32 checksum,
+matching ART's integrity check. This also rejects damaged compiler outputs whose ZIP CRC and transfer
+hashes are valid; rebuild the affected artifact instead of rewriting its checksum.
+Compatible byte differences and additional files do not reject a bundle.
+Predetermined checksums remain for pinned third-party inputs.
 
 Activation makes a private administrator-owned copy and verifies it again
 before stopping Droidloom. Versioned releases live under
@@ -72,7 +159,8 @@ supervisor, and participates in the same rollback transaction. A
 persistent transaction journal also records the pre-existing installation's
 files and symlinks, so the first migration can be rolled back. A failed start or
 empty application catalog restores the previous installation. Readiness also
-requires Android’s input bridge service to be running. An interrupted
+requires `sys.droidloom.framework_ready=1`, set after native input and authenticated
+channel setup. An interrupted
 activation is recovered after updater bootstrap on the next update, before
 compiling Android again. Rollback restores
 programs/configuration; it does not undo writes Android made to application

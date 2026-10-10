@@ -443,6 +443,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "droidloom-android-policy"
+version = "0.1.0"
+dependencies = [
+ "droidloom-denial-ipc",
+ "droidloom-input-protocol",
+ "droidloom-task-control",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "droidloom-applications"
 version = "0.1.0"
 dependencies = [
@@ -455,6 +466,36 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "droidloom-audio"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "clap",
+ "droidloom-audio-client",
+ "droidloom-audio-protocol",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "droidloom-audio-client"
+version = "0.1.0"
+dependencies = [
+ "droidloom-audio-protocol",
+ "libc",
+]
+
+[[package]]
+name = "droidloom-audio-protocol"
+version = "0.1.0"
+dependencies = [
+ "droidloom-denial-ipc",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -545,6 +586,16 @@ dependencies = [
  "clap",
  "droidloom-contracts",
  "flate2",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "droidloom-frame-timing"
+version = "0.1.0"
+dependencies = [
+ "clap",
  "serde",
  "serde_json",
  "tempfile",
@@ -642,6 +693,7 @@ dependencies = [
  "clap",
  "droidloom-contracts",
  "droidloom-cpu-placement",
+ "droidloom-task-control",
  "droidloom-window-policy",
  "libc",
  "serde",
@@ -663,6 +715,7 @@ version = "0.1.0"
 dependencies = [
  "drm",
  "droidloom-cpu-placement",
+ "droidloom-timing",
  "libc",
  "thiserror",
 ]
@@ -675,12 +728,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "droidloom-task-launcher"
+name = "droidloom-timing"
 version = "0.1.0"
 dependencies = [
- "droidloom-denial-ipc",
- "droidloom-task-control",
- "tempfile",
+ "droidloom-cpu-placement",
+ "libc",
 ]
 
 [[package]]
@@ -729,8 +781,10 @@ dependencies = [
  "droidloom-denial-endpoint",
  "droidloom-denial-ipc",
  "droidloom-denial-protocol",
+ "droidloom-input-protocol",
  "droidloom-surface-bridge",
  "droidloom-syncobj",
+ "droidloom-timing",
  "droidloom-window-policy",
  "futures-lite",
  "gbm",

@@ -1,0 +1,42 @@
+--- a/services/java/com/android/server/SystemServer.java
++++ b/services/java/com/android/server/SystemServer.java
+@@ -242,6 +242,7 @@
+ import com.android.server.pm.verify.domain.DomainVerificationService;
+ import com.android.server.policy.AppOpsPolicy;
++import com.android.server.policy.DroidloomWindowManagerPolicy;
+ import com.android.server.policy.PermissionPolicyService;
+ import com.android.server.policy.PhoneWindowManager;
+ import com.android.server.policy.role.RoleServicePlatformHelperImpl;
+ import com.android.server.power.PowerManagerService;
+@@ -1754,7 +1755,10 @@
+             // WMS needs sensor service ready
+             mSystemServiceManager.startBootPhase(t, SystemService.PHASE_WAIT_FOR_SENSOR_SERVICE);
+             wm = WindowManagerService.main(context, inputManager, !mFirstBoot,
+-                    new PhoneWindowManager(), mActivityManagerService.mActivityTaskManager);
++                    SystemProperties.getBoolean("ro.vendor.droidloom.surfaceflinger_tasks", false)
++                            ? new DroidloomWindowManagerPolicy()
++                            : new PhoneWindowManager(),
++                    mActivityManagerService.mActivityTaskManager);
+             ServiceManager.addService(Context.WINDOW_SERVICE, wm, /* allowIsolated= */ false,
+                     DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PRIORITY_HIGH
+                             | DUMP_FLAG_PROTO);
+--- a/services/core/Android.bp
++++ b/services/core/Android.bp
+@@ -153,6 +153,7 @@
+         ":services.core-aidl-sources",
+         ":services.core-sources",
+         ":services.core.protologsrc",
++        ":droidloom-window-policy-sources",
+         ":platform-compat-config",
+         ":platform-compat-overrides",
+         ":display-device-config",
+--- a/services/Android.bp
++++ b/services/Android.bp
+@@ -120,6 +120,7 @@
+         ":services.core-aidl-sources",
+         ":services.core-sources",
+         ":services.core-sources-am-wm",
++        ":droidloom-window-policy-sources",
+         "core/java/com/android/server/am/package.html",
+         ":services.accessibility-sources",
+         ":services.appprediction-sources",

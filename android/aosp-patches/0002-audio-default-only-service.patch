@@ -1,8 +1,8 @@
 diff --git a/audio/aidl/default/Android.bp b/audio/aidl/default/Android.bp
-index 86ccf258..08445d1f 100644
+index f46c2ee..cdb3dd4 100644
 --- a/audio/aidl/default/Android.bp
 +++ b/audio/aidl/default/Android.bp
-@@ -128,6 +128,85 @@ cc_library {
+@@ -131,6 +131,87 @@ cc_library {
      }),
  }
  
@@ -11,6 +11,8 @@ index 86ccf258..08445d1f 100644
 +// implementations that cannot be reached from its audio policy.
 +cc_library_static {
 +    name: "libaudioservicedroidloomimpl",
++    whole_static_libs: ["libdroidloom_audio_client"],
++    export_static_lib_headers: ["libdroidloom_audio_client"],
 +    defaults: [
 +        "aidlaudioservice_defaults",
 +        "latest_android_media_audio_common_types_ndk_shared",
@@ -88,7 +90,7 @@ index 86ccf258..08445d1f 100644
  cc_library {
      name: "libeffectconfig",
      srcs: [
-@@ -208,6 +287,36 @@ cc_binary {
+@@ -209,6 +290,38 @@ cc_binary {
      installable: false, //installed in apex com.android.hardware.audio
  }
  
@@ -118,6 +120,8 @@ index 86ccf258..08445d1f 100644
 +        "-Werror",
 +        "-Wthread-safety",
 +        "-DBACKEND_NDK",
++        // All translation units must see the same conditional driver interface.
++        "-DDROIDLOOM_AUDIO_DEFAULT_ONLY",
 +    ],
 +    installable: false,
 +}
@@ -126,15 +130,18 @@ index 86ccf258..08445d1f 100644
      name: "audio_policy_config_xml_converter_tests",
      vendor_available: true,
 diff --git a/audio/aidl/default/Module.cpp b/audio/aidl/default/Module.cpp
-index 7f658bec..5991aaf8 100644
+index 6f37f0b..b3a5006 100644
 --- a/audio/aidl/default/Module.cpp
 +++ b/audio/aidl/default/Module.cpp
-@@ -26,11 +26,13 @@
+@@ -26,11 +26,16 @@
  
  #include "core-impl/Configuration.h"
  #include "core-impl/Module.h"
 -#include "core-impl/ModuleBluetooth.h"
  #include "core-impl/ModulePrimary.h"
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++#include <droidloom_audio.h>
++#endif
 +#ifndef DROIDLOOM_AUDIO_DEFAULT_ONLY
 +#include "core-impl/ModuleBluetooth.h"
  #include "core-impl/ModuleRemoteSubmix.h"
@@ -144,7 +151,7 @@ index 7f658bec..5991aaf8 100644
  #include "core-impl/SoundDose.h"
  #include "core-impl/utils.h"
  
-@@ -115,6 +117,10 @@ std::shared_ptr<Module> Module::createInstance(Type type, std::unique_ptr<Configu
+@@ -115,6 +120,10 @@ std::shared_ptr<Module> Module::createInstance(Type type, std::unique_ptr<Config
      switch (type) {
          case Type::DEFAULT:
              return ndk::SharedRefBase::make<ModulePrimary>(std::move(config));
@@ -155,18 +162,408 @@ index 7f658bec..5991aaf8 100644
          case Type::R_SUBMIX:
              return ndk::SharedRefBase::make<ModuleRemoteSubmix>(std::move(config));
          case Type::STUB:
-@@ -124,6 +130,7 @@ std::shared_ptr<Module> Module::createInstance(Type type, std::unique_ptr<Configu
+@@ -123,6 +132,7 @@ std::shared_ptr<Module> Module::createInstance(Type type, std::unique_ptr<Config
+             return ndk::SharedRefBase::make<ModuleUsb>(std::move(config));
          case Type::BLUETOOTH:
              return ndk::SharedRefBase::make<ModuleBluetooth>(std::move(config));
 +#endif
      }
  }
  
- // static
+@@ -1563,6 +1573,9 @@ ndk::ScopedAStatus Module::getMicMute(bool* _aidl_return) {
+ ndk::ScopedAStatus Module::setMicMute(bool in_mute) {
+     LOG(DEBUG) << __func__ << ": " << mType << ": " << in_mute;
+     mMicMute = in_mute;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    droidloom_audio::mic_mute.store(in_mute);
++#endif
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+@@ -1854,11 +1867,17 @@ void Module::onPrepareToDisconnectExternalDevice(
+ }
+ 
+ ndk::ScopedAStatus Module::onMasterMuteChanged(bool mute __unused) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    droidloom_audio::master_mute.store(mute);
++#endif
+     LOG(VERBOSE) << __func__ << ": " << mType << ": do nothing and return ok";
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+ ndk::ScopedAStatus Module::onMasterVolumeChanged(float volume __unused) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    droidloom_audio::master_volume.store(volume);
++#endif
+     LOG(VERBOSE) << __func__ << ": " << mType << ": do nothing and return ok";
+     return ndk::ScopedAStatus::ok();
+ }
+diff --git a/audio/aidl/default/ModulePrimary.cpp b/audio/aidl/default/ModulePrimary.cpp
+index 9e4e9e7..8c38746 100644
+--- a/audio/aidl/default/ModulePrimary.cpp
++++ b/audio/aidl/default/ModulePrimary.cpp
+@@ -59,6 +59,14 @@ ndk::ScopedAStatus ModulePrimary::calculateBufferSizeFrames(
+         const ::aidl::android::media::audio::common::AudioFormatDescription& format,
+         const ::aidl::android::media::audio::common::AudioIoFlags& flags, int32_t latencyMs,
+         int32_t sampleRateHz, int32_t* bufferSizeFrames) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    // Keep the short BUS output aligned with the host's power-of-two periods.
++    if (format.type == ::aidl::android::media::audio::common::AudioFormatType::PCM &&
++        flags.getTag() == AudioIoFlags::output && sampleRateHz == 48000) {
++        *bufferSizeFrames = 256;
++        return ndk::ScopedAStatus::ok();
++    }
++#endif
+     if ((format.type != ::aidl::android::media::audio::common::AudioFormatType::PCM &&
+          StreamOffloadStub::getSupportedEncodings().count(format.encoding)) ||
+         common::isPcmOffload(format, flags)) {
+@@ -155,6 +163,9 @@ int32_t ModulePrimary::getNominalLatencyMs(const AudioPortConfig& portConfig) {
+     // the virtual Android device implementation to pass CTS. Hardware implementations
+     // should have significantly lower latency.
+     static constexpr int32_t kStandardLatencyMs = 85;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    return portConfig.flags.value().getTag() == AudioIoFlags::output ? 5 : 20;
++#endif
+     return hasMmapFlag(portConfig.flags.value()) ? kLowLatencyMs : kStandardLatencyMs;
+ }
+ 
+diff --git a/audio/aidl/default/Stream.cpp b/audio/aidl/default/Stream.cpp
+index 2670c40..bfbf1ac 100644
+--- a/audio/aidl/default/Stream.cpp
++++ b/audio/aidl/default/Stream.cpp
+@@ -388,14 +388,26 @@ StreamInWorkerLogic::Status StreamInWorkerLogic::cycle() {
+ bool StreamInWorkerLogic::read(size_t clientSize, StreamDescriptor::Reply* reply) {
+     ATRACE_CALL();
+     StreamContext::DataMQ* const dataMQ = mContext->getDataMQ();
+-    const size_t byteCount = std::min({clientSize, dataMQ->availableToWrite(), mDataBufferSize});
++    size_t byteCount = std::min({clientSize, dataMQ->availableToWrite(), mDataBufferSize});
+     const bool isConnected = mIsConnected;
+     const size_t frameSize = mContext->getFrameSize();
+     size_t actualFrameCount = 0;
+     bool fatal = false;
+     int32_t latency = mContext->getNominalLatencyMs();
++    void* dataBuffer = mDataBuffer.get();
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (isConnected && byteCount >= frameSize) {
++        size_t frames = byteCount / frameSize;
++        const auto status = mDriver->prepareTransfer(&dataBuffer, &frames);
++        if (status != ::android::OK && status != ::android::INVALID_OPERATION) {
++            reply->status = STATUS_INVALID_OPERATION;
++            return false;
++        }
++        byteCount = frames * frameSize;
++    }
++#endif
+     if (isConnected) {
+-        if (::android::status_t status = mDriver->transfer(mDataBuffer.get(), byteCount / frameSize,
++        if (::android::status_t status = mDriver->transfer(dataBuffer, byteCount / frameSize,
+                                                            &actualFrameCount, &latency);
+             status != ::android::OK) {
+             fatal = true;
+@@ -407,8 +419,18 @@ bool StreamInWorkerLogic::read(size_t clientSize, StreamDescriptor::Reply* reply
+         actualFrameCount = byteCount / frameSize;
+     }
+     const size_t actualByteCount = actualFrameCount * frameSize;
+-    if (bool success = actualByteCount > 0 ? dataMQ->write(&mDataBuffer[0], actualByteCount) : true;
+-        success) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mDriver->isInputMuted()) {
++        memset(mDataBuffer.get(), 0, actualByteCount);
++        dataBuffer = mDataBuffer.get();
++    }
++#endif
++    const bool success = actualByteCount == 0 || dataMQ->write(
++            static_cast<int8_t*>(dataBuffer), actualByteCount);
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mDriver->completeTransfer() != ::android::OK) fatal = true;
++#endif
++    if (success) {
+         LOG(VERBOSE) << __func__ << ": writing of " << actualByteCount << " bytes into data MQ"
+                      << " succeeded; connected? " << isConnected;
+         // Frames are provided and counted regardless of connection status.
+@@ -816,12 +838,37 @@ bool StreamOutWorkerLogic::write(size_t clientSize, StreamDescriptor::Reply* rep
+     const size_t frameSize = mContext->getFrameSize();
+     bool fatal = false;
+     int32_t latency = mContext->getNominalLatencyMs();
+-    if (readByteCount > 0 ? dataMQ->read(&mDataBuffer[0], readByteCount) : true) {
++    void* dataBuffer = mDataBuffer.get();
++    size_t byteCount = std::min({clientSize, readByteCount, mDataBufferSize});
++    bool readSuccess = true;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    bool external = false;
++    if (mIsConnected && byteCount >= frameSize) {
++        size_t frames = byteCount / frameSize;
++        const auto status = mDriver->prepareTransfer(&dataBuffer, &frames);
++        external = status == ::android::OK;
++        if (!external && status != ::android::INVALID_OPERATION) {
++            StreamContext::DataMQ::MemTransaction transaction;
++            if (dataMQ->beginRead(readByteCount, &transaction)) dataMQ->commitRead(readByteCount);
++            reply->status = STATUS_INVALID_OPERATION;
++            return false;
++        }
++        byteCount = frames * frameSize;
++    }
++    if (external) {
++        StreamContext::DataMQ::MemTransaction transaction;
++        readSuccess = dataMQ->beginRead(readByteCount, &transaction)
++                && transaction.copyFrom(static_cast<int8_t*>(dataBuffer),
++                        0, byteCount)
++                && dataMQ->commitRead(readByteCount);
++    } else
++#endif
++    if (readByteCount > 0) readSuccess = dataMQ->read(&mDataBuffer[0], readByteCount);
++    if (readSuccess) {
+         const bool isConnected = mIsConnected;
+         LOG(VERBOSE) << __func__ << ": reading of " << readByteCount << " bytes from data MQ"
+                      << " succeeded; connected? " << isConnected;
+         // Amount of data that the HAL module is going to actually use.
+-        size_t byteCount = std::min({clientSize, readByteCount, mDataBufferSize});
+         if (byteCount >= frameSize && mContext->getForceTransientBurst()) {
+             // In order to prevent the state machine from going to ACTIVE state for full write
+             // (sync) transfers, simulate a partial write.
+@@ -830,14 +877,14 @@ bool StreamOutWorkerLogic::write(size_t clientSize, StreamDescriptor::Reply* rep
+         size_t actualFrameCount = 0;
+         if (isConnected) {
+             if (::android::status_t status = mDriver->transfer(
+-                        mDataBuffer.get(), byteCount / frameSize, &actualFrameCount, &latency);
++                        dataBuffer, byteCount / frameSize, &actualFrameCount, &latency);
+                 status != ::android::OK) {
+                 fatal = true;
+                 LOG(ERROR) << __func__ << ": write failed: " << status;
+             }
+             auto streamDataProcessor = mContext->getStreamDataProcessor().lock();
+             if (streamDataProcessor != nullptr) {
+-                streamDataProcessor->process(mDataBuffer.get(), actualFrameCount * frameSize);
++                streamDataProcessor->process(dataBuffer, actualFrameCount * frameSize);
+             }
+         } else {
+             if (mContext->getAsyncCallback() == nullptr) {
+@@ -846,11 +893,17 @@ bool StreamOutWorkerLogic::write(size_t clientSize, StreamDescriptor::Reply* rep
+             actualFrameCount = byteCount / frameSize;
+         }
+         const size_t actualByteCount = actualFrameCount * frameSize;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++        if (mDriver->completeTransfer() != ::android::OK) fatal = true;
++#endif
+         // Frames are consumed and counted regardless of the connection status.
+         reply->fmqByteCount += actualByteCount;
+         mContext->advanceFrameCount(actualFrameCount);
+         populateReply(reply, isConnected);
+     } else {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++        mDriver->completeTransfer();
++#endif
+         LOG(WARNING) << __func__ << ": reading of " << readByteCount
+                      << " bytes of data from MQ failed";
+         reply->status = STATUS_NOT_ENOUGH_DATA;
+diff --git a/audio/aidl/default/include/core-impl/Stream.h b/audio/aidl/default/include/core-impl/Stream.h
+index f4aeaa4..d9921da 100644
+--- a/audio/aidl/default/include/core-impl/Stream.h
++++ b/audio/aidl/default/include/core-impl/Stream.h
+@@ -220,6 +220,15 @@ struct DriverInterface {
+     virtual ::android::status_t start() = 0;
+     virtual ::android::status_t transfer(void* buffer, size_t frameCount, size_t* actualFrameCount,
+                                          int32_t* latencyMs) = 0;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    // Retain externally shared sample memory through FMQ access and processing.
++    // Drivers without a shared pool keep the reference scratch-buffer path.
++    virtual ::android::status_t prepareTransfer(void** /*buffer*/, size_t* /*frameCount*/) {
++        return ::android::INVALID_OPERATION;
++    }
++    virtual ::android::status_t completeTransfer() { return ::android::OK; }
++    virtual bool isInputMuted() const { return false; }
++#endif
+     // No need to implement 'refinePosition' unless the driver can provide more precise
+     // data than just total frame count. For example, the driver may correctly account
+     // for any intermediate buffers.
+diff --git a/audio/aidl/default/include/core-impl/StreamPrimary.h b/audio/aidl/default/include/core-impl/StreamPrimary.h
+index 87dcc3b..ad2e934 100644
+--- a/audio/aidl/default/include/core-impl/StreamPrimary.h
++++ b/audio/aidl/default/include/core-impl/StreamPrimary.h
+@@ -24,6 +24,9 @@
+ #include "DriverStubImpl.h"
+ #include "StreamAlsaMonoPipe.h"
+ #include "primary/PrimaryMixer.h"
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++#include <droidloom_audio.h>
++#endif
+ 
+ namespace aidl::android::hardware::audio::core {
+ 
+@@ -42,6 +45,11 @@ class StreamPrimary : public StreamAlsaMonoPipe {
+                                  int32_t* latencyMs) override;
+     ::android::status_t refinePosition(StreamDescriptor::Position* position) override;
+     void shutdown() override;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    ::android::status_t prepareTransfer(void** buffer, size_t* frameCount) override;
++    ::android::status_t completeTransfer() override;
++    bool isInputMuted() const override { return droidloom_audio::mic_mute.load(); }
++#endif
+ 
+     // Overridden methods of 'StreamCommonImpl', called on a Binder thread.
+     ndk::ScopedAStatus setConnectedDevices(const ConnectedDevices& devices) override;
+@@ -71,6 +79,13 @@ class StreamPrimary : public StreamAlsaMonoPipe {
+     bool isStubStreamOnWorker() const { return mCurrAlsaDeviceId == kStubDeviceId; }
+ 
+     DriverStubImpl mStubDriver;
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    void* mHostAudio = nullptr;
++    void* mHostBuffer = nullptr;
++    uint32_t mHostBufferFrames = 0;
++    uint32_t mHostTransferredFrames = 0;
++    int64_t mHostFrameOffset = 0;
++#endif
+     mutable std::mutex mLock;
+     AlsaDeviceId mAlsaDeviceId GUARDED_BY(mLock) = kStubDeviceId;
+ 
 diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+index ac0d302..9316062 100644
 --- a/audio/aidl/default/primary/StreamPrimary.cpp
 +++ b/audio/aidl/default/primary/StreamPrimary.cpp
-@@ -203,9 +203,11 @@ bool StreamPrimary::useStubStream(
+@@ -52,10 +52,17 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+ }
+ 
+ ::android::status_t StreamPrimary::drain(StreamDescriptor::DrainMode mode) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mHostAudio) return dl_audio_control(mHostAudio,
++            mIsInput ? DL_AUDIO_FLUSH : DL_AUDIO_DRAIN);
++#endif
+     return isStubStreamOnWorker() ? mStubDriver.drain(mode) : StreamAlsaMonoPipe::drain(mode);
+ }
+ 
+ ::android::status_t StreamPrimary::flush() {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mHostAudio) return dl_audio_control(mHostAudio, DL_AUDIO_FLUSH);
++#endif
+     RETURN_STATUS_IF_ERROR(isStubStreamOnWorker() ? mStubDriver.flush()
+                                                   : StreamAlsaMonoPipe::flush());
+     // TODO(b/372951987): consider if this needs to be done from 'StreamInWorkerLogic::cycle'.
+@@ -63,10 +70,16 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+ }
+ 
+ ::android::status_t StreamPrimary::pause() {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mHostAudio) return dl_audio_control(mHostAudio, DL_AUDIO_PAUSE);
++#endif
+     return isStubStreamOnWorker() ? mStubDriver.pause() : StreamAlsaMonoPipe::pause();
+ }
+ 
+ ::android::status_t StreamPrimary::standby() {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mHostAudio) return dl_audio_control(mHostAudio, DL_AUDIO_STANDBY);
++#endif
+     return isStubStreamOnWorker() ? mStubDriver.standby() : StreamAlsaMonoPipe::standby();
+ }
+ 
+@@ -83,6 +96,21 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+         StreamAlsaMonoPipe::shutdown();  // Close currently opened ALSA devices.
+     }
+     if (isStub) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++        if (!mHostAudio) {
++            const int status = dl_audio_open("/dev/socket/droidloom/audio",
++                    mIsInput ? DL_AUDIO_CAPTURE : DL_AUDIO_PLAYBACK,
++                    mContext.getSampleRate(), mFrameSizeBytes / sizeof(int16_t),
++                    mIsInput ? 1024 : 8192, &mHostAudio);
++            // An older host or a denied microphone retains the timing-only
++            // fallback. A failed live transport is reported, never retried blind.
++            if (status != 0 && status != -ENOENT && status != -ECONNREFUSED && status != -EACCES) {
++                return status;
++            }
++            mHostFrameOffset = mContext.getFrameCount();
++        }
++        if (mHostAudio) return dl_audio_control(mHostAudio, DL_AUDIO_START);
++#endif
+         return mStubDriver.start();
+     }
+     RETURN_STATUS_IF_ERROR(StreamAlsaMonoPipe::start());
+@@ -94,6 +122,30 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+ 
+ ::android::status_t StreamPrimary::transfer(void* buffer, size_t frameCount,
+                                             size_t* actualFrameCount, int32_t* latencyMs) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mHostAudio) {
++        if (!frameCount) {
++            *actualFrameCount = 0;
++            return ::android::OK;
++        }
++        if (buffer != mHostBuffer || frameCount > mHostBufferFrames) return ::android::BAD_VALUE;
++        *actualFrameCount = frameCount;
++        mHostTransferredFrames = frameCount;
++        if (!mIsInput) {
++            const float gain = droidloom_audio::master_mute.load() ? 0.0f
++                    : droidloom_audio::master_volume.load();
++            if (gain != 1.0f) {
++                int16_t* samples = static_cast<int16_t*>(buffer);
++                const size_t count = frameCount * mFrameSizeBytes / sizeof(int16_t);
++                for (size_t i = 0; i < count; ++i) samples[i] = samples[i] * gain;
++            }
++        }
++        struct dl_audio_position position;
++        if (dl_audio_position(mHostAudio, &position) == 0)
++            *latencyMs = (position.latency_ns + 999999) / 1000000;
++        return ::android::OK;
++    }
++#endif
+     if (isStubStreamOnWorker()) {
+         return mStubDriver.transfer(buffer, frameCount, actualFrameCount, latencyMs);
+     }
+@@ -130,17 +182,53 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+     return ::android::OK;
+ }
+ 
+-::android::status_t StreamPrimary::refinePosition(StreamDescriptor::Position*) {
++::android::status_t StreamPrimary::refinePosition(StreamDescriptor::Position* position) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    if (mHostAudio) {
++        struct dl_audio_position host;
++        const int status = dl_audio_position(mHostAudio, &host);
++        if (status) return status;
++        position->frames = mHostFrameOffset + host.frames;
++        position->timeNs = host.monotonic_ns;
++        return ::android::OK;
++    }
++#else
++    (void)position;
++#endif
+     // Since not all data is actually sent to the HAL, use the position maintained by Stream class
+     // which accounts for all frames passed from / to the client.
+     return ::android::OK;
+ }
+ 
+ void StreamPrimary::shutdown() {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++    dl_audio_close(mHostAudio);
++    mHostAudio = mHostBuffer = nullptr;
++#endif
+     StreamAlsaMonoPipe::shutdown();
+     mStubDriver.shutdown();
+ }
+ 
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++::android::status_t StreamPrimary::prepareTransfer(void** buffer, size_t* frameCount) {
++    if (!mHostAudio) return ::android::INVALID_OPERATION;
++    const int status = dl_audio_acquire(mHostAudio, std::min<size_t>(*frameCount, mIsInput ? 1024 : 256),
++            buffer, &mHostBufferFrames);
++    if (status) return status;
++    mHostBuffer = *buffer;
++    mHostTransferredFrames = 0;
++    *frameCount = mHostBufferFrames;
++    return ::android::OK;
++}
++
++::android::status_t StreamPrimary::completeTransfer() {
++    if (!mHostAudio || !mHostBuffer) return ::android::OK;
++    const int status = dl_audio_submit(mHostAudio, mHostTransferredFrames);
++    mHostBuffer = nullptr;
++    return status;
++}
++#endif
++
+ ndk::ScopedAStatus StreamPrimary::setConnectedDevices(const ConnectedDevices& devices) {
+     LOG(DEBUG) << __func__ << ": " << ::android::internal::ToString(devices);
+     if (devices.size() > 1) {
+@@ -203,9 +291,11 @@ bool StreamPrimary::useStubStream(
      if (isInput) {
          return kSimulateInput || device.type.type == AudioDeviceType::IN_TELEPHONY_RX ||
                 device.type.type == AudioDeviceType::IN_FM_TUNER ||
@@ -178,3 +575,30 @@ diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/p
             device.type.connection == AudioDeviceDescription::CONNECTION_BUS /*deprecated*/;
  }
  
+diff --git a/audio/aidl/default/stub/DriverStubImpl.cpp b/audio/aidl/default/stub/DriverStubImpl.cpp
+index 74a4edc..a56ca85 100644
+--- a/audio/aidl/default/stub/DriverStubImpl.cpp
++++ b/audio/aidl/default/stub/DriverStubImpl.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <cmath>
+ #include <cstdlib>
++#include <cstring>
+ 
+ #define LOG_TAG "AHAL_Stream"
+ #include <Log.h>
+@@ -125,10 +126,14 @@ DriverStubImpl::DriverStubImpl(const StreamContext& context, int asyncSleepTimeU
+         }
+     }
+     if (mIsInput) {
++#ifdef DROIDLOOM_AUDIO_DEFAULT_ONLY
++        memset(buffer, 0, frameCount * mFrameSizeBytes);
++#else
+         uint8_t* byteBuffer = static_cast<uint8_t*>(buffer);
+         for (size_t i = 0; i < frameCount * mFrameSizeBytes; ++i) {
+             byteBuffer[i] = std::rand() % 255;
+         }
++#endif
+     }
+     return ::android::OK;
+ }

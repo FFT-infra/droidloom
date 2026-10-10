@@ -51,6 +51,7 @@ pub fn dex(path: &Path) -> Result<Vec<u8>> {
         if !out.status.success() {
             return fail("cannot extract compiled Android DEX");
         }
+        validate_dex(&out.stdout).map_err(|error| format!("{}!{name}: {error}", path.display()))?;
         result.extend(out.stdout);
     }
     if result.is_empty() {
@@ -60,6 +61,45 @@ pub fn dex(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(result)
+}
+fn dex_checksum(data: &[u8]) -> u32 {
+    // Adler-32, as used by ART over the bytes following checksum_ (offset 12).
+    // 5552 bytes bound both accumulators below u32::MAX before reduction.
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for chunk in data.chunks(5552) {
+        for &byte in chunk {
+            a += u32::from(byte);
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    (b << 16) | a
+}
+fn validate_dex(data: &[u8]) -> Result<()> {
+    if data.len() < 112 {
+        return fail("truncated DEX header");
+    }
+    if &data[..4] != b"dex\n"
+        || !matches!(
+            &data[4..8],
+            b"035\0" | b"037\0" | b"038\0" | b"039\0" | b"040\0"
+        )
+    {
+        return fail("unsupported DEX magic/version; expected standard DEX 035–040");
+    }
+    let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    if word(32) as usize != data.len() || word(36) != 112 || word(40) != 0x12345678 {
+        return fail("invalid DEX file size, header size or endian tag");
+    }
+    let actual = dex_checksum(&data[12..]);
+    let expected = word(8);
+    if actual != expected {
+        return fail(format!(
+            "bad DEX checksum ({actual:08x}, expected {expected:08x}); rebuild the Android artifact"
+        ));
+    }
+    Ok(())
 }
 fn architecture(data: &[u8]) -> Result<&'static str> {
     if data.len() < 20 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
@@ -97,31 +137,108 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
         return fail("SystemUI.apk lacks the clipboard adapter");
     }
     if !systemui
-        .windows(b"DROIDLOOM_NOTIFICATIONS_ABI=1;".len())
-        .any(|w| w == b"DROIDLOOM_NOTIFICATIONS_ABI=1;")
+        .windows(b"DROIDLOOM_NOTIFICATIONS_ABI=2;".len())
+        .any(|w| w == b"DROIDLOOM_NOTIFICATIONS_ABI=2;")
     {
         return fail("SystemUI.apk lacks the notification adapter");
     }
-    let launcher = runtime.join("ime/droidloom-input-bridge");
-    if fs::metadata(&launcher)?.permissions().mode() & 0o111 == 0 {
-        return fail(
-            "Android input bridge launcher is not executable; input and resizing cannot start",
-        );
-    }
+    let ime = dex(&runtime.join("ime/DroidloomIME.apk"))?;
     let composer =
         fs::read(runtime.join("bin/android.hardware.graphics.composer3-service.droidloom"))?;
     let arch = architecture(&composer)?.to_string();
     let version = input_abi(&composer)?;
-    let mut bridges = 0;
-    for relative in [
-        "framework/droidloom-input-bridge.jar",
-        "ime/droidloom-input-bridge.jar",
-    ] {
-        if !runtime.join(relative).is_file() {
-            return fail(format!("missing Android bridge copy: {relative}"));
-        }
+    let direct_input_abi = b"DROIDLOOM_DIRECT_INPUT_ABI=1;";
+    let presenter = fs::read(root.join("usr/bin/droidloom-wayland"))?;
+    if !composer
+        .windows(direct_input_abi.len())
+        .any(|w| w == direct_input_abi)
+        || !presenter
+            .windows(direct_input_abi.len())
+            .any(|w| w == direct_input_abi)
+    {
+        return fail("Composer and presenter lack paired direct input ABI 1");
     }
     let services = dex(&runtime.join("framework/services.jar"))?;
+    let catalog_class = b"Lcom/android/server/wm/DroidloomApplicationCatalog;";
+    if !services
+        .windows(catalog_class.len())
+        .any(|w| w == catalog_class)
+    {
+        return fail("in-process application catalog class is missing");
+    }
+    let policy_abi = b"DROIDLOOM_WINDOW_POLICY_ABI=1;";
+    let policy_native = fs::read(runtime.join("lib64/libinputflinger.so"))?;
+    let framework_abi = b"DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;";
+    for (name, data) in [
+        ("services.jar", services.clone()),
+        ("libinputflinger.so", policy_native.clone()),
+        ("droidloomd", fs::read(root.join("usr/bin/droidloomd"))?),
+        (
+            "droidloom-applications",
+            fs::read(root.join("usr/bin/droidloom-applications"))?,
+        ),
+    ] {
+        if !data
+            .windows(framework_abi.len())
+            .any(|w| w == framework_abi)
+        {
+            return fail(format!("{name} lacks direct framework control ABI 1"));
+        }
+    }
+    let notifications_abi = b"DROIDLOOM_NOTIFICATIONS_ABI=2;";
+    if !presenter
+        .windows(notifications_abi.len())
+        .any(|w| w == notifications_abi)
+    {
+        return fail("presenter lacks notification delta ABI 2");
+    }
+    if !services.windows(policy_abi.len()).any(|w| w == policy_abi)
+        || !policy_native
+            .windows(policy_abi.len())
+            .any(|w| w == policy_abi)
+    {
+        return fail("services.jar and libinputflinger.so lack paired Rust window policy ABI 1");
+    }
+    if architecture(&policy_native)? != arch {
+        return fail("wrong Rust window policy JNI architecture");
+    }
+    let task_abi = b"DROIDLOOM_TASK_BACKEND_ABI=2;";
+    let channels_abi = b"DROIDLOOM_HOST_CHANNELS_ABI=1;";
+    for (name, data) in [
+        ("services.jar", services.as_slice()),
+        ("SystemUI.apk", systemui.as_slice()),
+        ("DroidloomIME.apk", ime.as_slice()),
+        ("presenter", presenter.as_slice()),
+    ] {
+        if !data.windows(channels_abi.len()).any(|w| w == channels_abi) {
+            return fail(format!("{name} lacks direct host channels ABI 1"));
+        }
+    }
+    let native_input_abi = b"DROIDLOOM_NATIVE_INPUT_ABI=2;";
+    for (name, data) in [
+        ("services.jar", services.as_slice()),
+        ("libinputflinger.so", policy_native.as_slice()),
+        ("Composer", composer.as_slice()),
+    ] {
+        if !data
+            .windows(native_input_abi.len())
+            .any(|w| w == native_input_abi)
+        {
+            return fail(format!("{name} lacks native input ABI 2"));
+        }
+    }
+    if input_abi(&policy_native)? != version {
+        return fail("Composer and InputFlinger input protocols do not match");
+    }
+    for (name, data) in [
+        ("services.jar", services.as_slice()),
+        ("libinputflinger.so", policy_native.as_slice()),
+        ("Composer", composer.as_slice()),
+    ] {
+        if !data.windows(task_abi.len()).any(|w| w == task_abi) {
+            return fail(format!("{name} lacks framework task backend ABI 2"));
+        }
+    }
     if !services
         .windows(b"ro.vendor.droidloom.surfaceflinger_tasks".len())
         .any(|w| w == b"ro.vendor.droidloom.surfaceflinger_tasks")
@@ -129,37 +246,20 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
         return fail("services.jar lacks compiled Droidloom navigation policy");
     }
     for path in files(root)? {
-        if path
-            .file_name()
-            .is_some_and(|n| n == "droidloom-input-bridge.jar")
-        {
-            let data = dex(&path)?;
-            if !data
-                .windows(b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;".len())
-                .any(|w| w == b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;")
-            {
-                return fail("Android input bridge lacks the clipboard relay");
-            }
-            if !data
-                .windows(b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;".len())
-                .any(|w| w == b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;")
-            {
-                return fail("Android input bridge lacks the notification relay");
-            }
-            let receiver = input_abi(&data)?;
-            if version != receiver {
-                return fail(format!(
-                    "Composer input ABI v{version} does not match {} v{receiver}",
-                    path.display()
-                ));
-            }
-            if !data
-                .windows(b"Lcom/android/droidloom/catalog/ApplicationCatalog;".len())
-                .any(|w| w == b"Lcom/android/droidloom/catalog/ApplicationCatalog;")
-            {
-                return fail("bridge is missing the application catalog class");
-            }
-            bridges += 1;
+        if path.file_name().is_some_and(|name| {
+            matches!(
+                name.to_str(),
+                Some(
+                    "droidloom-input-bridge"
+                        | "droidloom-input-bridge.jar"
+                        | "droidloom-input-bridge.rc"
+                        | "droidloom-task-launcher"
+                        | "libdroidloom_task_launcher.dylib.so"
+                        | "droidloom-application-catalog.jar"
+                )
+            )
+        }) {
+            return fail("retired support artifact remains in payload");
         }
         let mut f = fs::File::open(&path)?;
         use std::io::Read;
@@ -170,9 +270,6 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
         {
             return fail(format!("wrong ELF architecture: {}", path.display()));
         }
-    }
-    if bridges == 0 {
-        return fail("missing Android bridge");
     }
     Ok((arch, version))
 }
@@ -284,20 +381,53 @@ mod tests {
 #[cfg(test)]
 mod artifact_tests {
     use super::*;
+    fn dex_fixture(payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0; 112];
+        data[..8].copy_from_slice(b"dex\n039\0");
+        data[36..40].copy_from_slice(&112_u32.to_le_bytes());
+        data[40..44].copy_from_slice(&0x12345678_u32.to_le_bytes());
+        data.extend_from_slice(payload);
+        refresh_dex_fixture(&mut data);
+        data
+    }
+    fn refresh_dex_fixture(data: &mut [u8]) {
+        let size = u32::try_from(data.len()).unwrap();
+        data[32..36].copy_from_slice(&size.to_le_bytes());
+        let checksum = dex_checksum(&data[12..]);
+        data[8..12].copy_from_slice(&checksum.to_le_bytes());
+    }
     fn fixture(root: &Path, composer: u16, java: u16) {
-        let launcher = root.join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge");
-        write(&launcher, b"#!/system/bin/sh\nexec app_process\n").unwrap();
-        mode(&launcher, 0o755).unwrap();
         let mut elf = vec![0; 64];
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = 2;
         elf[5] = 1;
         elf[18] = 62;
-        elf.extend(format!("DROIDLOOM_INPUT_ABI={composer};").bytes());
-        write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"),elf).unwrap();
+        elf.extend(format!("DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_INPUT_ABI={composer};DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_DIRECT_INPUT_ABI=1;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_HOST_CHANNELS_ABI=1;").bytes());
+        write(&root.join("usr/bin/droidloom-wayland"), &elf).unwrap();
+        write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"), &elf).unwrap();
+        elf.extend(format!("DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_INPUT_ABI={java};").bytes());
+        write(
+            &root.join("usr/lib/droidloom/runtime/lib64/libinputflinger.so"),
+            elf,
+        )
+        .unwrap();
+        for name in ["droidloomd", "droidloom-applications"] {
+            write(
+                &root.join("usr/bin").join(name),
+                b"DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;",
+            )
+            .unwrap();
+        }
         let d = tempfile::tempdir().unwrap();
-        write(&d.path().join("classes.dex"),format!("dex\n039\0DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_CLIPBOARD_RELAY_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=1;DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;Lcom/android/droidloom/catalog/ApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks")).unwrap();
-        let jar = root.join("usr/lib/droidloom/runtime/framework/droidloom-input-bridge.jar");
+        let payload = format!(
+            "DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_HOST_CHANNELS_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;Lcom/android/server/wm/DroidloomApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks"
+        );
+        write(
+            &d.path().join("classes.dex"),
+            dex_fixture(payload.as_bytes()),
+        )
+        .unwrap();
+        let jar = root.join("usr/lib/droidloom/runtime/framework/services.jar");
         fs::create_dir_all(jar.parent().unwrap()).unwrap();
         run(Command::new("zip")
             .current_dir(d.path())
@@ -307,14 +437,10 @@ mod artifact_tests {
         .unwrap();
         copy(
             &jar,
-            &root.join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge.jar"),
+            &root.join("usr/lib/droidloom/runtime/ime/DroidloomIME.apk"),
         )
         .unwrap();
-        copy(
-            &jar,
-            &root.join("usr/lib/droidloom/runtime/framework/services.jar"),
-        )
-        .unwrap();
+
         copy(
             &jar,
             &root.join("usr/lib/droidloom/runtime/ime/DroidloomHome.apk"),
@@ -337,6 +463,7 @@ mod artifact_tests {
             "ime/DroidloomHome.apk",
             "ime/home-setup",
             "systemui/SystemUI.apk",
+            "lib64/libinputflinger.so",
         ] {
             let d = tempfile::tempdir().unwrap();
             fixture(d.path(), 5, 5);
@@ -345,17 +472,158 @@ mod artifact_tests {
         }
     }
     #[test]
-    fn refuses_nonexecutable_input_launcher_even_when_recorded_that_way() {
+    fn refuses_stock_or_mismatched_window_policy_jni() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 5, 5);
+        let path = d
+            .path()
+            .join("usr/lib/droidloom/runtime/lib64/libinputflinger.so");
+        let native = fs::read(&path).unwrap();
+        for marker in [
+            b"DROIDLOOM_WINDOW_POLICY_ABI=0;",
+            b"DROIDLOOM_WINDOW_POLICY_ABI=2;",
+        ] {
+            let mut wrong = native[..64].to_vec();
+            wrong.extend_from_slice(marker);
+            write(&path, wrong).unwrap();
+            assert!(seal(d.path(), "fixture".into()).is_err());
+        }
+        let mut wrong_arch = native;
+        wrong_arch[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        write(&path, wrong_arch).unwrap();
+        assert!(seal(d.path(), "fixture".into()).is_err());
+    }
+    #[test]
+    fn refuses_retired_input_support_process() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);
         seal(d.path(), "fixture".into()).unwrap();
-        let launcher = d
-            .path()
-            .join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge");
-        mode(&launcher, 0o644).unwrap();
+        write(
+            &d.path()
+                .join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge.rc"),
+            b"service droidloom-input-bridge /vendor/bin/droidloom-input-bridge\n",
+        )
+        .unwrap();
         assert!(verify(d.path()).is_err());
-        // A manifest made from a bad installation must not legitimize the mode.
         assert!(seal(d.path(), "fixture".into()).is_err());
+    }
+    #[test]
+    fn direct_channels_and_owned_input_require_every_matching_peer() {
+        for (relative, marker) in [
+            (
+                "framework/services.jar",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "systemui/SystemUI.apk",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "ime/DroidloomIME.apk",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "../../../bin/droidloom-wayland",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "framework/services.jar",
+                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
+            ),
+            (
+                "lib64/libinputflinger.so",
+                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
+            ),
+            (
+                "bin/android.hardware.graphics.composer3-service.droidloom",
+                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            fixture(root.path(), 7, 7);
+            let path = root.path().join("usr/lib/droidloom/runtime").join(relative);
+            let archive = matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("jar" | "apk")
+            );
+            let mut data = if archive {
+                dex(&path).unwrap()
+            } else {
+                fs::read(&path).unwrap()
+            };
+            while let Some(start) = data.windows(marker.len()).position(|w| w == marker) {
+                data.drain(start..start + marker.len());
+            }
+            if archive {
+                refresh_dex_fixture(&mut data);
+                let temporary = tempfile::tempdir().unwrap();
+                write(&temporary.path().join("classes.dex"), &data).unwrap();
+                run(Command::new("zip")
+                    .current_dir(temporary.path())
+                    .args(["-q"])
+                    .arg(&path)
+                    .arg("classes.dex"))
+                .unwrap();
+            } else {
+                write(&path, data).unwrap();
+            }
+            let error = seal(root.path(), "mismatched".into())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ABI"), "{relative}: {error}");
+        }
+    }
+    #[test]
+    fn dex_checksums_match_adler32_reference_vectors() {
+        assert_eq!(dex_checksum(b""), 1);
+        assert_eq!(dex_checksum(b"Wikipedia"), 0x11e60398);
+    }
+    #[test]
+    fn rejects_damaged_dex_headers_and_payloads() {
+        let good = dex_fixture(b"compiled bytecode");
+        validate_dex(&good).unwrap();
+        for offset in [0, 8, 12, 32, 36, 40, 112] {
+            let mut damaged = good.clone();
+            damaged[offset] ^= 1;
+            assert!(validate_dex(&damaged).is_err(), "offset {offset}");
+        }
+        for length in [0, 7, 111, good.len() - 1] {
+            assert!(validate_dex(&good[..length]).is_err(), "length {length}");
+        }
+    }
+    #[test]
+    fn rejects_corrupt_secondary_dex_even_with_valid_zip_crc() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 7, 7);
+        let jar = d
+            .path()
+            .join("usr/lib/droidloom/runtime/framework/services.jar");
+        let temporary = tempfile::tempdir().unwrap();
+        let mut secondary = dex_fixture(b"secondary bytecode");
+        write(&temporary.path().join("classes2.dex"), &secondary).unwrap();
+        let append = || {
+            run(Command::new("zip")
+                .current_dir(temporary.path())
+                .arg("-q")
+                .arg(&jar)
+                .arg("classes2.dex"))
+            .unwrap();
+        };
+        append();
+        seal(d.path(), "valid-multidex".into()).unwrap();
+        // Repack a corrupted DEX, giving the ZIP member a correct CRC. This
+        // reproduces a damaged compiler output that transfer hashing accepts.
+        secondary[112] ^= 1;
+        write(&temporary.path().join("classes2.dex"), secondary).unwrap();
+        append();
+        for error in [
+            seal(d.path(), "bad-multidex".into()).unwrap_err(),
+            verify(d.path()).unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("services.jar!classes2.dex"), "{message}");
+            assert!(message.contains("bad DEX checksum"), "{message}");
+        }
     }
     #[test]
     fn refuses_mixed_native_java_bundle() {

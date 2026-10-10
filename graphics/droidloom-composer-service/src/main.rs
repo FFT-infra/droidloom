@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod control;
-mod input;
+mod input_handoff;
 mod surface_bridge;
 
 use std::fs::OpenOptions;
@@ -18,19 +18,19 @@ use droidloom_composer_aidl::minigbm::MinigbmBufferAdapter;
 use droidloom_composer_aidl::service::{ComposerLifecycle, ComposerService, SharedSession};
 use droidloom_denial_ipc::{ProtocolSocket, SeqPacket, SeqPacketListener};
 use droidloom_denial_protocol::{
-    capability, AndroidMessage, DenialMessage, InputEvent, TaskObjectId, PROTOCOL_MAJOR,
+    capability, AndroidMessage, DenialMessage, TaskObjectId, PROTOCOL_MAJOR,
 };
 use droidloom_syncobj::SyncobjDevice;
 
 use crate::control::TaskCoordinator;
-use crate::input::InputBridge;
+use crate::input_handoff::InputHandoff;
 use crate::surface_bridge::SurfaceBridge;
 
 const DEFAULT_SOCKET: &str = "/dev/socket/droidloom/denial";
 const DEFAULT_RENDER_NODE: &str = "/dev/dri/renderD128";
 const CONTROL_SOCKET_NAME: &str = "droidloom-task-control";
 const SURFACE_SOCKET_NAME: &str = "droidloom-surfaceflinger";
-const INPUT_SOCKET: &str = "/dev/socket/droidloom_input";
+const INPUT_SOCKET: &str = "/dev/socket/droidloom-framework/input";
 const SERVICE_NAME: &str = "android.hardware.graphics.composer3.IComposer/default";
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 
@@ -39,10 +39,10 @@ fn main() {
     let compatibility = std::str::from_utf8(&droidloom_input_protocol::BUILD_COMPATIBILITY)
         .expect("input compatibility marker is ASCII");
     if std::env::args().any(|arg| arg == "--compatibility") {
-        println!("{compatibility}");
+        println!("{compatibility} DROIDLOOM_TASK_BACKEND_ABI=2; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;");
         return;
     }
-    eprintln!("Droidloom Composer {compatibility}");
+    eprintln!("Droidloom Composer {compatibility} DROIDLOOM_TASK_BACKEND_ABI=2; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;");
     if let Err(error) = run() {
         eprintln!("Droidloom Composer fatal: {error}");
         std::process::exit(1);
@@ -64,10 +64,11 @@ fn run() -> Result<(), String> {
         SeqPacket::connect(&socket_path)
             .map_err(|error| format!("connect {}: {error}", socket_path.display()))?,
     );
-    let activation_requests = handshake(&socket)?;
+    let capabilities = handshake(&socket)?;
 
     let sink = DenialPresentationSink::new(socket, SyncobjDevice::from_file(render_file))
-        .with_activation_requests(activation_requests);
+        .with_activation_requests(capabilities & capability::TASK_ACTIVATION != 0)
+        .with_lazy_render_targets(capabilities & capability::LAZY_RENDER_TARGETS != 0);
     let session: SharedSession = Arc::new(Mutex::new(Session::default()));
     let factory_sink = sink.clone();
     let service = ComposerService::new(Arc::clone(&session), move || {
@@ -75,7 +76,7 @@ fn run() -> Result<(), String> {
     });
     let lifecycle = service.lifecycle();
     let coordinator = TaskCoordinator::new(sink.clone(), lifecycle.clone());
-    let input = InputBridge::new(INPUT_SOCKET);
+    let input = InputHandoff::new(sink.clone(), INPUT_SOCKET);
 
     ProcessState::set_thread_pool_max_thread_count(4);
     ProcessState::start_thread_pool();
@@ -168,13 +169,13 @@ fn arguments() -> Result<(PathBuf, PathBuf), String> {
     Ok((socket, render_node))
 }
 
-fn handshake(socket: &ProtocolSocket) -> Result<bool, String> {
+fn handshake(socket: &ProtocolSocket) -> Result<u64, String> {
     socket
         .send_android(
             &AndroidMessage::ClientHello {
                 min_major: PROTOCOL_MAJOR,
                 max_major: PROTOCOL_MAJOR,
-                capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION,
+                capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION | capability::DIRECT_INPUT | capability::LAZY_RENDER_TARGETS,
             },
             &[],
         )
@@ -189,9 +190,10 @@ fn handshake(socket: &ProtocolSocket) -> Result<bool, String> {
             capabilities,
             ..
         } if major == PROTOCOL_MAJOR
-            && capabilities & capability::REQUIRED_V1 == capability::REQUIRED_V1 =>
+            && capabilities & (capability::REQUIRED_V1 | capability::DIRECT_INPUT)
+                == capability::REQUIRED_V1 | capability::DIRECT_INPUT =>
         {
-            Ok(capabilities & capability::TASK_ACTIVATION != 0)
+            Ok(capabilities)
         }
         DenialMessage::Error { message, .. } => {
             Err(format!("Denial rejected handshake: {message}"))
@@ -205,7 +207,7 @@ fn event_loop(
     session: &SharedSession,
     lifecycle: &ComposerLifecycle,
     coordinator: &TaskCoordinator,
-    input: &InputBridge,
+    input: &InputHandoff,
 ) -> Result<(), String> {
     let mut receive_buffer = vec![0; droidloom_denial_protocol::MAX_PACKET_BYTES];
     loop {
@@ -215,6 +217,7 @@ fn event_loop(
             .map_err(|error| error.to_string())?;
         let message = received.message;
         match message {
+            DenialMessage::RequestInputChannel { generation } => input.request(generation)?,
             DenialMessage::Ping { cookie } => sink
                 .socket()
                 .send_android(&AndroidMessage::Pong { cookie }, &[])
@@ -225,17 +228,38 @@ fn event_loop(
             DenialMessage::ServerHello { .. } => {
                 return Err("repeated Denial ServerHello".to_owned());
             }
-            DenialMessage::DisplayPower { powered } => input.send_display_power(powered)?,
+            DenialMessage::DisplayPower { .. } | DenialMessage::Input { .. } =>
+                return Err("legacy input forwarding is retired; native input capability is required".into()),
             DenialMessage::RegisterRenderTarget {
                 object,
                 configure_serial,
                 buffer,
-            } => sink
-                .register_render_target(object, configure_serial, buffer, received.descriptors)
-                .map_err(|error| error.to_string())?,
-            DenialMessage::UnregisterRenderTarget { object, buffer } => sink
-                .unregister_render_target(object, buffer)
-                .map_err(|error| error.to_string())?,
+            } => {
+                if coordinator.is_retired(object) || coordinator.is_removing(object) {
+                    continue;
+                }
+                if let Err(error) = sink.register_render_target(
+                    object, configure_serial, buffer, received.descriptors,
+                ) {
+                    // Retirement may complete between the phase check above
+                    // and acquiring the sink's task map.
+                    if coordinator.is_removing(object) || coordinator.is_retired(object) {
+                        continue;
+                    }
+                    return Err(error.to_string());
+                }
+            }
+            DenialMessage::UnregisterRenderTarget { object, buffer } => {
+                if coordinator.is_retired(object) || coordinator.is_removing(object) {
+                    continue;
+                }
+                if let Err(error) = sink.unregister_render_target(object, buffer) {
+                    if coordinator.is_removing(object) || coordinator.is_retired(object) {
+                        continue;
+                    }
+                    return Err(error.to_string());
+                }
+            }
             task_message => {
                 if let DenialMessage::Presented {
                     timestamp_nanos,
@@ -247,6 +271,12 @@ fn event_loop(
                 }
                 let object = task_object(&task_message)
                     .ok_or_else(|| "task event omitted object identity".to_owned())?;
+                if coordinator.is_retired(object)
+                    || (coordinator.is_removing(object)
+                        && !matches!(task_message, DenialMessage::BufferReleased { .. }))
+                {
+                    continue;
+                }
                 let display = match sink.display_for_object(object) {
                     Ok(display) => display,
                     Err(_) if coordinator.is_retired(object) => continue,
@@ -269,16 +299,11 @@ fn event_loop(
                 // acknowledged to Denial. Wake the reservation before invoking
                 // Android's hotplug callback: during SurfaceFlinger bootstrap
                 // that callback may wait for the reservation owner to proceed.
-                if let AppliedDenialEvent::Configure {
-                    scale_numerator,
-                    scale_denominator,
-                    ..
-                } = &event
+                if let AppliedDenialEvent::Configure { .. } = &event
                 {
-                    coordinator.set_input_scale(object, *scale_numerator, *scale_denominator)?;
                     coordinator.display_connected(object)?;
                 }
-                dispatch_event(lifecycle, coordinator, input, object, display, event)?;
+                dispatch_event(lifecycle, coordinator, object, display, event)?;
             }
         }
     }
@@ -287,7 +312,6 @@ fn event_loop(
 fn dispatch_event(
     lifecycle: &ComposerLifecycle,
     coordinator: &TaskCoordinator,
-    input: &InputBridge,
     object: TaskObjectId,
     display: droidloom_composer::DisplayId,
     event: AppliedDenialEvent,
@@ -296,29 +320,14 @@ fn dispatch_event(
         AppliedDenialEvent::Configure {
             width,
             height,
-            scale_numerator,
-            scale_denominator,
             ..
         } => {
             if coordinator.is_direct_task(object) {
-                let (task, android_display) = coordinator.direct_task_route_for_object(object)?;
-                match input.send_task_bounds(
-                    task.0,
-                    android_display,
-                    width,
-                    height,
-                    scale_numerator,
-                    scale_denominator,
+                if let Err(error) = coordinator.queue_window_command(
+                    object,
+                    droidloom_task_control::TaskAction::Resize { width, height },
                 ) {
-                    Ok(()) => eprintln!(
-                        "Droidloom requested Android task {} bounds {width}x{height} at scale \
-                         {scale_numerator}/{scale_denominator}",
-                        task.0,
-                    ),
-                    Err(error) => eprintln!(
-                        "Droidloom deferred Android task {} bounds {width}x{height}: {error}",
-                        task.0
-                    ),
+                    eprintln!("Droidloom deferred Android object {} bounds: {error}", object.0);
                 }
                 return Ok(());
             }
@@ -338,11 +347,13 @@ fn dispatch_event(
         AppliedDenialEvent::Presented(_) => {}
         AppliedDenialEvent::Visibility { focused, .. } => {
             if focused && coordinator.is_direct_task(object) {
-                let (task, _) = coordinator.direct_task_route_for_object(object)?;
-                if let Err(error) = input.send_task_focus(task.0, true) {
+                if let Err(error) = coordinator.queue_window_command(
+                    object,
+                    droidloom_task_control::TaskAction::Focus,
+                ) {
                     eprintln!(
-                        "Droidloom deferred Android task {} keyboard focus: {error}",
-                        task.0
+                        "Droidloom deferred Android object {} keyboard focus: {error}",
+                        object.0
                     );
                 }
             }
@@ -358,59 +369,17 @@ fn dispatch_event(
                 );
                 return Ok(());
             }
-            let (task, _) = coordinator.direct_task_route_for_object(object)?;
-            match input.send_task_close(task.0) {
-                Ok(()) => eprintln!(
-                    "Droidloom requested Android task {} removal for host close object={}",
-                    task.0, object.0
-                ),
-                Err(error) => eprintln!(
-                    "Droidloom could not request Android task {} removal for host close: {error}",
-                    task.0
-                ),
+            if let Err(error) = coordinator.queue_window_command(
+                object,
+                droidloom_task_control::TaskAction::Close,
+            ) {
+                eprintln!(
+                    "Droidloom could not request Android object {} removal for host close: {error}",
+                    object.0
+                );
             }
         }
-        AppliedDenialEvent::Input {
-            serial,
-            timestamp_nanos,
-            event,
-        } => match coordinator.input_route_for_object(object) {
-            Ok((task, android_display, scale_numerator, scale_denominator)) => {
-                static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *KEY_TRACE.get_or_init(|| {
-                    std::env::var_os("DROIDLOOM_INPUT_TRACE").as_deref()
-                        == Some(std::ffi::OsStr::new("1"))
-                }) {
-                    if let InputEvent::Key {
-                        action,
-                        keycode,
-                        repeat,
-                    } = &event
-                    {
-                        eprintln!(
-                            "Droidloom key trace: stage=composer serial={serial} object={} task={} display={} action={action:?} scan_code={keycode} repeat={repeat}",
-                            object.0, task.0, android_display
-                        );
-                    }
-                }
-                if let Err(error) = input.send(
-                    serial,
-                    android_display,
-                    task.0,
-                    scale_numerator,
-                    scale_denominator,
-                    timestamp_nanos,
-                    event,
-                ) {
-                    eprintln!(
-                        "Droidloom dropped input serial {serial} for display {display:?}: {error}"
-                    );
-                }
-            }
-            Err(error) => eprintln!(
-                "Droidloom dropped unbound input serial {serial} for display {display:?}: {error}"
-            ),
-        },
+        AppliedDenialEvent::Input { .. } => return Err("legacy task input forwarding is retired".into()),
     }
     Ok(())
 }
@@ -429,6 +398,7 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
         DenialMessage::ServerHello { .. }
+        | DenialMessage::RequestInputChannel { .. }
         | DenialMessage::DisplayPower { .. }
         | DenialMessage::Ping { .. } => None,
     }

@@ -1,0 +1,341 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+index 9e7311f..5e5bb74 100644
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <bit>
+ #include <cmath>
+ #include <condition_variable>
+@@ -389,6 +390,8 @@ struct DroidloomLayers::State {
+     ConfigCache config;
+     std::map<uint64_t, std::shared_ptr<Read>> pending;
+     bool live = true;
++    bool retryOnRelease = false;
++    std::atomic<uint64_t> workRevision{1};
+ };
+ bool droidloomAsyncReleasesEnabled() {
+     static const bool enabled =
+@@ -421,12 +424,16 @@ sp<Fence> mergeDroidloomReleaseFence(const ReleaseCallbackId& id, sp<Fence> fenc
+ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint)
+     : mState(std::make_shared<State>()), mRequests(std::move(requests)) {
+     std::thread([state = mState, events = std::move(events), repaint = std::move(repaint)] {
++        const auto wakeWork = [&] {
++            state->workRevision.fetch_add(1, std::memory_order_release);
++            if (repaint) repaint();
++        };
+         std::vector<uint32_t> words;
+         base::unique_fd fd;
+         uint32_t op = 0;
+         while (receive(events.get(), 0, &words, &fd, &op)) {
+             if (op == 0x8005) {
+-                if (!configurationEvent(state->config, words, repaint)) break;
++                if (!configurationEvent(state->config, words, wakeWork)) break;
+                 continue;
+             }
+             if (op == 0x8007) {
+@@ -437,7 +444,7 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+                 }
+                 // One wake per drained batch, outside the state lock. Fresh
+                 // composition chooses current buffers, never an old snapshot.
+-                if (wake && repaint) repaint();
++                if (wake) wakeWork();
+                 continue;
+             }
+             if (op == 0x8006) {
+@@ -457,12 +464,12 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+                     }
+                     state->completed.notify_all();
+                 }
+-                if (wake && repaint) repaint();
++                if (wake) wakeWork();
+                 continue;
+             }
+             if (words.size() != 2 || (op != 0x8003 && op != 0x8004)) break;
+             const uint64_t ticket = words[0] | static_cast<uint64_t>(words[1]) << 32;
+-            std::lock_guard lock(state->mutex);
++            std::unique_lock lock(state->mutex);
+             auto it = state->pending.find(ticket);
+             if (it == state->pending.end()) {
+                 ALOGE("Droidloom unknown source release ticket");
+@@ -476,6 +483,9 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+                 break;
+             }
+             if (complete) state->pending.erase(it);
++            const bool retry = complete && state->retryOnRelease;
++            lock.unlock();
++            if (retry) wakeWork();
+         }
+         std::lock_guard lock(state->mutex);
+         state->live = false;
+@@ -484,6 +494,7 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+         // sync-files continue protecting buffers independently of this socket.
+         if (!state->pending.empty())
+             ALOGE("Droidloom layer stream lost with outstanding reads; retaining release gates");
++        wakeWork();
+     }).detach();
+ }
+ DroidloomLayers::~DroidloomLayers() = default;
+@@ -511,11 +522,25 @@ bool DroidloomLayers::getSize(ui::Size* size) {
+ }
+ 
+ bool DroidloomLayers::present(compositionengine::Output& output, uint32_t width, uint32_t height) {
++    {
++        std::lock_guard lock(mState->mutex);
++        // Arm before trying: a release racing with fallback preparation must
++        // leave a newer work revision rather than lose the retry wakeup.
++        mState->retryOnRelease = true;
++    }
+     const bool accepted = presentFrame(output, width, height);
++    {
++        std::lock_guard lock(mState->mutex);
++        mState->retryOnRelease = !accepted;
++    }
+     if (!accepted) invalidate();
+     return accepted;
+ }
+ 
++uint64_t DroidloomLayers::workRevision() const {
++    return mState->workRevision.load(std::memory_order_acquire);
++}
++
+ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t width,
+                                    uint32_t height) {
+     if (!droidloomAsyncReleasesEnabled()) return false;
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+index e5f3151..bb90397 100644
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -32,6 +32,7 @@ class DroidloomLayers {
+     ~DroidloomLayers();
+     void invalidate();
+     bool getSize(ui::Size* size);
++    uint64_t workRevision() const;
+     bool present(compositionengine::Output& output, uint32_t width, uint32_t height);
+ 
+    private:
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+index df866db..68a3c9e 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -375,6 +375,11 @@ ui::Size DroidloomNativeWindow::getTargetSize(SurfaceFlinger& flinger) {
+     return size;
+ }
+ 
++uint64_t DroidloomNativeWindow::getWorkRevision() {
++    std::lock_guard lock(mMutex);
++    return mLayers ? mLayers->workRevision() : 0;
++}
++
+ bool DroidloomNativeWindow::presentLayers(compositionengine::Output& output,
+                                         uint32_t width, uint32_t height, SurfaceFlinger& flinger) {
+     std::lock_guard lock(mMutex);
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+index 3466c07..159a491 100644
+--- a/services/surfaceflinger/DroidloomNativeWindow.h
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -41,6 +41,7 @@ public:
+     DroidloomNativeWindow(uint64_t task, uint32_t expectedWidth, uint32_t expectedHeight);
+     ~DroidloomNativeWindow() override;
+     ui::Size getTargetSize(SurfaceFlinger& flinger);
++    uint64_t getWorkRevision();
+     void setContentOpaque(bool opaque);
+     void setContentDamage(const Rect& damage);
+     bool presentLayers(compositionengine::Output& output, uint32_t width, uint32_t height, SurfaceFlinger& flinger);
+diff --git a/services/surfaceflinger/DroidloomTaskWork.h b/services/surfaceflinger/DroidloomTaskWork.h
+new file mode 100644
+index 0000000..bb8d04d
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomTaskWork.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <cstdint>
++#include <vector>
++
++namespace android {
++// Only acknowledged work is reusable. A wake arriving during preparation has
++// a newer revision and remains pending even if the older frame succeeds.
++class DroidloomTaskWork {
++    std::vector<uint64_t> mCandidate, mAccepted;
++    uint64_t mRevision = 0;
++    bool mValid = false;
++public:
++    void begin() { mCandidate.clear(); }
++    void add(uint64_t value) { mCandidate.push_back(value); }
++    bool needed(uint64_t revision, bool dirty) const {
++        return dirty || !mValid || mRevision != revision || mCandidate != mAccepted;
++    }
++    void accept(uint64_t revision) {
++        mAccepted.swap(mCandidate);
++        mRevision = revision;
++        mValid = true;
++    }
++};
++} // namespace android
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 160afef..2c7f44c 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -139,6 +139,7 @@
+ #include "Display/PhysicalDisplay.h"
+ #include "DisplayDevice.h"
+ #include "DroidloomNativeWindow.h"
++#include "DroidloomTaskWork.h"
+ #include "DisplayHardware/ComposerHal.h"
+ #include "DisplayHardware/FramebufferSurface.h"
+ #include "DisplayHardware/Hal.h"
+@@ -3463,9 +3464,11 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             Rect sourceCrop;
+             bool hasCrop = false;
+             bool hasBuffer = false;
++            bool dirty = false;
+             sp<IBinder> applicationToken;
+         };
+         struct DirectTaskOutput {
++            DroidloomTaskWork work;
+             sp<DroidloomNativeWindow> window;
+             std::unordered_map<uint64_t, std::shared_ptr<renderengine::ExternalTexture>> textures;
+             std::unique_ptr<compositionengine::CompositionEngine> engine;
+@@ -3509,6 +3512,14 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             if (!snapshot->isVisible) continue;
+ 
+             auto& frame = taskFrames[task];
++            auto& work = taskOutputs[task].work;
++            if (frame.layers.empty()) work.begin();
++            work.add(snapshot->uniqueSequence);
++            work.add(snapshot->buffer ? snapshot->buffer->getId() : 0);
++            work.add(snapshot->frameNumber);
++            frame.dirty |= snapshot->changes.any() || snapshot->clientChanges.any() ||
++                    snapshot->contentDirty || snapshot->autoRefresh || snapshot->isFrontBuffered() ||
++                    snapshot->sidebandStream != nullptr;
+             if (snapshot->inputInfo.applicationInfo.token != nullptr) {
+                 // Layers are traversed in Z order, so the topmost visible activity wins.
+                 frame.applicationToken = snapshot->inputInfo.applicationInfo.token;
+@@ -3530,16 +3541,9 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 }
+             }
+             frame.hasBuffer |= snapshot->externalTexture != nullptr;
+-            // Keep the task's LayerFE identity stable so OutputLayer coverage
+-            // and composition state survive ordinary buffer-only updates.
+-            auto& copy = taskOutputs[task].layers[snapshot->uniqueSequence];
+-            if (!copy) {
+-                copy = getFactory().createLayerFE(snapshot->name, owner);
+-                copy->mSnapshot = std::make_unique<frontend::LayerSnapshot>(*snapshot);
+-            } else {
+-                *copy->mSnapshot = *snapshot;
+-            }
+-            frame.layers.emplace_back(owner, copy);
++            // Retain references until the task dirty gate. Static tasks need
++            // neither a full snapshot copy nor Output preparation.
++            frame.layers.emplace_back(owner, sp<LayerFE>::fromExisting(layerFE));
+         }
+ 
+         std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
+@@ -3587,19 +3591,6 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 taskOutput.invalidated = true;
+                 continue;
+             }
+-            std::vector<uint32_t> layerOrder;
+-            layerOrder.reserve(frame.layers.size());
+-            for (const auto& [_, layer] : frame.layers) {
+-                layerOrder.push_back(layer->mSnapshot->uniqueSequence);
+-            }
+-            const bool layersChanged = layerOrder != taskOutput.layerOrder;
+-            if (layersChanged) {
+-                taskOutput.layerOrder = std::move(layerOrder);
+-                std::erase_if(taskOutput.layers, [&](const auto& entry) {
+-                    return std::find(taskOutput.layerOrder.begin(), taskOutput.layerOrder.end(),
+-                                     entry.first) == taskOutput.layerOrder.end();
+-                });
+-            }
+             if (!taskOutput.window) {
+                 if (systemTime() < taskOutput.retryAfter) continue;
+                 status_t initializationStatus = NO_ERROR;
+@@ -3643,6 +3634,14 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 taskOutput.engine->setHwComposer(mHWComposer.get());
+             }
+             const ui::Size targetSize = taskOutput.window->getTargetSize(*this);
++            // Capture before preparation. Asynchronous completions/configures
++            // increment this before scheduling composition, avoiding lost work.
++            const uint64_t workRevision = taskOutput.window->getWorkRevision();
++            const bool directLayers = base::GetBoolProperty("persist.vendor.droidloom.direct_layers", true);
++            taskOutput.work.add(directLayers);
++            taskOutput.work.add(static_cast<uint64_t>(refreshArgs.outputColorSetting));
++            taskOutput.work.add(static_cast<uint64_t>(refreshArgs.forceOutputColorMode));
++            taskOutput.work.add(static_cast<uint64_t>(refreshArgs.internalDisplayRotationFlags));
+             const Rect compositionCrop{
+                     frame.sourceCrop.left,
+                     frame.sourceCrop.top,
+@@ -3656,6 +3655,43 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                     taskOutput.targetSize != targetSize ||
+                     taskOutput.output->getState().layerFilter.layerStack != layerStack ||
+                     taskOutput.pacesetter != pacesetterId;
++            static uint64_t skippedTasks = 0, copiedSnapshots = 0, preparedTasks = 0;
++            static nsecs_t lastTaskStats = 0;
++            const bool dirty = resetOutput || taskOutput.invalidated || frame.dirty ||
++                    refreshArgs.colorTransformMatrix.has_value() ||
++                    refreshArgs.devOptFlashDirtyRegionsDelay.has_value();
++            const bool needsWork = taskOutput.work.needed(workRevision, dirty);
++            if (base::GetBoolProperty("persist.vendor.droidloom.task_stats", false) &&
++                taskNow - lastTaskStats >= 5'000'000'000) {
++                ALOGI("Droidloom task work: skipped=%" PRIu64 " snapshots=%" PRIu64 " prepared=%" PRIu64,
++                      skippedTasks, copiedSnapshots, preparedTasks);
++                lastTaskStats = taskNow;
++            }
++            if (!needsWork) { ++skippedTasks; continue; }
++            ++preparedTasks;
++            std::vector<uint32_t> layerOrder;
++            layerOrder.reserve(frame.layers.size());
++            for (auto& [owner, layer] : frame.layers) {
++                const auto& snapshot = *layer->mSnapshot;
++                layerOrder.push_back(snapshot.uniqueSequence);
++                auto& copy = taskOutput.layers[snapshot.uniqueSequence];
++                if (!copy) {
++                    copy = getFactory().createLayerFE(snapshot.name, owner);
++                    copy->mSnapshot = std::make_unique<frontend::LayerSnapshot>(snapshot);
++                } else {
++                    *copy->mSnapshot = snapshot;
++                }
++                layer = copy;
++                ++copiedSnapshots;
++            }
++            const bool layersChanged = layerOrder != taskOutput.layerOrder;
++            if (layersChanged) {
++                taskOutput.layerOrder = std::move(layerOrder);
++                std::erase_if(taskOutput.layers, [&](const auto& entry) {
++                    return std::find(taskOutput.layerOrder.begin(), taskOutput.layerOrder.end(),
++                                     entry.first) == taskOutput.layerOrder.end();
++                });
++            }
+             if (taskOutput.targetSize != targetSize) taskOutput.textures.clear();
+             if (resetOutput) {
+                 taskOutput.pacesetter = pacesetterId;
+@@ -3707,7 +3743,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             // Resolve the same occlusion, clipping and HWC geometry used by
+             // normal composition, but export the original producer buffers
+             // before invoking RenderEngine. This policy is application-neutral.
+-            if (base::GetBoolProperty("persist.vendor.droidloom.direct_layers", true) &&
++            if (directLayers &&
+                 droidloomAsyncReleasesEnabled()) {
+                 compositionengine::LayerFESet snapshots;
+                 output->prepare(taskRefresh, snapshots);
+@@ -3715,6 +3751,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 output->updateCompositionState(taskRefresh);
+                 if (taskOutput.window->presentLayers(*output, targetSize.width, targetSize.height, *this)) {
+                     taskOutput.invalidated = false;
++                    taskOutput.work.accept(workRevision);
+                     continue;
+                 }
+             }
+@@ -3779,6 +3816,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             const int readyFence = renderFence != Fence::NO_FENCE ? renderFence->dup() : -1;
+             status = nativeWindow->queueBuffer(nativeWindow, nativeBuffer, readyFence);
+             taskOutput.invalidated = status != NO_ERROR;
++            if (status == NO_ERROR) taskOutput.work.accept(workRevision);
+             if (status != NO_ERROR) {
+                 ALOGE("Failed to present Android task %d: %d", task, status);
+             }

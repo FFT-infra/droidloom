@@ -29,6 +29,8 @@ source-generation roles.
 | `droidloom-systemui-stubs` | Regenerate SystemUI Binder adapters when pinned AOSP interfaces change. The Rust builder checks these adapters. |
 | `droidloom-dmabuf-probe` | GLES/DMA-BUF/explicit-sync diagnostic; does not validate a complete Android app. |
 | `droidloom-translation-bench` | Repeat Digitalis host correctness tests, time seven guest workloads across three translation modes, and compare saved runs. See [translation benchmarking](../docs/BUILDING.md#translation-stress-and-performance-benchmarks). |
+| `droidloom-frame-timing` | Report sampled frame-stage elapsed/CPU percentiles and compare saved captures. See [frame timing baselines](../docs/BUILDING.md#frame-stage-timing-baselines). |
+| `droidloom-gpu-usage` | Read DRM per-client GPU engine counters and memory, deduplicate shared handles and retain bounded captures. Built by the `droidloom-frame-timing` package; see [GPU accounting](../docs/BUILDING.md#gpu-client-accounting). |
 | `droidloom-inspect.rs` | Optional read-only diagnostics for the development workstation's u1000 cell; fixed `features`, `properties`, and `configuration` modes. |
 
 The Rust updater and package workflow own x86_64 installation, init projection

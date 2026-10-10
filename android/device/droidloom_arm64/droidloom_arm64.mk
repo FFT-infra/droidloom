@@ -49,8 +49,7 @@ PRODUCT_PACKAGES += \
     DroidloomConnectivityOverlay \
     android.hardware.ethernet.prebuilt.xml \
     android.hardware.graphics.composer3-service.droidloom \
-    droidloom-task-launcher \
-    droidloom-input-bridge \
+    droidloom-framework-init \
     droidloom-lmkd-compat \
     droidloom-classpath-wrapper \
     android.hardware.graphics.allocator-service.minigbm \
@@ -79,6 +78,7 @@ PRODUCT_COPY_FILES += \
 # lib{EGL,GLESv1_CM,GLESv2}_mesa.so and vulkan.freedreno.so.
 # The ARM64 Mesa rendering path supports GLES 3.2 (0x00030002 = 196610).
 PRODUCT_VENDOR_PROPERTIES += \
+    persist.audio.normal_playback_period_ms=5 \
     ro.zygote=zygote64 \
     ro.vendor.droidloom.surfaceflinger_direct=true \
     ro.vendor.droidloom.surfaceflinger_tasks=true \

@@ -18,6 +18,8 @@ pub enum Component {
     Wayland,
     #[value(name = "droidloom-applications", alias = "applications")]
     Applications,
+    #[value(name = "droidloom-audio", alias = "audio")]
+    Audio,
     #[value(name = "droidloom-doctor", alias = "doctor")]
     Doctor,
     #[value(name = "droidloom-package-support", alias = "package-support")]
@@ -30,6 +32,7 @@ impl Component {
             Self::Supervisor => "droidloom-supervisor",
             Self::Wayland => "droidloom-wayland",
             Self::Applications => "droidloom-applications",
+            Self::Audio => "droidloom-audio",
             Self::Doctor => "droidloom-doctor",
             Self::PackageSupport => "droidloom-package-support",
         }
@@ -44,6 +47,7 @@ impl Component {
             ],
             Self::Wayland => &[("droidloom-wayland", "usr/bin/droidloom-wayland")],
             Self::Applications => &[("droidloom-applications", "usr/bin/droidloom-applications")],
+            Self::Audio => &[("droidloom-audio", "usr/bin/droidloom-audio")],
             Self::Doctor => &[("droidloom-doctor", "usr/bin/droidloom-doctor")],
             Self::PackageSupport => &[(
                 "droidloom-package-helper",

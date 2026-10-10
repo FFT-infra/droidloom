@@ -25,11 +25,19 @@ licenses; applying a patch does not give Droidloom ownership of that code.
   retains its Android Open Source Project copyright and Apache-2.0 notice.
   The audio APEX recipe preserves the upstream Apache license alongside
   Droidloom's GPL-covered changes.
+  The Java WindowManager policy adapter follows the pinned PhoneWindowManager
+  window-type classification and framework lifecycle contracts; its retained
+  AOSP portions carry their Apache-2.0 notice. The Rust policy/task engine, its
+  narrow JNI string adapter, and original
+  adapter additions are GPL-3.0-or-later.
 - Mesa, minigbm, libdrm and other graphics dependencies retain their upstream
   licenses. Mesa's source tree includes tools under different licenses; its
   core library is MIT-licensed. Consult the individual upstream files and
   Mesa's license catalog rather than assigning one license to the whole tree.
 - Cargo dependencies retain their published license expressions and notices.
+  The audio broker also uses the host distribution's PipeWire/SPA development
+  headers and shared library under their upstream terms. Its narrow C ABI adapter
+  is original Droidloom code; PipeWire is not vendored or linked into Android.
   The Rust package workflow collects their supplied license/copyright files
   and an inventory from locked Cargo metadata. This inventory includes
   workspace build/test and platform dependencies as well as runtime libraries;

@@ -907,9 +907,11 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     // pairing applies to all Android children, including mapper clients.
     init.env_remove("MESA_LOADER_DRIVER_OVERRIDE")
         .env_remove("vendor.minigbm.allocator");
+    if spec.graphics_backend != crate::GraphicsBackend::Drm {
+        init.env("vendor.minigbm.allocator", "dma_heap_images");
+    }
     if spec.graphics_backend == crate::GraphicsBackend::KgslDmaHeap {
-        init.env("MESA_LOADER_DRIVER_OVERRIDE", "zink")
-            .env("vendor.minigbm.allocator", "dma_heap_images");
+        init.env("MESA_LOADER_DRIVER_OVERRIDE", "zink");
     }
     let error = std::os::unix::process::CommandExt::exec(
         init.arg("second_stage")
@@ -1799,8 +1801,14 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     let denial_target = root.join(ANDROID_DENIAL_SOCKET);
     create_mount_target(&denial_target)?;
     bind_mount(&spec.denial_socket, &denial_target, false)?;
-    // Optional companion socket, owned by the same presenter. Older hosts
-    // without text-input support keep their ordinary hardware-key path.
+    // Framework-only host channels. The host listener is reachable only below
+    // its owner's 0700 directory. This guest mount directory restricts access
+    // to root/system even when the host owner is not Android's UID 1000.
+    let framework_host = root.join("dev/socket/droidloom-framework-host");
+    fs::create_dir_all(&framework_host)
+        .map_err(|source| io_error("create framework host channel directory", source))?;
+    set_owner(&framework_host, 1000, 1000)?;
+    set_mode(&framework_host, 0o700)?;
     let text_socket = spec.denial_socket.with_file_name("text-input.sock");
     if text_socket.exists() {
         if !fs::metadata(&text_socket)
@@ -1812,11 +1820,13 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
                 "text-input endpoint is not a socket".into(),
             ));
         }
-        let target = root.join("dev/socket/droidloom/text-input");
+        let target = framework_host.join("text-input");
         create_mount_target(&target)?;
         bind_mount(&text_socket, &target, false)?;
     }
-    for name in ["clipboard", "notifications"] {
+    // Audio is a separate user broker. Its systemd-owned socket survives broker
+    // restarts, preserving the inode bind-mounted into the Android cell.
+    for name in ["clipboard", "notifications", "audio"] {
         let socket = spec.denial_socket.with_file_name(format!("{name}.sock"));
         if socket.exists() {
             if !fs::symlink_metadata(&socket)
@@ -1828,7 +1838,11 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
                     "{name} endpoint is not a socket"
                 )));
             }
-            let target = root.join(format!("dev/socket/droidloom/{name}"));
+            let target = if name == "audio" {
+                root.join("dev/socket/droidloom/audio")
+            } else {
+                framework_host.join(name)
+            };
             create_mount_target(&target)?;
             bind_mount(&socket, &target, false)?;
         }
@@ -1961,8 +1975,7 @@ fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), Developmen
         .map_err(|source| io_error("read Android init for ADB", source))?;
     init.push_str(crate::adb::INIT_POLICY);
     let source = directory.join("init.rc");
-    fs::write(&source, init)
-        .map_err(|source| io_error("write Android ADB init policy", source))?;
+    fs::write(&source, init).map_err(|source| io_error("write Android ADB init policy", source))?;
     set_mode(&source, 0o644)?;
     bind_mount(&source, &target, true)
 }

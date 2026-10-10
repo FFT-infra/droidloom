@@ -10,8 +10,7 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.drawable.Drawable;
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
+import com.android.droidloom.runtime.HostChannel;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.UserHandle;
@@ -24,6 +23,7 @@ import java.io.DataOutputStream;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.UUID;
 import org.json.JSONArray;
@@ -43,7 +43,7 @@ public final class NotificationBridge extends NotificationListenerService implem
     private long generation;
     private boolean dirty;
     private volatile boolean stopped, connected, listening;
-    private volatile LocalSocket socket;
+    private volatile HostChannel socket;
     private static final class Entry {
         final StatusBarNotification sbn;
         final String version;
@@ -56,7 +56,7 @@ public final class NotificationBridge extends NotificationListenerService implem
     public void start() {
         try {
             registerAsSystemService(context, new ComponentName(context, NotificationBridge.class), UserHandle.USER_SYSTEM);
-            Log.i(TAG, "DROIDLOOM_NOTIFICATIONS_ABI=1;");
+            Log.i(TAG, "DROIDLOOM_NOTIFICATIONS_ABI=2;");
             Thread worker = new Thread(this::connect, "droidloom-notifications");
             worker.setDaemon(true); worker.start();
         } catch (Exception e) { Log.e(TAG, "Notification listener registration failed: " + e.getClass().getSimpleName()); }
@@ -94,19 +94,17 @@ public final class NotificationBridge extends NotificationListenerService implem
     private void connect() {
         com.android.droidloom.runtime.CpuPlacement.background();
         while (!stopped) {
-            try (LocalSocket current = new LocalSocket()) {
+            try (HostChannel current = HostChannel.open(HostChannel.NOTIFICATIONS)) {
                 socket=current;
-                current.connect(new LocalSocketAddress("droidloom-notifications", LocalSocketAddress.Namespace.ABSTRACT));
-                if (current.getPeerCredentials().getUid()!=0) throw new SecurityException();
                 DataOutputStream out=new DataOutputStream(current.getOutputStream());
-                send(out,new JSONObject().put("type","hello").put("abi",1));
+                send(out,new JSONObject().put("type","hello").put("abi",2));
                 current.setSoTimeout(5000);
                 DataInputStream input=new DataInputStream(current.getInputStream());
                 int helloLength=input.readInt();
                 if(helloLength<=0 || helloLength>4096) throw new IllegalArgumentException();
                 byte[] helloBytes=new byte[helloLength]; input.readFully(helloBytes);
                 JSONObject hello=new JSONObject(new String(helloBytes,StandardCharsets.UTF_8));
-                if(!"hello".equals(hello.optString("type")) || hello.optInt("abi")!=1) throw new IllegalArgumentException();
+                if(!"hello".equals(hello.optString("type")) || hello.optInt("abi")!=2) throw new IllegalArgumentException();
                 current.setSoTimeout(0);
                 connected=true;
                 Thread writer=new Thread(() -> writeSnapshots(current,out),"droidloom-notifications-out");
@@ -131,8 +129,10 @@ public final class NotificationBridge extends NotificationListenerService implem
             if(!stopped) try { Thread.sleep(2000); } catch(InterruptedException ignored) { }
         }
     }
-    private void writeSnapshots(LocalSocket current, DataOutputStream out) {
+    private void writeSnapshots(HostChannel current, DataOutputStream out) {
         com.android.droidloom.runtime.CpuPlacement.background();
+        LinkedHashMap<String,String> sent = new LinkedHashMap<>();
+        boolean initial = true;
         try {
             while(!stopped && connected) {
                 ArrayList<Entry> entries;
@@ -141,12 +141,32 @@ public final class NotificationBridge extends NotificationListenerService implem
                     if(stopped || !connected) return;
                     entries=new ArrayList<>(active.values()); dirty=false;
                 }
-                send(out,new JSONObject().put("type","begin"));
-                for(Entry entry:entries) {
-                    try { send(out,new JSONObject().put("type","post").put("notification",encode(entry))); }
-                    catch(org.json.JSONException | android.content.pm.PackageManager.NameNotFoundException e) { /* An uninstalled app can race a snapshot. */ }
+                LinkedHashMap<String,String> next = new LinkedHashMap<>();
+                if(initial) send(out,new JSONObject().put("type","begin"));
+                else {
+                    // Retire entries before adding replacements so a full host set
+                    // never transiently exceeds MAX_ACTIVE during a delta update.
+                    HashSet<String> present = new HashSet<>();
+                    for(Entry entry:entries) present.add(entry.sbn.getKey());
+                    for(String key:sent.keySet()) if(!present.contains(key))
+                        send(out,new JSONObject().put("type","remove").put("key",key).put("version",sent.get(key)));
                 }
-                send(out,new JSONObject().put("type","end"));
+                for(Entry entry:entries) {
+                    String key=entry.sbn.getKey();
+                    if(!initial && entry.version.equals(sent.get(key))) {
+                        next.put(key,entry.version); continue;
+                    }
+                    try {
+                        send(out,new JSONObject().put("type","post").put("notification",encode(entry)));
+                        next.put(key,entry.version);
+                    } catch(org.json.JSONException | android.content.pm.PackageManager.NameNotFoundException e) {
+                        // Preserve the acknowledged version so a later event retries this entry.
+                        // An app removed during encoding is retired by the following removal event.
+                        if(sent.containsKey(key)) next.put(key,sent.get(key));
+                    }
+                }
+                if(initial) send(out,new JSONObject().put("type","end"));
+                sent=next; initial=false;
             }
         } catch(Exception e) { closeSocket(current); }
     }
@@ -221,12 +241,12 @@ public final class NotificationBridge extends NotificationListenerService implem
         if(bytes.length>MAX_FRAME) throw new IllegalArgumentException("Notification frame too large");
         out.writeInt(bytes.length); out.write(bytes); out.flush();
     }
-    private static void closeSocket(LocalSocket socket) {
+    private static void closeSocket(HostChannel socket) {
         try { socket.shutdownInput(); } catch(Exception ignored) { }
         try { socket.shutdownOutput(); } catch(Exception ignored) { }
         try { socket.close(); } catch(Exception ignored) { }
     }
-    private void disconnect() { connected=false; LocalSocket current=socket; if(current!=null) closeSocket(current); synchronized(lock) { lock.notifyAll(); } }
+    private void disconnect() { connected=false; HostChannel current=socket; if(current!=null) closeSocket(current); synchronized(lock) { lock.notifyAll(); } }
     @Override public void close() { stopped=true; disconnect(); try { unregisterAsSystemService(); } catch(Exception ignored) { } }
-    public void dump(PrintWriter out) { synchronized(lock) { out.println("DROIDLOOM_NOTIFICATIONS_ABI=1; notificationsListening="+listening+" notificationsConnected="+connected+" activeNotifications="+active.size()); } }
+    public void dump(PrintWriter out) { synchronized(lock) { out.println("DROIDLOOM_NOTIFICATIONS_ABI=2; notificationsListening="+listening+" notificationsConnected="+connected+" activeNotifications="+active.size()); } }
 }
