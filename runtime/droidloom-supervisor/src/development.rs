@@ -58,6 +58,13 @@ compile_error!("Droidloom supports only aarch64 and x86_64 hosts");
 const DRM_DEVICE_MAJOR: u64 = 226;
 const DRM_RENDER_MINOR_BASE: u64 = 128;
 const MAX_RENDER_NODE_UEVENT_BYTES: usize = 64 * 1024;
+const V4L2_CAP_VIDEO_M2M_MPLANE: u32 = 0x0000_4000;
+const V4L2_CAP_DEVICE_CAPS: u32 = 0x8000_0000;
+const V4L2_QUERYCAP_IOCTL: libc::c_ulong = 0x8068_5600;
+const ANDROID_IRIS_VIDEO_NODE: &str = "video0";
+const ANDROID_CAMERA_GID: u32 = 1006;
+const ANDROID_SYSTEM_UID: u32 = 1000;
+const ANDROID_SYSTEM_GID: u32 = 1000;
 const PRIVATE_SYSCTL_DIRECTORY: &str = "android-private-sysctls";
 const PRIVATE_NET_CORE_DIRECTORY: &str = "net-core";
 const PRIVATE_BPF_SYSCTLS: [(&str, &str); 2] =
@@ -1821,8 +1828,25 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             .map_err(|source| io_error("create render-node minor compatibility alias", source))?;
     }
 
+    let iris_devices_ready = if spec.video_decoder == Some(crate::VideoDecoderBackend::Iris) {
+        match create_iris_device_nodes(&dev) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "droidloom-supervisor: warning: Iris video decoding is unavailable ({error}); continuing without Iris devices"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     for path in spec.graphics_backend.auxiliary_devices() {
         let path = Path::new(path);
+        if iris_devices_ready && path == Path::new("/dev/dma_heap/system") {
+            continue;
+        }
         let (major, minor) = auxiliary_graphics_device_numbers(path)?;
         let target = root.join(path.strip_prefix("/").expect("fixed absolute device path"));
         fs::create_dir_all(target.parent().expect("device parent"))
@@ -1910,6 +1934,156 @@ fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), Developm
         u32::try_from(major).expect("Linux device major"),
         u32::try_from(minor).expect("Linux device minor"),
     ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IrisVideoDecoder {
+    major: u32,
+    minor: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct V4l2Capability {
+    driver: [u8; 16],
+    card: [u8; 32],
+    bus_info: [u8; 32],
+    version: u32,
+    capabilities: u32,
+    device_caps: u32,
+    reserved: [u32; 3],
+}
+
+fn is_iris_decoder_capability(capability: &V4l2Capability, effective_caps: u32) -> bool {
+    c_string_field(&capability.driver) == "iris_driver"
+        && c_string_field(&capability.card) == "Iris Decoder"
+        && effective_caps & V4L2_CAP_VIDEO_M2M_MPLANE != 0
+}
+
+fn c_string_field(bytes: &[u8]) -> &str {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+fn discover_iris_video_decoder() -> Result<IrisVideoDecoder, DevelopmentError> {
+    let class_root = Path::new("/sys/class/video4linux");
+    let entries = fs::read_dir(class_root)
+        .map_err(|source| io_error("enumerate host V4L2 devices", source))?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error("read host V4L2 entry", source))?;
+        let Some(node_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !node_name
+            .strip_prefix("video")
+            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let device_link = entry.path().join("device/driver");
+        let driver = match fs::canonicalize(&device_link) {
+            Ok(driver) => driver,
+            Err(_) => continue,
+        };
+        if driver.file_name().and_then(OsStr::to_str) != Some("qcom-iris") {
+            continue;
+        }
+
+        let host_path = Path::new("/dev").join(&node_name);
+        let metadata = fs::symlink_metadata(&host_path)
+            .map_err(|source| io_error("stat candidate Iris decoder", source))?;
+        if !metadata.file_type().is_char_device() {
+            return Err(DevelopmentError::InvalidInput(format!(
+                "{} is not a character device",
+                host_path.display()
+            )));
+        }
+        let (major, minor) = linux_device_numbers(metadata.rdev());
+        let uevent = fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/uevent"))
+            .map_err(|source| io_error("read candidate Iris decoder identity", source))?;
+        if !uevent
+            .lines()
+            .any(|line| line == format!("DEVNAME={node_name}"))
+        {
+            return Err(DevelopmentError::InvalidInput(format!(
+                "{} does not match its kernel device identity",
+                host_path.display()
+            )));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&host_path)
+            .map_err(|source| io_error("open candidate Iris decoder for QUERYCAP", source))?;
+        let mut capability = V4l2Capability::default();
+        // SAFETY: V4L2 defines VIDIOC_QUERYCAP as _IOR('V', 0, struct
+        // v4l2_capability); repr(C) matches the kernel UAPI layout.
+        let result = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                V4L2_QUERYCAP_IOCTL,
+                std::ptr::addr_of_mut!(capability),
+            )
+        };
+        if result != 0 {
+            return Err(io_error(
+                "query candidate Iris decoder capabilities",
+                io::Error::last_os_error(),
+            ));
+        }
+        let caps = if capability.capabilities & V4L2_CAP_DEVICE_CAPS != 0 {
+            capability.device_caps
+        } else {
+            capability.capabilities
+        };
+        if !is_iris_decoder_capability(&capability, caps) {
+            continue;
+        }
+        matches.push(IrisVideoDecoder {
+            major: u32::try_from(major).expect("Linux device major fits u32"),
+            minor: u32::try_from(minor).expect("Linux device minor fits u32"),
+        });
+    }
+    match matches.as_slice() {
+        [decoder] => Ok(decoder.clone()),
+        [] => Err(DevelopmentError::InvalidInput(
+            "Iris decoder requested but no qcom-iris V4L2 node with iris_driver, Iris Decoder, and M2M multi-planar capability was found".into(),
+        )),
+        _ => Err(DevelopmentError::InvalidInput(
+            "multiple Iris V4L2 M2M multi-planar nodes matched; refusing ambiguous exposure".into(),
+        )),
+    }
+}
+
+fn create_iris_device_nodes(dev: &Path) -> Result<(), DevelopmentError> {
+    let decoder = discover_iris_video_decoder()?;
+    let (heap_major, heap_minor) = auxiliary_graphics_device_numbers(Path::new("/dev/dma_heap/system"))?;
+    let decoder_node = dev.join(ANDROID_IRIS_VIDEO_NODE);
+    let heap_node = dev.join("dma_heap/system");
+    fs::create_dir_all(heap_node.parent().expect("fixed DMA heap path"))
+        .map_err(|source| io_error("create private DMA heap directory", source))?;
+
+    let result = (|| {
+        make_device_node(&decoder_node, "c", decoder.major, decoder.minor, "660")?;
+        // The Codec2 service runs as user media with the camera supplementary
+        // group; the private node is inaccessible to other Android groups.
+        set_owner(&decoder_node, 0, ANDROID_CAMERA_GID)?;
+
+        // Android's standard ueventd rule exposes the system DMA heap as
+        // 0444 system:system. Keep that exact node private to this cell.
+        make_device_node(&heap_node, "c", heap_major, heap_minor, "444")?;
+        set_owner(&heap_node, ANDROID_SYSTEM_UID, ANDROID_SYSTEM_GID)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&decoder_node);
+        let _ = fs::remove_file(&heap_node);
+    }
+    result
 }
 
 fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
