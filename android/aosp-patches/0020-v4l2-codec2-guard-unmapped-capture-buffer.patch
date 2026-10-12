@@ -1,0 +1,20 @@
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -661,8 +661,14 @@
+ 
+         // Get the corresponding VideoFrame of the dequeued buffer.
+         auto it = mFrameAtDevice.find(bufferId);
+-        ALOG_ASSERT(it != mFrameAtDevice.end(), "buffer %zu is not found at mFrameAtDevice",
+-                    bufferId);
++        if (it == mFrameAtDevice.end()) {
++            ALOGE("CAPTURE DQBUF returned an unmapped buffer: id=%zu bitstreamId=%d "
++                  "bytesUsed=%zu mapped=%zu allocated=%zu",
++                  bufferId, bitstreamId, bytesUsed, mFrameAtDevice.size(),
++                  mOutputQueue->allocatedBuffersCount());
++            onError();
++            return;
++        }
+         auto frame = std::move(it->second);
+         mFrameAtDevice.erase(it);
+ 
