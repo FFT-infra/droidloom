@@ -1,0 +1,13 @@
+# Include the platform GRALLOC allocator in Codec2 pool mask. The default mask
+# omits it, which falls back to BASIC_GRAPHIC and allocates a new DMA-BUF for
+# every ByteBuffer output frame. Keep the default ION and BUFFERQUEUE pools.
+on early-init
+    setprop debug.stagefright.c2-poolmask 458752
+
+service droidloom-v4l2-codec2 /vendor/bin/hw/android.hardware.media.c2-default-service
+    class hal
+    user media
+    group camera mediadrm drmrpc
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh
+    setenv MESA_GLSL_CACHE_DISABLE 1

@@ -1,0 +1,28 @@
+cc_binary {
+    name: "droidloom-v4l2-codec2-service",
+    stem: "android.hardware.media.c2-default-service",
+    vendor: true,
+    relative_install_path: "hw",
+    defaults: ["libcodec2-aidl-defaults"],
+    srcs: ["droidloom-v4l2-codec2-service.cpp"],
+    shared_libs: [
+        "//external/v4l2_codec2:libv4l2_codec2_v4l2",
+        "//external/v4l2_codec2:libv4l2_codec2_components",
+        "libavservices_minijail",
+        "libchrome",
+        "libcutils",
+        "liblog",
+        "libutils",
+    ],
+    required: ["android.hardware.media.c2-default-seccomp_policy", "droidloom-v4l2-codec2-extended-seccomp-policy"],
+    init_rc: ["droidloom-v4l2-codec2-service.rc"],
+    vintf_fragments: ["droidloom-v4l2-codec2-service.xml"],
+}
+
+prebuilt_etc {
+    name: "droidloom-v4l2-codec2-extended-seccomp-policy",
+    src: "seccomp_policy/android.hardware.media.c2-extended-seccomp_policy",
+    filename: "android.hardware.media.c2-extended-seccomp_policy",
+    sub_dir: "seccomp_policy",
+    vendor: true,
+}

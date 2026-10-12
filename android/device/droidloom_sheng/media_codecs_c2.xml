@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MediaCodecs>
+    <!-- Iris decoders rank ahead of Android's software codecs (rank 512), so
+         MediaCodecList prefers hardware and falls back to software for formats
+         outside the limits below. All four decoders passed every AVC/HEVC/VP9/
+         AV1 ByteBuffer/Surface row at 1080p and 4K on release
+         1790523179423045439-1267899. -->
+    <!-- Caps: 4K30 or 1080p60. The vendor service admits four decoder
+         instances in total, so further simultaneous streams use software. -->
+    <Decoders>
+        <MediaCodec name="c2.v4l2.avc.decoder" type="video/avc" rank="256">
+            <Limit name="size" min="16x16" max="3840x2160" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="blocks-per-second" range="1-972000" />
+            <Limit name="bitrate" range="1-120000000" />
+            <Limit name="concurrent-instances" max="4" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.v4l2.hevc.decoder" type="video/hevc" rank="256">
+            <Limit name="size" min="16x16" max="3840x2160" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="blocks-per-second" range="1-972000" />
+            <Limit name="bitrate" range="1-120000000" />
+            <Limit name="concurrent-instances" max="4" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.v4l2.vp9.decoder" type="video/x-vnd.on2.vp9" rank="256">
+            <Limit name="size" min="16x16" max="3840x2160" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="blocks-per-second" range="1-972000" />
+            <Limit name="bitrate" range="1-120000000" />
+            <Limit name="concurrent-instances" max="4" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.v4l2.av1.decoder" type="video/av01" rank="256">
+            <Limit name="size" min="16x16" max="3840x2160" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="blocks-per-second" range="1-972000" />
+            <Limit name="bitrate" range="1-120000000" />
+            <Limit name="concurrent-instances" max="4" />
+        </MediaCodec>
+    </Decoders>
+</MediaCodecs>
