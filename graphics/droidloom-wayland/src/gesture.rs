@@ -1,0 +1,555 @@
+//! Finger-only edge gesture recognition.
+//!
+//! The recognizer never consumes a stream before it commits: while a candidate
+//! is pending the application receives every event, and the caller pilfers the
+//! contact exactly once by cancelling it when the swipe confirms. Pen tools,
+//! additional fingers, vertical scrolling and outward drags never produce a
+//! Back. There is no animation, no timer and no cross-contact state.
+//!
+//! [`TopPullCandidate`] is the same idea for a drag out of the top edge, and
+//! nothing more than that: it classifies, it never confirms and the caller
+//! never consumes the contact. It exists so the pull can be drawn, and that
+//! drawing plus the reveal its release can earn is the whole of its effect —
+//! the shell's own top-edge gesture keeps the touch, fullscreen is not toggled
+//! from here, and a Back is never the result.
+
+use droidloom_denial_protocol::TaskObjectId;
+
+/// Width of the edge band where a swipe may begin, in logical pixels.
+pub const EDGE_MARGIN: f64 = 24.0;
+/// Depth of the top band a pull may begin in, in logical pixels.
+pub const TOP_MARGIN: f64 = 48.0;
+/// Travel that classifies an undecided swipe.
+pub const SLOP: f64 = 10.0;
+/// Inward travel that commits a Back.
+pub const CONFIRM_DISTANCE: f64 = 48.0;
+/// Travel a fling must reach before velocity alone can commit it.
+pub const FLING_TRAVEL: f64 = 24.0;
+/// Logical pixels per second that qualify a fling.
+pub const FLING_SPEED: f64 = 750.0;
+/// Retreat toward the start edge that aborts a committed swipe before release.
+pub const RETREAT_DISTANCE: f64 = 16.0;
+/// Downward travel a pull reveals with, at any speed.
+pub const TOP_CONFIRM_PULL: f64 = 32.0;
+/// Shorter travel that reveals only from a flick.
+pub const TOP_FLICK_PULL: f64 = 20.0;
+/// Milliseconds after the touch down within which a short pull is still a flick.
+pub const TOP_FLICK_MS: u64 = 200;
+
+/// One recognition update for a tracked contact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwipeUpdate {
+    /// Undecided; the application keeps receiving the stream.
+    Pending,
+    /// The swipe committed; the caller cancels the contact exactly once.
+    Confirmed,
+    /// The candidate disqualified; the application keeps the whole stream.
+    Cancelled,
+}
+
+/// A live view of the swipe, for drawing feedback while it is still undecided.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SwipeFeedback {
+    pub from_left: bool,
+    /// How far the contact has travelled away from its edge.
+    pub inward: f64,
+    /// Where the contact landed along the edge, in content coordinates. The
+    /// stage is drawn around this rather than around the finger, so the
+    /// indicator stays put and only its depth follows the hand.
+    pub along: f64,
+    /// Signed inward speed in logical pixels per second.
+    pub speed: f64,
+    pub confirmed: bool,
+}
+
+/// A single finger monitored for an inward edge swipe over one task.
+#[derive(Clone, Copy, Debug)]
+pub struct SwipeBackCandidate {
+    object: TaskObjectId,
+    /// Wayland touch id, kept as the protocol's contact identity.
+    pointer_id: u32,
+    from_left: bool,
+    start: (f64, f64),
+    last: (f64, f64),
+    last_time_ms: u64,
+    peak_speed: f64,
+    inward_speed: f64,
+    confirmed: bool,
+    cancelled: bool,
+    stealing: bool,
+}
+
+impl SwipeBackCandidate {
+    /// Begin monitoring a touch that starts inside the content's edge band.
+    ///
+    /// Positions are content-local logical coordinates. Degenerate geometry,
+    /// non-finite input and touches that start outside the band yield `None`.
+    pub fn begin(
+        object: TaskObjectId,
+        pointer_id: u32,
+        position: (f64, f64),
+        window_size: (u32, u32),
+        edge: f64,
+        time_ms: u64,
+    ) -> Option<Self> {
+        let (width, height) = (f64::from(window_size.0), f64::from(window_size.1));
+        if !position.0.is_finite() || !position.1.is_finite() || !edge.is_finite() {
+            return None;
+        }
+        if width <= edge * 2.0 || height <= 0.0 || position.1 < 0.0 || position.1 > height {
+            return None;
+        }
+        let from_left = if position.0 <= edge {
+            true
+        } else if position.0 >= width - edge {
+            false
+        } else {
+            return None;
+        };
+        Some(Self {
+            object,
+            pointer_id,
+            from_left,
+            start: position,
+            last: position,
+            last_time_ms: time_ms,
+            peak_speed: 0.0,
+            inward_speed: 0.0,
+            confirmed: false,
+            cancelled: false,
+            stealing: false,
+        })
+    }
+
+    /// The swipe's current geometry, for drawing feedback.
+    pub fn feedback(&self) -> SwipeFeedback {
+        let dx = self.last.0 - self.start.0;
+        SwipeFeedback {
+            from_left: self.from_left,
+            inward: if self.from_left { dx } else { -dx },
+            along: self.start.1,
+            speed: self.inward_speed,
+            confirmed: self.confirmed,
+        }
+    }
+
+    /// Whether this tracker belongs to the given Wayland touch id.
+    pub fn matches(&self, pointer_id: u32) -> bool {
+        self.pointer_id == pointer_id
+    }
+
+    /// The task the swipe started on.
+    pub fn object(&self) -> TaskObjectId {
+        self.object
+    }
+
+    /// Whether the caller has already cancelled this contact for the swipe.
+    pub fn stealing(&self) -> bool {
+        self.stealing
+    }
+
+    /// Record that the caller pilfered the contact.
+    pub fn mark_stealing(&mut self) {
+        self.stealing = true;
+    }
+
+    /// Classify a motion sample.
+    pub fn on_motion(&mut self, position: (f64, f64), time_ms: u64) -> SwipeUpdate {
+        if !position.0.is_finite() || !position.1.is_finite() {
+            self.cancelled = true;
+            return SwipeUpdate::Cancelled;
+        }
+        let dt = time_ms.saturating_sub(self.last_time_ms);
+        let sample_dx = position.0 - self.last.0;
+        let sample_dy = position.1 - self.last.1;
+        if dt > 0 {
+            let speed = sample_dx.hypot(sample_dy) * 1000.0 / dt as f64;
+            if speed > self.peak_speed {
+                self.peak_speed = speed;
+            }
+            // Signed inward velocity, so the indicator can lean with the hand.
+            self.inward_speed = if self.from_left {
+                sample_dx * 1000.0 / dt as f64
+            } else {
+                -sample_dx * 1000.0 / dt as f64
+            };
+        }
+        self.last = position;
+        self.last_time_ms = time_ms;
+
+        if self.cancelled {
+            return SwipeUpdate::Cancelled;
+        }
+        let dx = position.0 - self.start.0;
+        let dy = position.1 - self.start.1;
+        let inward = if self.from_left { dx } else { -dx };
+
+        if self.confirmed {
+            if inward < RETREAT_DISTANCE {
+                self.cancelled = true;
+                return SwipeUpdate::Cancelled;
+            }
+            return SwipeUpdate::Confirmed;
+        }
+        // Vertical dominance hands the whole sequence back to the application.
+        if dy.abs() >= SLOP && dy.abs() > dx.abs() {
+            self.cancelled = true;
+            return SwipeUpdate::Cancelled;
+        }
+        // Pulling outward toward the bezel is not a Back.
+        if inward < -SLOP {
+            self.cancelled = true;
+            return SwipeUpdate::Cancelled;
+        }
+        if inward >= CONFIRM_DISTANCE
+            || (inward >= FLING_TRAVEL && self.peak_speed >= FLING_SPEED)
+        {
+            self.confirmed = true;
+            return SwipeUpdate::Confirmed;
+        }
+        SwipeUpdate::Pending
+    }
+
+    /// Finish the contact. `Some(object)` means one Back must be sent.
+    ///
+    /// Confirmation happens on motion samples only; a stream that never
+    /// classified stays with the application, so release only re-checks the
+    /// retreat threshold.
+    pub fn on_up(&mut self, _time_ms: u64) -> Option<TaskObjectId> {
+        if self.cancelled {
+            return None;
+        }
+        let dx = self.last.0 - self.start.0;
+        let inward = if self.from_left { dx } else { -dx };
+        if inward < RETREAT_DISTANCE {
+            return None;
+        }
+        self.confirmed.then_some(self.object)
+    }
+}
+
+/// One recognition update for a contact tracked as a possible top pull.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullUpdate {
+    /// Still a pull; the caller keeps drawing it.
+    Pending,
+    /// Not a pull; the caller drops the indicator.
+    Cancelled,
+}
+
+/// A single finger monitored for a downward pull out of the top edge.
+///
+/// Until the finger lifts the caller does nothing but draw: the contact itself
+/// is never touched. That is deliberate — the top edge is where the shell's own
+/// gesture lives, so a client that consumed the touch or acted on it would be
+/// racing the shell for the same hand. The one thing released here is the
+/// reveal, asked for at the release and never before it.
+#[derive(Clone, Copy, Debug)]
+pub struct TopPullCandidate {
+    object: TaskObjectId,
+    pointer_id: u32,
+    start: (f64, f64),
+    last: (f64, f64),
+    start_time_ms: u64,
+    last_time_ms: u64,
+    cancelled: bool,
+}
+
+impl TopPullCandidate {
+    /// Begin monitoring a touch that starts inside the content's top band.
+    ///
+    /// Positions are content-local logical coordinates. Degenerate geometry,
+    /// non-finite input and touches that start outside the band yield `None`.
+    pub fn begin(
+        object: TaskObjectId,
+        pointer_id: u32,
+        position: (f64, f64),
+        window_size: (u32, u32),
+        time_ms: u64,
+    ) -> Option<Self> {
+        if !position.0.is_finite() || !position.1.is_finite() {
+            return None;
+        }
+        let (width, height) = (f64::from(window_size.0), f64::from(window_size.1));
+        if width <= 0.0 || position.0 < 0.0 || position.0 > width {
+            return None;
+        }
+        if !(0.0..=TOP_MARGIN).contains(&position.1) || position.1 > height {
+            return None;
+        }
+        Some(Self {
+            object,
+            pointer_id,
+            start: position,
+            last: position,
+            start_time_ms: time_ms,
+            last_time_ms: time_ms,
+            cancelled: false,
+        })
+    }
+
+    /// The task the pull started on.
+    pub fn object(&self) -> TaskObjectId {
+        self.object
+    }
+
+    /// Whether this tracker belongs to the given Wayland touch id.
+    pub fn matches(&self, pointer_id: u32) -> bool {
+        self.pointer_id == pointer_id
+    }
+
+    /// How far the contact has travelled down from the top edge.
+    pub fn pull(&self) -> f64 {
+        self.last.1 - self.start.1
+    }
+
+    /// Classify a motion sample.
+    pub fn on_motion(&mut self, position: (f64, f64), time_ms: u64) -> PullUpdate {
+        if !position.0.is_finite() || !position.1.is_finite() {
+            self.cancelled = true;
+            return PullUpdate::Cancelled;
+        }
+        self.last = position;
+        self.last_time_ms = time_ms;
+        if self.cancelled {
+            return PullUpdate::Cancelled;
+        }
+        let dx = position.0 - self.start.0;
+        let dy = position.1 - self.start.1;
+        // Sideways travel is the swipe's business, and upward travel is
+        // nothing's: either way the tab has no reason to stay on screen.
+        if dx.abs() >= SLOP && dx.abs() > dy.abs() {
+            self.cancelled = true;
+            return PullUpdate::Cancelled;
+        }
+        if dy < -SLOP {
+            self.cancelled = true;
+            return PullUpdate::Cancelled;
+        }
+        PullUpdate::Pending
+    }
+
+    /// Finish the contact. `true` means the release has earned the fullscreen
+    /// pair.
+    ///
+    /// This is the only decision the pull makes, and it waits for the release
+    /// because the recognizer never confirms: the caller draws while the pull
+    /// is pending and nothing acts before the finger lifts. Travel past
+    /// [`TOP_CONFIRM_PULL`] is a deliberate pull and earns it however slowly it
+    /// was made; a shorter one earns it only as the old recognizer's quick
+    /// flick, timed from the last sample the finger produced rather than from
+    /// the release, so a flick that is held before letting go still counts.
+    pub fn on_up(&self) -> bool {
+        if self.cancelled {
+            return false;
+        }
+        let dx = self.last.0 - self.start.0;
+        let dy = self.last.1 - self.start.1;
+        // A pull that leans sideways belongs to the shell's own edge gesture
+        // however far down it went, and an upward one is nobody's pull.
+        if dy <= dx.abs() {
+            return false;
+        }
+        dy >= TOP_CONFIRM_PULL
+            || (dy >= TOP_FLICK_PULL
+                && self.last_time_ms.saturating_sub(self.start_time_ms) < TOP_FLICK_MS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW: (u32, u32) = (800, 600);
+    const TASK: TaskObjectId = TaskObjectId(7);
+
+    fn begin_left() -> SwipeBackCandidate {
+        SwipeBackCandidate::begin(TASK, 3, (10.0, 300.0), WINDOW, EDGE_MARGIN, 1_000).unwrap()
+    }
+
+    #[test]
+    fn a_slow_inward_swipe_confirms_at_the_distance_threshold() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((30.0, 302.0), 1_016), SwipeUpdate::Pending);
+        assert_eq!(candidate.on_motion((60.0, 305.0), 1_032), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(1_050), Some(TASK));
+    }
+
+    #[test]
+    fn the_right_edge_mirrors_the_left_edge() {
+        let mut candidate =
+            SwipeBackCandidate::begin(TASK, 4, (790.0, 200.0), WINDOW, EDGE_MARGIN, 0).unwrap();
+        assert_eq!(candidate.on_motion((760.0, 202.0), 100), SwipeUpdate::Pending);
+        assert_eq!(candidate.on_motion((735.0, 205.0), 220), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(260), Some(TASK));
+    }
+
+    #[test]
+    fn vertical_scrolling_cancels_and_never_confirms() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((11.0, 320.0), 16), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_motion((80.0, 320.0), 32), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_up(48), None);
+    }
+
+    #[test]
+    fn outward_drag_is_not_a_back() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((-4.0, 301.0), 16), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_up(24), None);
+    }
+
+    #[test]
+    fn a_fast_fling_confirms_before_the_distance_threshold() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((36.0, 301.0), 1_016), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(1_020), Some(TASK));
+    }
+
+    #[test]
+    fn retreat_after_confirmation_aborts_the_back() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((60.0, 302.0), 16), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_motion((12.0, 302.0), 32), SwipeUpdate::Cancelled);
+        assert_eq!(candidate.on_up(48), None);
+    }
+
+    #[test]
+    fn shallow_retreat_keeps_the_confirmation() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_motion((60.0, 302.0), 16), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_motion((30.0, 302.0), 32), SwipeUpdate::Confirmed);
+        assert_eq!(candidate.on_up(48), Some(TASK));
+    }
+
+    #[test]
+    fn a_motionless_tap_is_not_a_back() {
+        let mut candidate = begin_left();
+        assert_eq!(candidate.on_up(1_100), None);
+    }
+
+    #[test]
+    fn invalid_samples_cancel_instead_of_guessing() {
+        let mut candidate = begin_left();
+        assert_eq!(
+            candidate.on_motion((f64::NAN, 300.0), 16),
+            SwipeUpdate::Cancelled
+        );
+        assert_eq!(candidate.on_up(24), None);
+    }
+
+    #[test]
+    fn content_middle_and_degenerate_geometry_never_begin() {
+        assert!(
+            SwipeBackCandidate::begin(TASK, 1, (400.0, 300.0), WINDOW, EDGE_MARGIN, 0).is_none()
+        );
+        assert!(
+            SwipeBackCandidate::begin(TASK, 1, (10.0, 700.0), WINDOW, EDGE_MARGIN, 0).is_none()
+        );
+        assert!(
+            SwipeBackCandidate::begin(TASK, 1, (10.0, 300.0), (40, 600), EDGE_MARGIN, 0).is_none()
+        );
+    }
+
+    #[test]
+    fn identity_and_replay_are_deterministic() {
+        let candidate = begin_left();
+        assert!(candidate.matches(3));
+        assert!(!candidate.matches(4));
+        let trace = [(20.0, 301.0, 16u64), (50.0, 304.0, 32), (70.0, 306.0, 48)];
+        let run = || {
+            let mut candidate = begin_left();
+            let mut updates = Vec::new();
+            for (x, y, time) in trace {
+                updates.push(candidate.on_motion((x, y), 1_000 + time));
+            }
+            (updates, candidate.on_up(1_060))
+        };
+        assert_eq!(run(), run());
+    }
+
+    fn begin_pull() -> TopPullCandidate {
+        TopPullCandidate::begin(TASK, 3, (400.0, 12.0), WINDOW, 0).unwrap()
+    }
+
+    #[test]
+    fn a_pull_begins_in_the_top_band_only() {
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, 300.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, TOP_MARGIN + 0.1), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, -1.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (900.0, 12.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, 12.0), (0, 0), 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (f64::NAN, 12.0), WINDOW, 0).is_none());
+        assert!(TopPullCandidate::begin(TASK, 1, (400.0, TOP_MARGIN), WINDOW, 0).is_some());
+    }
+
+    #[test]
+    fn a_downward_drag_reports_its_travel_and_never_cancels() {
+        let mut pull = begin_pull();
+        assert_eq!(pull.on_motion((402.0, 40.0), 40), PullUpdate::Pending);
+        assert_eq!(pull.pull(), 28.0);
+        assert_eq!(pull.on_motion((405.0, 300.0), 60), PullUpdate::Pending);
+        assert_eq!(pull.object(), TASK);
+        assert!(pull.matches(3) && !pull.matches(4));
+    }
+
+    #[test]
+    fn sideways_and_upward_travel_abandon_the_pull() {
+        let mut sideways = begin_pull();
+        assert_eq!(sideways.on_motion((440.0, 14.0), 40), PullUpdate::Cancelled);
+        // Cancellation is permanent.
+        assert_eq!(sideways.on_motion((440.0, 90.0), 60), PullUpdate::Cancelled);
+        let mut upward = begin_pull();
+        assert_eq!(upward.on_motion((400.0, 0.0), 40), PullUpdate::Cancelled);
+        let mut invalid = begin_pull();
+        assert_eq!(invalid.on_motion((f64::NAN, 40.0), 0), PullUpdate::Cancelled);
+    }
+
+    #[test]
+    fn a_pull_that_only_shifts_sideways_stays_pending() {
+        // Under the slop the tab must not flicker away from a finger that is
+        // really pulling down with a little drift.
+        let mut pull = begin_pull();
+        assert_eq!(pull.on_motion((406.0, 40.0), 40), PullUpdate::Pending);
+        assert_eq!(pull.pull(), 28.0);
+    }
+
+    #[test]
+    fn a_long_pull_reveals_however_slowly_it_was_made() {
+        let mut pull = begin_pull();
+        assert_eq!(pull.on_motion((402.0, 60.0), 900), PullUpdate::Pending);
+        assert!(pull.on_up());
+    }
+
+    #[test]
+    fn a_short_flick_reveals_inside_the_flick_window() {
+        let mut pull = begin_pull();
+        assert_eq!(pull.on_motion((404.0, 36.0), 120), PullUpdate::Pending);
+        assert!(pull.pull() < TOP_CONFIRM_PULL);
+        assert!(pull.on_up());
+    }
+
+    #[test]
+    fn a_short_pull_released_slowly_does_not_reveal() {
+        let mut pull = begin_pull();
+        // The flick window is exclusive: down at its edge the pull is a slow
+        // one already.
+        let update = pull.on_motion((404.0, 36.0), TOP_FLICK_MS);
+        assert_eq!(update, PullUpdate::Pending);
+        assert!(!pull.on_up());
+    }
+
+    #[test]
+    fn a_pull_that_leans_sideways_never_reveals() {
+        // Down far enough to reveal, but leaning as much across as down: the
+        // side-swipe recognizer's gesture, not this one's.
+        let mut lean = begin_pull();
+        assert_eq!(lean.on_motion((433.0, 45.0), 120), PullUpdate::Pending);
+        assert!(lean.pull() >= TOP_CONFIRM_PULL);
+        assert!(!lean.on_up());
+        // Past the slop the sideways travel has already abandoned the pull.
+        let mut wide = begin_pull();
+        assert_eq!(wide.on_motion((440.0, 45.0), 120), PullUpdate::Cancelled);
+        assert!(!wide.on_up());
+    }
+}

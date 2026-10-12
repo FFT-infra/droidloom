@@ -18,6 +18,7 @@ members = [
     "graphics/droidloom-denial-endpoint",
     "graphics/droidloom-wayland",
     "graphics/droidloom-camera",
+    "graphics/droidloom-listenfd",
     "graphics/droidloom-denial-protocol",
     "graphics/droidloom-input-protocol",
     "graphics/droidloom-minigbm",

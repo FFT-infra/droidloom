@@ -3,8 +3,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod activation;
+mod chrome;
 mod clipboard;
 mod fence_wakeup;
+mod gesture;
+mod gesture_feedback;
 mod imports;
 mod input;
 mod insets;
@@ -13,7 +16,11 @@ mod notifications;
 mod presentation_audit;
 mod readiness;
 mod resize;
+mod session;
 mod text_input;
+
+#[cfg(test)]
+mod window_lifecycle_tests;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
