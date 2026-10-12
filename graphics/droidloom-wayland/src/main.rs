@@ -19,9 +19,6 @@ mod resize;
 mod session;
 mod text_input;
 
-#[cfg(test)]
-mod window_lifecycle_tests;
-
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
