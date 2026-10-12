@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.xiaomi.touchservice">
+
+    <application
+        android:label="TouchService"
+        android:hasCode="true">
+
+        <service
+            android:name=".pencilengine.PencilEngineManagerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.xiaomi.touchservice.pencilengine.IPencilEngine" />
+                <action android:name="touchservice.intent.bind" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".TouchService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="touchservice.intent.bind" />
+                <action android:name="touchservice.intent.start" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>
