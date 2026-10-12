@@ -888,12 +888,10 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     create_private_dev(spec, &root)?;
     mount_first_stage_runtime_filesystems(&root)?;
     bind_boot_parameters(spec, &root)?;
-    let cpu_policy = crate::cpu_placement::prepare(&root, spec.id().as_str())
+    let cpu_backends = crate::cpu_placement::prepare(&root, spec.id().as_str())
         .map_err(|source| io_error("prepare private Android CPU placement hierarchy", source))?;
-    bind_development_cgroups(spec, &root, cpu_policy.is_some())?;
-    if let Some(policy) = cpu_policy {
-        bind_cpu_policy(spec, &root, &policy)?;
-    }
+    bind_development_cgroups(spec, &root, cpu_backends.cpuset)?;
+    bind_cpu_policy(spec, &root, &cpu_backends)?;
     bind_adb_configuration(spec, &root)?;
 
     // The reusable base is a system-as-root image, but Droidloom has already
@@ -1317,6 +1315,7 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         .map_err(|source| io_error("create Android fusectl mount point", source))?;
     project_loop_sysfs(&sys)?;
     project_power_supply_sysfs(&sys)?;
+    publish_cpu_topology_sysfs(&sys)?;
     let render_metadata = read_render_node_sysfs_metadata(&spec.render_node)?;
     publish_render_node_sysfs_metadata(&sys, &render_metadata)?;
     run_os(
@@ -1327,6 +1326,27 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             sys.into_os_string(),
         ],
     )
+}
+
+fn publish_cpu_topology_sysfs(sys: &Path) -> Result<(), DevelopmentError> {
+    // get_nprocs(), get_nprocs_conf() and therefore Java's
+    // Runtime.availableProcessors() read this subtree. With a synthetic sysfs
+    // that does not contain it, bionic falls back to its hardcoded single CPU
+    // while the cell really schedules on every allowed core. Applications which
+    // size a pool, a renderer or a code path from the core count then misjudge
+    // the cell, so publish the CPU set this cell actually inherits rather than
+    // the host's full topology.
+    let cpus = droidloom_cpu_placement::CpuSet::current()
+        .map_err(|source| io_error("read the cell's allowed CPU set", source))?;
+    let cpu = sys.join("devices/system/cpu");
+    fs::create_dir_all(&cpu).map_err(|source| io_error("create synthetic CPU topology", source))?;
+    for name in ["possible", "present", "online"] {
+        let node = cpu.join(name);
+        fs::write(&node, format!("{}\n", cpus.list()))
+            .map_err(|source| io_error("publish synthetic CPU topology", source))?;
+        set_mode(&node, 0o444)?;
+    }
+    Ok(())
 }
 
 fn discover_power_supply_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, DevelopmentError> {
@@ -1980,28 +2000,31 @@ fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), Developmen
     bind_mount(&source, &target, true)
 }
 
-fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), DevelopmentError> {
+fn bind_cpu_policy(
+    spec: &CellSpec,
+    root: &Path,
+    backends: &crate::cpu_placement::Backends,
+) -> Result<(), DevelopmentError> {
     let directory = spec.runtime_dir.join("cpu-policy");
     fs::create_dir(&directory).map_err(|e| io_error("create CPU policy directory", e))?;
-    // Preserve the already projected init file, including the classpath and
-    // shared-kernel adaptations. The appended on-init action follows AOSP's
-    // cpuset defaults and completes before services are started.
-    let target = root.join("system/etc/init/hw/init.rc");
-    let mut init =
-        fs::read_to_string(&target).map_err(|e| io_error("read Android init policy", e))?;
-    init.push_str(policy);
-    let source = directory.join("init.rc");
-    fs::write(&source, init).map_err(|e| io_error("write Android CPU init policy", e))?;
-    bind_mount(&source, &target, true)?;
+    if let Some(policy) = &backends.policy {
+        let target = root.join("system/etc/init/hw/init.rc");
+        let mut init =
+            fs::read_to_string(&target).map_err(|e| io_error("read Android init policy", e))?;
+        init.push_str(policy);
+        let source = directory.join("init.rc");
+        fs::write(&source, init).map_err(|e| io_error("write Android CPU init policy", e))?;
+        bind_mount(&source, &target, true)?;
 
-    let target = root.join("system/etc/init/surfaceflinger.rc");
-    let original =
-        fs::read_to_string(&target).map_err(|e| io_error("read SurfaceFlinger service", e))?;
-    let service = crate::cpu_placement::graphics_service(&original)
-        .map_err(|e| io_error("set SurfaceFlinger graphics role", e))?;
-    let source = directory.join("surfaceflinger.rc");
-    fs::write(&source, service).map_err(|e| io_error("write SurfaceFlinger CPU policy", e))?;
-    bind_mount(&source, &target, true)?;
+        let target = root.join("system/etc/init/surfaceflinger.rc");
+        let original =
+            fs::read_to_string(&target).map_err(|e| io_error("read SurfaceFlinger service", e))?;
+        let service = crate::cpu_placement::graphics_service(&original)
+            .map_err(|e| io_error("set SurfaceFlinger graphics role", e))?;
+        let source = directory.join("surfaceflinger.rc");
+        fs::write(&source, service).map_err(|e| io_error("write SurfaceFlinger CPU policy", e))?;
+        bind_mount(&source, &target, true)?;
+    }
 
     let mut targets = vec![root.join("system/etc/task_profiles.json")];
     for relative in [
@@ -2033,7 +2056,7 @@ fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), Dev
     for (index, target) in targets.iter().enumerate() {
         let original =
             fs::read_to_string(target).map_err(|e| io_error("read Android task profiles", e))?;
-        let translated = crate::cpu_placement::task_profiles(&original)
+        let translated = crate::cpu_placement::task_profiles(&original, backends)
             .map_err(|e| io_error("translate Android CPU task profiles", e))?;
         let source = directory.join(format!("profiles-{index}.json"));
         fs::write(&source, translated).map_err(|e| io_error("write Android task profiles", e))?;
@@ -2457,6 +2480,20 @@ mod tests {
                     & 0o777,
                 0o444
             );
+        }
+    }
+
+    #[test]
+    fn synthetic_sysfs_reports_the_cell_cpu_set() {
+        let sys = tempfile::tempdir().unwrap();
+        publish_cpu_topology_sysfs(sys.path()).unwrap();
+        let cpus = droidloom_cpu_placement::CpuSet::current().unwrap().list();
+        for name in ["possible", "present", "online"] {
+            let node = sys.path().join("devices/system/cpu").join(name);
+            // Linux's own format: digits, commas and ranges. Consumers count
+            // entries, so the list must name exactly the inherited CPUs.
+            assert_eq!(fs::read_to_string(&node).unwrap(), format!("{cpus}\n"));
+            assert_eq!(fs::metadata(&node).unwrap().mode() & 0o777, 0o444);
         }
     }
 }

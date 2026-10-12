@@ -885,6 +885,7 @@ mod tests {
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),
             graphics_backend: crate::GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
     }
