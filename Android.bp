@@ -62,6 +62,33 @@ android_app {
 }
 
 android_app {
+    name: "TouchService",
+    manifest: "android/framework/droidloom-touchservice/AndroidManifest.xml",
+    srcs: [
+        "android/framework/droidloom-touchservice/src/**/*.java",
+        "android/framework/droidloom-touchservice/src/**/*.aidl",
+    ],
+    sdk_version: "37",
+    min_sdk_version: "31",
+    certificate: "platform",
+    use_resource_processor: false,
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+java_library {
+    name: "xiaomi-pencilengine-pad",
+    srcs: ["android/framework/xiaomi-pencilengine-pad/src/**/*.java"],
+    installable: true,
+    system_ext_specific: true,
+    sdk_version: "37",
+    min_sdk_version: "31",
+    dex_preopt: { enabled: false },
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
+android_app {
     name: "DroidloomSystemUI",
     manifest: "android/framework/droidloom-systemui/AndroidManifest.xml",
     srcs: ["android/framework/droidloom-systemui/src/**/*.java",
