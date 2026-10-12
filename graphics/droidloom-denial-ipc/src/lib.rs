@@ -507,38 +507,7 @@ impl SeqPacket {
     pub fn peer_credentials(&self) -> Result<PeerCredentials, IpcError> {
         peer_credentials(self)
     }
-}
 
-/// Read kernel-authenticated peer PID, UID, and GID from any connected Unix socket descriptor.
-pub fn peer_credentials(fd: impl AsFd) -> Result<PeerCredentials, IpcError> {
-    let mut credentials = MaybeUninit::<libc::ucred>::uninit();
-    let mut length = libc::socklen_t::try_from(mem::size_of::<libc::ucred>())
-        .map_err(|_| IpcError::InvalidAncillary)?;
-    // SAFETY: the kernel writes at most the advertised `ucred` size into
-    // valid uninitialized storage, and the descriptor stays live.
-    let result = unsafe {
-        libc::getsockopt(
-            fd.as_fd().as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &raw mut length,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    if usize::try_from(length).ok() != Some(mem::size_of::<libc::ucred>()) {
-        return Err(IpcError::InvalidAncillary);
-    }
-    // SAFETY: successful `getsockopt` initialized the complete `ucred`.
-    let credentials = unsafe { credentials.assume_init() };
-    Ok(PeerCredentials {
-        pid: u32::try_from(credentials.pid).map_err(|_| IpcError::InvalidAncillary)?,
-        uid: credentials.uid,
-        gid: credentials.gid,
-    })
-}
 
     /// Send exactly one record with up to four attached descriptors.
     ///
@@ -712,6 +681,37 @@ impl AsFd for SeqPacket {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+}
+
+/// Read kernel-authenticated peer PID, UID, and GID from any connected Unix socket descriptor.
+pub fn peer_credentials(fd: impl AsFd) -> Result<PeerCredentials, IpcError> {
+    let mut credentials = MaybeUninit::<libc::ucred>::uninit();
+    let mut length = libc::socklen_t::try_from(mem::size_of::<libc::ucred>())
+        .map_err(|_| IpcError::InvalidAncillary)?;
+    // SAFETY: the kernel writes at most the advertised `ucred` size into
+    // valid uninitialized storage, and the descriptor stays live.
+    let result = unsafe {
+        libc::getsockopt(
+            fd.as_fd().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if usize::try_from(length).ok() != Some(mem::size_of::<libc::ucred>()) {
+        return Err(IpcError::InvalidAncillary);
+    }
+    // SAFETY: successful `getsockopt` initialized the complete `ucred`.
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(PeerCredentials {
+        pid: u32::try_from(credentials.pid).map_err(|_| IpcError::InvalidAncillary)?,
+        uid: credentials.uid,
+        gid: credentials.gid,
+    })
 }
 
 /// Untyped record returned by [`SeqPacket::receive_record`].
