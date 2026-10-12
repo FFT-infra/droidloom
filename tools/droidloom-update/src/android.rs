@@ -809,7 +809,7 @@ pub fn build_targets(
             write(&destination, fs::read(repo.join(relative))?)?;
         }
     }
-    crate::native_bridge::prepare_build(source, &vendor, work, &mut p)?;
+    crate::native_bridge::prepare_build(source, &vendor, work, &mut p, target_arch(product)?)?;
     let mesa = vendor.join("mesa3d");
     fs::create_dir_all(&mesa)?;
     run(Command::new("rsync")

@@ -21,7 +21,8 @@ use tempfile::Builder;
 use thiserror::Error;
 
 const MAX_LOCK_BYTES: u64 = 1024 * 1024;
-const MAX_PROJECTS: usize = 224;
+// Keep dependency growth finite while leaving room for pinned build-only projects.
+const MAX_PROJECTS: usize = 256;
 const MAX_LINKS: usize = 64;
 const MAX_SPARSE_PATHS: usize = 128;
 const OFFICIAL_REMOTE: &str = "https://android.googlesource.com/";
@@ -446,8 +447,9 @@ pub fn materialize(
 /// Existing projects must be clean and still resolve to the same URL and
 /// commit recorded by the new plan. The new plan must be a strict extension of
 /// the published manifest: reconciliation never changes or removes an input.
-/// A sparse project may add explicitly locked paths at the same commit; it may
-/// not drop a previously materialized sparse path.
+/// A sparse project may add explicitly locked paths at the same commit, or
+/// replace paths with ancestors that retain their complete contents. It may
+/// not drop previously materialized source inputs.
 /// Each missing project is staged and renamed independently, so interruption
 /// leaves either a complete exact checkout or no checkout at that path. The
 /// manifest is replaced atomically only after the complete tree verifies.
@@ -565,10 +567,12 @@ fn validate_plan_extension(
         let compatible = replacement.is_some_and(|candidate| {
             candidate.sparse_paths == project.sparse_paths
                 || project.sparse_paths.is_empty()
-                || project
-                    .sparse_paths
-                    .iter()
-                    .all(|path| candidate.sparse_paths.contains(path))
+                || project.sparse_paths.iter().all(|path| {
+                    candidate
+                        .sparse_paths
+                        .iter()
+                        .any(|parent| path.starts_with(parent))
+                })
         });
         if !compatible {
             problems.push(format!(
@@ -938,6 +942,36 @@ mod tests {
     }
 
     #[test]
+    fn project_count_limit_is_bounded_and_allows_locked_dependencies() {
+        let base = valid_lock();
+        let project = base.projects[0].clone();
+        let mut lock = base.clone();
+        lock.projects = (0..MAX_PROJECTS)
+            .map(|index| SparseProject {
+                path: format!("project/{index}").into(),
+                name: format!("platform/project-{index}"),
+                ..project.clone()
+            })
+            .collect();
+        let mut problems = Vec::new();
+        validate_projects(&lock, &mut problems);
+        assert!(problems.is_empty());
+
+        lock.projects.push(SparseProject {
+            path: "project/overflow".into(),
+            name: "platform/project-overflow".into(),
+            ..project
+        });
+        problems.clear();
+        validate_projects(&lock, &mut problems);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("projects must contain"))
+        );
+    }
+
+    #[test]
     fn plan_uses_only_exact_official_projects() {
         let plan = build_plan(&valid_lock()).unwrap();
         assert!(!plan.unrestricted_repo_sync);
@@ -1118,6 +1152,30 @@ mod tests {
 
         let mut contracted = expanded;
         contracted.projects[0].sparse_paths = vec!["tools".into()];
+        assert!(validate_plan_extension(&initial, &contracted).is_err());
+    }
+
+    #[test]
+    fn reconciliation_accepts_sparse_ancestors_without_dropping_inputs() {
+        let mut initial = build_plan(&valid_lock()).unwrap();
+        initial.projects[0].sparse_paths = vec![
+            "graphics/allocator/2.0".into(),
+            "graphics/allocator/3.0".into(),
+            "graphics/bufferqueue/1.0".into(),
+        ];
+        let mut expanded = initial.clone();
+        expanded.projects[0].sparse_paths = vec![
+            "graphics/allocator".into(),
+            "graphics/bufferqueue".into(),
+            "camera/device/aidl".into(),
+        ];
+        validate_plan_extension(&initial, &expanded).unwrap();
+
+        let mut sibling = expanded.clone();
+        sibling.projects[0].sparse_paths[0] = "graphics/allocators".into();
+        assert!(validate_plan_extension(&initial, &sibling).is_err());
+        let mut contracted = expanded;
+        contracted.projects[0].sparse_paths.remove(1);
         assert!(validate_plan_extension(&initial, &contracted).is_err());
     }
 

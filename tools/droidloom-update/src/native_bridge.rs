@@ -49,6 +49,7 @@ pub fn prepare_build(
     vendor: &Path,
     work: &Path,
     projection: &mut crate::android::Projection,
+    target_arch: &str,
 ) -> Result<()> {
     let bridge = source.join("frameworks/libs/binary_translation");
     // Android 17 forbids global libnativehelper include paths. Export its
@@ -101,11 +102,19 @@ cc_library_headers {
             copy(&library, &link.join(format!("{name}.so")))?;
         }
         let bytes = fs::read(link.join(format!("{name}.so")))?;
+        // The pinned system image matches the Android target: x86_64 cells
+        // link the translator against x86_64 host libraries, ARM64 cells link
+        // natively against aarch64 ones.
+        let machine = match target_arch {
+            "x86_64" => 62u16,
+            "aarch64" => 183u16,
+            _ => return fail("unsupported Android target architecture"),
+        };
         if bytes.len() < 20
             || &bytes[..6] != b"\x7fELF\x02\x01"
-            || u16::from_le_bytes([bytes[18], bytes[19]]) != 62
+            || u16::from_le_bytes([bytes[18], bytes[19]]) != machine
         {
-            return fail(format!("invalid pinned x86_64 API library: {name}"));
+            return fail(format!("invalid pinned {target_arch} API library: {name}"));
         }
         blueprint.push_str(&format!(
             r#"
@@ -260,6 +269,93 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
         .arg(repo.join("android/manifest/native-bridge-lock.json")))
 }
 
+/// Publish the runtime APEX debuggerd binaries at their well-known system paths.
+///
+/// The image ships `crash_dump64` only inside `com.android.runtime.apex`. When
+/// the linker cannot read `/proc/self/exe` it falls back to its own argv[0] path
+/// and aborts with "unable to stat either /proc/self/exe or crash_dump64" when
+/// that path does not exist. A crashing crash_dump then makes the kernel invoke
+/// the dumper for the dumper, and each of those aborts the same way: one
+/// application crash becomes a process flood that starves the whole cell.
+///
+/// The symlink is created dangling when the tree has no APEX copy; it publishes
+/// the path the resolver checks, and the target appears with the APEX mount.
+/// Drop the AVF (protected-VM) APEX from the derived system image.
+///
+/// Nothing in a Droidloom cell can serve that APEX: the shared host kernel
+/// runs no microdroid VMs, and the classpath projection already replaces the
+/// APEX's javalib under `/apex/com.android.virt` before `derive_classpath`
+/// runs. Its VINTF manifest is what remains, and it still declares
+/// `IRemotelyProvisionedComponent/avf`; `rkpdapp` picks that declaration up
+/// and asks servicemanager for a service whose binary the projection hides,
+/// so init fails the lazy start once per second for the whole cell lifetime.
+/// Without the APEX the declaration disappears with it and `rkpdapp` keeps
+/// only the `/default` instance.
+fn remove_avf_apex(tree: &Path) -> Result<()> {
+    let apex_dir = tree.join("system/apex");
+    let modified = fs::metadata(&apex_dir)?.modified()?;
+    let mut removed = false;
+    for name in ["com.android.virt.apex", "com.android.virt.capex"] {
+        let candidate = apex_dir.join(name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(&candidate)?;
+                removed = true;
+            }
+            Ok(_) => return fail(format!("{name} is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !removed {
+        return fail("the base system image carries no AVF APEX to remove");
+    }
+    // Removing a directory entry only changes that directory's own mtime, and
+    // the inventory comparison below covers directories too.
+    fs::File::open(&apex_dir)?.set_modified(modified)?;
+    Ok(())
+}
+
+/// Publish the cell's virtual camera HAL at its platform path.
+///
+/// The HAL links the camera service client, whose closure needs
+/// `libandroidicu.so` from the i18n APEX. Only binaries inside a platform
+/// partition resolve that apex from their linker namespace, so a copy under
+/// `/droidloom/...` dies at exec with "library libandroidicu.so not found".
+/// Staging it into the system image keeps it a plain platform binary, exactly
+/// like upstream's virtual_camera.
+fn publish_virtual_camera(product: &Path, tree: &Path) -> Result<()> {
+    let source = product.join("system/bin/virtual_camera");
+    let target = tree.join("system/bin/droidloom-virtual-camera");
+    if fs::symlink_metadata(&target).is_ok() {
+        return fail("system image already carries droidloom-virtual-camera");
+    }
+    copy(&source, &target)?;
+    mode(&target, 0o755)?;
+    run(Command::new("chown").arg("0:0").arg(&target))?;
+    run(Command::new("setfattr")
+        .args(["-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+        .arg(&target))?;
+    Ok(())
+}
+
+fn link_apex_debuggerd(tree: &Path) -> Result<()> {
+    let bin = tree.join("system/bin");
+    for name in ["crash_dump64", "crash_dump32"] {
+        let link = bin.join(name);
+        if fs::symlink_metadata(&link).is_ok() {
+            continue;
+        }
+        let target = Path::new("/apex/com.android.runtime/bin").join(name);
+        std::os::unix::fs::symlink(&target, &link)?;
+        run(Command::new("chown").args(["-h", "0:0"]).arg(&link))?;
+        run(Command::new("setfattr")
+            .args(["-h", "-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+            .arg(&link))?;
+    }
+    Ok(())
+}
+
 fn guest_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -290,39 +386,62 @@ pub fn derive_image(
         .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
     let tree = work.path().join("tree");
     crate::image_policy::extract(image, &tree)?;
+    remove_avf_apex(&tree)?;
     let properties = tree.join("system/build.prop");
-    let updated = bridge_properties(&fs::read_to_string(&properties)?)?;
-    fs::write(&properties, updated)?;
+    // The translator merge below only exists for ARM64 guests on x86_64
+    // hosts. ARM64 cells execute natively: keep the base ABI contract and
+    // record native provenance instead of injecting bridge properties.
+    let product_name = product
+        .file_name()
+        .ok_or("Android product output has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let native_arm64 = match product_name.as_str() {
+        "droidloom_x86_64" => false,
+        "droidloom_arm64" | "droidloom_sheng" => true,
+        _ => return fail("unknown Android product for NativeBridge derivation"),
+    };
+    if !native_arm64 {
+        let updated = bridge_properties(&fs::read_to_string(&properties)?)?;
+        fs::write(&properties, updated)?;
+    } else if !fs::read_to_string(&properties)?
+        .lines()
+        .any(|line| line == "ro.build.version.sdk=37")
+    {
+        return fail("native ARM64 system image requires the pinned Android 17 base");
+    }
 
     let mut paths = Vec::new();
-    for entry in fs::read_dir(product.join("system/lib64"))? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("libberberis_")
-            && entry.file_name().to_string_lossy().ends_with(".so")
-        {
-            paths.push(entry.path());
+    if !native_arm64 {
+        for entry in fs::read_dir(product.join("system/lib64"))? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libberberis_")
+                && entry.file_name().to_string_lossy().ends_with(".so")
+            {
+                paths.push(entry.path());
+            }
         }
-    }
-    guest_files(&product.join("system/lib64/arm64"), &mut paths)?;
-    guest_files(&product.join("system/bin/arm64"), &mut paths)?;
-    paths.push(product.join("system/etc/ld.config.arm64.txt"));
-    paths.sort();
-    for required in [
-        "system/lib64/libberberis_arm64.so",
-        "system/lib64/libberberis_exec_region.so",
-        "system/lib64/libberberis_proxy_libc.so",
-        "system/lib64/libberberis_proxy_libEGL.so",
-        "system/lib64/libberberis_proxy_libGLESv2.so",
-        "system/lib64/libberberis_proxy_libvulkan.so",
-        "system/lib64/arm64/libc.so",
-        "system/lib64/arm64/libnative_bridge_vdso.so",
-        "system/bin/arm64/linker64",
-    ] {
-        if !paths.contains(&product.join(required)) {
-            return fail(format!("missing required NativeBridge output: {required}"));
+        guest_files(&product.join("system/lib64/arm64"), &mut paths)?;
+        guest_files(&product.join("system/bin/arm64"), &mut paths)?;
+        paths.push(product.join("system/etc/ld.config.arm64.txt"));
+        paths.sort();
+        for required in [
+            "system/lib64/libberberis_arm64.so",
+            "system/lib64/libberberis_exec_region.so",
+            "system/lib64/libberberis_proxy_libc.so",
+            "system/lib64/libberberis_proxy_libEGL.so",
+            "system/lib64/libberberis_proxy_libGLESv2.so",
+            "system/lib64/libberberis_proxy_libvulkan.so",
+            "system/lib64/arm64/libc.so",
+            "system/lib64/arm64/libnative_bridge_vdso.so",
+            "system/bin/arm64/linker64",
+        ] {
+            if !paths.contains(&product.join(required)) {
+                return fail(format!("missing required NativeBridge output: {required}"));
+            }
         }
     }
     let mut inventory = BTreeMap::new();
@@ -411,9 +530,12 @@ pub fn derive_image(
         "source": serde_json::from_slice::<serde_json::Value>(&fs::read(source_lock)?)?,
         "build_source": serde_json::from_slice::<serde_json::Value>(&fs::read(
             product.join("droidloom-native-bridge-source.json"))?)?,
-        "guest_abi": "arm64-v8a", "host_abi": "x86_64",
-        "native_executables": false, "files": inventory,
+        "guest_abi": "arm64-v8a",
+        "host_abi": if native_arm64 { "arm64-v8a" } else { "x86_64" },
+        "native_executables": native_arm64, "files": inventory,
     });
+    link_apex_debuggerd(&tree)?;
+    publish_virtual_camera(product, &tree)?;
     let manifest_path = tree.join("system/etc/droidloom-native-bridge.json");
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     run(Command::new("chown").arg("0:0").arg(&manifest_path))?;
@@ -470,6 +592,92 @@ mod tests {
     use super::*;
 
     const LOCK: &str = include_str!("../../../android/manifest/native-bridge-lock.json");
+
+    /// `chown` and `setfattr` need privileges the unit test does not have; the
+    /// path publication is what this covers, so stub both on PATH.
+    fn tool_stubs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["chown", "setfattr"] {
+            let tool = dir.path().join(name);
+            fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn avf_apex_removal_takes_either_packaging_and_keeps_its_siblings() {
+        let tree = tempfile::tempdir().unwrap();
+        let apex_dir = tree.path().join("system/apex");
+        fs::create_dir_all(&apex_dir).unwrap();
+        fs::write(apex_dir.join("com.android.virt.apex"), b"apex").unwrap();
+        fs::write(apex_dir.join("com.android.adbd.apex"), b"keep").unwrap();
+        let modified = fs::metadata(&apex_dir).unwrap().modified().unwrap();
+
+        remove_avf_apex(tree.path()).unwrap();
+
+        assert!(!apex_dir.join("com.android.virt.apex").exists());
+        assert!(apex_dir.join("com.android.adbd.apex").exists());
+        assert_eq!(fs::metadata(&apex_dir).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn avf_apex_removal_accepts_the_compressed_packaging() {
+        let tree = tempfile::tempdir().unwrap();
+        let apex_dir = tree.path().join("system/apex");
+        fs::create_dir_all(&apex_dir).unwrap();
+        fs::write(apex_dir.join("com.android.virt.capex"), b"capex").unwrap();
+
+        remove_avf_apex(tree.path()).unwrap();
+
+        assert!(!apex_dir.join("com.android.virt.capex").exists());
+    }
+
+    #[test]
+    fn avf_apex_removal_rejects_a_tree_without_the_apex() {
+        let tree = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("system/apex")).unwrap();
+        assert!(remove_avf_apex(tree.path()).is_err());
+    }
+
+    /// Journal corruption is not observed by this worktree's mutation sites, and
+    /// the stub directory keeps the helper's privileged commands inert.
+    #[test]
+    fn debuggerd_paths_are_published_when_the_apex_owns_them() {
+        // SAFETY: this test is the only one that mutates the environment, and
+        // the value is restored before it returns.
+        let stubs = tool_stubs();
+        let original = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{original}", stubs.path().display());
+        unsafe { std::env::set_var("PATH", &path) };
+
+        let tree = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("system/bin")).unwrap();
+        link_apex_debuggerd(tree.path()).unwrap();
+
+        // The APEX mount is what makes the target appear, so the derivation
+        // states the path for each architecture the runtime can dump.
+        for name in ["crash_dump64", "crash_dump32"] {
+            assert_eq!(
+                fs::read_link(tree.path().join("system/bin").join(name)).unwrap(),
+                Path::new("/apex/com.android.runtime/bin").join(name)
+            );
+        }
+        // An existing entry stays untouched, and the step is idempotent.
+        let link = tree.path().join("system/bin/crash_dump64");
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, b"existing").unwrap();
+        link_apex_debuggerd(tree.path()).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"existing");
+        assert!(fs::symlink_metadata(tree.path().join("system/bin/crash_dump32"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // SAFETY: restoring the value this test replaced.
+        unsafe { std::env::set_var("PATH", original) };
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         output(
