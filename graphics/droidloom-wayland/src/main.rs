@@ -65,8 +65,7 @@ use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
-    Window, WindowConfigure, WindowDecorations, WindowHandler, WindowManagerCapabilities,
-    WindowState,
+    Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
 use thiserror::Error;
 use wayland_client::globals::{BindError, registry_queue_init};
