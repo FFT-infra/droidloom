@@ -17,6 +17,7 @@ members = [
     "graphics/droidloom-denial-ipc",
     "graphics/droidloom-denial-endpoint",
     "graphics/droidloom-wayland",
+    "graphics/droidloom-camera",
     "graphics/droidloom-denial-protocol",
     "graphics/droidloom-input-protocol",
     "graphics/droidloom-minigbm",

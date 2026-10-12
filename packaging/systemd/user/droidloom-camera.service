@@ -1,0 +1,16 @@
+[Unit]
+Description=Droidloom cell camera bridge
+PartOf=droidloom.service
+ConditionPathExists=/etc/droidloom/cell.json
+Requires=droidloom-camera.socket
+After=pipewire.service wireplumber.service droidloom-camera.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+Environment=WAYLAND_DISPLAY= DISPLAY= XDG_CURRENT_DESKTOP= XDG_SESSION_ID=
+EnvironmentFile=-%t/droidloom/session.env
+ExecStart=/usr/bin/droidloom-camera
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10

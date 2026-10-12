@@ -1,0 +1,205 @@
+#include <cassert>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <queue>
+#include <string>
+#include <vector>
+
+#define ASSERT(condition) assert(condition)
+
+struct ControlList {
+    void merge(const ControlList &) { ++merges; }
+    unsigned int merges = 0;
+};
+
+struct Request {
+    explicit Request(uint32_t id) : id(id) {}
+    uint32_t sequence() const { return id; }
+    bool hasPendingBuffers() const { return bufferPending; }
+    Request *_d() { return this; }
+    ControlList &metadata() { return controls; }
+    uint32_t id;
+    bool bufferPending = true;
+    bool completed = false;
+    bool cancelled = false;
+    unsigned int completions = 0;
+    ControlList controls;
+};
+
+struct FrameBuffer {
+    Request *request() { return owner; }
+    Request *owner;
+};
+
+class PipelineHandler {
+public:
+    void cancelRequest(Request *request)
+    {
+        ASSERT(!request->completed);
+        request->cancelled = true;
+        request->bufferPending = false;
+        completeRequest(request);
+    }
+    bool completeBuffer(Request *request, FrameBuffer *)
+    {
+        ASSERT(request->bufferPending);
+        request->bufferPending = false;
+        return true;
+    }
+    void completeRequest(Request *request)
+    {
+        ASSERT(!request->completed);
+        request->completed = true;
+        while (!queued.empty() && queued.front()->completed) {
+            Request *ready = queued.front();
+            queued.pop_front();
+            ASSERT(!ready->hasPendingBuffers());
+            ++ready->completions;
+            completedOrder.push_back(ready->sequence());
+            if (callback)
+                callback(ready);
+        }
+    }
+    std::deque<Request *> queued;
+    std::vector<uint32_t> completedOrder;
+    std::function<void(Request *)> callback;
+};
+
+@DECLARATIONS@
+
+struct Signal {
+    template<class... Args> void disconnect(Args...) {}
+};
+struct DelayedControls {
+    void applyControls() {}
+};
+struct V4L2Subdevice {
+    void setFrameStartEnabled(bool) {}
+    Signal frameStart;
+};
+struct V4L2VideoDevice {
+    void streamOff() { stopped = true; }
+    void releaseBuffers() { released = true; }
+    Signal bufferReady;
+    bool stopped = false;
+    bool released = false;
+};
+struct Converter {
+    void stop() {}
+};
+struct SoftwareIsp {
+    void stop()
+    {
+        stopped = true;
+        if (returnCancelledBuffer)
+            returnCancelledBuffer();
+    }
+    std::function<void()> returnCancelledBuffer;
+    bool stopped = false;
+};
+struct Camera {};
+class SimpleCameraData;
+
+class SimplePipelineHandler : public PipelineHandler {
+public:
+    void stopDevice(Camera *camera);
+    SimpleCameraData *cameraData(Camera *) { return data; }
+    void releasePipeline(SimpleCameraData *) { released = true; }
+    SimpleCameraData *data = nullptr;
+    bool released = false;
+};
+
+class SimpleCameraData {
+public:
+    explicit SimpleCameraData(SimplePipelineHandler *owner) : owner_(owner) {}
+    SimplePipelineHandler *pipe() { return owner_; }
+    void clearIncompleteRequests();
+    void tryCompleteRequest(Request *request);
+    void conversionOutputDone(FrameBuffer *buffer);
+    void metadataReady(uint32_t frame, const ControlList &metadata);
+    void imageBufferReady(FrameBuffer *) {}
+    struct RequestOutputs { Request *request; };
+    std::queue<RequestOutputs> conversionQueue_;
+    SimpleFrames frameInfo_;
+    std::vector<int> conversionBuffers_;
+    V4L2VideoDevice *video_ = nullptr;
+    V4L2Subdevice *frameStartEmitter_ = nullptr;
+    std::unique_ptr<DelayedControls> delayedCtrls_;
+    bool useConversion_ = true;
+    Converter *converter_ = nullptr;
+    SoftwareIsp *swIsp_ = nullptr;
+    SimplePipelineHandler *owner_;
+};
+
+@METHODS@
+
+int main()
+{
+    unsigned int failures = 0;
+    auto check = [&](bool condition, const std::string &name) {
+        std::cout << (condition ? "PASS " : "FAIL ") << name << '\n';
+        failures += !condition;
+    };
+    SimplePipelineHandler pipe;
+    SimpleCameraData data(&pipe);
+    V4L2VideoDevice video;
+    SoftwareIsp isp;
+    Camera camera;
+    pipe.data = &data;
+    data.video_ = &video;
+    data.swIsp_ = &isp;
+    data.conversionBuffers_.push_back(1);
+
+    Request conversionQueued(1), inIsp(2), metadataOnly(3), alreadyDone(4);
+    for (Request *request : { &conversionQueued, &inIsp, &metadataOnly, &alreadyDone }) {
+        pipe.queued.push_back(request);
+        data.frameInfo_.create(request, true);
+    }
+    data.conversionQueue_.push({ &conversionQueued });
+    FrameBuffer ispBuffer{ &inIsp };
+    FrameBuffer metadataBuffer{ &metadataOnly };
+    FrameBuffer doneBuffer{ &alreadyDone };
+
+    // The real completion method must retain an output waiting for IPA metadata.
+    data.conversionOutputDone(&metadataBuffer);
+    check(!metadataOnly.completed && !metadataOnly.bufferPending,
+          "completed buffer waits for metadata while streaming");
+    data.metadataReady(alreadyDone.sequence(), {});
+    data.conversionOutputDone(&doneBuffer);
+    check(alreadyDone.completed && !alreadyDone.cancelled,
+          "normal metadata plus buffer completes successfully");
+
+    // SoftwareIsp::stop() returns cancelled output buffers after stopping its IPA.
+    isp.returnCancelledBuffer = [&] { data.conversionOutputDone(&ispBuffer); };
+    // Exercise reentrant and late metadata without resurrecting released records.
+    pipe.callback = [&](Request *request) { data.metadataReady(request->sequence(), {}); };
+    pipe.stopDevice(&camera);
+    for (Request *request : { &conversionQueued, &inIsp, &metadataOnly, &alreadyDone })
+        data.metadataReady(request->sequence(), {});
+
+    check(conversionQueued.cancelled && conversionQueued.completions == 1,
+          "conversion-queue request cancelled exactly once");
+    check(inIsp.cancelled && inIsp.completions == 1,
+          "ISP-cancelled output does not wait for missing metadata");
+    check(metadataOnly.cancelled && metadataOnly.completions == 1,
+          "metadata-only outstanding request cancelled exactly once");
+    check(alreadyDone.completions == 1 && !alreadyDone.cancelled,
+          "already completed request is not cancelled again");
+    check(pipe.queued.empty(), "framework pending queue empty after stop");
+    check(pipe.completedOrder == std::vector<uint32_t>({1, 2, 3, 4}),
+          "completion callbacks remain in request order");
+    check(metadataOnly.controls.merges == 0 && inIsp.controls.merges == 0,
+          "reentrant and late metadata ignored after cancellation");
+    check(data.conversionQueue_.empty() && data.conversionBuffers_.empty() &&
+          data.frameInfo_.find(1) == nullptr && data.frameInfo_.find(2) == nullptr &&
+          data.frameInfo_.find(3) == nullptr && data.frameInfo_.find(4) == nullptr,
+          "all pipeline-owned request references released");
+    check(isp.stopped && video.stopped && video.released && pipe.released,
+          "ISP video and pipeline teardown still executed");
+    std::cout << "failures=" << failures << '\n';
+    return failures ? 1 : 0;
+}
