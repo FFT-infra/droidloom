@@ -235,7 +235,7 @@ fn stage_bundle(payload: &Path, private: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub fn apply(payload: &Path, uid: u32) -> Result<()> {
+pub fn apply(payload: &Path, uid: u32, start_runtime: bool) -> Result<()> {
     refuse_package_installation()?;
     if unsafe { libc::geteuid() } != 0 {
         return fail("activation requires administrator authentication");
@@ -391,16 +391,18 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
         run(Command::new("systemctl").args(["disable", "droidloomd.service"]))?;
         run(Command::new("systemctl").args(["--global", "disable", "droidloom.service"]))?;
         run(user_command(uid, "systemctl")?.args(["--user", "disable", "droidloom.service"]))?;
-        start(uid)?;
-        let response =
-            output(user_command(uid, "/usr/bin/droidloomctl")?.args(["--json", "applications"]))?;
-        let response: serde_json::Value = serde_json::from_str(&response)?;
-        if response["ok"] != true
-            || response["applications"]
-                .as_array()
-                .is_none_or(|a| a.is_empty())
-        {
-            return fail("Android readiness check failed");
+        if start_runtime {
+            start(uid)?;
+            let response =
+                output(user_command(uid, "/usr/bin/droidloomctl")?.args(["--json", "applications"]))?;
+            let response: serde_json::Value = serde_json::from_str(&response)?;
+            if response["ok"] != true
+                || response["applications"]
+                    .as_array()
+                    .is_none_or(|a| a.is_empty())
+            {
+                return fail("Android readiness check failed");
+            }
         }
         Ok(())
     })();
@@ -414,10 +416,16 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
     durable_write(
         &base.join("last-update.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"release":id,"source":manifest.source_identity,"input_abi":manifest.input_abi,"readiness":"catalog","autostart":false}),
+            &serde_json::json!({"release":id,"source":manifest.source_identity,"input_abi":manifest.input_abi,"readiness":if start_runtime {"catalog"} else {"not-started"},"autostart":false}),
         )?,
     )?;
-    println!("Droidloom updated and running. Automatic startup remains disabled.");
+    if start_runtime {
+        println!("Droidloom updated and running. Automatic startup remains disabled.");
+    } else {
+        println!(
+            "Droidloom installed and stopped. Runtime readiness has not been checked. Automatic startup remains disabled."
+        );
+    }
     Ok(())
 }
 

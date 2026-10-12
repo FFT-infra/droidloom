@@ -109,6 +109,8 @@ enum Action {
     /// Privileged activation worker; normally invoked automatically through polkit.
     #[command(hide = true)]
     Apply {
+        #[arg(long, default_value_t = false)]
+        no_start: bool,
         payload: PathBuf,
         #[arg(long)]
         uid: u32,
@@ -188,8 +190,12 @@ fn execute(args: Args) -> Result<()> {
             );
         }
         Some(Action::Recover { uid }) => return install::recover(*uid),
-        Some(Action::Apply { payload, uid }) => {
-            return install::apply(&payload.canonicalize()?, *uid);
+        Some(Action::Apply {
+            payload,
+            uid,
+            no_start,
+        }) => {
+            return install::apply(&payload.canonicalize()?, *uid, !no_start);
         }
         Some(Action::DerivePresenter { base, presenter, build_record, output }) => {
             let id = derive::run(&repository(args.source.clone())?, base, presenter, build_record, output)?;

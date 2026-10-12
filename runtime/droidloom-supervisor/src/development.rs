@@ -437,6 +437,14 @@ impl Drop for DevelopmentCell {
 
 /// Start a development cell and return its exact lifecycle handle.
 ///
+fn unshare_supports_forward_signals() -> bool {
+    std::process::Command::new("unshare")
+        .arg("--help")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("--forward-signals"))
+        .unwrap_or(false)
+}
+
 /// `entry_executable` must expose the supervisor's private
 /// `development-enter --spec ...` command. Separating it from the caller lets
 /// `droidloomd` own the cell while keeping namespace entry in the small
@@ -468,25 +476,29 @@ pub fn start_development_cell(
     };
     let parent_pid = unsafe { libc::getpid() };
     let mut command = droidloom_cpu_placement::command("ip");
-    command
-        .args(["netns", "exec", network.namespace(), "unshare"])
-        .args([
-            OsStr::new("--mount"),
-            OsStr::new("--pid"),
-            // Host-side setup helpers also need /proc to describe this PID
-            // namespace (not only the procfs later exposed inside Android).
-            OsStr::new("--mount-proc"),
-            OsStr::new("--ipc"),
-            OsStr::new("--uts"),
-            OsStr::new("--fork"),
-            OsStr::new("--kill-child=TERM"),
-            OsStr::new("--forward-signals"),
-            OsStr::new("--propagation=private"),
-            entry_executable.as_os_str(),
-            OsStr::new("development-enter"),
-            OsStr::new("--spec"),
-            spec_path.as_os_str(),
-        ]);
+    command.args(["netns", "exec", network.namespace(), "unshare"]);
+    let mut unshare_args = vec![
+        OsStr::new("--mount"),
+        OsStr::new("--pid"),
+        // Host-side setup helpers also need /proc to describe this PID
+        // namespace (not only the procfs later exposed inside Android).
+        OsStr::new("--mount-proc"),
+        OsStr::new("--ipc"),
+        OsStr::new("--uts"),
+        OsStr::new("--fork"),
+        OsStr::new("--kill-child=TERM"),
+    ];
+    if unshare_supports_forward_signals() {
+        unshare_args.push(OsStr::new("--forward-signals"));
+    }
+    unshare_args.extend([
+        OsStr::new("--propagation=private"),
+        entry_executable.as_os_str(),
+        OsStr::new("development-enter"),
+        OsStr::new("--spec"),
+        spec_path.as_os_str(),
+    ]);
+    command.args(unshare_args);
     // If the lifecycle owner disappears even under SIGKILL or a crash,
     // terminate `unshare`; its own --kill-child contract then terminates
     // Android PID 1. Only deterministic network/path residue remains for the
