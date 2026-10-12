@@ -63,6 +63,7 @@ const V4L2_CAP_DEVICE_CAPS: u32 = 0x8000_0000;
 const V4L2_QUERYCAP_IOCTL: libc::c_ulong = 0x8068_5600;
 const ANDROID_IRIS_VIDEO_NODE: &str = "video0";
 const ANDROID_CAMERA_GID: u32 = 1006;
+const ANDROID_INPUT_GID: u32 = 1004;
 const ANDROID_SYSTEM_UID: u32 = 1000;
 const ANDROID_SYSTEM_GID: u32 = 1000;
 const PRIVATE_SYSCTL_DIRECTORY: &str = "android-private-sysctls";
@@ -1726,6 +1727,37 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         make_device_node(&dev.join(name), "c", major, minor, mode)?;
     }
 
+    // Kernel hotplug uevents reach every listener, including the cell's
+    // ueventd, so a device attached to the host would otherwise be published
+    // here as /dev/input/event* even though this private /dev never creates
+    // it, and Android would read that device directly alongside this
+    // runtime's routed input.
+    //
+    // The pen relay's button and gesture devices are the exception: it creates
+    // them for an Android reader and nothing else on the host reads them, so
+    // the cell takes exactly those two and Android's InputReader turns them
+    // into the key events note-taking applications bind their eraser and
+    // gesture actions to. The pen tip stays on the routed path, so no stroke
+    // is delivered twice. The directory is read-only afterwards, which keeps
+    // every other host device out.
+    let input = dev.join("input");
+    fs::create_dir_all(&input)
+        .map_err(|source| io_error("create private input directory", source))?;
+    for (index, device) in discover_pen_input_devices()?.into_iter().enumerate() {
+        let node = input.join(format!("event{index}"));
+        make_device_node(&node, "c", device.major, device.minor, "660")?;
+        set_owner(&node, 0, ANDROID_INPUT_GID)?;
+    }
+    bind_mount(&input, &input, false)?;
+    run_os(
+        "mount",
+        [
+            OsString::from("-o"),
+            OsString::from("remount,bind,ro,nosuid"),
+            input.into_os_string(),
+        ],
+    )?;
+
     // The pinned CI base contains ext4-payload APEX packages. apexd obtains
     // unused loop minors through loop-control; provide only loop devices, not
     // the host block-device tree that ueventd would otherwise recreate.
@@ -1906,9 +1938,9 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     Ok(())
 }
 
-fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
+fn verified_char_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|source| io_error("stat auxiliary graphics device", source))?;
+        .map_err(|source| io_error("stat auxiliary device", source))?;
     if !metadata.file_type().is_char_device() {
         return Err(DevelopmentError::InvalidInput(format!(
             "{} must be a character device, not a symlink",
@@ -1917,7 +1949,7 @@ fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), Developm
     }
     let (major, minor) = linux_device_numbers(metadata.rdev());
     let uevent = fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/uevent"))
-        .map_err(|source| io_error("read auxiliary graphics device identity", source))?;
+        .map_err(|source| io_error("read auxiliary device identity", source))?;
     let expected = format!(
         "DEVNAME={}",
         path.strip_prefix("/dev")
@@ -1934,6 +1966,60 @@ fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), Developm
         u32::try_from(major).expect("Linux device major"),
         u32::try_from(minor).expect("Linux device minor"),
     ))
+}
+
+fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
+    verified_char_device_numbers(path)
+}
+
+/// One host input device the pen relay created for an Android reader.
+struct PenInputDevice {
+    major: u32,
+    minor: u32,
+}
+
+/// The pen relay's Android-facing input devices, matched by their physical
+/// device path. The relay keeps the pen's own device tree to itself and
+/// publishes these for the platform that reads them.
+fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError> {
+    const PEN_PHYS: [&str; 2] = ["waydroid-pen-buttons", "waydroid-gesture-android"];
+    let Ok(entries) = fs::read_dir("/sys/class/input") else {
+        return Ok(Vec::new());
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name
+            .strip_prefix("event")
+            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let phys = match fs::read_to_string(entry.path().join("device/phys")) {
+            Ok(phys) => phys.trim().to_owned(),
+            Err(_) => continue,
+        };
+        if PEN_PHYS.contains(&phys.as_str()) {
+            if let Ok((major, minor)) =
+                verified_char_device_numbers(&Path::new("/dev/input").join(&name))
+            {
+                map.insert(phys, PenInputDevice { major, minor });
+            }
+        }
+    }
+    let mut devices = Vec::new();
+    for phys in PEN_PHYS {
+        if let Some(device) = map.remove(phys) {
+            devices.push(device);
+        }
+    }
+    Ok(devices)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

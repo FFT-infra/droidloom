@@ -95,6 +95,15 @@ use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
     zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    self as tablet, zwp_tablet_manager_v2::ZwpTabletManagerV2,
+    zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+    zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+    zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+    zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+    zwp_tablet_pad_v2::ZwpTabletPadV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    zwp_tablet_tool_v2::ZwpTabletToolV2, zwp_tablet_v2::ZwpTabletV2,
+};
 
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
@@ -276,6 +285,36 @@ impl Contact {
     }
 }
 
+struct TabletToolState {
+    tool_id: u32,
+    surface: Option<wl_surface::WlSurface>,
+    x: f64,
+    y: f64,
+    pressure: u16,
+    is_down: bool,
+    pending_down: bool,
+    pending_up: bool,
+    pending_proximity_out: bool,
+    dirty_motion: bool,
+}
+
+impl TabletToolState {
+    fn new(tool_id: u32) -> Self {
+        Self {
+            tool_id,
+            surface: None,
+            x: 0.0,
+            y: 0.0,
+            pressure: 0,
+            is_down: false,
+            pending_down: false,
+            pending_up: false,
+            pending_proximity_out: false,
+            dirty_motion: false,
+        }
+    }
+}
+
 struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
@@ -290,6 +329,11 @@ struct App {
     published_display_power: Option<bool>,
     presentation_time: PresentationTimeState,
     seat_state: SeatState,
+    tablet_manager: Option<ZwpTabletManagerV2>,
+    tablet_seats: Vec<(wl_seat::WlSeat, ZwpTabletSeatV2)>,
+    tablet_tools: Vec<TabletToolState>,
+    tablet_tool_proxies: BTreeMap<u32, ZwpTabletToolV2>,
+    tablet_proxies: BTreeMap<u32, (u32, ZwpTabletV2)>,
     dmabuf_state: DmabufState,
     feedback: Option<DmabufFeedback>,
     compositor: CompositorState,
@@ -1348,6 +1392,12 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
+        for tool in &mut self.tablet_tools {
+            if tool.surface.as_ref().and_then(|s| self.task_for_surface(s)) == Some(object) {
+                tool.is_down = false;
+                tool.surface = None;
+            }
+        }
         if self.endpoint.is_some() {
             if let Err(error) = self.update_output_refreshes() {
                 self.fail(&error);
@@ -1612,6 +1662,10 @@ impl App {
         self.focused = None;
         self.pointer_contact = None;
         self.touch_contacts.clear();
+        for tool in &mut self.tablet_tools {
+            tool.is_down = false;
+            tool.surface = None;
+        }
     }
 
     fn send_input(
@@ -2238,7 +2292,9 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.bind_tablet_seat(seat, qh);
+    }
 
     fn new_capability(
         &mut self,
@@ -2301,13 +2357,382 @@ impl SeatHandler for App {
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.unbind_tablet_seat(&seat);
         self.text_input.remove_resource();
         self.keyboard = None;
         self.pointer = None;
         self.touch = None;
         self.pointer_contact = None;
         self.touch_contacts.clear();
+    }
+}
+
+impl App {
+    fn bind_tablet_seat(&mut self, seat: wl_seat::WlSeat, qh: &QueueHandle<Self>) {
+        if self.tablet_manager.is_none()
+            || self.tablet_seats.iter().any(|(existing, _)| *existing == seat)
+        {
+            return;
+        }
+        let tablet_seat = self
+            .tablet_manager
+            .as_ref()
+            .unwrap()
+            .get_tablet_seat(&seat, qh, ());
+        self.tablet_seats.push((seat, tablet_seat));
+    }
+
+    fn unbind_tablet_seat(&mut self, seat: &wl_seat::WlSeat) {
+        if let Some(pos) = self.tablet_seats.iter().position(|(s, _)| s == seat) {
+            let (_, proxy) = self.tablet_seats.remove(pos);
+            proxy.destroy();
+        }
+    }
+
+    fn tablet_tool_mut(&mut self, tool_id: u32) -> &mut TabletToolState {
+        if let Some(index) = self.tablet_tools.iter().position(|t| t.tool_id == tool_id) {
+            &mut self.tablet_tools[index]
+        } else {
+            self.tablet_tools.push(TabletToolState::new(tool_id));
+            self.tablet_tools.last_mut().unwrap()
+        }
+    }
+
+    fn cancel_tablet_tool(&mut self, tool_id: u32) {
+        if let Some(tool) = self.tablet_tools.iter_mut().find(|t| t.tool_id == tool_id) {
+            if tool.is_down {
+                if let Some(surface) = &tool.surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    let pointer_id = 0x8000_0000 | tool_id;
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Cancel,
+                            pointer_id,
+                            x_fixed: 0,
+                            y_fixed: 0,
+                            pressure: 0,
+                        },
+                    );
+                }
+                tool.is_down = false;
+            }
+            tool.surface = None;
+        }
+    }
+
+    fn flush_tablet_tool(&mut self, tool_id: u32) {
+        let tool = self.tablet_tool_mut(tool_id);
+        let pending_down = std::mem::take(&mut tool.pending_down);
+        let pending_up = std::mem::take(&mut tool.pending_up);
+        let pending_out = std::mem::take(&mut tool.pending_proximity_out);
+        let dirty_motion = std::mem::take(&mut tool.dirty_motion);
+        let x = tool.x;
+        let y = tool.y;
+        let pressure = tool.pressure;
+        let surface = tool.surface.clone();
+
+        let pointer_id = 0x8000_0000 | tool_id;
+
+        if pending_down {
+            if let Some(surface) = &surface
+                && let Some(object) = self.task_for_surface(surface)
+            {
+                self.text_input.note_touch();
+                if self.focused != Some(object) {
+                    let _ = self.set_focus(Some(object));
+                }
+                let (x_fixed, y_fixed) = self.fixed_position(object, (x, y));
+                let press = if pressure > 0 { pressure } else { u16::MAX };
+                if let Err(error) = self.send_input(
+                    object,
+                    InputEvent::Touch {
+                        action: TouchAction::Down,
+                        pointer_id,
+                        x_fixed,
+                        y_fixed,
+                        pressure: press,
+                    },
+                ) {
+                    self.fail(&error);
+                } else {
+                    self.tablet_tool_mut(tool_id).is_down = true;
+                }
+            }
+        }
+
+        if dirty_motion && self.tablet_tool_mut(tool_id).is_down && !pending_up {
+            if let Some(surface) = &surface
+                && let Some(object) = self.task_for_surface(surface)
+            {
+                let (x_fixed, y_fixed) = self.fixed_position(object, (x, y));
+                let _ = self.send_input(
+                    object,
+                    InputEvent::Touch {
+                        action: TouchAction::Motion,
+                        pointer_id,
+                        x_fixed,
+                        y_fixed,
+                        pressure,
+                    },
+                );
+            }
+        }
+
+        if pending_up {
+            let was_down = self.tablet_tool_mut(tool_id).is_down;
+            if was_down {
+                if let Some(surface) = &surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    let (x_fixed, y_fixed) = self.fixed_position(object, (x, y));
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Up,
+                            pointer_id,
+                            x_fixed,
+                            y_fixed,
+                            pressure: 0,
+                        },
+                    );
+                }
+                self.tablet_tool_mut(tool_id).is_down = false;
+            }
+        }
+
+        if pending_out {
+            let was_down = self.tablet_tool_mut(tool_id).is_down;
+            if was_down {
+                if let Some(surface) = &surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Cancel,
+                            pointer_id,
+                            x_fixed: 0,
+                            y_fixed: 0,
+                            pressure: 0,
+                        },
+                    );
+                }
+                self.tablet_tool_mut(tool_id).is_down = false;
+            }
+            self.tablet_tool_mut(tool_id).surface = None;
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletManagerV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletManagerV2,
+        _event: tablet::zwp_tablet_manager_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletSeatV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletSeatV2,
+        event: tablet::zwp_tablet_seat_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let seat_id = proxy.id().protocol_id();
+        match &event {
+            tablet::zwp_tablet_seat_v2::Event::TabletAdded { id } => {
+                state
+                    .tablet_proxies
+                    .insert(id.id().protocol_id(), (seat_id, id.clone()));
+            }
+            tablet::zwp_tablet_seat_v2::Event::ToolAdded { id } => {
+                let tool_id = id.id().protocol_id();
+                state.tablet_tool_proxies.insert(tool_id, id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletSeatV2,
+        [
+            0 => (ZwpTabletV2, ()),
+            1 => (ZwpTabletToolV2, ()),
+            2 => (ZwpTabletPadV2, ())
+        ]
+    );
+}
+
+impl Dispatch<ZwpTabletToolV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletToolV2,
+        event: tablet::zwp_tablet_tool_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let tool_id = proxy.id().protocol_id();
+        match event {
+            tablet::zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.surface = Some(surface);
+                tool.pressure = 0;
+            }
+            tablet::zwp_tablet_tool_v2::Event::ProximityOut => {
+                state.tablet_tool_mut(tool_id).pending_proximity_out = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Down { .. } => {
+                state.tablet_tool_mut(tool_id).pending_down = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Up => {
+                state.tablet_tool_mut(tool_id).pending_up = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.x = x;
+                tool.y = y;
+                tool.dirty_motion = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.pressure =
+                    u16::try_from(pressure.min(u32::from(u16::MAX))).unwrap_or(u16::MAX);
+                tool.dirty_motion = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Button {
+                button,
+                state: button_state,
+                ..
+            } => {
+                let action = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                        KeyAction::Down
+                    }
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Released) => {
+                        KeyAction::Up
+                    }
+                    _ => return,
+                };
+                let tool = state.tablet_tool_mut(tool_id);
+                if let Some(surface) = &tool.surface
+                    && let Some(object) = state.task_for_surface(surface)
+                {
+                    let _ = state.send_input(
+                        object,
+                        InputEvent::Key {
+                            action,
+                            keycode: button,
+                            repeat: 0,
+                        },
+                    );
+                }
+            }
+            tablet::zwp_tablet_tool_v2::Event::Frame { .. } => {
+                state.flush_tablet_tool(tool_id);
+            }
+            tablet::zwp_tablet_tool_v2::Event::Removed => {
+                state.cancel_tablet_tool(tool_id);
+                state.tablet_tools.retain(|tool| tool.tool_id != tool_id);
+                state.tablet_tool_proxies.remove(&tool_id);
+                proxy.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletV2,
+        _event: tablet::zwp_tablet_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadV2,
+        _event: tablet::zwp_tablet_pad_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletPadV2,
+        [
+            0 => (ZwpTabletPadRingV2, ()),
+            1 => (ZwpTabletPadStripV2, ()),
+            2 => (ZwpTabletPadGroupV2, ()),
+            3 => (ZwpTabletPadDialV2, ())
+        ]
+    );
+}
+
+impl Dispatch<ZwpTabletPadGroupV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadGroupV2,
+        _event: tablet::zwp_tablet_pad_group_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadRingV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadRingV2,
+        _event: tablet::zwp_tablet_pad_ring_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadStripV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadStripV2,
+        _event: tablet::zwp_tablet_pad_strip_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadDialV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadDialV2,
+        _event: tablet::zwp_tablet_pad_dial_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -2762,6 +3187,16 @@ fn run() -> Result<(), PresenterError> {
     }
     let sync_manager: WpLinuxDrmSyncobjManagerV1 = globals.bind(&qh, 1..=1, ())?;
     let output_power_manager: ZwlrOutputPowerManagerV1 = globals.bind(&qh, 1..=1, ())?;
+    let tablet_manager: Option<ZwpTabletManagerV2> = globals.bind(&qh, 1..=1, ()).ok();
+    let seat_state = SeatState::new(&globals, &qh);
+    let mut tablet_seats = Vec::new();
+    if let Some(manager) = &tablet_manager {
+        for seat in seat_state.seats() {
+            if !tablet_seats.iter().any(|(existing, _)| *existing == seat) {
+                tablet_seats.push((seat.clone(), manager.get_tablet_seat(&seat, &qh, ())));
+            }
+        }
+    }
     let mut app = App {
         activation: activation::Activation::new(&globals, &qh),
         layer_globals: layers::Globals {
@@ -2786,7 +3221,12 @@ fn run() -> Result<(), PresenterError> {
         host_display_powered: None,
         published_display_power: None,
         presentation_time,
-        seat_state: SeatState::new(&globals, &qh),
+        seat_state,
+        tablet_manager,
+        tablet_seats,
+        tablet_tools: Vec::new(),
+        tablet_tool_proxies: BTreeMap::new(),
+        tablet_proxies: BTreeMap::new(),
         dmabuf_state,
         feedback: None,
         compositor,
