@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <!-- Denial routes touch and pointer gestures through Droidloom's targeted
+         MotionEvent bridge. Physical input nodes remain private to the host.
+         Declare the basic touch interface apps can use through that bridge;
+         physical sensors, cameras and microphones are separate capabilities. -->
+    <feature name="android.hardware.touchscreen" />
+    <!-- The routed MotionEvent bridge preserves independent contact IDs and
+         emits POINTER_DOWN/POINTER_UP for simultaneous touches. -->
+    <feature name="android.hardware.touchscreen.multitouch" />
+    <feature name="android.hardware.touchscreen.multitouch.distinct" />
+    <feature name="android.hardware.faketouch" />
+    <!-- Freeform Android tasks support both window orientations. -->
+    <feature name="android.hardware.screen.landscape" />
+    <feature name="android.hardware.screen.portrait" />
+    <!-- SystemServer starts WifiService behind this declaration and the AOSP
+         default implementation answers without a radio. Scanning and connecting
+         still fail, but apps that dereference the manager instead of checking
+         it stop crashing; Bilibili's device-id library is the measured case. -->
+    <feature name="android.hardware.wifi" />
+    <!-- Droidloom audio bridge streams playback and capture PCM via host PipeWire. -->
+    <feature name="android.hardware.audio.output" />
+    <feature name="android.hardware.audio.low_latency" />
+    <feature name="android.hardware.microphone" />
+</permissions>

@@ -1,0 +1,10 @@
+# Xiaomi Focus Pen Pro.
+#
+# Map barrel buttons and gestures to Android canonical keys BUTTON_7..10 (194..197)
+# which Xiaomi note-taking applications (StarNote, Notein, etc.) bind to.
+key 331   BUTTON_7
+key 332   BUTTON_8
+key 262   BUTTON_7
+key 263   BUTTON_8
+key 264   BUTTON_9
+key 265   BUTTON_10

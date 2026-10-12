@@ -1,0 +1,6 @@
+# Xiaomi Focus Pen (M80p).
+#
+# Map barrel buttons to Android canonical keys BUTTON_7 / BUTTON_8 (194 / 195)
+# which Xiaomi note-taking applications (StarNote, Notein, etc.) bind to.
+key 331   BUTTON_7
+key 332   BUTTON_8

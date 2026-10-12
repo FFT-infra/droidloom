@@ -1,0 +1,12 @@
+# V4L2Device uses eventfd() for poll interruption.
+eventfd2: 1
+# Codec2 process initialization queries its parent PID.
+getppid: 1
+# Android media base code uses uname while initializing the decoder service.
+uname: 1
+# V4L2 Codec2 queries system information while configuring hardware decode.
+sysinfo: 1
+# Codec2 configures socket timeouts; this follows the AOSP mediaswcodec policy.
+setsockopt: 1
+# The active V4L2 Codec2 path receives socket data while decoding.
+recvfrom: 1

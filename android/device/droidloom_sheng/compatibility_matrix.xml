@@ -1,0 +1,13 @@
+<compatibility-matrix version="9.0" type="device">
+    <hal format="hidl">
+        <name>android.hidl.manager</name>
+        <version>1.0</version>
+        <interface>
+            <name>IServiceManager</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <system-sdk>
+        <version>37</version>
+    </system-sdk>
+</compatibility-matrix>

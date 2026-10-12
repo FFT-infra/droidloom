@@ -1,0 +1,13 @@
+import /droidloom/ime/droidloom-home.rc
+
+service vendor.droidloom-composer /vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom
+    class hal animation
+    user system
+    group system graphics drmrpc
+    capabilities SYS_NICE
+    socket droidloom-task-control seqpacket+listen 0660 system system
+    socket droidloom-surfaceflinger seqpacket+listen 0660 system graphics
+    interface aidl android.hardware.graphics.composer3.IComposer/default
+    stdio_to_kmsg
+    onrestart restart surfaceflinger
+    task_profiles MaxPerformance
