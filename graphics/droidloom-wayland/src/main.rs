@@ -1392,10 +1392,13 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
-        for tool in &mut self.tablet_tools {
-            if tool.surface.as_ref().and_then(|s| self.task_for_surface(s)) == Some(object) {
-                tool.is_down = false;
-                tool.surface = None;
+        let target_surface = self.tasks.get(&object).and_then(TaskWindow::surface).cloned();
+        if let Some(target) = target_surface {
+            for tool in &mut self.tablet_tools {
+                if tool.surface.as_ref() == Some(&target) {
+                    tool.is_down = false;
+                    tool.surface = None;
+                }
             }
         }
         if self.endpoint.is_some() {
@@ -2400,26 +2403,29 @@ impl App {
     }
 
     fn cancel_tablet_tool(&mut self, tool_id: u32) {
-        if let Some(tool) = self.tablet_tools.iter_mut().find(|t| t.tool_id == tool_id) {
-            if tool.is_down {
-                if let Some(surface) = &tool.surface
-                    && let Some(object) = self.task_for_surface(surface)
-                {
-                    let pointer_id = 0x8000_0000 | tool_id;
-                    let _ = self.send_input(
-                        object,
-                        InputEvent::Touch {
-                            action: TouchAction::Cancel,
-                            pointer_id,
-                            x_fixed: 0,
-                            y_fixed: 0,
-                            pressure: 0,
-                        },
-                    );
-                }
-                tool.is_down = false;
-            }
-            tool.surface = None;
+        let (surface, is_down) = {
+            let Some(tool) = self.tablet_tools.iter_mut().find(|t| t.tool_id == tool_id) else {
+                return;
+            };
+            let surface = tool.surface.take();
+            let is_down = std::mem::replace(&mut tool.is_down, false);
+            (surface, is_down)
+        };
+        if is_down
+            && let Some(surface) = surface
+            && let Some(object) = self.task_for_surface(&surface)
+        {
+            let pointer_id = 0x8000_0000 | tool_id;
+            let _ = self.send_input(
+                object,
+                InputEvent::Touch {
+                    action: TouchAction::Cancel,
+                    pointer_id,
+                    x_fixed: 0,
+                    y_fixed: 0,
+                    pressure: 0,
+                },
+            );
         }
     }
 
@@ -2625,9 +2631,13 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                     }
                     _ => return,
                 };
-                let tool = state.tablet_tool_mut(tool_id);
-                if let Some(surface) = &tool.surface
-                    && let Some(object) = state.task_for_surface(surface)
+                let surface = state
+                    .tablet_tools
+                    .iter()
+                    .find(|t| t.tool_id == tool_id)
+                    .and_then(|t| t.surface.clone());
+                if let Some(surface) = surface
+                    && let Some(object) = state.task_for_surface(&surface)
                 {
                     let _ = state.send_input(
                         object,
