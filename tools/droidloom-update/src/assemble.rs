@@ -450,7 +450,12 @@ pub fn assemble_artifacts(
         &product.join("system/bin/vold"),
         &payload.join("usr/lib/droidloom/storage/vold"),
     )?;
-    for name in ["libbinder.so", "libmeminfo.so", "libinputflinger.so"] {
+    for name in [
+        "libbinder.so",
+        "libmeminfo.so",
+        "libinputflinger.so",
+        "libaudiobase.so",
+    ] {
         copy(
             &product.join("system/lib64").join(name),
             &runtime.join("lib64").join(name),
