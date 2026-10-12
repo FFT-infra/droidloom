@@ -1,6 +1,7 @@
 use crate::util::*;
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -8,8 +9,9 @@ use std::{
 pub const HOST_PACKAGES: &[&str] = &[
     "droidloom-supervisor",
     "droidloom-wayland",
-    "droidloom-applications",
     "droidloom-audio",
+    "droidloom-camera",
+    "droidloom-applications",
     "droidloom-doctor",
     "droidloom-update",
     "droidloom-package-support",
@@ -19,8 +21,9 @@ pub const HOST_BINARIES: &[&str] = &[
     "droidloomctl",
     "droidloom-supervisor",
     "droidloom-wayland",
-    "droidloom-applications",
     "droidloom-audio",
+    "droidloom-camera",
+    "droidloom-applications",
     "droidloom-doctor",
     "droidloom-update",
 ];
@@ -69,7 +72,15 @@ fn prepare_inputs_from(
     arch: &str,
     reuse_installed: bool,
 ) -> Result<PathBuf> {
-    let lock_path = repo.join(format!("android/manifest/source-lock-{arch}.json"));
+    // The generic source-lock.json pins the aarch64 CI base; x86_64 has its
+    // own lock. `arch` is the Android target architecture, which may differ
+    // from the build host during cross builds.
+    let lock_name = match arch {
+        "x86_64" => "source-lock-x86_64.json",
+        "aarch64" => "source-lock.json",
+        _ => return fail("unsupported Android target architecture"),
+    };
+    let lock_path = repo.join(format!("android/manifest/{lock_name}"));
     let lock = json(&lock_path)?;
     let typed = droidloom_image::load_source_lock(&lock_path)?;
     let base = if reuse_installed {
@@ -228,16 +239,23 @@ fn extract_package_base(archive: &Path, base: &Path) -> Result<()> {
     fs::rename(temporary.path(), base)?;
     Ok(())
 }
-pub fn mesa_tools(work: &Path, jobs: usize, panfrost: bool) -> Result<()> {
+pub fn mesa_tools(work: &Path, jobs: usize) -> Result<()> {
     run(Command::new("pkg-config").args(["--exists", "LLVMSPIRVLib"]))?;
-    // The package tool cache can retain absolute /build container paths.
-    // Keep the workstation's ARM shader compiler cache separate from it.
-    let build = work.join(if panfrost {
-        "mesa-panfrost-tools"
-    } else {
-        "mesa-tools"
-    });
+    let build = work.join("mesa-tools");
     let mut configure = Command::new("meson");
+    // These compiler helpers always run on the build host (their outputs feed
+    // the Android build). A cross sysroot leaked through the environment would
+    // silently link foreign libraries into native tools, so scrub it here.
+    // The Rust cross flow keeps its own target-scoped variables untouched.
+    for var in [
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_ALLOW_CROSS",
+        "TARGET_PKG_CONFIG_SYSROOT_DIR",
+        "TARGET_PKG_CONFIG_PATH",
+    ] {
+        configure.env_remove(var);
+    }
     configure
         .env("CCACHE_DIR", work.join("ccache"))
         .env("CCACHE_TEMPDIR", work.join("ccache-tmp"));
@@ -265,32 +283,35 @@ pub fn mesa_tools(work: &Path, jobs: usize, panfrost: bool) -> Result<()> {
         "-Dgles2=disabled",
         "-Dvideo-codecs=",
         "-Dbuild-tests=false",
-        if panfrost {
-            "-Dtools=panfrost"
-        } else {
-            "-Dtools="
-        },
+        "-Dtools=",
         "-Dvalgrind=disabled",
         "-Dlibunwind=disabled",
     ]);
     run_build(&mut configure)?;
     let mut ninja = Command::new("ninja");
-    ninja
-        .arg("-C")
-        .arg(&build)
-        .arg(format!("-j{jobs}"))
-        .args([
-            "src/compiler/clc/mesa_clc",
-            "src/compiler/spirv/vtn_bindgen2",
-        ])
-        .env("PYTHONPATH", work.join("python"))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("CCACHE_DIR", work.join("ccache"))
-        .env("CCACHE_TEMPDIR", work.join("ccache-tmp"));
-    if panfrost {
-        ninja.arg("src/panfrost/clc/panfrost_compile");
+    for var in [
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_ALLOW_CROSS",
+        "TARGET_PKG_CONFIG_SYSROOT_DIR",
+        "TARGET_PKG_CONFIG_PATH",
+    ] {
+        ninja.env_remove(var);
     }
-    run_build(&mut ninja)
+    run_build(
+        ninja
+            .arg("-C")
+            .arg(&build)
+            .arg(format!("-j{jobs}"))
+            .args([
+                "src/compiler/clc/mesa_clc",
+                "src/compiler/spirv/vtn_bindgen2",
+            ])
+            .env("PYTHONPATH", work.join("python"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("CCACHE_DIR", work.join("ccache"))
+            .env("CCACHE_TEMPDIR", work.join("ccache-tmp")),
+    )
 }
 pub fn assemble(
     repo: &Path,
@@ -300,12 +321,42 @@ pub fn assemble(
     host: &Path,
     payload: &Path,
     uid: u32,
+    target_arch: &str,
 ) -> Result<()> {
-    assemble_artifacts(repo, work, base, product, host, payload)?;
+    assemble_artifacts(repo, work, base, product, host, payload, target_arch)?;
     let notices = payload.join("usr/share/licenses/droidloom");
     crate::licenses::project(repo, &notices)?;
     crate::licenses::rust(repo, &notices.join("rust"))?;
-    configure_local(repo, payload, uid)
+    let product_name = product.file_name().and_then(OsStr::to_str).ok_or("Android product output has no name")?;
+    configure_local(repo, payload, uid, target_arch, product_name)?;
+    normalize_install_permissions(payload)
+}
+
+/// Staged runtime files are public installation data, not private build state.
+/// Do not inherit a builder's umask into root-owned files used by desktop or
+/// Android service users. Keep the staging root private and never follow links.
+pub(crate) fn normalize_install_permissions(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return fail("installation staging root must be a real directory");
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            normalize_install_permissions(&entry.path())?;
+            mode(&entry.path(), 0o755)?;
+        } else if kind.is_file() {
+            let executable = entry.metadata()?.permissions().mode() & 0o111 != 0;
+            mode(&entry.path(), if executable { 0o755 } else { 0o644 })?;
+        } else if !kind.is_symlink() {
+            return fail("non-regular installation payload");
+        }
+        // Package staging has its own generated aliases. Leave those alone;
+        // source-bundle sealing still rejects all symlinks independently.
+    }
+    Ok(())
 }
 
 /// Stage the complete artifact recipe without reading any build-host configuration.
@@ -316,17 +367,14 @@ pub fn assemble_artifacts(
     product: &Path,
     host: &Path,
     payload: &Path,
+    target_arch: &str,
 ) -> Result<()> {
-    let runtime = payload.join("usr/lib/droidloom/runtime");
     let product_name = product
         .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("Android product directory has no name")?;
-    let arm64 = match product_name {
-        "droidloom_arm64" => true,
-        "droidloom_x86_64" => false,
-        _ => return fail("unsupported Android product directory"),
-    };
+        .ok_or("Android product output has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let runtime = payload.join("usr/lib/droidloom/runtime");
     for name in HOST_BINARIES {
         let dest = payload.join("usr/bin").join(name);
         copy(&host.join(name), &dest)?;
@@ -341,6 +389,8 @@ pub fn assemble_artifacts(
         ("system/bin/netd", "bin/netd-cell-policy"),
         ("system/bin/servicemanager", "bin/servicemanager"),
         ("system/bin/surfaceflinger", "bin/surfaceflinger"),
+        ("system/bin/virtual_camera", "camera/bin/virtual_camera"),
+        ("system/bin/droidloom-camera-producer", "camera/bin/droidloom-camera-producer"),
         (
             "vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom",
             "bin/android.hardware.graphics.composer3-service.droidloom",
@@ -353,6 +403,14 @@ pub fn assemble_artifacts(
         (
             "system/app/DroidloomHome/DroidloomHome.apk",
             "ime/DroidloomHome.apk",
+        ),
+        (
+            "system/app/TouchService/TouchService.apk",
+            "ime/TouchService.apk",
+        ),
+        (
+            "system/system_ext/framework/xiaomi-pencilengine-pad.jar",
+            "framework/xiaomi-pencilengine-pad.jar",
         ),
         (
             "system/system_ext/priv-app/DroidloomSystemUI/DroidloomSystemUI.apk",
@@ -384,7 +442,7 @@ pub fn assemble_artifacts(
         copy(
             &work
                 .join("android-out")
-                .join(crate::android::apex_output_for_product(name, product_name).unwrap()),
+                .join(crate::android::apex_output(name).unwrap()),
             &runtime.join(destination),
         )?;
     }
@@ -392,18 +450,17 @@ pub fn assemble_artifacts(
         &product.join("system/bin/vold"),
         &payload.join("usr/lib/droidloom/storage/vold"),
     )?;
-    for name in [
-        "libbinder.so",
-        "libmeminfo.so",
-        "libinputflinger.so",
-        "libaudiobase.so",
-    ] {
+    for name in ["libbinder.so", "libmeminfo.so", "libinputflinger.so"] {
         copy(
             &product.join("system/lib64").join(name),
             &runtime.join("lib64").join(name),
         )?;
     }
-    for name in [
+    // The userspace GPU driver differs per target: AMD on x86_64 desktops,
+    // the generic libdrm core on ARM64 MSM hosts (the Freedreno winsys code
+    // ships inside libgallium_dri; no separate libdrm_freedreno is emitted).
+    // A missing entry fails loudly at copy time.
+    let mut vendor_libs = vec![
         "libdroidloom_surface_bridge.dylib.so",
         "libdroidloom_task_control.dylib.so",
         "libdroidloom_composer_aidl.dylib.so",
@@ -416,16 +473,16 @@ pub fn assemble_artifacts(
         "libdroidloom_selinux_compat.so",
         "libminigbm_gralloc.so",
         "libgallium_dri.so",
-    ] {
+    ];
+    vendor_libs.push(match target_arch {
+        "x86_64" => "libdrm_amdgpu.so",
+        "aarch64" => "libdrm.so",
+        _ => return fail("unsupported Android target architecture"),
+    });
+    for name in vendor_libs {
         copy(
             &product.join("vendor/lib64").join(name),
             &runtime.join("lib64").join(name),
-        )?;
-    }
-    if !arm64 {
-        copy(
-            &product.join("vendor/lib64/libdrm_amdgpu.so"),
-            &runtime.join("lib64/libdrm_amdgpu.so"),
         )?;
     }
     for name in [
@@ -446,11 +503,12 @@ pub fn assemble_artifacts(
             "compat/vintf/compatibility_matrix.device.xml",
         ),
         (
-            "android/device/droidloom_arm64/droidloom-composer.rc",
+            &format!("android/device/{product_name}/droidloom-composer.rc"),
             "etc/init/droidloom-composer.rc",
         ),
         ("packaging/ime/setup", "ime/setup"),
         ("packaging/home/setup", "ime/home-setup"),
+        ("android/hardware/camera/producer.rc", "camera/producer.rc"),
         (
             "android/framework/droidloom-home/droidloom-home.rc",
             "ime/droidloom-home.rc",
@@ -462,6 +520,13 @@ pub fn assemble_artifacts(
     ] {
         copy(&repo.join(src), &runtime.join(dst))?;
     }
+    // The Composer init fragment lives beside its product definition.
+    copy(
+        &repo.join(format!(
+            "android/device/{product_name}/droidloom-composer.rc"
+        )),
+        &runtime.join("etc/init/droidloom-composer.rc"),
+    )?;
     copy(
         &work.join("init.rc"),
         &runtime.join("compat/init-classpath-first-pixels.rc"),
@@ -481,26 +546,32 @@ pub fn assemble_artifacts(
         )?;
     }
     let images = payload.join("var/lib/droidloom/images/images");
-    copy(&base.join("product.img"), &images.join("product.img"))?;
-    if arm64 {
-        // Native ARM apps need neither an ISA translator nor the desktop-only
-        // system_ext projection. Keep both pinned input partitions intact.
-        for name in ["system.img", "system_ext.img"] {
-            copy(&base.join(name), &images.join(name))?;
-        }
+    if crate::android::declares_tablet(&product_name)? {
+        crate::image_policy::declare_tablet(
+            &base.join("product.img"),
+            &images.join("product.img"),
+        )?;
     } else {
-        crate::native_bridge::stage_image(
-            repo,
-            &base.join("system.img"),
-            &images.join("system.img"),
-            product,
-        )?;
-        crate::image_policy::stage(
-            &base.join("system_ext.img"),
-            &images.join("system_ext.img"),
-            &product.join("vendor/build.prop"),
-        )?;
+        copy(&base.join("product.img"), &images.join("product.img"))?;
     }
+    crate::native_bridge::stage_image(
+        repo,
+        &base.join("system.img"),
+        &images.join("system.img"),
+        product,
+    )?;
+    let pencilengine_jar = product.join("system/system_ext/framework/xiaomi-pencilengine-pad.jar");
+    let pencilengine_opt = if pencilengine_jar.is_file() {
+        Some(pencilengine_jar.as_path())
+    } else {
+        None
+    };
+    crate::image_policy::stage(
+        &base.join("system_ext.img"),
+        &images.join("system_ext.img"),
+        &product.join("vendor/build.prop"),
+        pencilengine_opt,
+    )?;
     let vendor = product.join("vendor.img");
     let mut magic = [0; 4];
     use std::io::Read;
@@ -515,9 +586,10 @@ pub fn assemble_artifacts(
     for name in [
         "system/droidloomd.service",
         "user/droidloom.service",
-        "user/droidloom-applications.service",
         "user/droidloom-audio.service",
-        "user/droidloom-audio.socket",
+        "user/droidloom-camera.service",
+        "user/droidloom-camera.socket",
+        "user/droidloom-applications.service",
     ] {
         copy(
             &repo.join("packaging/systemd").join(name),
@@ -527,38 +599,80 @@ pub fn assemble_artifacts(
     Ok(())
 }
 
-fn configure_local(repo: &Path, payload: &Path, uid: u32) -> Result<()> {
-    let mut spec = json(&repo.join("packaging/cell-spec-x86_64-u1000.json"))?;
-    let render = render_node()?;
-    spec["host_uid"] = json!(uid);
-    spec["render_node"] = json!(render);
-    spec["data_dir"] = json!(format!("/var/lib/droidloom/users/{uid}/data"));
-    spec["runtime_dir"] = json!(format!("/run/droidloom/cells/u{uid}"));
-    spec["denial_socket"] = json!(format!("/run/user/{uid}/droidloom/native-bridge.sock"));
-    spec["shared_storage_directories"] = json!([]);
-    if Path::new("/etc/droidloom/cell.json").exists() {
-        let existing = json(Path::new("/etc/droidloom/cell.json"))?;
-        preserve_settings(&mut spec, &existing, uid)?;
-    }
-    let record = output(Command::new("getent").args(["passwd", &uid.to_string()]))?;
-    configure_target(
-        repo,
-        payload,
-        &spec,
-        record.split(':').next().ok_or("user absent")?,
-    )
-}
-
-fn configure_target(repo: &Path, payload: &Path, spec: &Value, user: &str) -> Result<()> {
+fn configure_local(repo: &Path, payload: &Path, uid: u32, target_arch: &str, product_name: &str) -> Result<()> {
     let runtime = payload.join("usr/lib/droidloom/runtime");
-    let uid = spec["host_uid"]
-        .as_u64()
-        .filter(|uid| *uid > 0 && *uid <= u64::from(u32::MAX))
-        .ok_or("cell requires an unprivileged desktop UID")?;
-    let render = spec["render_node"]
-        .as_str()
-        .filter(|path| path.starts_with("/dev/dri/") && !path.contains(['\n', '\r']))
-        .ok_or("cell requires a DRM render node")?;
+    // The ARM64 cell recipe is the Moto-validated variant; only identity
+    // fields are rewritten below, never the runtime mappings.
+    let spec_name = match target_arch {
+        "x86_64" => "packaging/cell-spec-x86_64-u1000.json",
+        "aarch64" => "packaging/cell-spec-arm64-u1001.json",
+        _ => return fail("unsupported Android target architecture"),
+    };
+    let mut spec = json(&repo.join(spec_name))?;
+    let render = render_node(target_arch)?;
+    // Normalize every identity field to the target desktop user. The base
+    // recipe pins the Moto developer ids; cross bundles must not inherit them.
+    let base_uid = spec["host_uid"].as_u64().unwrap_or(1000);
+    let reroute = |value: &str| {
+        value
+            .replace(&format!("/users/{base_uid}/"), &format!("/users/{uid}/"))
+            .replace(&format!("/user/{base_uid}/"), &format!("/user/{uid}/"))
+            .replace(&format!("cells/u{base_uid}"), &format!("cells/u{uid}"))
+    };
+    spec["host_uid"] = json!(uid);
+    // The build host may not know the target desktop user (cross bundles).
+    // Explicit overrides win; otherwise resolve through the host user database.
+    let passwd = match std::env::var("DROIDLOOM_TARGET_USER") {
+        Ok(user) if !user.is_empty() => format!("{user}:x:{uid}:"),
+        _ => output(Command::new("getent").args(["passwd", &uid.to_string()]))?,
+    };
+    let mut fields = passwd.split(':');
+    let user = serde_json::to_string(fields.next().ok_or("user absent")?)?;
+    let gid: u32 = match std::env::var("DROIDLOOM_TARGET_GID") {
+        Ok(gid) if !gid.is_empty() => gid.parse().map_err(|_| "bad DROIDLOOM_TARGET_GID")?,
+        _ => fields
+            .nth(2)
+            .ok_or("group absent")?
+            .parse()
+            .map_err(|_| "bad group id")?,
+    };
+    // NOTE: no top-level host_gid is written: the lifecycle protocol message
+    // has no such field (per-directory host_gid entries are untouched).
+    for field in ["data_dir", "runtime_dir", "denial_socket"] {
+        if let Some(path) = spec[field].as_str() {
+            spec[field] = json!(reroute(path));
+        }
+    }
+    // The shared-storage probe path carries the base recipe's uid as well.
+    if let Some(probe) = spec["shared_storage_probe"].as_str() {
+        spec["shared_storage_probe"] = json!(reroute(probe));
+    }
+    spec["render_node"] = json!(render);
+    spec["shared_storage_directories"] = json!([]);
+    let target_cell_config = std::env::var_os("DROIDLOOM_TARGET_CELL_CONFIG").map(PathBuf::from);
+    let existing_cell_config = existing_cell_config_path(
+        target_arch,
+        std::env::consts::ARCH,
+        Path::new("/etc/droidloom/cell.json"),
+        target_cell_config.as_deref(),
+    )?;
+    let allow_product_video_decoder_default = if let Some(path) = existing_cell_config {
+        let existing = json(&path)?;
+        let has_video_decoder_setting = existing
+            .as_object()
+            .is_some_and(|object| object.contains_key("video_decoder"));
+        preserve_settings(&mut spec, &existing, uid)?;
+        // Removing the optional field from an existing cell is an explicit
+        // request to keep using Android's software codecs after updates.
+        has_video_decoder_setting
+    } else {
+        true
+    };
+    apply_product_video_decoder_default(
+        &mut spec,
+        product_name,
+        allow_product_video_decoder_default,
+    );
     for entry in spec["android_file_overrides"]
         .as_array()
         .ok_or("missing overrides")?
@@ -584,10 +698,9 @@ fn configure_target(repo: &Path, payload: &Path, spec: &Value, user: &str) -> Re
     write(
         &payload.join("usr/lib/environment.d/60-droidloom.conf"),
         format!(
-            "DROIDLOOM_HOST_PEER_PID=0\nDROIDLOOM_HOST_PEER_UID=1000\nDROIDLOOM_HOST_PEER_GID=1000\nDROIDLOOM_RENDER_NODE={render}\n"
+            "DROIDLOOM_HOST_PEER_PID=0\nDROIDLOOM_HOST_PEER_UID={uid}\nDROIDLOOM_HOST_PEER_GID={gid}\nDROIDLOOM_RENDER_NODE={render}\n"
         ),
     )?;
-    let user = serde_json::to_string(user)?;
     write(
         &payload.join("etc/polkit-1/rules.d/49-droidloom.rules"),
         format!(
@@ -596,74 +709,17 @@ fn configure_target(repo: &Path, payload: &Path, spec: &Value, user: &str) -> Re
     )?;
     Ok(())
 }
-
-pub struct CrossTarget<'a> {
-    pub product: &'a str,
-    pub cell_spec: &'a Path,
-    pub user: &'a str,
-}
-
-pub fn stage_cross(
-    repo: &Path,
-    work: &Path,
-    host: &Path,
-    base: &Path,
-    target: CrossTarget<'_>,
-    destination: &Path,
-) -> Result<()> {
-    let CrossTarget {
-        product,
-        cell_spec,
-        user,
-    } = target;
-    let _lock = Lock::acquire(&work.join("package-build.lock"))?;
-    let _source_lock = Lock::acquire(&work.join("aosp-source-update.lock"))?;
-    if destination.exists() {
-        return fail("bundle destination already exists; retain it and choose a new destination");
+fn render_node(target_arch: &str) -> Result<String> {
+    // Cross bundles target a different machine: the target operator pins its
+    // render node explicitly instead of inheriting the build host's.
+    if let Ok(node) = std::env::var("DROIDLOOM_RENDER_NODE")
+        && !node.is_empty()
+    {
+        return Ok(node);
     }
-    let lock = match product {
-        "droidloom_arm64" => "android/manifest/source-lock.json",
-        "droidloom_x86_64" => "android/manifest/source-lock-x86_64.json",
-        _ => return fail("unsupported Android product"),
-    };
-    let lock = json(&repo.join(lock))?;
-    for name in ["system", "system_ext", "product"] {
-        let expected = lock["aosp_ci_base"]["partitions"][format!("{name}_a")]
-            .as_str()
-            .ok_or("base image identity is missing")?;
-        if hash(&base.join(format!("{name}.img")))? != expected {
-            return fail(format!("{name} differs from the pinned {product} base"));
-        }
+    if target_arch != std::env::consts::ARCH {
+        return fail("cross bundle requires DROIDLOOM_RENDER_NODE for the target device");
     }
-    let parent = destination
-        .parent()
-        .ok_or("bundle destination has no parent")?;
-    fs::create_dir_all(parent)?;
-    let staging = tempfile::Builder::new()
-        .prefix("cross-bundle-")
-        .tempdir_in(parent)?;
-    assemble_artifacts(
-        repo,
-        work,
-        base,
-        &work.join("android-out/target/product").join(product),
-        host,
-        staging.path(),
-    )?;
-    configure_target(repo, staging.path(), &json(cell_spec)?, user)?;
-    let notices = staging.path().join("usr/share/licenses/droidloom");
-    crate::licenses::project(repo, &notices)?;
-    crate::licenses::rust(repo, &notices.join("rust"))?;
-    let id = crate::bundle::seal(staging.path(), crate::bundle::source_identity(repo)?)?;
-    crate::bundle::verify(staging.path())?;
-    fs::rename(staging.path(), destination)?;
-    println!(
-        "Verified cross-built bundle {id}: {}",
-        destination.display()
-    );
-    Ok(())
-}
-fn render_node() -> Result<String> {
     let mut nodes = fs::read_dir("/sys/class/drm")?.collect::<std::io::Result<Vec<_>>>()?;
     nodes.sort_by_key(|e| e.file_name());
     for node in nodes {
@@ -671,14 +727,42 @@ fn render_node() -> Result<String> {
             continue;
         }
         if let Ok(driver) = fs::canonicalize(node.path().join("device/driver"))
-            && driver
-                .file_name()
-                .is_some_and(|n| n == "amdgpu" || n == "i915" || n == "xe")
+            && driver.file_name().is_some_and(|n| {
+                n == "amdgpu" || n == "i915" || n == "xe" || n == "msm" || n == "msm_dpu" || n == "freedreno"
+            })
         {
             return Ok(format!("/dev/dri/{}", node.file_name().to_string_lossy()));
         }
     }
-    fail("this x86_64 product requires an AMD or Intel render node")
+    fail("no supported render node found (AMD, Intel or MSM); pin one with DROIDLOOM_RENDER_NODE")
+}
+fn existing_cell_config_path(
+    target_arch: &str,
+    host_arch: &str,
+    host_config: &Path,
+    target_config: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    if target_arch == host_arch {
+        return Ok(host_config.is_file().then(|| host_config.to_path_buf()));
+    }
+    let path = target_config.ok_or("cross bundle requires DROIDLOOM_TARGET_CELL_CONFIG for the target device")?;
+    if !path.is_file() {
+        return fail("DROIDLOOM_TARGET_CELL_CONFIG does not name a regular file");
+    }
+    Ok(Some(path.to_path_buf()))
+}
+fn apply_product_video_decoder_default(spec: &mut Value, product_name: &str, allowed: bool) {
+    if allowed && spec.get("video_decoder").is_none() {
+        if let Some(decoder) = video_decoder_for_product(product_name) {
+            spec["video_decoder"] = json!(decoder);
+        }
+    }
+}
+fn video_decoder_for_product(_product_name: &str) -> Option<&'static str> {
+    // No sheng decoder combination has passed sustained real-stream validation.
+    // Keep Android's software codecs as the default until a tested capability is
+    // explicitly enabled by the device configuration.
+    None
 }
 fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()> {
     if existing["host_uid"].as_u64() != Some(u64::from(uid)) {
@@ -690,6 +774,7 @@ fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()>
         "subordinate_uids",
         "subordinate_gids",
         "shared_storage_directories",
+        "video_decoder",
     ] {
         if let Some(value) = existing.get(field) {
             spec[field] = value.clone();
@@ -701,9 +786,115 @@ fn preserve_settings(spec: &mut Value, existing: &Value, uid: u32) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_install_modes_do_not_inherit_private_build_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stage = tempfile::tempdir().unwrap();
+        mode(stage.path(), 0o700).unwrap();
+        let config = stage.path().join("usr/lib/environment.d/60-droidloom.conf");
+        let library = stage.path().join("usr/lib/droidloom/runtime/lib64/composer.so");
+        write(&config, b"DROIDLOOM_MODE=desktop\n").unwrap();
+        write(&library, b"permission fixture, not an ELF").unwrap();
+        mode(&config, 0o600).unwrap();
+        mode(&library, 0o700).unwrap();
+        mode(config.parent().unwrap(), 0o700).unwrap();
+        mode(library.parent().unwrap(), 0o700).unwrap();
+
+        normalize_install_permissions(stage.path()).unwrap();
+        normalize_install_permissions(stage.path()).unwrap();
+        assert_eq!(fs::metadata(&config).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(fs::metadata(&library).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(config.parent().unwrap()).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(library.parent().unwrap()).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(stage.path()).unwrap().permissions().mode() & 0o7777, 0o700);
+        assert_eq!(fs::read(&config).unwrap(), b"DROIDLOOM_MODE=desktop\n");
+        assert_eq!(fs::read(&library).unwrap(), b"permission fixture, not an ELF");
+    }
+
+    #[test]
+    fn install_mode_normalization_never_follows_package_aliases() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let stage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("untouched");
+        write(&secret, b"outside").unwrap();
+        mode(&secret, 0o600).unwrap();
+        symlink(outside.path(), stage.path().join("alias")).unwrap();
+        normalize_install_permissions(stage.path()).unwrap();
+        assert_eq!(fs::metadata(&secret).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert!(normalize_install_permissions(&stage.path().join("alias")).is_err());
+        // Source bundles still reject links; allowing a generated package alias
+        // here does not relax their inventory validation.
+        assert!(crate::bundle::inventory(stage.path()).is_err());
+    }
+
+    #[test]
+    fn install_modes_remove_write_and_privilege_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stage = tempfile::tempdir().unwrap();
+        let file = stage.path().join("binary");
+        write(&file, b"permission fixture").unwrap();
+        mode(&file, 0o6777).unwrap();
+        normalize_install_permissions(stage.path()).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn no_product_enables_an_unvalidated_video_decoder_by_default() {
+        for product in ["droidloom_sheng", "droidloom_arm64", "droidloom_x86_64"] {
+            assert_eq!(video_decoder_for_product(product), None);
+        }
+    }
+
+    #[test]
+    fn cross_bundle_uses_an_explicit_target_cell_config() {
+        let d = tempfile::tempdir().unwrap();
+        let host = d.path().join("host-cell.json");
+        let target = d.path().join("sheng-cell.json");
+        std::fs::write(&host, b"{}").unwrap();
+        std::fs::write(&target, b"{}").unwrap();
+        assert!(existing_cell_config_path("aarch64", "x86_64", &host, None).is_err());
+        assert_eq!(
+            existing_cell_config_path("aarch64", "x86_64", &host, Some(&target)).unwrap(),
+            Some(target),
+        );
+        assert_eq!(
+            existing_cell_config_path("x86_64", "x86_64", &host, None).unwrap(),
+            Some(host),
+        );
+    }
+
+    #[test]
+    fn removed_video_decoder_setting_stays_disabled_on_update() {
+        let existing = json!({"host_uid":1000});
+        let mut candidate = json!({});
+        preserve_settings(&mut candidate, &existing, 1000).unwrap();
+        apply_product_video_decoder_default(&mut candidate, "droidloom_sheng", false);
+        assert!(candidate.get("video_decoder").is_none());
+    }
+
+    #[test]
+    fn unvalidated_sheng_decoder_remains_disabled_even_when_defaults_are_allowed() {
+        let mut candidate = json!({});
+        apply_product_video_decoder_default(&mut candidate, "droidloom_sheng", true);
+        assert!(candidate.get("video_decoder").is_none());
+
+        let mut explicitly_disabled = json!({"video_decoder":null});
+        apply_product_video_decoder_default(
+            &mut explicitly_disabled,
+            "droidloom_sheng",
+            true,
+        );
+        assert!(explicitly_disabled["video_decoder"].is_null());
+    }
+
     #[test]
     fn update_keeps_personal_state_but_replaces_runtime_mappings() {
-        let existing = json!({"host_uid":1000,"data_dir":"/var/lib/droidloom/custom-data","shared_storage_directories":[{"source":"/home/test/Downloads"}],"android_file_overrides":["old"]});
+        let existing = json!({"host_uid":1000,"data_dir":"/var/lib/droidloom/custom-data","shared_storage_directories":[{"source":"/home/test/Downloads"}],"video_decoder":"iris","android_file_overrides":["old"]});
         let mut candidate = json!({"android_file_overrides":["new"]});
         preserve_settings(&mut candidate, &existing, 1000).unwrap();
         assert_eq!(candidate["data_dir"], existing["data_dir"]);
@@ -712,6 +903,7 @@ mod tests {
             existing["shared_storage_directories"]
         );
         assert_eq!(candidate["android_file_overrides"], json!(["new"]));
+        assert_eq!(candidate["video_decoder"], json!("iris"));
         assert!(preserve_settings(&mut candidate, &existing, 1001).is_err());
     }
 }

@@ -5,7 +5,7 @@ fn available(name: &str) -> bool {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .any(|p| p.join(name).is_file())
 }
-pub fn ensure() -> Result<()> {
+pub fn ensure(runtime_host: bool) -> Result<()> {
     let arch = PathBuf::from("/etc/arch-release").exists();
     let mut packages = BTreeSet::new();
     for (command, package) in [
@@ -17,6 +17,7 @@ pub fn ensure() -> Result<()> {
         ("meson", "meson"),
         ("ninja", "ninja"),
         ("pkg-config", "pkgconf"),
+        ("gst-inspect-1.0", "gstreamer"),
         ("cc", "base-devel"),
         ("llvm-config", "llvm"),
         ("bison", "bison"),
@@ -49,7 +50,8 @@ pub fn ensure() -> Result<()> {
         ("gbm", "mesa"),
         ("libdrm", "libdrm"),
         ("wayland-client", "wayland"),
-        ("libpipewire-0.3", "libpipewire"),
+        ("gstreamer-app-1.0", "gst-plugins-base-libs"),
+        ("gstreamer-video-1.0", "gst-plugins-base-libs"),
         ("LLVMSPIRVLib", "spirv-llvm-translator"),
     ] {
         if !available("pkg-config")
@@ -64,6 +66,26 @@ pub fn ensure() -> Result<()> {
                 ));
             }
             packages.insert(package);
+        }
+    }
+    // Runtime plugins only matter where the camera bridge will actually run.
+    // A cross bundle is built for another machine, whose runtime packages are
+    // its own operator's concern; only build-time libraries are required here.
+    if runtime_host {
+        for (plugin, package) in [("pipewire", "gst-plugin-pipewire"), ("videorate", "gst-plugins-base")] {
+            if !available("gst-inspect-1.0")
+                || !Command::new("gst-inspect-1.0").arg(plugin).stdout(std::process::Stdio::null()).status()?.success()
+            {
+                if !arch {
+                    return fail(format!("missing GStreamer plugin {plugin}; install the host PipeWire and GStreamer base plugins"));
+                }
+                packages.insert(package);
+            }
+        }
+        if arch && !Command::new("pacman").args(["-Qq", "pipewire-libcamera"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()?.success()
+        {
+            packages.insert("pipewire-libcamera");
         }
     }
     if !packages.is_empty() {

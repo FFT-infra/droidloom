@@ -1,13 +1,62 @@
 use crate::util::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::Command,
+};
+
 pub const MANIFEST: &str = "droidloom-update.json";
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub const PRESENTER: &str = "usr/bin/droidloom-wayland";
+pub(crate) const CAMERA_EXECUTABLES: &[&str] = &[
+    "usr/bin/droidloom-camera",
+    "usr/lib/droidloom/runtime/camera/bin/virtual_camera",
+    "usr/lib/droidloom/runtime/camera/bin/droidloom-camera-producer",
+];
+pub(crate) const CAMERA_DATA: &[&str] = &[
+    "usr/lib/systemd/user/droidloom-camera.service",
+    "usr/lib/systemd/user/droidloom-camera.socket",
+    "usr/lib/droidloom/runtime/camera/producer.rc",
+];
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILES: usize = 20_000;
+const MAX_COMPONENTS: usize = 64;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
+    pub path: String,
+    pub component: String,
+    pub size: u64,
+    pub sha256: String,
     pub mode: u32,
 }
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleKind {
+    Full,
+    PresenterDerivative,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    pub name: String,
+    pub source_commit: String,
+    pub cargo_lock_sha256: Option<String>,
+    pub source_lock_sha256: Option<String>,
+    pub target: String,
+    pub toolchain: String,
+    pub build_profile: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: u32,
@@ -15,7 +64,89 @@ pub struct Manifest {
     pub architecture: String,
     pub input_abi: u16,
     pub source_identity: String,
-    pub files: BTreeMap<String, Artifact>,
+    pub kind: BundleKind,
+    pub base_build_id: Option<String>,
+    pub components: Vec<Component>,
+    pub files: Vec<Artifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyManifest {
+    pub schema: u32,
+    pub build_id: String,
+    pub architecture: String,
+    pub input_abi: u16,
+    pub source_identity: String,
+    pub files: BTreeMap<String, LegacyArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyArtifact {
+    pub mode: u32,
+}
+
+pub enum ManifestRecord {
+    Legacy(LegacyManifest),
+    VerifiedFormat(Manifest),
+}
+
+/// Build provenance is captured before compilation and rechecked before sealing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildProvenance {
+    pub source_commit: String,
+    pub cargo_lock_sha256: String,
+    pub source_lock_sha256: String,
+    pub toolchain: String,
+    pub target: String,
+}
+
+impl BuildProvenance {
+    pub fn capture(repo: &Path, architecture: &str) -> Result<Self> {
+        let source_commit = clean_source_commit(repo)?;
+        let result = Self {
+            source_commit,
+            cargo_lock_sha256: hash(&repo.join("Cargo.lock"))?,
+            source_lock_sha256: hash(&repo.join("android/manifest/m2-sparse-source-lock.json"))?,
+            toolchain: output(Command::new("rustc").arg("--version"))?,
+            target: host_target(architecture)?.to_owned(),
+        };
+        Ok(result)
+    }
+
+    pub fn check_unchanged(&self, repo: &Path) -> Result<()> {
+        if clean_source_commit(repo)? != self.source_commit
+            || hash(&repo.join("Cargo.lock"))? != self.cargo_lock_sha256
+            || hash(&repo.join("android/manifest/m2-sparse-source-lock.json"))? != self.source_lock_sha256
+        {
+            return fail("source or build locks changed during the build; refusing to seal");
+        }
+        Ok(())
+    }
+
+    fn components(&self) -> Vec<Component> {
+        ["android", "presenter", "runtime"]
+            .into_iter()
+            .map(|name| Component {
+                name: name.into(),
+                source_commit: self.source_commit.clone(),
+                cargo_lock_sha256: (name != "android").then(|| self.cargo_lock_sha256.clone()),
+                source_lock_sha256: Some(self.source_lock_sha256.clone()),
+                target: self.target.clone(),
+                toolchain: self.toolchain.clone(),
+                build_profile: "release".into(),
+            })
+            .collect()
+    }
+}
+
+pub fn host_target(architecture: &str) -> Result<&'static str> {
+    match architecture {
+        "x86_64" => Ok("x86_64-unknown-linux-gnu"),
+        "aarch64" => Ok("aarch64-unknown-linux-gnu"),
+        _ => fail("unsupported bundle architecture"),
+    }
 }
 pub fn input_abi(data: &[u8]) -> Result<u16> {
     let prefix = b"DROIDLOOM_INPUT_ABI=";
@@ -51,7 +182,6 @@ pub fn dex(path: &Path) -> Result<Vec<u8>> {
         if !out.status.success() {
             return fail("cannot extract compiled Android DEX");
         }
-        validate_dex(&out.stdout).map_err(|error| format!("{}!{name}: {error}", path.display()))?;
         result.extend(out.stdout);
     }
     if result.is_empty() {
@@ -61,45 +191,6 @@ pub fn dex(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(result)
-}
-fn dex_checksum(data: &[u8]) -> u32 {
-    // Adler-32, as used by ART over the bytes following checksum_ (offset 12).
-    // 5552 bytes bound both accumulators below u32::MAX before reduction.
-    let (mut a, mut b) = (1_u32, 0_u32);
-    for chunk in data.chunks(5552) {
-        for &byte in chunk {
-            a += u32::from(byte);
-            b += a;
-        }
-        a %= 65521;
-        b %= 65521;
-    }
-    (b << 16) | a
-}
-fn validate_dex(data: &[u8]) -> Result<()> {
-    if data.len() < 112 {
-        return fail("truncated DEX header");
-    }
-    if &data[..4] != b"dex\n"
-        || !matches!(
-            &data[4..8],
-            b"035\0" | b"037\0" | b"038\0" | b"039\0" | b"040\0"
-        )
-    {
-        return fail("unsupported DEX magic/version; expected standard DEX 035–040");
-    }
-    let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-    if word(32) as usize != data.len() || word(36) != 112 || word(40) != 0x12345678 {
-        return fail("invalid DEX file size, header size or endian tag");
-    }
-    let actual = dex_checksum(&data[12..]);
-    let expected = word(8);
-    if actual != expected {
-        return fail(format!(
-            "bad DEX checksum ({actual:08x}, expected {expected:08x}); rebuild the Android artifact"
-        ));
-    }
-    Ok(())
 }
 fn architecture(data: &[u8]) -> Result<&'static str> {
     if data.len() < 20 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
@@ -111,11 +202,37 @@ fn architecture(data: &[u8]) -> Result<&'static str> {
         _ => fail("unsupported ELF architecture"),
     }
 }
+pub(crate) fn camera_payload_present(root: &Path) -> bool {
+    CAMERA_EXECUTABLES.iter().chain(CAMERA_DATA).any(|path| root.join(path).exists())
+}
+
+fn verify_camera_payload(root: &Path, expected_arch: &str) -> Result<()> {
+    // Older complete releases have no camera closure and remain valid rollback
+    // targets. A partially included camera must never become an installable bundle.
+    if !camera_payload_present(root) {
+        return Ok(());
+    }
+    for path in CAMERA_EXECUTABLES.iter().chain(CAMERA_DATA) {
+        let metadata = fs::symlink_metadata(root.join(path))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return fail(format!("missing camera component: {path}"));
+        }
+    }
+    for path in CAMERA_EXECUTABLES {
+        let path = root.join(path);
+        if fs::metadata(&path)?.permissions().mode() & 0o111 != 0o111
+            || executable_architecture(&path)? != expected_arch
+        {
+            return fail(format!("camera executable is inaccessible or has the wrong architecture: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
 fn compatibility(root: &Path) -> Result<(String, u16)> {
     let runtime = root.join("usr/lib/droidloom/runtime");
     let home = dex(&runtime.join("ime/DroidloomHome.apk"))?;
-    if !home
-        .windows(b"Lcom/android/droidloom/home/HomeActivity;".len())
+    if !home.windows(b"Lcom/android/droidloom/home/HomeActivity;".len())
         .any(|w| w == b"Lcom/android/droidloom/home/HomeActivity;")
     {
         return fail("DroidloomHome.apk lacks compiled HOME activity");
@@ -124,142 +241,71 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
         return fail("missing HOME provisioning script");
     }
     let systemui = dex(&runtime.join("systemui/SystemUI.apk"))?;
-    if !systemui
-        .windows(b"DROIDLOOM_SYSTEMUI_ABI=1;".len())
+    if !systemui.windows(b"DROIDLOOM_SYSTEMUI_ABI=1;".len())
         .any(|w| w == b"DROIDLOOM_SYSTEMUI_ABI=1;")
     {
         return fail("SystemUI.apk is not the Droidloom minimal implementation");
     }
-    if !systemui
-        .windows(b"DROIDLOOM_CLIPBOARD_ABI=1;".len())
-        .any(|w| w == b"DROIDLOOM_CLIPBOARD_ABI=1;")
-    {
+    if !systemui.windows(b"DROIDLOOM_CLIPBOARD_ABI=1;".len())
+        .any(|w| w == b"DROIDLOOM_CLIPBOARD_ABI=1;") {
         return fail("SystemUI.apk lacks the clipboard adapter");
     }
-    if !systemui
-        .windows(b"DROIDLOOM_NOTIFICATIONS_ABI=2;".len())
-        .any(|w| w == b"DROIDLOOM_NOTIFICATIONS_ABI=2;")
-    {
+    if !systemui.windows(b"DROIDLOOM_NOTIFICATIONS_ABI=1;".len()).any(|w| w == b"DROIDLOOM_NOTIFICATIONS_ABI=1;") {
         return fail("SystemUI.apk lacks the notification adapter");
     }
-    let ime = dex(&runtime.join("ime/DroidloomIME.apk"))?;
+    let launcher = runtime.join("ime/droidloom-input-bridge");
+    if fs::metadata(&launcher)?.permissions().mode() & 0o111 == 0 {
+        return fail(
+            "Android input bridge launcher is not executable; input and resizing cannot start",
+        );
+    }
     let composer =
         fs::read(runtime.join("bin/android.hardware.graphics.composer3-service.droidloom"))?;
     let arch = architecture(&composer)?.to_string();
     let version = input_abi(&composer)?;
-    let direct_input_abi = b"DROIDLOOM_DIRECT_INPUT_ABI=1;";
-    let presenter = fs::read(root.join("usr/bin/droidloom-wayland"))?;
-    if !composer
-        .windows(direct_input_abi.len())
-        .any(|w| w == direct_input_abi)
-        || !presenter
-            .windows(direct_input_abi.len())
-            .any(|w| w == direct_input_abi)
-    {
-        return fail("Composer and presenter lack paired direct input ABI 1");
+    let mut bridges = 0;
+    for relative in [
+        "framework/droidloom-input-bridge.jar",
+        "ime/droidloom-input-bridge.jar",
+    ] {
+        if !runtime.join(relative).is_file() {
+            return fail(format!("missing Android bridge copy: {relative}"));
+        }
     }
     let services = dex(&runtime.join("framework/services.jar"))?;
-    let catalog_class = b"Lcom/android/server/wm/DroidloomApplicationCatalog;";
-    if !services
-        .windows(catalog_class.len())
-        .any(|w| w == catalog_class)
-    {
-        return fail("in-process application catalog class is missing");
-    }
-    let policy_abi = b"DROIDLOOM_WINDOW_POLICY_ABI=1;";
-    let policy_native = fs::read(runtime.join("lib64/libinputflinger.so"))?;
-    let framework_abi = b"DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;";
-    for (name, data) in [
-        ("services.jar", services.clone()),
-        ("libinputflinger.so", policy_native.clone()),
-        ("droidloomd", fs::read(root.join("usr/bin/droidloomd"))?),
-        (
-            "droidloom-applications",
-            fs::read(root.join("usr/bin/droidloom-applications"))?,
-        ),
-    ] {
-        if !data
-            .windows(framework_abi.len())
-            .any(|w| w == framework_abi)
-        {
-            return fail(format!("{name} lacks direct framework control ABI 1"));
-        }
-    }
-    let notifications_abi = b"DROIDLOOM_NOTIFICATIONS_ABI=2;";
-    if !presenter
-        .windows(notifications_abi.len())
-        .any(|w| w == notifications_abi)
-    {
-        return fail("presenter lacks notification delta ABI 2");
-    }
-    if !services.windows(policy_abi.len()).any(|w| w == policy_abi)
-        || !policy_native
-            .windows(policy_abi.len())
-            .any(|w| w == policy_abi)
-    {
-        return fail("services.jar and libinputflinger.so lack paired Rust window policy ABI 1");
-    }
-    if architecture(&policy_native)? != arch {
-        return fail("wrong Rust window policy JNI architecture");
-    }
-    let task_abi = b"DROIDLOOM_TASK_BACKEND_ABI=2;";
-    let channels_abi = b"DROIDLOOM_HOST_CHANNELS_ABI=1;";
-    for (name, data) in [
-        ("services.jar", services.as_slice()),
-        ("SystemUI.apk", systemui.as_slice()),
-        ("DroidloomIME.apk", ime.as_slice()),
-        ("presenter", presenter.as_slice()),
-    ] {
-        if !data.windows(channels_abi.len()).any(|w| w == channels_abi) {
-            return fail(format!("{name} lacks direct host channels ABI 1"));
-        }
-    }
-    let native_input_abi = b"DROIDLOOM_NATIVE_INPUT_ABI=2;";
-    for (name, data) in [
-        ("services.jar", services.as_slice()),
-        ("libinputflinger.so", policy_native.as_slice()),
-        ("Composer", composer.as_slice()),
-    ] {
-        if !data
-            .windows(native_input_abi.len())
-            .any(|w| w == native_input_abi)
-        {
-            return fail(format!("{name} lacks native input ABI 2"));
-        }
-    }
-    if input_abi(&policy_native)? != version {
-        return fail("Composer and InputFlinger input protocols do not match");
-    }
-    for (name, data) in [
-        ("services.jar", services.as_slice()),
-        ("libinputflinger.so", policy_native.as_slice()),
-        ("Composer", composer.as_slice()),
-    ] {
-        if !data.windows(task_abi.len()).any(|w| w == task_abi) {
-            return fail(format!("{name} lacks framework task backend ABI 2"));
-        }
-    }
     if !services
         .windows(b"ro.vendor.droidloom.surfaceflinger_tasks".len())
         .any(|w| w == b"ro.vendor.droidloom.surfaceflinger_tasks")
     {
         return fail("services.jar lacks compiled Droidloom navigation policy");
     }
-    for path in files(root)? {
-        if path.file_name().is_some_and(|name| {
-            matches!(
-                name.to_str(),
-                Some(
-                    "droidloom-input-bridge"
-                        | "droidloom-input-bridge.jar"
-                        | "droidloom-input-bridge.rc"
-                        | "droidloom-task-launcher"
-                        | "libdroidloom_task_launcher.dylib.so"
-                        | "droidloom-application-catalog.jar"
-                )
-            )
-        }) {
-            return fail("retired support artifact remains in payload");
+    for path in payload_files(root)? {
+        if path
+            .file_name()
+            .is_some_and(|n| n == "droidloom-input-bridge.jar")
+        {
+            let data = dex(&path)?;
+            if !data.windows(b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;".len())
+                .any(|w| w == b"DROIDLOOM_CLIPBOARD_RELAY_ABI=1;") {
+                return fail("Android input bridge lacks the clipboard relay");
+            }
+            if !data.windows(b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;".len()).any(|w| w == b"DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;") {
+                return fail("Android input bridge lacks the notification relay");
+            }
+            let receiver = input_abi(&data)?;
+            if version != receiver {
+                return fail(format!(
+                    "Composer input ABI v{version} does not match {} v{receiver}",
+                    path.display()
+                ));
+            }
+            if !data
+                .windows(b"Lcom/android/droidloom/catalog/ApplicationCatalog;".len())
+                .any(|w| w == b"Lcom/android/droidloom/catalog/ApplicationCatalog;")
+            {
+                return fail("bridge is missing the application catalog class");
+            }
+            bridges += 1;
         }
         let mut f = fs::File::open(&path)?;
         use std::io::Read;
@@ -271,90 +317,272 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
             return fail(format!("wrong ELF architecture: {}", path.display()));
         }
     }
+    if bridges == 0 {
+        return fail("missing Android bridge");
+    }
+    verify_camera_payload(root, &arch)?;
     Ok((arch, version))
 }
-fn inventory(root: &Path) -> Result<BTreeMap<String, Artifact>> {
-    let mut map = BTreeMap::new();
-    for path in files(root)? {
-        let relative = path
-            .strip_prefix(root)?
-            .to_str()
-            .ok_or("non-UTF8 bundle path")?;
-        if relative == MANIFEST {
-            continue;
-        }
-        map.insert(
-            relative.to_owned(),
-            Artifact {
-                mode: fs::metadata(path)?.permissions().mode() & 0o777,
-            },
-        );
-    }
-    Ok(map)
+pub fn valid_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
-pub fn seal(root: &Path, source_identity: String) -> Result<String> {
+
+pub fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn valid_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn valid_build_id(value: &str) -> bool {
+    value.len() <= 128
+        && value.split_once('-').is_some_and(|(time, pid)| {
+            !time.is_empty() && !pid.is_empty()
+                && time.bytes().all(|c| c.is_ascii_digit())
+                && pid.bytes().all(|c| c.is_ascii_digit())
+        })
+}
+
+pub fn new_build_id() -> Result<String> {
+    Ok(format!("{}-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?.as_nanos(), std::process::id()))
+}
+
+pub fn executable_architecture(path: &Path) -> Result<&'static str> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header)?;
+    architecture(&header)
+}
+
+/// Keep traversal bounded before either hashing or privileged staging starts.
+pub fn payload_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return fail("bundle root must be a directory, not a symlink");
+    }
+    let mut pending = vec![(root.to_owned(), 0usize)];
+    let mut result = Vec::new();
+    let mut entries = 0;
+    let mut total = 0u64;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > 64 { return fail("bundle directory nesting exceeds limit"); }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > MAX_FILES * 2 { return fail("bundle entry count exceeds limit"); }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                let size = entry.metadata()?.len();
+                total = total.checked_add(size).ok_or("bundle size overflow")?;
+                if size > MAX_FILE_BYTES || total > MAX_TOTAL_BYTES || result.len() >= MAX_FILES {
+                    return fail("bundle payload exceeds size or file-count limit");
+                }
+                result.push(entry.path());
+            } else {
+                return fail(format!("bundle symlinks and non-regular inputs are forbidden: {}", entry.path().display()));
+            }
+        }
+    }
+    result.sort();
+    Ok(result)
+}
+
+fn component_for(path: &str) -> &'static str {
+    if path == PRESENTER {
+        "presenter"
+    } else if path.starts_with("usr/lib/droidloom/runtime/") || path.starts_with("var/lib/droidloom/images/") {
+        "android"
+    } else {
+        "runtime"
+    }
+}
+
+pub fn inventory(root: &Path) -> Result<Vec<Artifact>> {
+    let mut result = Vec::new();
+    for path in payload_files(root)? {
+        let relative = path.strip_prefix(root)?.to_str().ok_or("non-UTF8 bundle path")?;
+        if relative == MANIFEST { continue; }
+        if !valid_relative_path(relative) { return fail("invalid component path"); }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.mode() & 0o7000 != 0 || metadata.len() == 0 {
+            return fail(format!("empty or privileged bundle component: {relative}"));
+        }
+        result.push(Artifact {
+            path: relative.into(),
+            component: component_for(relative).into(),
+            size: metadata.len(),
+            sha256: hash(&path)?,
+            mode: metadata.mode() & 0o777,
+        });
+    }
+    Ok(result)
+}
+
+pub fn validate_manifest(m: &Manifest) -> Result<()> {
+    if m.schema != 3 || !valid_build_id(&m.build_id) || m.input_abi == 0
+        || m.source_identity.is_empty() || m.source_identity.len() > 4096
+        || m.source_identity.chars().any(char::is_control)
+    {
+        return fail("invalid schema-3 bundle header");
+    }
+    let target = host_target(&m.architecture)?;
+    match (m.kind, m.base_build_id.as_deref()) {
+        (BundleKind::Full, None) => {}
+        (BundleKind::PresenterDerivative, Some(base)) if valid_build_id(base) && base != m.build_id => {}
+        _ => return fail("invalid bundle base identity"),
+    }
+    if m.files.is_empty() || m.files.len() > MAX_FILES || m.components.is_empty() || m.components.len() > MAX_COMPONENTS {
+        return fail("bundle record count exceeds limits");
+    }
+    let mut components = BTreeSet::new();
+    for c in &m.components {
+        if !matches!(c.name.as_str(), "android" | "presenter" | "runtime")
+            || !components.insert(c.name.as_str()) || !valid_commit(&c.source_commit)
+            || c.target != target || c.toolchain.is_empty() || c.toolchain.len() > 1024
+            || c.toolchain.chars().any(char::is_control) || c.build_profile != "release"
+            || c.cargo_lock_sha256.as_deref().is_some_and(|v| !valid_digest(v))
+            || c.source_lock_sha256.as_deref().is_some_and(|v| !valid_digest(v))
+            || (c.name == "android" && c.source_lock_sha256.is_none())
+            || (c.name != "android" && c.cargo_lock_sha256.is_none())
+        {
+            return fail("invalid or duplicate component provenance");
+        }
+    }
+    let mut previous: Option<&str> = None;
+    let mut total = 0u64;
+    for a in &m.files {
+        if !valid_relative_path(&a.path) || a.path == MANIFEST
+            || previous.is_some_and(|v| v >= a.path.as_str())
+            || !components.contains(a.component.as_str()) || a.component != component_for(&a.path)
+            || a.size == 0 || a.size > MAX_FILE_BYTES || !valid_digest(&a.sha256)
+            || a.mode & !0o777 != 0
+        {
+            return fail(format!("invalid, duplicate or unordered file record: {}", a.path));
+        }
+        if (a.path.starts_with("usr/") || a.path.starts_with("etc/"))
+            && (a.mode & 0o004 == 0 || a.mode & 0o022 != 0
+                || (a.mode & 0o111 != 0 && a.mode & 0o001 == 0))
+        {
+            return fail(format!("runtime component has unsafe installation permissions: {} (mode {:o})", a.path, a.mode));
+        }
+        previous = Some(&a.path);
+        total = total.checked_add(a.size).ok_or("bundle size overflow")?;
+        if total > MAX_TOTAL_BYTES { return fail("bundle total size exceeds limit"); }
+    }
+    if !m.files.iter().any(|a| a.path == PRESENTER) {
+        return fail("bundle lacks a recorded presenter");
+    }
+    Ok(())
+}
+
+pub fn verify_inventory(root: &Path, m: &Manifest) -> Result<()> {
+    validate_manifest(m)?;
+    let actual = payload_files(root)?;
+    let actual: BTreeSet<_> = actual.iter()
+        .map(|p| p.strip_prefix(root).map(Path::to_owned))
+        .collect::<std::result::Result<_, _>>()?;
+    let expected: BTreeSet<_> = m.files.iter().map(|a| PathBuf::from(&a.path))
+        .chain(std::iter::once(PathBuf::from(MANIFEST))).collect();
+    if actual != expected { return fail("bundle file inventory differs from its manifest"); }
+    for a in &m.files {
+        let path = root.join(&a.path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() != a.size || metadata.mode() & 0o7777 != a.mode {
+            return fail(format!("bundle size or permissions changed: {}", a.path));
+        }
+        if hash(&path)? != a.sha256 {
+            return fail(format!("bundle content hash changed: {}", a.path));
+        }
+    }
+    Ok(())
+}
+
+pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit { return fail("metadata input exceeds limit or is not a regular file"); }
+    let mut bytes = Vec::new();
+    file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit { return fail("metadata input exceeds limit"); }
+    Ok(bytes)
+}
+
+pub fn inspect(root: &Path) -> Result<ManifestRecord> {
+    let bytes = read_bounded(&root.join(MANIFEST), MAX_MANIFEST_BYTES)?;
+    let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+    match header.get("schema").and_then(serde_json::Value::as_u64) {
+        Some(3) => {
+            let m: Manifest = serde_json::from_slice(&bytes)?;
+            validate_manifest(&m)?;
+            Ok(ManifestRecord::VerifiedFormat(m))
+        }
+        Some(2) => {
+            let m: LegacyManifest = serde_json::from_slice(&bytes)?;
+            if m.schema != 2 || !valid_build_id(&m.build_id) || m.files.len() > MAX_FILES
+                || m.files.iter().any(|(p, a)| !valid_relative_path(p) || a.mode & !0o777 != 0)
+            {
+                return fail("invalid legacy bundle record");
+            }
+            Ok(ManifestRecord::Legacy(m))
+        }
+        _ => fail("unsupported bundle manifest schema"),
+    }
+}
+
+pub fn write_manifest(root: &Path, m: &Manifest) -> Result<()> {
+    validate_manifest(m)?;
+    let bytes = serde_json::to_vec_pretty(m)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES { return fail("bundle manifest exceeds size limit"); }
+    durable_write(&root.join(MANIFEST), bytes)
+}
+
+pub fn seal(root: &Path, provenance: &BuildProvenance) -> Result<String> {
     let (architecture, input_abi) = compatibility(root)?;
+    if provenance.target != host_target(&architecture)? { return fail("build provenance has the wrong target"); }
     let manifest = Manifest {
-        schema: 2,
-        build_id: format!(
-            "{}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos(),
-            std::process::id()
-        ),
+        schema: 3,
+        build_id: new_build_id()?,
         architecture,
         input_abi,
-        source_identity,
+        source_identity: provenance.source_commit.clone(),
+        kind: BundleKind::Full,
+        base_build_id: None,
+        components: provenance.components(),
         files: inventory(root)?,
     };
-    write(&root.join(MANIFEST), serde_json::to_vec_pretty(&manifest)?)?;
+    write_manifest(root, &manifest)?;
     Ok(manifest.build_id)
 }
+
 pub fn verify(root: &Path) -> Result<Manifest> {
-    let m: Manifest = serde_json::from_slice(&fs::read(root.join(MANIFEST))?)?;
-    if m.schema != 2
-        || m.build_id.is_empty()
-        || !m.build_id.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-    {
-        return fail("invalid bundle build record");
-    }
-    for (relative, artifact) in &m.files {
-        let path = Path::new(relative);
-        if path
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return fail("invalid component path");
-        }
-        let metadata = fs::metadata(root.join(path))?;
-        if !metadata.is_file() || metadata.len() == 0 {
-            return fail(format!("missing or empty component: {relative}"));
-        }
-        if artifact.mode & 0o111 != 0 && metadata.permissions().mode() & 0o111 == 0 {
-            return fail(format!("component is not executable: {relative}"));
-        }
-    }
-    let (arch, abi) = compatibility(root)?;
-    if arch != m.architecture || abi != m.input_abi {
-        return fail("manifest disagrees with compiled artifacts");
-    }
+    let root = root.canonicalize()?;
+    let m = match inspect(&root)? {
+        ManifestRecord::VerifiedFormat(m) => m,
+        ManifestRecord::Legacy(m) => return fail(format!(
+            "legacy schema 2 bundle {} ({}, input ABI {}, source {}) is not content-verified; build a clean schema-3 baseline before activation or derivation",
+            m.build_id, m.architecture, m.input_abi, m.source_identity)),
+    };
+    verify_inventory(&root, &m)?;
+    let (arch, abi) = compatibility(&root)?;
+    if arch != m.architecture || abi != m.input_abi { return fail("manifest disagrees with compiled artifacts"); }
     Ok(m)
 }
-pub fn source_identity(repo: &Path) -> Result<String> {
-    let revision =
-        output(
-            Command::new("git")
-                .current_dir(repo)
-                .args(["rev-parse", "--short", "HEAD"]),
-        )?;
-    let dirty = !output(
-        Command::new("git")
-            .current_dir(repo)
-            .args(["status", "--porcelain"]),
-    )?
-    .is_empty();
-    Ok(format!("{revision}{}", if dirty { "+local" } else { "" }))
+
+pub fn clean_source_commit(repo: &Path) -> Result<String> {
+    let revision = output(Command::new("git").current_dir(repo).args(["rev-parse", "HEAD"]))?;
+    if !valid_commit(&revision) || !output(Command::new("git").current_dir(repo).args(["status", "--porcelain", "--untracked-files=all"]))?.is_empty() {
+        return fail("bundle provenance requires a clean Git checkout at a full commit");
+    }
+    Ok(revision)
 }
 
 #[cfg(test)]
@@ -379,55 +607,39 @@ mod tests {
 }
 
 #[cfg(test)]
-mod artifact_tests {
+pub(crate) mod artifact_tests {
     use super::*;
-    fn dex_fixture(payload: &[u8]) -> Vec<u8> {
-        let mut data = vec![0; 112];
-        data[..8].copy_from_slice(b"dex\n039\0");
-        data[36..40].copy_from_slice(&112_u32.to_le_bytes());
-        data[40..44].copy_from_slice(&0x12345678_u32.to_le_bytes());
-        data.extend_from_slice(payload);
-        refresh_dex_fixture(&mut data);
-        data
+    fn test_provenance(arch: &str) -> BuildProvenance {
+        BuildProvenance {
+            source_commit: "a".repeat(40),
+            cargo_lock_sha256: "b".repeat(64),
+            source_lock_sha256: "c".repeat(64),
+            toolchain: "rustc test".into(),
+            target: host_target(arch).unwrap().into(),
+        }
     }
-    fn refresh_dex_fixture(data: &mut [u8]) {
-        let size = u32::try_from(data.len()).unwrap();
-        data[32..36].copy_from_slice(&size.to_le_bytes());
-        let checksum = dex_checksum(&data[12..]);
-        data[8..12].copy_from_slice(&checksum.to_le_bytes());
-    }
-    fn fixture(root: &Path, composer: u16, java: u16) {
+    pub(crate) fn fixture(root: &Path, composer: u16, java: u16) {
+        let launcher = root.join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge");
+        write(&launcher, b"#!/system/bin/sh\nexec app_process\n").unwrap();
+        mode(&launcher, 0o755).unwrap();
         let mut elf = vec![0; 64];
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = 2;
         elf[5] = 1;
         elf[18] = 62;
-        elf.extend(format!("DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_INPUT_ABI={composer};DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_DIRECT_INPUT_ABI=1;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_HOST_CHANNELS_ABI=1;").bytes());
-        write(&root.join("usr/bin/droidloom-wayland"), &elf).unwrap();
-        write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"), &elf).unwrap();
-        elf.extend(format!("DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_INPUT_ABI={java};").bytes());
-        write(
-            &root.join("usr/lib/droidloom/runtime/lib64/libinputflinger.so"),
-            elf,
-        )
-        .unwrap();
-        for name in ["droidloomd", "droidloom-applications"] {
-            write(
-                &root.join("usr/bin").join(name),
-                b"DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;",
-            )
-            .unwrap();
-        }
+        elf.extend(format!("DROIDLOOM_INPUT_ABI={composer};").bytes());
+        write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"),elf).unwrap();
+        let mut presenter_elf = vec![0; 64];
+        presenter_elf[..4].copy_from_slice(b"\x7fELF");
+        presenter_elf[4] = 2;
+        presenter_elf[5] = 1;
+        presenter_elf[18] = 62;
+        let presenter = root.join(PRESENTER);
+        write(&presenter, presenter_elf).unwrap();
+        mode(&presenter, 0o755).unwrap();
         let d = tempfile::tempdir().unwrap();
-        let payload = format!(
-            "DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_HOST_CHANNELS_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;Lcom/android/server/wm/DroidloomApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks"
-        );
-        write(
-            &d.path().join("classes.dex"),
-            dex_fixture(payload.as_bytes()),
-        )
-        .unwrap();
-        let jar = root.join("usr/lib/droidloom/runtime/framework/services.jar");
+        write(&d.path().join("classes.dex"),format!("dex\n039\0DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_CLIPBOARD_RELAY_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=1;DROIDLOOM_NOTIFICATIONS_RELAY_ABI=1;Lcom/android/droidloom/catalog/ApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks")).unwrap();
+        let jar = root.join("usr/lib/droidloom/runtime/framework/droidloom-input-bridge.jar");
         fs::create_dir_all(jar.parent().unwrap()).unwrap();
         run(Command::new("zip")
             .current_dir(d.path())
@@ -437,206 +649,136 @@ mod artifact_tests {
         .unwrap();
         copy(
             &jar,
-            &root.join("usr/lib/droidloom/runtime/ime/DroidloomIME.apk"),
-        )
-        .unwrap();
-
-        copy(
-            &jar,
-            &root.join("usr/lib/droidloom/runtime/ime/DroidloomHome.apk"),
+            &root.join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge.jar"),
         )
         .unwrap();
         copy(
             &jar,
-            &root.join("usr/lib/droidloom/runtime/systemui/SystemUI.apk"),
+            &root.join("usr/lib/droidloom/runtime/framework/services.jar"),
         )
         .unwrap();
-        write(
-            &root.join("usr/lib/droidloom/runtime/ime/home-setup"),
-            b"#!/system/bin/sh\n",
-        )
-        .unwrap();
+        copy(&jar, &root.join("usr/lib/droidloom/runtime/ime/DroidloomHome.apk")).unwrap();
+        copy(&jar, &root.join("usr/lib/droidloom/runtime/systemui/SystemUI.apk")).unwrap();
+        write(&root.join("usr/lib/droidloom/runtime/ime/home-setup"), b"#!/system/bin/sh\n").unwrap();
     }
+    pub(crate) fn camera_fixture(root: &Path) {
+        for relative in CAMERA_EXECUTABLES {
+            copy(&root.join(PRESENTER), &root.join(relative)).unwrap();
+            mode(&root.join(relative), 0o755).unwrap();
+        }
+        for relative in CAMERA_DATA {
+            write(&root.join(relative), b"camera runtime fixture\n").unwrap();
+            mode(&root.join(relative), 0o644).unwrap();
+        }
+    }
+
     #[test]
-    fn refuses_bundle_without_minimal_system_apps() {
+    fn complete_camera_closure_and_older_camera_free_bundles_verify() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 5, 5);
+        let provenance = test_provenance("x86_64");
+        seal(d.path(), &provenance).unwrap();
+        verify(d.path()).unwrap();
+        assert!(!camera_payload_present(d.path()));
+        camera_fixture(d.path());
+        seal(d.path(), &provenance).unwrap();
+        verify(d.path()).unwrap();
+        assert!(camera_payload_present(d.path()));
+    }
+
+    #[test]
+    fn camera_closure_rejects_each_missing_component() {
+        for relative in CAMERA_EXECUTABLES.iter().chain(CAMERA_DATA) {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            camera_fixture(d.path());
+            let provenance = test_provenance("x86_64");
+            seal(d.path(), &provenance).unwrap();
+            fs::remove_file(d.path().join(relative)).unwrap();
+            assert!(verify(d.path()).is_err(), "removed {relative}");
+            assert!(seal(d.path(), &provenance).is_err(), "resealed incomplete {relative}");
+        }
+    }
+
+    #[test]
+    fn camera_executables_require_execute_permissions_and_native_architecture() {
+        for relative in CAMERA_EXECUTABLES {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            camera_fixture(d.path());
+            let provenance = test_provenance("x86_64");
+            mode(&d.path().join(relative), 0o644).unwrap();
+            assert!(seal(d.path(), &provenance).is_err());
+            mode(&d.path().join(relative), 0o755).unwrap();
+            let mut bytes = fs::read(d.path().join(relative)).unwrap();
+            bytes[18] = 183;
+            write(&d.path().join(relative), bytes).unwrap();
+            assert!(seal(d.path(), &provenance).is_err());
+        }
+    }
+
+    #[test]
+    fn refuses_runtime_files_unreadable_by_installed_service_users() {
         for relative in [
-            "ime/DroidloomHome.apk",
-            "ime/home-setup",
-            "systemui/SystemUI.apk",
-            "lib64/libinputflinger.so",
+            "usr/lib/environment.d/60-droidloom.conf",
+            "usr/lib/droidloom/runtime/lib64/restricted.so",
         ] {
             let d = tempfile::tempdir().unwrap();
             fixture(d.path(), 5, 5);
+            let file = d.path().join(relative);
+            write(&file, b"permission-validation fixture").unwrap();
+            mode(&file, 0o600).unwrap();
+            assert!(seal(d.path(), &test_provenance("x86_64")).is_err(),
+                "root-owned runtime data must be readable after installation: {relative}");
+        }
+    }
+
+    #[test]
+    fn refuses_unsafe_runtime_execution_permissions() {
+        for permissions in [0o744, 0o775, 0o777] {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
+            mode(&d.path().join(PRESENTER), permissions).unwrap();
+            assert!(seal(d.path(), &test_provenance("x86_64")).is_err());
+        }
+    }
+
+    #[test]
+    fn refuses_bundle_without_minimal_system_apps() {
+        let provenance = test_provenance("x86_64");
+        for relative in ["ime/DroidloomHome.apk", "ime/home-setup", "systemui/SystemUI.apk"] {
+            let d = tempfile::tempdir().unwrap();
+            fixture(d.path(), 5, 5);
             fs::remove_file(d.path().join("usr/lib/droidloom/runtime").join(relative)).unwrap();
-            assert!(seal(d.path(), "fixture".into()).is_err());
+            assert!(seal(d.path(), &provenance).is_err());
         }
     }
     #[test]
-    fn refuses_stock_or_mismatched_window_policy_jni() {
+    fn refuses_nonexecutable_input_launcher_even_when_recorded_that_way() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);
-        let path = d
+        let provenance = test_provenance("x86_64");
+        seal(d.path(), &provenance).unwrap();
+        let launcher = d
             .path()
-            .join("usr/lib/droidloom/runtime/lib64/libinputflinger.so");
-        let native = fs::read(&path).unwrap();
-        for marker in [
-            b"DROIDLOOM_WINDOW_POLICY_ABI=0;",
-            b"DROIDLOOM_WINDOW_POLICY_ABI=2;",
-        ] {
-            let mut wrong = native[..64].to_vec();
-            wrong.extend_from_slice(marker);
-            write(&path, wrong).unwrap();
-            assert!(seal(d.path(), "fixture".into()).is_err());
-        }
-        let mut wrong_arch = native;
-        wrong_arch[18..20].copy_from_slice(&183_u16.to_le_bytes());
-        write(&path, wrong_arch).unwrap();
-        assert!(seal(d.path(), "fixture".into()).is_err());
-    }
-    #[test]
-    fn refuses_retired_input_support_process() {
-        let d = tempfile::tempdir().unwrap();
-        fixture(d.path(), 5, 5);
-        seal(d.path(), "fixture".into()).unwrap();
-        write(
-            &d.path()
-                .join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge.rc"),
-            b"service droidloom-input-bridge /vendor/bin/droidloom-input-bridge\n",
-        )
-        .unwrap();
+            .join("usr/lib/droidloom/runtime/ime/droidloom-input-bridge");
+        mode(&launcher, 0o644).unwrap();
         assert!(verify(d.path()).is_err());
-        assert!(seal(d.path(), "fixture".into()).is_err());
-    }
-    #[test]
-    fn direct_channels_and_owned_input_require_every_matching_peer() {
-        for (relative, marker) in [
-            (
-                "framework/services.jar",
-                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
-            ),
-            (
-                "systemui/SystemUI.apk",
-                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
-            ),
-            (
-                "ime/DroidloomIME.apk",
-                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
-            ),
-            (
-                "../../../bin/droidloom-wayland",
-                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
-            ),
-            (
-                "framework/services.jar",
-                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
-            ),
-            (
-                "lib64/libinputflinger.so",
-                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
-            ),
-            (
-                "bin/android.hardware.graphics.composer3-service.droidloom",
-                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
-            ),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            fixture(root.path(), 7, 7);
-            let path = root.path().join("usr/lib/droidloom/runtime").join(relative);
-            let archive = matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("jar" | "apk")
-            );
-            let mut data = if archive {
-                dex(&path).unwrap()
-            } else {
-                fs::read(&path).unwrap()
-            };
-            while let Some(start) = data.windows(marker.len()).position(|w| w == marker) {
-                data.drain(start..start + marker.len());
-            }
-            if archive {
-                refresh_dex_fixture(&mut data);
-                let temporary = tempfile::tempdir().unwrap();
-                write(&temporary.path().join("classes.dex"), &data).unwrap();
-                run(Command::new("zip")
-                    .current_dir(temporary.path())
-                    .args(["-q"])
-                    .arg(&path)
-                    .arg("classes.dex"))
-                .unwrap();
-            } else {
-                write(&path, data).unwrap();
-            }
-            let error = seal(root.path(), "mismatched".into())
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("ABI"), "{relative}: {error}");
-        }
-    }
-    #[test]
-    fn dex_checksums_match_adler32_reference_vectors() {
-        assert_eq!(dex_checksum(b""), 1);
-        assert_eq!(dex_checksum(b"Wikipedia"), 0x11e60398);
-    }
-    #[test]
-    fn rejects_damaged_dex_headers_and_payloads() {
-        let good = dex_fixture(b"compiled bytecode");
-        validate_dex(&good).unwrap();
-        for offset in [0, 8, 12, 32, 36, 40, 112] {
-            let mut damaged = good.clone();
-            damaged[offset] ^= 1;
-            assert!(validate_dex(&damaged).is_err(), "offset {offset}");
-        }
-        for length in [0, 7, 111, good.len() - 1] {
-            assert!(validate_dex(&good[..length]).is_err(), "length {length}");
-        }
-    }
-    #[test]
-    fn rejects_corrupt_secondary_dex_even_with_valid_zip_crc() {
-        let d = tempfile::tempdir().unwrap();
-        fixture(d.path(), 7, 7);
-        let jar = d
-            .path()
-            .join("usr/lib/droidloom/runtime/framework/services.jar");
-        let temporary = tempfile::tempdir().unwrap();
-        let mut secondary = dex_fixture(b"secondary bytecode");
-        write(&temporary.path().join("classes2.dex"), &secondary).unwrap();
-        let append = || {
-            run(Command::new("zip")
-                .current_dir(temporary.path())
-                .arg("-q")
-                .arg(&jar)
-                .arg("classes2.dex"))
-            .unwrap();
-        };
-        append();
-        seal(d.path(), "valid-multidex".into()).unwrap();
-        // Repack a corrupted DEX, giving the ZIP member a correct CRC. This
-        // reproduces a damaged compiler output that transfer hashing accepts.
-        secondary[112] ^= 1;
-        write(&temporary.path().join("classes2.dex"), secondary).unwrap();
-        append();
-        for error in [
-            seal(d.path(), "bad-multidex".into()).unwrap_err(),
-            verify(d.path()).unwrap_err(),
-        ] {
-            let message = error.to_string();
-            assert!(message.contains("services.jar!classes2.dex"), "{message}");
-            assert!(message.contains("bad DEX checksum"), "{message}");
-        }
+        // A manifest made from a bad installation must not legitimize the mode.
+        assert!(seal(d.path(), &provenance).is_err());
     }
     #[test]
     fn refuses_mixed_native_java_bundle() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 4, 5);
-        assert!(seal(d.path(), "fixture".into()).is_err());
+        assert!(seal(d.path(), &test_provenance("x86_64")).is_err());
         assert!(!d.path().join(MANIFEST).exists());
     }
     #[test]
-    fn checks_required_components_without_requiring_identical_bytes() {
+    fn verifies_exact_content_instead_of_compatibility_only() {
         let d = tempfile::tempdir().unwrap();
         fixture(d.path(), 5, 5);
-        seal(d.path(), "fixture".into()).unwrap();
+        seal(d.path(), &test_provenance("x86_64")).unwrap();
         verify(d.path()).unwrap();
         let file = d.path().join(
             "usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom",
@@ -647,12 +789,26 @@ mod artifact_tests {
         let mut compatible = original.clone();
         compatible.extend_from_slice(b"different build metadata");
         write(&file, &compatible).unwrap();
-        verify(d.path()).unwrap();
+        assert!(verify(d.path()).is_err(), "different bytes at the same path must fail schema 3");
         fs::remove_file(&file).unwrap();
         assert!(verify(d.path()).is_err());
         write(&file, &original).unwrap();
         write(&d.path().join("unexpected"), b"old component").unwrap();
+        assert!(verify(d.path()).is_err(), "unrecorded payload files must fail the exact inventory");
+        fs::remove_file(d.path().join("unexpected")).unwrap();
         verify(d.path()).unwrap();
+    }
+    #[test]
+    fn rejects_same_mode_content_tampering() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 5, 5);
+        seal(d.path(), &test_provenance("x86_64")).unwrap();
+        let file = d.path().join("usr/lib/droidloom/runtime/ime/home-setup");
+        let mut bytes = fs::read(&file).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        write(&file, &bytes).unwrap();
+        assert!(verify(d.path()).is_err(), "same size and mode with different bytes must fail");
     }
     #[test]
     fn rejects_foreign_architecture_in_other_component() {
@@ -664,6 +820,6 @@ mod artifact_tests {
         elf[5] = 1;
         elf[18] = 183;
         write(&d.path().join("wrong-library.so"), elf).unwrap();
-        assert!(seal(d.path(), "fixture".into()).is_err());
+        assert!(seal(d.path(), &test_provenance("x86_64")).is_err());
     }
 }
