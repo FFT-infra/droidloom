@@ -119,6 +119,7 @@ const CELL_BOOT_ADAPTATIONS: &str = concat!(
 // Android target architecture selected by the product. The x86_64 cell runs
 // ARM64 guests through the source-built translator; ARM64 cells execute
 // natively, so their base libraries and vendor modules are aarch64 ELF.
+#[allow(dead_code)]
 pub(crate) fn target_arch(product: &str) -> Result<&'static str> {
     match product {
         "droidloom_x86_64" => Ok("x86_64"),
@@ -130,6 +131,7 @@ pub(crate) fn target_arch(product: &str) -> Result<&'static str> {
 // The product class follows the display the product presents. The tablet
 // product drives one large landscape display; the others present a phone-sized
 // display and keep the class their pinned base image already states.
+#[allow(dead_code)]
 pub(crate) fn declares_tablet(product: &str) -> Result<bool> {
     match product {
         "droidloom_sheng" => Ok(true),
