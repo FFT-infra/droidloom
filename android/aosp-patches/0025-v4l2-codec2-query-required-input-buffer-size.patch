@@ -1,0 +1,75 @@
+diff --git a/common/include/v4l2_codec2/common/Common.h b/common/include/v4l2_codec2/common/Common.h
+index ac55bd2..2eee886 100644
+--- a/common/include/v4l2_codec2/common/Common.h
++++ b/common/include/v4l2_codec2/common/Common.h
+@@ -6,6 +6,7 @@
+ #define ANDROID_V4L2_CODEC2_COMMON_COMMON_H
+ 
+ #include <inttypes.h>
++#include <stddef.h>
+ 
+ #include <optional>
+ #include <string>
+@@ -48,6 +49,8 @@ using SupportedProfiles = std::vector<SupportedProfile>;
+ // Contains the capabilites of the decoder or encoder.
+ struct SupportedCapabilities {
+     VideoCodec codec;
++    // Required bitstream input size reported by the V4L2 OUTPUT queue.
++    size_t maxInputBufferSize = 0;
+     SupportedProfiles supportedProfiles;
+     C2Config::profile_t defaultProfile = C2Config::PROFILE_UNUSED;
+     std::vector<C2Config::level_t> supportedLevels;
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 8b6f2ac..ad29060 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -13,6 +13,8 @@
+ #include <log/log.h>
+ #include <media/stagefright/foundation/MediaDefs.h>
+ 
++#include <algorithm>
++
+ #include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/plugin_store/V4L2AllocatorId.h>
+ 
+@@ -302,7 +304,8 @@ DecodeInterface::DecodeInterface(const std::string& name,
+ 
+     addParameter(
+             DefineParam(mMaxInputSize, C2_PARAMKEY_INPUT_MAX_BUFFER_SIZE)
+-                    .withDefault(new C2StreamMaxBufferSizeInfo::input(0u, kInputBufferSizeFor1080p))
++                    .withDefault(new C2StreamMaxBufferSizeInfo::input(
++                            0u, std::max(kInputBufferSizeFor1080p, caps.maxInputBufferSize)))
+                     .withFields({
+                             C2F(mMaxInputSize, value).any(),
+                     })
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index 19601bc..1b677be 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -2295,6 +2295,26 @@ SupportedCapabilities V4L2Device::queryDecodingCapabilities(VideoCodec codec) {
+             V4L2Device::Type::kDecoder, {V4L2Device::videoCodecToPixFmt(codec)});
+     caps.defaultLevel = V4L2Device::getDefaultLevel(codec);
+ 
++    // Probe S_FMT on a disposable decoder fd before C2 allocates bitstream buffers. Some
++    // drivers return the requested size unchanged from TRY_FMT even when S_FMT later reports
++    // a larger required sizeimage (Iris reports 14 MiB for VP9 on sheng).
++    const uint32_t inputPixelFormat = V4L2Device::videoCodecToPixFmt(codec);
++    scoped_refptr<V4L2Device> formatProbe = V4L2Device::create();
++    if (formatProbe->open(Type::kDecoder, inputPixelFormat)) {
++        scoped_refptr<V4L2Queue> outputQueue =
++                formatProbe->getQueue(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++        if (outputQueue) {
++            auto format = outputQueue->setFormat(inputPixelFormat, ui::Size(), 0, 0);
++            if (format && format->fmt.pix_mp.num_planes > 0) {
++                caps.maxInputBufferSize = format->fmt.pix_mp.plane_fmt[0].sizeimage;
++                if (caps.maxInputBufferSize > 0) {
++                    ALOGI("V4L2 decoder input sizeimage: fourcc=0x%08x size=%zu",
++                          inputPixelFormat, caps.maxInputBufferSize);
++                }
++            }
++        }
++    }
++
+     return caps;
+ }
+ 
