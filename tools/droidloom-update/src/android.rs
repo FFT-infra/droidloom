@@ -10,8 +10,12 @@ pub const TARGETS: &[&str] = &[
     "droidloom-native-bridge",
     "android.hardware.graphics.composer3-service.droidloom",
     "droidloom-framework-init",
+    "virtual_camera",
+    "droidloom-camera-producer",
     "DroidloomIME",
     "DroidloomHome",
+    "TouchService",
+    "xiaomi-pencilengine-pad",
     "DroidloomSystemUI",
     "droidloom-lmkd-compat",
     "droidloom-classpath-wrapper",
@@ -85,13 +89,91 @@ pub fn apex_output_for_product(name: &str, product: &str) -> Option<PathBuf> {
     let path = apex_output(name)?;
     match product {
         "droidloom_x86_64" => Some(PathBuf::from(path)),
-        "droidloom_arm64" => Some(PathBuf::from(
+        "droidloom_arm64" | "droidloom_sheng" => Some(PathBuf::from(
             path.replace("android_x86_64", "android_arm64_armv8-a"),
         )),
         _ => None,
     }
 }
+/// Cell-local boot adaptations for the pinned product image.
+///
+/// Attestation: the image enables RKP-only mode because it expects Google's
+/// provisioning service and a secure keymint. Cells run the nonsecure
+/// keymint, whose certificate request that service rejects (HTTP 400), and
+/// in RKP-only mode keystore treats the failure as fatal instead of falling
+/// back to the keymint-provided attestation key. The property is read per
+/// key request, and product build.prop outranks every other partition, so
+/// the adaptation has to run here, after property loading and before any
+/// keystore client.
+///
+/// Preserve boot identity: the nonsecure KeyMint binds its root-of-trust
+/// properties into encrypted key blobs. Adding a locked vbmeta device state
+/// changes that identity and makes existing keys unreadable, including the
+/// synthetic-password key required to boot system_server. RKP fallback must
+/// not rewrite boot identity to obtain a different attestation result.
+const CELL_BOOT_ADAPTATIONS: &str = concat!(
+    "on early-init\n",
+    "    setprop remote_provisioning.tee.rkp_only 0\n",
+);
+
+// Android target architecture selected by the product. The x86_64 cell runs
+// ARM64 guests through the source-built translator; ARM64 cells execute
+// natively, so their base libraries and vendor modules are aarch64 ELF.
+pub(crate) fn target_arch(product: &str) -> Result<&'static str> {
+    match product {
+        "droidloom_x86_64" => Ok("x86_64"),
+        "droidloom_arm64" | "droidloom_sheng" => Ok("aarch64"),
+        _ => fail(format!("unsupported product: {product}")),
+    }
+}
+
+// The product class follows the display the product presents. The tablet
+// product drives one large landscape display; the others present a phone-sized
+// display and keep the class their pinned base image already states.
+pub(crate) fn declares_tablet(product: &str) -> Result<bool> {
+    match product {
+        "droidloom_sheng" => Ok(true),
+        "droidloom_x86_64" | "droidloom_arm64" => Ok(false),
+        _ => fail(format!("unknown product class for {product}")),
+    }
+}
 const PATCHES: &[(&str, &str)] = &[
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0015-v4l2-codec2-zero-unknown-dimensions.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0025-v4l2-codec2-query-required-input-buffer-size.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0027-v4l2-codec2-av1-decoder.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0018-v4l2-codec2-drc-output-reconfigure.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0019-v4l2-codec2-gralloc-dmabuf-identity.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0020-v4l2-codec2-guard-unmapped-capture-buffer.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0021-v4l2-codec2-recycle-initial-eos-buffer.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0024-v4l2-codec2-igba-surface-output.patch",
+    ),
+    (
+        "external/v4l2_codec2",
+        "android/aosp-patches/0028-v4l2-codec2-keep-input-buffer-size-floor.patch",
+    ),
     (
         "external/libdrm",
         "android/aosp-patches/0015-libdrm-empty-version-strings.patch",
@@ -127,6 +209,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/av",
         "android/audio/0001-host-buffered-playback.patch",
+    ),
+    (
+        "frameworks/av",
+        "android/aosp-patches/0031-virtual-camera-cpu-yuv.patch",
     ),
     (
         "system/memory/libmeminfo",
@@ -259,6 +345,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/base",
         "android/framework/0006-droidloom-direct-host-channels.patch",
+    ),
+    (
+        "hardware/interfaces",
+        "android/aosp-patches/0033-static-virtual-accelerometer.patch",
     ),
 ];
 #[derive(Serialize, Deserialize)]
@@ -597,10 +687,11 @@ pub fn build(
     build_targets(repo, source, out, work, product, jobs, &targets)
 }
 fn full_targets(product: &str) -> Vec<&'static str> {
+    let is_arm = matches!(product, "droidloom_arm64" | "droidloom_sheng");
     TARGETS
         .iter()
         .copied()
-        .filter(|name| product != "droidloom_arm64" || *name != "droidloom-native-bridge")
+        .filter(|name| !is_arm || *name != "droidloom-native-bridge")
         .collect()
 }
 pub fn build_targets(
@@ -628,7 +719,8 @@ pub fn build_targets(
     if !audio_only {
         remove_retired_input_support(&out.join("target/product").join(product))?;
     }
-    let native_bridge_source = if audio_only || framework_only || product == "droidloom_arm64" {
+    let is_arm = matches!(product, "droidloom_arm64" | "droidloom_sheng");
+    let native_bridge_source = if audio_only || framework_only || is_arm {
         None
     } else {
         Some(crate::native_bridge::prepare_source(repo, source)?)
@@ -802,7 +894,14 @@ pub fn build_targets(
         .current_dir(init.path())
         .arg("apply")
         .arg(repo.join("android/apex-compat/0001-droidloom-classpath-projection.patch")))?;
-    copy(&init.path().join("rootdir/init.rc"), &work.join("init.rc"))?;
+    write(
+        &work.join("init.rc"),
+        format!(
+            "import /droidloom/camera/producer.rc\n{}{}",
+            CELL_BOOT_ADAPTATIONS,
+            fs::read_to_string(init.path().join("rootdir/init.rc"))?
+        ),
+    )?;
     p.stabilize_all()?;
     bootstrap(source, out)?;
     copy(
@@ -893,7 +992,7 @@ fn framework_output(name: &str, product: &str) -> Option<PathBuf> {
         name if name.starts_with("libdroidloom_") && TASK_BACKEND_TARGETS.contains(&name) => {
             let arch = match product {
                 "droidloom_x86_64" => "x86_64",
-                "droidloom_arm64" => "arm64_armv8-a",
+                "droidloom_arm64" | "droidloom_sheng" => "arm64_armv8-a",
                 _ => return None,
             };
             Some(PathBuf::from(format!(
@@ -906,7 +1005,7 @@ fn framework_output(name: &str, product: &str) -> Option<PathBuf> {
         "surfaceflinger" => {
             let arch = match product {
                 "droidloom_x86_64" => "x86_64",
-                "droidloom_arm64" => "arm64_armv8-a",
+                "droidloom_arm64" | "droidloom_sheng" => "arm64_armv8-a",
                 _ => return None,
             };
             Some(PathBuf::from(format!(
@@ -916,7 +1015,7 @@ fn framework_output(name: &str, product: &str) -> Option<PathBuf> {
         "libinputflinger" => {
             let variant = match product {
                 "droidloom_x86_64" => "android_x86_64_shared",
-                "droidloom_arm64" => "android_arm64_armv8-a_shared",
+                "droidloom_arm64" | "droidloom_sheng" => "android_arm64_armv8-a_shared",
                 _ => return None,
             };
             Some(PathBuf::from(format!(
@@ -932,7 +1031,7 @@ fn framework_output(name: &str, product: &str) -> Option<PathBuf> {
         "android.hardware.graphics.composer3-service.droidloom" => {
             let arch = match product {
                 "droidloom_x86_64" => "x86_64",
-                "droidloom_arm64" => "arm64_armv8-a",
+                "droidloom_arm64" | "droidloom_sheng" => "arm64_armv8-a",
                 _ => return None,
             };
             Some(PathBuf::from(format!(
@@ -1038,7 +1137,7 @@ mod tests {
 
     #[test]
     fn focused_task_targets_have_outputs_for_each_product() {
-        for product in ["droidloom_x86_64", "droidloom_arm64"] {
+        for product in ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"] {
             for target in TASK_BACKEND_TARGETS {
                 assert!(
                     framework_output(target, product).is_some(),
@@ -1048,6 +1147,19 @@ mod tests {
         }
         assert!(TASK_BACKEND_TARGETS.contains(&"surfaceflinger"));
         assert!(framework_output("surfaceflinger", "unknown").is_none());
+    }
+
+    #[test]
+    fn every_product_declares_its_architecture_and_device_class() {
+        for product in ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"] {
+            assert!(target_arch(product).is_ok());
+            assert!(declares_tablet(product).is_ok());
+        }
+        assert!(declares_tablet("droidloom_sheng").unwrap());
+        for phone in ["droidloom_x86_64", "droidloom_arm64"] {
+            assert!(!declares_tablet(phone).unwrap());
+        }
+        assert!(declares_tablet("droidloom_new").is_err());
     }
 
     #[test]
@@ -1166,6 +1278,60 @@ mod tests {
 #[cfg(test)]
 mod patch_tests {
     use super::*;
+
+    #[test]
+    fn cell_boot_adaptations_preserve_existing_keymint_boot_identity() {
+        // KeyMint binds these boot properties into existing encrypted key blobs.
+        // Changing even an absent device-state property invalidates user keys.
+        for device_state in [None, Some("unlocked"), Some("locked")] {
+            let mut properties = std::collections::BTreeMap::from([
+                ("ro.boot.verifiedbootstate", "green"),
+                ("ro.boot.vbmeta.public_key_digest", "00"),
+            ]);
+            if let Some(value) = device_state {
+                properties.insert("ro.boot.vbmeta.device_state", value);
+            }
+            let original = properties.clone();
+            for line in CELL_BOOT_ADAPTATIONS.lines() {
+                let words = line.split_whitespace().collect::<Vec<_>>();
+                if words.first() == Some(&"setprop") {
+                    assert_eq!(words.len(), 3);
+                    properties.insert(words[1], words[2]);
+                }
+            }
+            let boot_identity = properties
+                .iter()
+                .filter(|(key, _)| key.starts_with("ro.boot."))
+                .map(|(key, value)| (*key, *value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(boot_identity, original, "boot identity must survive an update");
+            assert_eq!(properties.get("remote_provisioning.tee.rkp_only"), Some(&"0"));
+        }
+    }
+
+    #[test]
+    fn sheng_codec2_patch_set_is_reproducible_and_excludes_diagnostics() {
+        let patches = PATCHES
+            .iter()
+            .filter_map(|(project, patch)| (*project == "external/v4l2_codec2").then_some(*patch))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            patches,
+            vec![
+                "android/aosp-patches/0015-v4l2-codec2-zero-unknown-dimensions.patch",
+                "android/aosp-patches/0025-v4l2-codec2-query-required-input-buffer-size.patch",
+                "android/aosp-patches/0027-v4l2-codec2-av1-decoder.patch",
+                "android/aosp-patches/0018-v4l2-codec2-drc-output-reconfigure.patch",
+                "android/aosp-patches/0019-v4l2-codec2-gralloc-dmabuf-identity.patch",
+                "android/aosp-patches/0020-v4l2-codec2-guard-unmapped-capture-buffer.patch",
+                "android/aosp-patches/0021-v4l2-codec2-recycle-initial-eos-buffer.patch",
+                "android/aosp-patches/0024-v4l2-codec2-igba-surface-output.patch",
+                "android/aosp-patches/0028-v4l2-codec2-keep-input-buffer-size-floor.patch",
+            ]
+        );
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(patches.iter().all(|patch| repo_root.join(patch).is_file()));
+    }
     #[test]
     fn patch_in_source_without_git_root_is_restored_inside_enclosing_checkout() {
         let d = tempfile::tempdir().unwrap();

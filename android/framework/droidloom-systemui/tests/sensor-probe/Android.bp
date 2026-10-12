@@ -1,0 +1,15 @@
+android_test {
+    name: "DroidloomSensorProbe",
+    manifest: "AndroidManifest.xml",
+    srcs: ["Probe.java"],
+    sdk_version: "current",
+    min_sdk_version: "29",
+    target_sdk_version: "35",
+    test_suites: ["device-tests"],
+    optimize: {
+        enabled: false,
+    },
+    dex_preopt: {
+        enabled: false,
+    },
+}
