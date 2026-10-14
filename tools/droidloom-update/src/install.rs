@@ -48,6 +48,10 @@ const ALIASES: &[(&str, &str)] = &[
         "usr/lib/systemd/user/droidloom-audio.service",
     ),
     (
+        "/usr/lib/systemd/user/droidloom-audio.socket",
+        "usr/lib/systemd/user/droidloom-audio.socket",
+    ),
+    (
         "/usr/lib/environment.d/60-droidloom.conf",
         "usr/lib/environment.d/60-droidloom.conf",
     ),
@@ -604,6 +608,25 @@ mod staging_tests {
                         && *relative == format!("usr/bin/{name}")),
                 "{name}"
             );
+        }
+    }
+    #[test]
+    fn activation_covers_every_shipped_systemd_unit() {
+        // A fresh updater installation writes exactly the alias targets; any unit
+        // the assembler stages into usr/lib/systemd without an alias here would be
+        // silently absent from the live system (for example droidloom-audio.socket).
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for directory in ["system", "user"] {
+            for entry in fs::read_dir(repo.join("packaging/systemd").join(directory)).unwrap() {
+                let name = entry.unwrap().file_name();
+                let relative = format!("usr/lib/systemd/{directory}/{}", name.to_string_lossy());
+                let installed = format!("/{relative}");
+                assert!(
+                    required_aliases(true)
+                        .any(|(path, target)| *path == installed && *target == relative),
+                    "missing activation alias for staged systemd unit: {relative}"
+                );
+            }
         }
     }
     #[test]

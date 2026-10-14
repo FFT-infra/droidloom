@@ -205,11 +205,28 @@ For manual desktop acceptance after activating a matching build:
 Routed input is received inside `libinputflinger`. Rust owns its listening socket
 below `/dev/socket/droidloom-framework`, a system-owned private directory. The
 existing policy's systemReady hook starts it without a support process or FD relay.
-The Rust receiver validates fixed 48-byte input ABI 7 records, including the
-framework task incarnation, and tracks gestures, repeats and modifiers. A small
+The Rust receiver validates fixed 48-byte input ABI 8 records, including the
+framework task incarnation, and tracks touch gestures, native mouse buttons,
+hover, wheel axes, keyboard repeats and modifiers. ABI 7 remains accepted for
+touch, keyboard and display power only; it never receives mouse records. A small
 C++ adapter constructs native Android events and calls the existing targeted
 InputDispatcher entry point without the support bridge's per-event Java objects
 or Binder parcels.
+Mouse events carry the registered `Droidloom Host Mouse` device identity,
+`SOURCE_MOUSE`, button state, relative motion, and fractional wheel axes. Side
+buttons also produce Android Back/Forward keys. The host cursor uses the
+compositor's cursor-shape protocol or the configured cursor theme.
+Native mouse requires rebuilding and activating the matching Composer and
+InputFlinger runtime; updating only the presenter keeps the ABI 7 left-button
+touch fallback and does not enable right-click, hover or wheel dispatch.
+The same pending ABI 8 wire carries native stylus proximity, pen/eraser type,
+pressure, signed tilt and both barrel buttons. InputFlinger constructs
+`SOURCE_STYLUS` events, including hover enter/move/exit and stroke cancellation;
+tilt is converted to Android tilt/orientation axes. Tool and route retirement,
+focus loss and EOF cancel held strokes. ABI 7 continues using the touch fallback.
+Tilt is quantized to whole degrees; distance, rotation and wheel tool axes are
+not carried by this fixed-size wire. Native C++ compilation and physical-pen
+acceptance still require the matching Android build.
 WMS publishes task bounds and input-application tokens on its task worker,
 outside the global lock. Bounds are updated on changes; pointer motion performs
 no task-bounds Binder query or SurfaceFlinger token lookup. Retirement, token

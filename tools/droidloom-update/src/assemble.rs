@@ -390,7 +390,13 @@ pub fn assemble_artifacts(
         ("system/bin/servicemanager", "bin/servicemanager"),
         ("system/bin/surfaceflinger", "bin/surfaceflinger"),
         ("system/bin/virtual_camera", "camera/bin/virtual_camera"),
-        ("system/bin/droidloom-camera-producer", "camera/bin/droidloom-camera-producer"),
+        // The producer declares `vendor: true`, so Soong emits it below the
+        // vendor partition and init starts it from /vendor/bin (see
+        // producer.rc). No other recipe produces a system/bin copy.
+        (
+            "vendor/bin/droidloom-camera-producer",
+            "camera/bin/droidloom-camera-producer",
+        ),
         (
             "vendor/bin/hw/android.hardware.graphics.composer3-service.droidloom",
             "bin/android.hardware.graphics.composer3-service.droidloom",

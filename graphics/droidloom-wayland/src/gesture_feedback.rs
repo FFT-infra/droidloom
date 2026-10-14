@@ -277,6 +277,11 @@ impl Drop for Feedback {
 }
 
 impl Feedback {
+    /// Keep the indicator above the last Android layer in the same parent.
+    pub(super) fn raise_above(&self, sibling: &wl_surface::WlSurface) {
+        self.role.place_above(sibling);
+    }
+
     pub(super) fn new(
         globals: &layers::Globals,
         compositor: &CompositorState,

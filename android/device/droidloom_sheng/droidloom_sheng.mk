@@ -97,6 +97,7 @@ PRODUCT_VENDOR_PROPERTIES += \
     ro.vendor.droidloom.surfaceflinger_tasks=true \
     ro.hardware.egl=mesa \
     ro.hardware.vulkan=freedreno \
+    ro.gfx.angle.supported=true \
     ro.opengles.version=196610 \
     ro.sf.lcd_density=360 \
     dalvik.vm.heapstartsize=16m \

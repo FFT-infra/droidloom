@@ -1,9 +1,9 @@
 //! Direct, nonblocking input writer. Composer only delegates the socket once.
 use droidloom_denial_ipc::{IpcError, SeqPacket};
-use droidloom_denial_protocol::{InputEvent, TouchAction};
+use droidloom_denial_protocol::{InputEvent, TaskObjectId, TouchAction};
 use droidloom_input_protocol::{
-    MAX_POINTER_ID, PROTOCOL_MAJOR, RECORD_BYTES, encode_display_power, encode_key, encode_touch,
-    scale_fixed,
+    LEGACY_PROTOCOL_MAJOR, MAX_POINTER_ID, PROTOCOL_MAJOR, RECORD_BYTES, encode_display_power,
+    encode_key, encode_touch, scale_fixed,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -11,6 +11,65 @@ use std::{
 };
 
 const QUEUE_LIMIT: usize = 512;
+
+/// Presses belong to the task that received them, even after focus changes.
+#[derive(Default)]
+pub(super) struct Keys {
+    pressed: BTreeMap<u32, TaskObjectId>,
+    consumed: BTreeMap<u32, TaskObjectId>,
+}
+
+impl Keys {
+    pub fn press(&mut self, key: u32, task: TaskObjectId) -> Option<TaskObjectId> {
+        // A new physical press supersedes a shortcut whose release was lost.
+        self.consumed.remove(&key);
+        self.pressed.insert(key, task)
+    }
+    pub fn owner(&self, key: u32) -> Option<TaskObjectId> {
+        self.pressed.get(&key).copied()
+    }
+    pub fn consume(&mut self, key: u32, task: TaskObjectId) -> Option<TaskObjectId> {
+        self.consumed.insert(key, task);
+        self.pressed.remove(&key)
+    }
+    pub fn is_consumed(&self, key: u32) -> bool {
+        self.consumed.contains_key(&key)
+    }
+    pub fn release(&mut self, key: u32) -> Option<TaskObjectId> {
+        if self.consumed.remove(&key).is_some() {
+            return None;
+        }
+        self.pressed.remove(&key)
+    }
+    pub fn take_task(&mut self, task: TaskObjectId) -> Vec<u32> {
+        self.consumed.retain(|_, owner| *owner != task);
+        let keys: Vec<_> = self
+            .pressed
+            .iter()
+            .filter_map(|(key, owner)| (*owner == task).then_some(*key))
+            .collect();
+        for key in &keys {
+            self.pressed.remove(key);
+        }
+        keys
+    }
+    pub fn clear(&mut self) {
+        self.pressed.clear();
+        self.consumed.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum MouseAction {
+    Enter = 0,
+    Motion = 1,
+    Leave = 2,
+    Press = 3,
+    Release = 4,
+    Scroll = 5,
+    Cancel = 6,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Route {
@@ -22,14 +81,21 @@ pub(super) struct Route {
 #[derive(Default)]
 pub(super) struct DirectInput {
     socket: Option<SeqPacket>,
-    queue: VecDeque<[u8; RECORD_BYTES]>,
+    queue: VecDeque<(Option<Route>, [u8; RECORD_BYTES])>,
     pointers: BTreeMap<(u32, u32), (u32, Route)>,
+    pens: BTreeMap<u32, Route>,
     generation: u64,
     requested: bool,
     power: Option<bool>,
+    wire: u16,
+    blocked: bool,
 }
 
 impl DirectInput {
+    pub fn set_blocked(&mut self, blocked: bool) {
+        self.blocked = blocked;
+    }
+
     pub fn next_request(&mut self) -> Option<u64> {
         if self.socket.is_some() || self.requested {
             return None;
@@ -46,7 +112,7 @@ impl DirectInput {
         if generation != self.generation || !self.requested {
             return Ok(false);
         }
-        if wire != PROTOCOL_MAJOR {
+        if wire != PROTOCOL_MAJOR && wire != LEGACY_PROTOCOL_MAJOR {
             return Err(format!("native input wire ABI {wire} != {PROTOCOL_MAJOR}"));
         }
         let socket = SeqPacket::from_owned_fd(fd).map_err(|e| e.to_string())?;
@@ -56,8 +122,9 @@ impl DirectInput {
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         self.disconnect();
         self.socket = Some(socket);
+        self.wire = wire;
         if let Some(power) = self.power {
-            self.enqueue(encode_display_power(power))?;
+            self.enqueue(None, encode_display_power(power))?;
         }
         Ok(true)
     }
@@ -66,7 +133,133 @@ impl DirectInput {
         self.socket = None; // EOF makes InputFlinger cancel held input.
         self.queue.clear();
         self.pointers.clear();
+        self.pens.clear();
         self.requested = false;
+    }
+
+    pub fn supports_mouse(&self) -> bool {
+        self.socket.is_some() && self.wire == PROTOCOL_MAJOR
+    }
+
+    pub fn cancel_route(&mut self, route: Route, timestamp: u64) -> Result<(), String> {
+        // Retired presses must never replay after a task/route replacement.
+        // Keep other tasks' ordered input and send cancellation to the old route.
+        self.queue
+            .retain(|(owner, record)| *owner != Some(route) || is_release_record(record));
+        let tools: Vec<_> = self
+            .pens
+            .iter()
+            .filter_map(|(tool, owner)| (*owner == route).then_some(*tool))
+            .collect();
+        for tool in tools {
+            self.send_stylus(
+                route,
+                (1, 1),
+                timestamp,
+                droidloom_input_protocol::Stylus {
+                    tool,
+                    action: 5,
+                    ..Default::default()
+                },
+            )?;
+        }
+        let contact = self
+            .pointers
+            .values()
+            .find_map(|(id, owned)| (*owned == route).then_some(*id));
+        if let Some(id) = contact {
+            if self.socket.is_some() {
+                let record = encode_touch(
+                    route.display,
+                    route.task,
+                    timestamp,
+                    TouchAction::Cancel as u8,
+                    id,
+                    0,
+                    0,
+                    0,
+                    route.incarnation,
+                )
+                .map_err(|e| e.to_string())?;
+                self.enqueue(Some(route), record)?;
+            }
+            self.pointers.retain(|_, (_, owned)| *owned != route);
+        }
+        Ok(())
+    }
+
+    pub fn send_stylus(
+        &mut self,
+        mut route: Route,
+        scale: (u32, u32),
+        timestamp: u64,
+        mut pen: droidloom_input_protocol::Stylus,
+    ) -> Result<(), String> {
+        if !self.supports_mouse() {
+            return Err("native stylus requires input wire ABI 8".into());
+        }
+        if pen.action == 0 {
+            if let Some(old) = self.pens.remove(&pen.tool) {
+                let cancel = droidloom_input_protocol::encode_stylus(
+                    old.display,
+                    old.task,
+                    timestamp,
+                    old.incarnation,
+                    droidloom_input_protocol::Stylus { action: 5, ..pen },
+                )
+                .map_err(|e| e.to_string())?;
+                self.enqueue(Some(old), cancel)?;
+            }
+            self.pens.insert(pen.tool, route);
+        } else if let Some(original) = self.pens.get(&pen.tool) {
+            route = *original;
+        } else {
+            return Ok(());
+        }
+        pen.x_fixed = scale_fixed(pen.x_fixed, scale.0, scale.1).map_err(|e| e.to_string())?;
+        pen.y_fixed = scale_fixed(pen.y_fixed, scale.0, scale.1).map_err(|e| e.to_string())?;
+        let record = droidloom_input_protocol::encode_stylus(
+            route.display,
+            route.task,
+            timestamp,
+            route.incarnation,
+            pen,
+        )
+        .map_err(|e| e.to_string())?;
+        if matches!(pen.action, 2 | 5) {
+            self.pens.remove(&pen.tool);
+        }
+        self.enqueue(Some(route), record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_mouse(
+        &mut self,
+        route: Route,
+        scale: (u32, u32),
+        timestamp: u64,
+        action: MouseAction,
+        button: u32,
+        position: (i32, i32),
+        scroll: (i16, i16),
+    ) -> Result<(), String> {
+        if !self.supports_mouse() {
+            return Err("native mouse requires input wire ABI 8".into());
+        }
+        let record = droidloom_input_protocol::encode_mouse(
+            route.display,
+            route.task,
+            timestamp,
+            action as u8,
+            button,
+            scale_fixed(position.0, scale.0, scale.1).map_err(|e| e.to_string())?,
+            scale_fixed(position.1, scale.0, scale.1).map_err(|e| e.to_string())?,
+            scroll.0,
+            scroll.1,
+            route.incarnation,
+        )
+        .map_err(|e| e.to_string())?;
+        self.enqueue(Some(route), record)
     }
 
     pub fn set_power(&mut self, power: bool) -> Result<(), String> {
@@ -75,7 +268,7 @@ impl DirectInput {
         }
         self.power = Some(power);
         if self.socket.is_some() {
-            self.enqueue(encode_display_power(power))?;
+            self.enqueue(None, encode_display_power(power))?;
         }
         Ok(())
     }
@@ -102,8 +295,23 @@ impl DirectInput {
                 let key = (route.display, pointer_id);
                 let android_id = match action {
                     TouchAction::Down => {
-                        if self.pointers.contains_key(&key) {
-                            return self.fail("duplicate touch down");
+                        if let Some((id, original)) = self.pointers.get(&key).copied() {
+                            // A lost Wayland up must cancel only the affected
+                            // Android gesture, not the shared keyboard channel.
+                            let cancel = encode_touch(
+                                original.display,
+                                original.task,
+                                timestamp,
+                                TouchAction::Cancel as u8,
+                                id,
+                                0,
+                                0,
+                                0,
+                                original.incarnation,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            self.enqueue(Some(original), cancel)?;
+                            self.pointers.retain(|_, (_, owned)| *owned != original);
                         }
                         let Some(id) = (0..=MAX_POINTER_ID).find(|candidate| {
                             !self.pointers.iter().any(|((display, _), (id, _))| {
@@ -162,20 +370,28 @@ impl DirectInput {
             }
         }
         .map_err(|e| e.to_string())?;
-        self.enqueue(record)
+        self.enqueue(Some(route), record)
     }
 
-    fn enqueue(&mut self, record: [u8; RECORD_BYTES]) -> Result<(), String> {
+    fn enqueue(
+        &mut self,
+        route: Option<Route>,
+        mut record: [u8; RECORD_BYTES],
+    ) -> Result<(), String> {
+        record[4..6].copy_from_slice(&self.wire.to_le_bytes());
         self.flush()?;
         if self.queue.len() == QUEUE_LIMIT {
             return self.fail("native input queue exhausted; cancelling stream");
         }
-        self.queue.push_back(record);
+        self.queue.push_back((route, record));
         self.flush()
     }
 
     pub fn flush(&mut self) -> Result<(), String> {
-        while let (Some(socket), Some(record)) = (self.socket.as_ref(), self.queue.front()) {
+        if self.blocked {
+            return Ok(());
+        }
+        while let (Some(socket), Some((_, record))) = (self.socket.as_ref(), self.queue.front()) {
             match socket.send_record(record, &[]) {
                 Ok(()) => {
                     self.queue.pop_front();
@@ -198,7 +414,7 @@ impl DirectInput {
             (
                 s.as_fd().as_raw_fd(),
                 libc::POLLIN
-                    | if self.queue.is_empty() {
+                    | if self.queue.is_empty() || self.blocked {
                         0
                     } else {
                         libc::POLLOUT
@@ -220,12 +436,374 @@ impl DirectInput {
     }
 }
 
+// Repeated teardown must keep releases for presses already delivered before
+// the clipboard barrier. These records are produced only by our encoders.
+fn is_release_record(record: &[u8; RECORD_BYTES]) -> bool {
+    use droidloom_input_protocol::{KIND_KEY, KIND_MOUSE, KIND_STYLUS, KIND_TOUCH};
+    match record[6] {
+        KIND_KEY => record[7] == droidloom_denial_protocol::KeyAction::Up as u8,
+        KIND_TOUCH => matches!(record[7], 2 | 3), // Up / Cancel
+        KIND_MOUSE => matches!(record[7], 2 | 4 | 6), // Leave / Release / Cancel
+        KIND_STYLUS => matches!(record[7] & 7, 2 | 4 | 5), // Leave / Up / Cancel
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use droidloom_denial_ipc::ProtocolSocket;
     use droidloom_denial_protocol::{AndroidMessage, KeyAction};
     use droidloom_input_protocol::{Payload, Record, decode};
+
+    #[test]
+    fn clipboard_barrier_orders_keys_mouse_and_pen_without_writable_spin() {
+        let (mut input, receiver) = connected();
+        receiver.set_nonblocking(true).unwrap();
+        input.set_blocked(true);
+        input.send(route(), (1, 1), 1, 100, key()).unwrap();
+        input
+            .send_mouse(
+                route(),
+                (1, 1),
+                101,
+                MouseAction::Press,
+                0x110,
+                (0, 0),
+                (0, 0),
+            )
+            .unwrap();
+        input
+            .send_stylus(
+                route(),
+                (1, 1),
+                102,
+                droidloom_input_protocol::Stylus {
+                    tool: 1,
+                    action: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        input.flush().unwrap();
+        assert!(
+            receiver.receive_record().is_err(),
+            "input must wait for clipboard"
+        );
+        assert_eq!(input.fd().unwrap().1 & libc::POLLOUT, 0);
+        input.set_blocked(false);
+        input.flush().unwrap();
+        assert!(matches!(sample(&receiver).payload, Payload::Key { .. }));
+        assert!(matches!(sample(&receiver).payload, Payload::Mouse { .. }));
+        assert!(matches!(sample(&receiver).payload, Payload::Stylus { .. }));
+        assert!(receiver.receive_record().is_err());
+    }
+
+    #[test]
+    fn clipboard_barrier_reconnect_never_replays_a_held_modifier() {
+        let (mut input, old_receiver) = connected();
+        old_receiver.set_nonblocking(true).unwrap();
+        input.set_blocked(true);
+        input.send(route(), (1, 1), 1, 100, key()).unwrap();
+        assert!(old_receiver.receive_record().is_err());
+        input.disconnect();
+        let generation = input.next_request().unwrap();
+        let (writer, receiver) = SeqPacket::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        input
+            .attach(
+                generation,
+                PROTOCOL_MAJOR,
+                writer.as_fd().try_clone_to_owned().unwrap(),
+            )
+            .unwrap();
+        input.set_blocked(false);
+        input.flush().unwrap();
+        assert!(
+            receiver.receive_record().is_err(),
+            "new receiver must not inherit presses"
+        );
+        input.send(route(), (1, 1), 2, 101, key()).unwrap();
+        assert!(matches!(
+            sample(&receiver).payload,
+            Payload::Key { serial: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn clipboard_barrier_retirement_discards_old_presses_but_preserves_other_tasks() {
+        let (mut input, receiver) = connected();
+        receiver.set_nonblocking(true).unwrap();
+        input.set_blocked(true);
+        input.send(route(), (1, 1), 1, 100, key()).unwrap();
+        input
+            .send(route(), (1, 1), 2, 101, touch(7, TouchAction::Down))
+            .unwrap();
+        let other = Route {
+            task: 43,
+            ..route()
+        };
+        input.send(other, (1, 1), 3, 102, key()).unwrap();
+        input.cancel_route(route(), 103).unwrap();
+        input.set_blocked(false);
+        input.flush().unwrap();
+        let kept = sample(&receiver);
+        assert_eq!((kept.task, kept.action), (43, KeyAction::Down as u8));
+        while let Ok(record) = receiver.receive_record() {
+            let Record::Input(sample) = decode(&record.bytes).unwrap() else {
+                panic!("input");
+            };
+            assert_eq!(
+                (sample.task, sample.action),
+                (42, TouchAction::Cancel as u8)
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_barrier_overflow_cancels_instead_of_overtaking() {
+        let (mut input, receiver) = connected();
+        receiver.set_nonblocking(true).unwrap();
+        input.set_blocked(true);
+        for serial in 1..=QUEUE_LIMIT as u64 {
+            input.send(route(), (1, 1), serial, serial, key()).unwrap();
+        }
+        assert!(input.send(route(), (1, 1), 513, 513, key()).is_err());
+        assert!(input.fd().is_none());
+        assert!(input.queue.is_empty());
+        assert!(receiver.receive_record().is_err());
+    }
+
+    #[test]
+    fn repeated_retirement_keeps_release_for_an_already_delivered_key() {
+        let (mut input, receiver) = connected();
+        receiver.set_nonblocking(true).unwrap();
+        input.send(route(), (1, 1), 1, 100, key()).unwrap();
+        sample(&receiver);
+        input.set_blocked(true);
+        input.cancel_route(route(), 101).unwrap();
+        input
+            .send(
+                route(),
+                (1, 1),
+                2,
+                102,
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode: 30,
+                    repeat: 0,
+                },
+            )
+            .unwrap();
+        input.cancel_route(route(), 103).unwrap();
+        input.set_blocked(false);
+        input.flush().unwrap();
+        let up = sample(&receiver);
+        assert_eq!((up.task, up.action), (42, KeyAction::Up as u8));
+    }
+
+    #[test]
+    fn native_pen_socket_scales_axes_and_cancels_the_original_route() {
+        let (mut input, receiver) = connected();
+        let pen = droidloom_input_protocol::Stylus {
+            tool: 99,
+            action: 0,
+            x_fixed: 2 << 16,
+            y_fixed: 3 << 16,
+            pressure: 32768,
+            tilt_x: 30,
+            tilt_y: -45,
+            eraser: true,
+            buttons: 1,
+        };
+        input.send_stylus(route(), (3, 2), 100, pen).unwrap();
+        let entered = sample(&receiver);
+        assert_eq!(entered.code, 99);
+        assert_eq!(entered.action, 0);
+        let Payload::Stylus {
+            x,
+            y,
+            tilt_x,
+            tilt_y,
+            eraser,
+            buttons,
+            ..
+        } = entered.payload
+        else {
+            panic!("native stylus")
+        };
+        assert_eq!(
+            (x, y, tilt_x, tilt_y, eraser, buttons),
+            (3.0, 4.5, 30.0, -45.0, true, 1)
+        );
+        // Focus changes must not redirect the tool's release to another task.
+        input
+            .send_stylus(
+                Route {
+                    task: 43,
+                    ..route()
+                },
+                (3, 2),
+                101,
+                droidloom_input_protocol::Stylus { action: 4, ..pen },
+            )
+            .unwrap();
+        assert_eq!(sample(&receiver).task, 42);
+        input.cancel_route(route(), 102).unwrap();
+        let cancelled = sample(&receiver);
+        assert_eq!(
+            (cancelled.task, cancelled.code, cancelled.action),
+            (42, 99, 5)
+        );
+        input.send(route(), (1, 1), 3, 103, key()).unwrap();
+        assert!(matches!(sample(&receiver).payload, Payload::Key { .. }));
+        assert!(input.pens.is_empty());
+    }
+
+    #[test]
+    fn capture_key_lost_up_does_not_swallow_the_next_normal_release() {
+        let mut keys = Keys::default();
+        keys.consume(50, TaskObjectId(42));
+        keys.take_task(TaskObjectId(42));
+        keys.press(50, TaskObjectId(43));
+        assert_eq!(keys.release(50), Some(TaskObjectId(43)));
+    }
+
+    #[test]
+    fn capture_key_reconnect_and_fresh_press_discard_stale_consumption() {
+        let mut keys = Keys::default();
+        keys.consume(50, TaskObjectId(42));
+        keys.clear();
+        assert!(!keys.is_consumed(50));
+        keys.consume(50, TaskObjectId(42));
+        keys.press(50, TaskObjectId(42));
+        assert_eq!(keys.release(50), Some(TaskObjectId(42)));
+    }
+
+    #[test]
+    fn keys_release_to_the_original_task_and_focus_loss_clears_modifiers() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.press(29, TaskObjectId(42)), None);
+        keys.press(30, TaskObjectId(42));
+        keys.press(42, TaskObjectId(43));
+        assert_eq!(keys.release(30), Some(TaskObjectId(42)));
+        assert_eq!(keys.take_task(TaskObjectId(42)), [29]);
+        assert_eq!(keys.release(29), None);
+        assert_eq!(keys.owner(42), Some(TaskObjectId(43)));
+        keys.clear();
+        assert_eq!(keys.release(42), None);
+    }
+
+    #[test]
+    fn lost_up_resynchronizes_one_gesture_without_disconnecting_keyboard() {
+        let (mut input, receiver) = connected();
+        input
+            .send(route(), (1, 1), 1, 100, touch(7, TouchAction::Down))
+            .unwrap();
+        sample(&receiver);
+        let other = Route {
+            task: 43,
+            ..route()
+        };
+        input
+            .send(other, (1, 1), 2, 101, touch(8, TouchAction::Down))
+            .unwrap();
+        sample(&receiver);
+        input
+            .send(route(), (1, 1), 3, 102, touch(7, TouchAction::Down))
+            .unwrap();
+        let cancelled = sample(&receiver);
+        assert_eq!(
+            (cancelled.task, cancelled.action),
+            (42, TouchAction::Cancel as u8)
+        );
+        assert_eq!(sample(&receiver).action, TouchAction::Down as u8);
+        assert!(input.fd().is_some());
+        input
+            .send(other, (1, 1), 4, 103, touch(8, TouchAction::Up))
+            .unwrap();
+        assert_eq!(sample(&receiver).task, 43);
+        input.send(route(), (1, 1), 5, 104, key()).unwrap();
+        assert!(matches!(
+            sample(&receiver).payload,
+            Payload::Key { serial: 5, .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_channel_keeps_its_wire_and_never_receives_mouse_records() {
+        let (writer, receiver) = SeqPacket::pair().unwrap();
+        let mut input = DirectInput::default();
+        let generation = input.next_request().unwrap();
+        input
+            .attach(
+                generation,
+                LEGACY_PROTOCOL_MAJOR,
+                writer.as_fd().try_clone_to_owned().unwrap(),
+            )
+            .unwrap();
+        assert!(!input.supports_mouse());
+        input.send(route(), (1, 1), 1, 100, key()).unwrap();
+        let record = receiver.receive_record().unwrap();
+        assert_eq!(&record.bytes[4..6], &LEGACY_PROTOCOL_MAJOR.to_le_bytes());
+        assert!(decode(&record.bytes).is_ok());
+        assert!(
+            input
+                .send_mouse(route(), (1, 1), 101, MouseAction::Enter, 0, (0, 0), (0, 0))
+                .is_err()
+        );
+        assert!(input.fd().is_some());
+    }
+
+    #[test]
+    fn mouse_coordinates_scale_but_wheel_detents_do_not() {
+        let (mut input, receiver) = connected();
+        input
+            .send_mouse(
+                route(),
+                (3, 2),
+                100,
+                MouseAction::Scroll,
+                0,
+                (2 << 16, 4 << 16),
+                (128, -256),
+            )
+            .unwrap();
+        assert_eq!(
+            sample(&receiver).payload,
+            Payload::Mouse {
+                x: 3.0,
+                y: 6.0,
+                scroll_x: 0.5,
+                scroll_y: -1.0
+            }
+        );
+    }
+
+    #[test]
+    fn retiring_a_task_cancels_its_contacts_before_reusing_host_ids() {
+        let (mut input, receiver) = connected();
+        input
+            .send(route(), (1, 1), 1, 100, touch(7, TouchAction::Down))
+            .unwrap();
+        sample(&receiver);
+        input.cancel_route(route(), 101).unwrap();
+        assert_eq!(sample(&receiver).action, TouchAction::Cancel as u8);
+        let replacement = Route {
+            task: 43,
+            incarnation: 8,
+            ..route()
+        };
+        input
+            .send(replacement, (1, 1), 2, 102, touch(7, TouchAction::Down))
+            .unwrap();
+        let next = sample(&receiver);
+        assert_eq!(
+            (next.task, next.incarnation, next.action),
+            (43, 8, TouchAction::Down as u8)
+        );
+        assert!(input.fd().is_some());
+    }
 
     fn route() -> Route {
         Route {

@@ -4,6 +4,102 @@ These limitations apply to the current pacman preview. Installation and APK
 commands are in [INSTALL.md](INSTALL.md); source builds are in
 [BUILDING.md](BUILDING.md).
 
+## sheng UU Remote mouse and keyboard recovery
+
+The `sheng-modern-port` migration replaced the old native mouse route with a
+left-button touchscreen fallback, omitted the host mouse device registration,
+and dropped keyboard press ownership and focus-loss releases. The old remote
+client path also retained registered external device IDs through InputDispatcher,
+used relative motion axes, and offered Ctrl+Alt+M pointer confinement with an
+optional compositor keyboard-shortcut inhibitor. Reference changes are
+`44a14a5`, `f55a3d2`, `07e4965`, and `45a07f3` on `sheng-port`.
+UU's keyboard accessibility service remains enabled and bound on sheng; its
+permissions were not changed. On sheng, the
+installed full bundle `1791816149245073770-377850` is from `41f0f67` and uses
+input ABI 7; it predates the later tablet-tool changes.
+
+The current working tree restores native mouse hover, buttons, wheel axes,
+relative motion and side-button navigation using input ABI 8. It also restores
+the previous external device descriptors, InputDispatcher device-ID retention,
+keypad/NumLock mapping and handling of unmapped vendor keys without resetting
+other held input. Composer and
+InputFlinger must be rebuilt together. The Android C++ adapter and EventHub
+patch still require compilation against the pinned Android source and device
+acceptance. Captured native input during a remote session and physical pen input
+have not been verified. This is not yet a verified complete bundle or a release.
+
+A temporary presenter is running on sheng through
+`/run/user/1000/systemd/user/droidloom.service.d/70-input-recovery.conf`.
+Its executable is
+`/home/xinyang/.local/libexec/droidloom-input-recovery-20261014/droidloom-wayland-capture`,
+SHA-256 `dc0b53fa9989e53e8f26d4b3621378dad7c5576e0d96a5eb2e3b198b589fdfd0`.
+The packaged executable and active bundle were retained. The override disappears
+on device reboot. Remove that one drop-in, reload the user manager and restart
+only `droidloom.service` to roll back before reboot.
+
+With the ABI 7 image, the temporary presenter repairs key ownership/focus-loss
+releases, host cursor setup, route retirement and touch-stream recovery. Native
+mouse features remain disabled. Device checks confirmed a host mouse click opens
+Android Settings search, full keyboard text and Ctrl+A work, and holding Ctrl
+while clicking outside, releasing it outside, then returning permits a normal
+`z` input (`keyboardtestz`). No duplicate-down/input reconnection occurred during
+those checks. UU opens with the explicit launch component
+`com.netease.uuremote/com.remote.app.ui.activity.LaunchActivity` (the package-only
+launch returned activity-start error -91). Ctrl+Alt+M confinement activation and
+release were verified in UU's local window, without connecting to another device.
+The live Denial compositor advertises pointer constraints but no
+`zwp_keyboard_shortcuts_inhibit_manager_v1`; capture logs therefore correctly
+report `shortcuts-inhibited=false`. Desktop-wide shortcuts are not guaranteed
+to pass through. The local input/presenter/policy suites have 160 passing tests;
+the Android build-plan suite has nine. These checks do not validate native mouse
+dispatch on Android or replace UU remote-session acceptance.
+
+The next local recovery pass reconnects the previously unused window-control
+and gesture modules: F11 or the floating Fullscreen button toggles fullscreen,
+a top-edge pull reveals Back/Fullscreen, and an immersive side swipe cancels
+the application's touch once before sending Back. Pointer capture leaves F11
+with the remote application. Overlay controls stay above Android layer surfaces;
+their reveal timeout participates in the event-loop deadline.
+
+Native stylus records now preserve pen/eraser, hover, pressure, whole-degree
+tilt and both barrel buttons, with route/EOF cancellation. Tablet Pad's Group
+and Ring/Strip/Dial child bindings follow tablet-v2. ABI 7 retains touch fallback.
+Distance, rotation and tablet-wheel axes remain outside this wire. The native
+pen decoder regression was observed failing before the change and passing
+afterward; socket routing, hover/stroke/button lifecycle, replacement and
+retirement tests pass locally. UI behavior and Android C++ dispatch have not
+yet been verified on sheng.
+
+The same pass restores camera socket startup, guest runtime projection and
+producer staging from vendor/bin, installs the missing audio socket alias,
+records native ARM64 build provenance, restores the presenter session lease,
+and fixes ARM64 diagnostic C-character types and capture-key cleanup.
+
+The UU Remote physical keyboard blocker was resolved by removing `InputDeviceClass::DPAD`
+from `android/inputflinger/0002-droidloom-targeted-injection-binder.patch`: Android's
+keyboard classifier now categorizes Droidloom Host Keyboard as `KEYBOARD_TYPE_ALPHABETIC`
+(type 2), ensuring `Configuration.keyboard` exposes a positive hardware keyboard
+(`+keyb`) rather than `-keyb` (`KEYBOARD_NOKEYS`), allowing remote sessions to receive key events.
+
+The camera bridge pipeline (`graphics/droidloom-camera/src/capture.rs`) now incorporates
+`videoconvert` and `videoscale` elements in front of the framerate limiter and RGBA appsink,
+and relaxes discovery caps to generic `video/x-raw`. This ensures physical hardware sensors
+exposing NV12, YUY2, or BGRx streams at non-contract resolutions can be discovered by PipeWire
+and normalized into 1280x720 RGBA frames for the Android virtual camera HAL.
+
+GPU and gaming best practices are integrated: `ro.gfx.angle.supported=true` is enabled
+for sheng while retaining Turnip as the primary Vulkan driver, Mesa shader cache persistence
+is configured via `/data/vendor/mesa_shader_cache` (mode 01777) and second-stage init
+environment injection (`MESA_SHADER_CACHE_DIR`), and the devfreq governor performance profile
+is documented for host deployment.
+
+These changes are local. A complete paired Android build and device
+acceptance remain pending.
+Local validation: the full Rust workspace check succeeds; input
+protocol, Android policy and presenter suites pass 168 tests, the camera-wiring,
+supervisor, and camera conversion regression test suites pass.
+The ARM64 host presenter release build is at `target/release/droidloom-wayland`.
+
 ## Application compatibility
 
 - **Clash of Clans on the x86_64 desktop.** Version 18.600.5 rejected inherited

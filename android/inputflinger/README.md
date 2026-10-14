@@ -35,8 +35,16 @@ path. The builder permits only its existing Binder virtual override in
 creation, permissions, shutdown and stale-socket cleanup in a system-private
 directory. A restarted system_server starts its own listener again.
 
-The receiver validates input ABI 7 and rejects stale incarnations. It sleeps in
-socket polling at idle, cancels keys/gestures on disconnect or route retirement,
+The receiver validates input ABI 8 (with touch/key-only ABI 7 compatibility) and
+rejects stale incarnations. `0005-droidloom-host-mouse.patch` restores the host
+mouse input-device registration. Native mouse events retain mouse source,
+button/hover/wheel semantics and the real registered device ID; side buttons
+also dispatch Back/Forward keys. It sleeps in
+socket polling at idle. `0006-droidloom-host-device-identities.patch` preserves
+registered external keyboard/mouse IDs for task-token-targeted injection, as
+the previous sheng UU Remote integration did. Ordinary non-targeted injection
+retains Android's original device-ID policy. It cancels keys/gestures on
+disconnect or route retirement,
 and retains Binder tokens through cancellation dispatch. Native input ABI 2
 metadata prevents mixed framework/Composer builds. The Wayland presenter writes
 directly to the native receiver. Composer delegates the connected writer FD at

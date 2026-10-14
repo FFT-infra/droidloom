@@ -313,6 +313,14 @@ const PATCHES: &[(&str, &str)] = &[
         "android/inputflinger/0004-droidloom-native-input.patch",
     ),
     (
+        "frameworks/native",
+        "android/inputflinger/0005-droidloom-host-mouse.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/inputflinger/0006-droidloom-host-device-identities.patch",
+    ),
+    (
         "",
         "android/init-compat/0001-droidloom-cell-namespace.patch",
     ),
@@ -696,6 +704,30 @@ fn full_targets(product: &str) -> Vec<&'static str> {
         .filter(|name| !is_arm || *name != "droidloom-native-bridge")
         .collect()
 }
+/// Which NativeBridge source record a build must publish.
+///
+/// Native ARM64 cells execute ARM64 code directly and record the pinned AOSP
+/// source identity; x86_64 cells record the Teto translator revision. Focused
+/// framework/audio builds publish nothing so they never overwrite a record a
+/// full build already wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeBridgeSourceKind {
+    Translator,
+    Native,
+}
+
+fn native_bridge_source_kind(product: &str, targets: &[&str]) -> Option<NativeBridgeSourceKind> {
+    if targets == AUDIO_TARGETS
+        || targets == ["services", "libinputflinger"]
+        || targets == TASK_BACKEND_TARGETS
+    {
+        return None;
+    }
+    Some(match product {
+        "droidloom_arm64" | "droidloom_sheng" => NativeBridgeSourceKind::Native,
+        _ => NativeBridgeSourceKind::Translator,
+    })
+}
 pub fn build_targets(
     repo: &Path,
     source: &Path,
@@ -721,11 +753,16 @@ pub fn build_targets(
     if !audio_only {
         remove_retired_input_support(&out.join("target/product").join(product))?;
     }
-    let is_arm = matches!(product, "droidloom_arm64" | "droidloom_sheng");
-    let native_bridge_source = if audio_only || framework_only || is_arm {
-        None
-    } else {
-        Some(crate::native_bridge::prepare_source(repo, source)?)
+    // Full builds publish the source record the image derivation consumes.
+    // Focused builds must leave any existing record untouched.
+    let native_bridge_source = match native_bridge_source_kind(product, targets) {
+        Some(NativeBridgeSourceKind::Translator) => {
+            Some(crate::native_bridge::prepare_source(repo, source)?)
+        }
+        Some(NativeBridgeSourceKind::Native) => {
+            Some(crate::native_bridge::native_source(product, &lock)?)
+        }
+        None => None,
     };
     for (aidl, adapter) in [
         ("statusbar/IStatusBar.aidl", "EmptyStatusBar"),
@@ -1162,6 +1199,48 @@ mod tests {
             assert!(!declares_tablet(phone).unwrap());
         }
         assert!(declares_tablet("droidloom_new").is_err());
+    }
+
+    /// A full build must publish the source record its derivation consumes:
+    /// native ARM64 records real AOSP identity, x86_64 records the translator.
+    #[test]
+    fn full_builds_publish_a_source_record_for_every_product() {
+        for product in ["droidloom_arm64", "droidloom_sheng"] {
+            let full = full_targets(product);
+            assert_eq!(
+                native_bridge_source_kind(product, &full),
+                Some(NativeBridgeSourceKind::Native),
+                "{product}"
+            );
+        }
+        let full = full_targets("droidloom_x86_64");
+        assert_eq!(
+            native_bridge_source_kind("droidloom_x86_64", &full),
+            Some(NativeBridgeSourceKind::Translator)
+        );
+    }
+
+    /// Focused framework/audio builds must never overwrite the record a full
+    /// build wrote, for either architecture.
+    #[test]
+    fn focused_builds_never_rewrite_the_source_record() {
+        for product in ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"] {
+            assert_eq!(
+                native_bridge_source_kind(product, AUDIO_TARGETS),
+                None,
+                "{product} audio"
+            );
+            assert_eq!(
+                native_bridge_source_kind(product, &["services", "libinputflinger"]),
+                None,
+                "{product} framework"
+            );
+            assert_eq!(
+                native_bridge_source_kind(product, TASK_BACKEND_TARGETS),
+                None,
+                "{product} task backend"
+            );
+        }
     }
 
     #[test]

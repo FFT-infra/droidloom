@@ -943,6 +943,8 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
             .env("ANDROID_STORAGE", "/storage")
             .env("ASEC_MOUNTPOINT", "/mnt/asec")
             .env("LOOP_MOUNTPOINT", "/mnt/obb")
+            .env("MESA_SHADER_CACHE_DIR", "/data/vendor/mesa_shader_cache")
+            .env("MESA_SHADER_CACHE_MAX_SIZE", "2G")
             .env("LD_PRELOAD", ANDROID_SELINUX_COMPAT_PRELOAD),
     );
     Err(io_error("exec Android init", error))
@@ -1912,9 +1914,10 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         create_mount_target(&target)?;
         bind_mount(&text_socket, &target, false)?;
     }
-    // Audio is a separate user broker. Its systemd-owned socket survives broker
-    // restarts, preserving the inode bind-mounted into the Android cell.
-    for name in ["clipboard", "notifications", "audio"] {
+    // Audio and camera are separate user brokers. Their systemd-owned sockets
+    // survive broker restarts, preserving the inode bind-mounted into the
+    // Android cell at the endpoint each guest client dials.
+    for name in ["clipboard", "notifications", "audio", "camera"] {
         let socket = spec.denial_socket.with_file_name(format!("{name}.sock"));
         if socket.exists() {
             if !fs::symlink_metadata(&socket)
@@ -1926,10 +1929,14 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
                     "{name} endpoint is not a socket"
                 )));
             }
-            let target = if name == "audio" {
-                root.join("dev/socket/droidloom/audio")
-            } else {
-                framework_host.join(name)
+            // The presenter consumes the framework-only clipboard and
+            // notification channels below its private host directory, while
+            // the Android audio and camera clients dial their own fixed guest
+            // endpoints.
+            let target = match name {
+                "audio" => root.join("dev/socket/droidloom/audio"),
+                "camera" => root.join("dev/socket/droidloom/camera"),
+                _ => framework_host.join(name),
             };
             create_mount_target(&target)?;
             bind_mount(&socket, &target, false)?;

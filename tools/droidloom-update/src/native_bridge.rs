@@ -255,6 +255,19 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
     let executable = worker.path().join("droidloom-update");
     fs::copy("/proc/self/exe", &executable)?;
     mode(&executable, 0o755)?;
+    // The x86_64 cell builds the Teto translator and records its lock. Native
+    // ARM64 cells never build or run it, so they record the AOSP sparse source
+    // lock that actually produced their system partition.
+    let product_name = product
+        .file_name()
+        .ok_or("Android product output has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let source_lock = match product_name.as_str() {
+        "droidloom_x86_64" => "native-bridge-lock.json",
+        "droidloom_arm64" | "droidloom_sheng" => "m2-sparse-source-lock.json",
+        _ => return fail("unknown Android product for NativeBridge derivation"),
+    };
     run(Command::new("fakeroot")
         .arg("--")
         .arg(executable)
@@ -266,7 +279,7 @@ pub fn stage_image(repo: &Path, image: &Path, destination: &Path, product: &Path
         .arg("--product")
         .arg(product)
         .arg("--source-lock")
-        .arg(repo.join("android/manifest/native-bridge-lock.json")))
+        .arg(repo.join("android/manifest").join(source_lock)))
 }
 
 /// Publish the runtime APEX debuggerd binaries at their well-known system paths.
@@ -366,6 +379,92 @@ fn guest_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read and validate the build-source record for the derived image.
+///
+/// The record is produced by a full build (`native_source` for native ARM64,
+/// `prepare_source` for the x86_64 translator). Focused builds deliberately do
+/// not write it. Fail closed on a missing or mismatched record instead of
+/// substituting a plausible value, so a full ARM64 build that skipped
+/// publication is caught here rather than silently accepted.
+fn read_build_source(
+    product: &Path,
+    product_name: &str,
+    native_arm64: bool,
+    source_lock: &Path,
+) -> Result<serde_json::Value> {
+    let path = product.join("droidloom-native-bridge-source.json");
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).map_err(|error| {
+        format!(
+            "missing NativeBridge build source for {product_name}: {}: {error}",
+            path.display()
+        )
+    })?)?;
+    if native_arm64 {
+        // A native cell must record its real AOSP identity. Never accept a
+        // Teto translator record as a stand-in for a translation path the
+        // build did not run.
+        if record.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+            return fail("native ARM64 build source has an unsupported schema version");
+        }
+        if record.get("kind").and_then(|v| v.as_str()) != Some("native_arm64") {
+            return fail("native ARM64 build source is not a native provenance record");
+        }
+        if record.get("product").and_then(|v| v.as_str()) != Some(product_name) {
+            return fail("native ARM64 build source names a different product");
+        }
+        if record.get("target_arch").and_then(|v| v.as_str()) != Some("aarch64") {
+            return fail("native ARM64 build source names a different target architecture");
+        }
+        if record
+            .get("superproject")
+            .and_then(|v| v.get("commit"))
+            .and_then(|v| v.as_str())
+            .is_none()
+        {
+            return fail("native ARM64 build source lacks a superproject identity");
+        }
+        let recorded = record
+            .get("source_lock_sha256")
+            .and_then(|v| v.as_str())
+            .ok_or("native ARM64 build source lacks a source-lock digest")?;
+        if recorded != hash(source_lock)? {
+            return fail("native ARM64 build source does not match the current source lock");
+        }
+    } else {
+        // The x86_64 translator path keeps its existing strict contract: an
+        // exact commit plus the working-tree snapshot fields.
+        if record.get("kind").is_some() {
+            return fail("x86_64 build source is not a Teto translator record");
+        }
+        let commit = record
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .ok_or("x86_64 build source lacks a translator commit")?;
+        if commit.len() != 40
+            || !commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return fail("x86_64 build source has an invalid translator commit");
+        }
+        match record.get("working_tree").and_then(|v| v.as_bool()) {
+            Some(true) => {
+                if record
+                    .get("base_commit")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+                    || !record.get("files").is_some_and(|v| v.is_object())
+                {
+                    return fail("x86_64 development build source lacks its base or files");
+                }
+            }
+            Some(false) => {}
+            None => return fail("x86_64 build source lacks its working-tree state"),
+        }
+    }
+    Ok(record)
 }
 
 /// Rebuild the system EROFS in one fakeroot session, retaining its metadata.
@@ -525,11 +624,11 @@ pub fn derive_image(
             ])
             .arg(&directory))?;
     }
+    let build_source = read_build_source(product, &product_name, native_arm64, source_lock)?;
     let manifest = serde_json::json!({
         "schema_version": 1,
         "source": serde_json::from_slice::<serde_json::Value>(&fs::read(source_lock)?)?,
-        "build_source": serde_json::from_slice::<serde_json::Value>(&fs::read(
-            product.join("droidloom-native-bridge-source.json"))?)?,
+        "build_source": build_source,
         "guest_abi": "arm64-v8a",
         "host_abi": if native_arm64 { "arm64-v8a" } else { "x86_64" },
         "native_executables": native_arm64, "files": inventory,
@@ -870,6 +969,127 @@ mod tests {
         }
         assert!(bridge_properties("ro.build.version.sdk=36\n").is_err());
     }
+
+    const SPARSE_LOCK: &str =
+        include_str!("../../../android/manifest/m2-sparse-source-lock.json");
+
+    fn sparse_lock_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m2-sparse-source-lock.json");
+        fs::write(&path, SPARSE_LOCK).unwrap();
+        (dir, path)
+    }
+
+    fn product_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let product = dir.path().join(name);
+        fs::create_dir_all(&product).unwrap();
+        (dir, product)
+    }
+
+    /// The native record a full ARM64 build writes must round-trip through the
+    /// derivation consumer for both native products.
+    #[test]
+    fn native_arm64_source_is_produced_and_consumed_for_every_native_product() {
+        let (_lock_dir, lock) = sparse_lock_file();
+        for product in ["droidloom_arm64", "droidloom_sheng"] {
+            let record = native_source(product, &lock).unwrap();
+            assert_eq!(record["kind"], "native_arm64");
+            assert_eq!(record["product"], product);
+            assert_eq!(record["target_arch"], "aarch64");
+            assert_eq!(record["source_lock_sha256"], hash(&lock).unwrap());
+            let (_dir, product_path) = product_dir(product);
+            fs::write(
+                product_path.join("droidloom-native-bridge-source.json"),
+                serde_json::to_vec_pretty(&record).unwrap(),
+            )
+            .unwrap();
+            let consumed = read_build_source(&product_path, product, true, &lock).unwrap();
+            assert_eq!(consumed, record);
+        }
+    }
+
+    /// A full ARM64 build that failed to publish its record must be rejected,
+    /// never silently accepted by borrowing translator provenance.
+    #[test]
+    fn native_arm64_derivation_rejects_missing_or_wrong_source() {
+        let (_lock_dir, lock) = sparse_lock_file();
+        let (_dir, product) = product_dir("droidloom_arm64");
+        assert!(read_build_source(&product, "droidloom_arm64", true, &lock).is_err());
+
+        // A Teto translator record is not valid native provenance.
+        let teto = serde_json::json!({
+            "commit": "0".repeat(40), "working_tree": false,
+        });
+        fs::write(
+            product.join("droidloom-native-bridge-source.json"),
+            serde_json::to_vec(&teto).unwrap(),
+        )
+        .unwrap();
+        assert!(read_build_source(&product, "droidloom_arm64", true, &lock).is_err());
+
+        // A native record for a different product is rejected too.
+        let other = native_source("droidloom_sheng", &lock).unwrap();
+        fs::write(
+            product.join("droidloom-native-bridge-source.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        assert!(read_build_source(&product, "droidloom_arm64", true, &lock).is_err());
+
+        // A stale source-lock digest fails closed instead of being trusted.
+        let mut stale = native_source("droidloom_arm64", &lock).unwrap();
+        stale["source_lock_sha256"] = serde_json::json!("0".repeat(64));
+        fs::write(
+            product.join("droidloom-native-bridge-source.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(read_build_source(&product, "droidloom_arm64", true, &lock).is_err());
+    }
+
+    /// The x86_64 translator path keeps its strict contract, and a native
+    /// record is not accepted there either.
+    #[test]
+    fn x86_64_derivation_keeps_strict_translator_provenance() {
+        let (_lock_dir, lock) = sparse_lock_file();
+        let (_dir, product) = product_dir("droidloom_x86_64");
+        let write = |value: &serde_json::Value| {
+            fs::write(
+                product.join("droidloom-native-bridge-source.json"),
+                serde_json::to_vec(value).unwrap(),
+            )
+            .unwrap();
+        };
+
+        write(&serde_json::json!({
+            "commit": "917021cf3ecd077eb1581146a79d2265011755b8",
+            "working_tree": false,
+        }));
+        assert!(read_build_source(&product, "droidloom_x86_64", false, &lock).is_ok());
+
+        // A development snapshot must carry its base and working files.
+        write(&serde_json::json!({
+            "commit": "0".repeat(40), "base_commit": "1".repeat(40),
+            "working_tree": true, "files": {"a": "hash"},
+        }));
+        assert!(read_build_source(&product, "droidloom_x86_64", false, &lock).is_ok());
+        write(&serde_json::json!({
+            "commit": "0".repeat(40), "working_tree": true,
+        }));
+        assert!(read_build_source(&product, "droidloom_x86_64", false, &lock).is_err());
+
+        // Short, non-hex, or missing commits and a native record are rejected.
+        for invalid in [
+            serde_json::json!({"commit": "main", "working_tree": false}),
+            serde_json::json!({"commit": "Z".repeat(40), "working_tree": false}),
+            serde_json::json!({"working_tree": false}),
+            native_source("droidloom_arm64", &lock).unwrap(),
+        ] {
+            write(&invalid);
+            assert!(read_build_source(&product, "droidloom_x86_64", false, &lock).is_err());
+        }
+    }
 }
 
 fn validate_source_lock(lock: &SourceLock) -> Result<()> {
@@ -894,6 +1114,37 @@ pub fn prepare_source(repo: &Path, source: &Path) -> Result<serde_json::Value> {
         source,
         std::env::var_os("DROIDLOOM_NATIVE_BRIDGE_SOURCE").map(PathBuf::from),
     )
+}
+
+/// Publish the real build-source record for a native ARM64 cell.
+///
+/// Native ARM64 products execute ARM64 code directly, so they have no Teto
+/// translator revision to record. They still need an explicit, verifiable
+/// source identity because [`derive_image`] consumes this record for every
+/// product. Record the pinned AOSP superproject and the exact source-lock
+/// digest instead of borrowing translator provenance the build never used.
+pub fn native_source(product: &str, source_lock: &Path) -> Result<serde_json::Value> {
+    let target_arch = match product {
+        "droidloom_arm64" | "droidloom_sheng" => "aarch64",
+        _ => {
+            return fail(format!(
+                "native ARM64 source requires an ARM64 product, not {product}"
+            ));
+        }
+    };
+    let lock: serde_json::Value = serde_json::from_slice(&fs::read(source_lock)?)?;
+    let superproject = lock
+        .get("superproject")
+        .cloned()
+        .ok_or("sparse source lock has no superproject identity")?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "native_arm64",
+        "product": product,
+        "target_arch": target_arch,
+        "superproject": superproject,
+        "source_lock_sha256": hash(source_lock)?,
+    }))
 }
 
 fn prepare_source_with_local(

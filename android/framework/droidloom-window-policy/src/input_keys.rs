@@ -55,6 +55,7 @@ pub(super) fn android_keycode(scan: u32) -> Option<i32> {
         52 => 56,   // PERIOD
         53 => 76,   // SLASH
         54 => 60,   // SHIFT_RIGHT
+        55 => 155,  // NUMPAD_MULTIPLY
         56 => 57,   // ALT_LEFT
         57 => 62,   // SPACE
         58 => 115,  // CAPS_LOCK
@@ -68,10 +69,27 @@ pub(super) fn android_keycode(scan: u32) -> Option<i32> {
         66 => 138,  // F8
         67 => 139,  // F9
         68 => 140,  // F10
+        69 => 143,  // NUM_LOCK
+        70 => 116,  // SCROLL_LOCK
+        71 => 151,  // NUMPAD_7
+        72 => 152,  // NUMPAD_8
+        73 => 153,  // NUMPAD_9
+        74 => 156,  // NUMPAD_SUBTRACT
+        75 => 148,  // NUMPAD_4
+        76 => 149,  // NUMPAD_5
+        77 => 150,  // NUMPAD_6
+        78 => 157,  // NUMPAD_ADD
+        79 => 145,  // NUMPAD_1
+        80 => 146,  // NUMPAD_2
+        81 => 147,  // NUMPAD_3
+        82 => 144,  // NUMPAD_0
+        83 => 158,  // NUMPAD_DOT
         87 => 141,  // F11
         88 => 142,  // F12
         96 => 160,  // NUMPAD_ENTER
         97 => 114,  // CTRL_RIGHT
+        98 => 154,  // NUMPAD_DIVIDE
+        99 => 120,  // SYSRQ
         100 => 58,  // ALT_RIGHT
         102 => 122, // MOVE_HOME
         103 => 19,  // DPAD_UP
@@ -83,11 +101,19 @@ pub(super) fn android_keycode(scan: u32) -> Option<i32> {
         109 => 93,  // PAGE_DOWN
         110 => 124, // INSERT
         111 => 112, // FORWARD_DEL
+        113 => 164, // VOLUME_MUTE
+        114 => 25,  // VOLUME_DOWN
+        115 => 24,  // VOLUME_UP
+        117 => 161, // NUMPAD_EQUALS
+        119 => 121, // BREAK
+        121 => 159, // NUMPAD_COMMA
         125 => 117, // META_LEFT
         126 => 118, // META_RIGHT
         139 => 82,  // MENU
         158 => 4,   // BACK
         159 => 125, // FORWARD
+        0x113 | 0x116 => 4, // Mouse side/back button navigation
+        0x114 | 0x115 => 125, // Mouse extra/forward button navigation
         _ => return None,
     })
 }

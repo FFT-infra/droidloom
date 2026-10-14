@@ -656,6 +656,12 @@ pub(super) struct Chrome {
 }
 
 impl Chrome {
+    /// Keep controls above Android layer subsurfaces after reordering.
+    pub(super) fn raise_above(&self, sibling: &wl_surface::WlSurface) {
+        self.back.role.place_above(sibling);
+        self.fullscreen.role.place_above(&self.back.surface);
+    }
+
     pub(super) fn new(
         globals: &layers::Globals,
         compositor: &CompositorState,
@@ -719,14 +725,14 @@ impl Chrome {
         };
         let end = fullscreen_x.saturating_add(BUTTON as i32);
         let content_width = i32::try_from(content_width).unwrap_or(i32::MAX);
-        eprintln!(
+        if input_trace_enabled() { eprintln!(
             "Droidloom trace: stage=chrome event=place header={header} chromeless={chromeless} revealed={revealed} y={y} disc_centre_y={} back_x={back_x} full_x={fullscreen_x} leading_buttons={} cluster_end={} scale={} buffer_px={} content_width={content_width}",
             y + (BUTTON / 2) as i32,
             self.leading_buttons,
             native_cluster_end(self.leading_buttons),
             self.scale,
             BUTTON * self.scale,
-        );
+        ); }
         // A pair that runs off the window is worse than none: on a device with
         // no keyboard the frame's own Close and the keyboard's `F11` remain.
         let fits = back_x >= 0 && end <= content_width;

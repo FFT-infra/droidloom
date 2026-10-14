@@ -230,6 +230,26 @@ impl Stream {
         self.active = false;
         true
     }
+
+    pub(super) fn contains_surface(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.views.values().any(|v| &v.surface == surface)
+    }
+
+    pub(super) fn surface_offset(&self, surface: &wl_surface::WlSurface) -> Option<(f64, f64)> {
+        for view in self.views.values() {
+            if &view.surface == surface {
+                if let Some(geom) = view.geometry {
+                    return Some((
+                        f64::from(geom.destination[0]),
+                        f64::from(geom.destination[1]),
+                    ));
+                }
+                return Some((0.0, 0.0));
+            }
+        }
+        None
+    }
+
     fn release(&mut self) -> Result<(), PresenterError> {
         // Poll drains only signalled eventfds. Readiness selects the task;
         // the real timeline below still decides ownership and safe reuse.
@@ -926,6 +946,12 @@ impl App {
         if root_changed || !stream.active {
             root.attach(stream.root.as_ref().map(|(_, buffer)| buffer), 0, 0);
             root.damage_buffer(0, 0, root_size.0 as i32, root_size.1 as i32);
+        }
+        if let Some(feedback) = task.gesture_feedback.as_ref() {
+            feedback.raise_above(&previous);
+        }
+        if let Some(chrome) = task.chrome.as_ref() {
+            chrome.raise_above(&previous);
         }
         root.commit();
         self.activation.mapped(object, &root);

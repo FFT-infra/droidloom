@@ -1,0 +1,15 @@
+diff --git a/services/inputflinger/dispatcher/InputDispatcher.cpp b/services/inputflinger/dispatcher/InputDispatcher.cpp
+--- a/services/inputflinger/dispatcher/InputDispatcher.cpp
++++ b/services/inputflinger/dispatcher/InputDispatcher.cpp
+@@ -5031,4 +5031,11 @@ InputEventInjectionResult InputDispatcher::injectInputEventToApplication(
+     DeviceId resolvedDeviceId = VIRTUAL_KEYBOARD_ID;
+     if (policyFlags & POLICY_FLAG_FILTERED) {
+         resolvedDeviceId = event->getDeviceId();
++    } else if (targetApplicationToken != nullptr && event->getDeviceId() > 0 &&
++               (event->getType() == InputEventType::KEY ||
++                (event->getType() == InputEventType::MOTION &&
++                 isFromSource(static_cast<const MotionEvent&>(*event).getSource(),
++                              AINPUT_SOURCE_MOUSE)))) {
++        // Remote clients resolve the registered host InputDevice from this ID.
++        resolvedDeviceId = event->getDeviceId();
+     }

@@ -145,6 +145,36 @@ fn geometry() -> Geometry {
 }
 
 #[test]
+fn scale_callback_preserves_control_feedback_and_cursor_buffer_scales() {
+    let mut wire = Wire::new();
+    let content = wire.view();
+    let button = wire.view();
+    let feedback = wire.view();
+    let cursor = wire.compositor.create_surface(&wire.qh, ());
+    for surface in [&button.surface, &feedback.surface, &cursor] {
+        surface.set_buffer_scale(2);
+    }
+    wire.requests();
+    for surface in [&wire.root, &content.surface] {
+        super::super::apply_content_buffer_scale(surface, true);
+    }
+    for surface in [&button.surface, &feedback.surface, &cursor] {
+        super::super::apply_content_buffer_scale(surface, false);
+    }
+    let requests = wire.requests();
+    for surface in [&wire.root, &content.surface] {
+        assert_eq!(count(&requests, surface, "set_buffer_scale"), 1);
+    }
+    for surface in [&button.surface, &feedback.surface, &cursor] {
+        assert_eq!(
+            count(&requests, surface, "set_buffer_scale"),
+            0,
+            "a scale notification must not overwrite the owner's rendered buffer scale"
+        );
+    }
+}
+
+#[test]
 fn animated_peer_sends_no_requests_for_unchanged_buffer_or_solid_children() {
     let mut wire = Wire::new();
     let mut buffered = wire.view();

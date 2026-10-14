@@ -48,6 +48,10 @@ fn caps() -> gst::Caps {
         .build()
 }
 
+fn discovery_caps() -> gst::Caps {
+    gst::Caps::builder("video/x-raw").build()
+}
+
 /// Discover only unambiguous libcamera colour streams, without opening a sensor.
 pub fn sources() -> io::Result<[Option<String>; 2]> {
     let provider =
@@ -65,7 +69,7 @@ pub fn sources() -> io::Result<[Option<String>; 2]> {
             continue;
         };
         if properties.get::<String>("device.api").ok().as_deref() != Some("libcamera")
-            || device.caps().is_none_or(|c| !c.can_intersect(&caps()))
+            || device.caps().is_none_or(|c| !c.can_intersect(&discovery_caps()))
         {
             continue;
         }
@@ -106,6 +110,12 @@ impl Drop for Pipeline {
 
 fn pipeline(source: &gst::Element) -> io::Result<(Pipeline, gst_app::AppSink)> {
     let pipeline = Pipeline(gst::Pipeline::new());
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(failure)?;
+    let scale = gst::ElementFactory::make("videoscale")
+        .build()
+        .map_err(failure)?;
     let rate = gst::ElementFactory::make("videorate")
         .property("drop-only", true)
         .build()
@@ -119,9 +129,9 @@ fn pipeline(source: &gst::Element) -> io::Result<(Pipeline, gst_app::AppSink)> {
         .build();
     pipeline
         .0
-        .add_many([source, &rate, sink.upcast_ref()])
+        .add_many([source, &convert, &scale, &rate, sink.upcast_ref()])
         .map_err(failure)?;
-    gst::Element::link_many([source, &rate, sink.upcast_ref()]).map_err(failure)?;
+    gst::Element::link_many([source, &convert, &scale, &rate, sink.upcast_ref()]).map_err(failure)?;
     Ok((pipeline, sink))
 }
 
@@ -308,5 +318,54 @@ mod tests {
         client.shutdown(Shutdown::Both).unwrap();
         let result = worker.join().unwrap();
         assert!(result.is_ok(), "capture shutdown: {result:?}");
+    }
+
+    #[test]
+    fn synthetic_capture_converts_non_rgba_source_to_contract_rgba() {
+        gst::init().unwrap();
+        // A bin outputting YUY2 at 640x480, simulating camera hardware that does not output native 1280x720 RGBA
+        let bin = gst::Bin::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .property_from_str("pattern", "ball")
+            .build()
+            .unwrap();
+        let filter_caps = gst::Caps::builder("video/x-raw")
+            .field("format", "YUY2")
+            .field("width", 640)
+            .field("height", 480)
+            .build();
+        let filter = gst::ElementFactory::make("capsfilter")
+            .property("caps", &filter_caps)
+            .build()
+            .unwrap();
+        bin.add_many([&src, &filter]).unwrap();
+        src.link(&filter).unwrap();
+        let pad = filter.static_pad("src").unwrap();
+        let ghost = gst::GhostPad::with_target(&pad).unwrap();
+        bin.add_pad(&ghost).unwrap();
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || stream_source(&mut server, bin.upcast_ref()));
+        let mut header = [0; 24];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..8], b"DCAR\x01\x00\x02\x00");
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..8], b"DCAR\x01\x00\x03\x00");
+        assert_eq!(
+            u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize,
+            FRAME_BYTES
+        );
+        let mut frame = vec![0; FRAME_BYTES];
+        client.read_exact(&mut frame).unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        let result = worker.join().unwrap();
+        assert!(result.is_ok(), "capture conversion failed: {result:?}");
     }
 }

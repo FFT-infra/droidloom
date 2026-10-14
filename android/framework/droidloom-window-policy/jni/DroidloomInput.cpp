@@ -2,6 +2,7 @@
 // Android event construction only; decoding, routing and input state live in Rust.
 #include "DroidloomInput.h"
 #include <dispatcher/InputDispatcher.h>
+#include "InputReader.h"
 #include <binder/IPCThreadState.h>
 #include <input/Input.h>
 #include <private/android_filesystem_config.h>
@@ -18,8 +19,8 @@ std::map<InputManager*, std::shared_ptr<DroidloomInput>> gManagers;
 }
 
 void DroidloomInput::registerManager(InputManager* manager,
-        inputdispatcher::InputDispatcher& dispatcher, JavaVM* vm) {
-    auto input = std::make_shared<DroidloomInput>(dispatcher, vm);
+        inputdispatcher::InputDispatcher& dispatcher, InputReaderInterface& reader, JavaVM* vm) {
+    auto input = std::make_shared<DroidloomInput>(dispatcher, reader, vm);
     std::lock_guard lock(gManagersLock);
     gManagers.emplace(manager, std::move(input));
 }
@@ -58,8 +59,8 @@ extern "C" void droidloom_input_retire(int32_t, int64_t);
 
 static void releaseToken(uintptr_t token) { delete reinterpret_cast<sp<IBinder>*>(token); }
 
-DroidloomInput::DroidloomInput(inputdispatcher::InputDispatcher& dispatcher, JavaVM* vm)
-      : mDispatcher(dispatcher), mVm(vm),
+DroidloomInput::DroidloomInput(inputdispatcher::InputDispatcher& dispatcher, InputReaderInterface& reader, JavaVM* vm)
+      : mDispatcher(dispatcher), mReader(reader), mVm(vm),
         mNative(droidloom_input_create(reinterpret_cast<uintptr_t>(this), inject, workerLifecycle)) {}
 DroidloomInput::~DroidloomInput() { stop(); }
 void DroidloomInput::stop() {
@@ -131,29 +132,57 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
     if (token == 0) return false;
     const sp<IBinder> target = *reinterpret_cast<const sp<IBinder>*>(token);
     const IdGenerator ids(IdGenerator::Source::OTHER);
+    // These host capability devices live for the reader's lifetime. Resolve
+    // them lazily after startup, outside InputDispatcher's lock, then reuse
+    // their real IDs so applications can query the event's InputDevice.
+    if ((event->kind == 2 && input.mKeyboardDeviceId < 0)
+            || (event->kind == 7 && input.mMouseDeviceId == 0)) {
+        for (const auto& device : input.mReader.getInputDevices()) {
+            if (device.getDisplayName() == "Droidloom Host Keyboard") input.mKeyboardDeviceId = device.getId();
+            if (device.getDisplayName() == "Droidloom Host Mouse") input.mMouseDeviceId = device.getId();
+        }
+    }
     KeyEvent key;
     MotionEvent motion;
     InputEvent* androidEvent;
     if (event->kind == 2) {
-        key.initialize(ids.nextId(), -1, AINPUT_SOURCE_KEYBOARD, ui::LogicalDisplayId{event->display},
+        key.initialize(ids.nextId(), input.mKeyboardDeviceId, AINPUT_SOURCE_KEYBOARD, ui::LogicalDisplayId{event->display},
                 {}, event->action, event->flags, event->keyCode, event->scanCode,
                 event->meta, event->repeat, event->downTime, event->eventTime);
         androidEvent = &key;
-    } else if (event->kind == 1 && event->count > 0 && event->count <= 32) {
+    } else if ((event->kind == 1 || event->kind == 7 || event->kind == 8) && event->count > 0 && event->count <= 32) {
+        const bool mouse = event->kind == 7;
+        const bool stylus = event->kind == 8;
+        if ((mouse || stylus) && event->count != 1) return false;
         std::array<PointerProperties, 32> properties{};
         std::array<PointerCoords, 32> coords{};
         for (int32_t i = 0; i < event->count; ++i) {
             properties[i].id = event->pointers[i].id;
-            properties[i].toolType = ToolType::FINGER;
+            properties[i].toolType = mouse ? ToolType::MOUSE : stylus
+                    ? (event->keyCode == 4 ? ToolType::ERASER : ToolType::STYLUS) : ToolType::FINGER;
             coords[i].setAxisValue(AMOTION_EVENT_AXIS_X, event->pointers[i].x);
             coords[i].setAxisValue(AMOTION_EVENT_AXIS_Y, event->pointers[i].y);
             coords[i].setAxisValue(AMOTION_EVENT_AXIS_PRESSURE, event->pointers[i].pressure);
             coords[i].setAxisValue(AMOTION_EVENT_AXIS_SIZE, 1.0f);
         }
-        motion.initialize(ids.nextId(), 0, AINPUT_SOURCE_TOUCHSCREEN, ui::LogicalDisplayId{event->display},
-                {}, event->action, 0, {}, 0, 0, 0, MotionClassification::NONE,
-                ui::Transform{}, 1.0f, 1.0f, AMOTION_EVENT_INVALID_CURSOR_POSITION,
-                AMOTION_EVENT_INVALID_CURSOR_POSITION, ui::Transform{}, event->downTime,
+        if (mouse) {
+            coords[0].setAxisValue(AMOTION_EVENT_AXIS_HSCROLL, event->pointers[1].x);
+            coords[0].setAxisValue(AMOTION_EVENT_AXIS_VSCROLL, event->pointers[1].y);
+            coords[0].setAxisValue(AMOTION_EVENT_AXIS_RELATIVE_X, event->pointers[2].x);
+            coords[0].setAxisValue(AMOTION_EVENT_AXIS_RELATIVE_Y, event->pointers[2].y);
+        }
+        if (stylus) {
+            coords[0].setAxisValue(AMOTION_EVENT_AXIS_TILT, event->pointers[1].x);
+            coords[0].setAxisValue(AMOTION_EVENT_AXIS_ORIENTATION, event->pointers[1].y);
+        }
+        motion.initialize(ids.nextId(), mouse ? input.mMouseDeviceId : 0,
+                mouse ? AINPUT_SOURCE_MOUSE : stylus ? AINPUT_SOURCE_STYLUS : AINPUT_SOURCE_TOUCHSCREEN, ui::LogicalDisplayId{event->display},
+                {}, event->action, mouse ? event->keyCode : stylus ? event->scanCode : 0, {}, 0,
+                (mouse || stylus) ? event->meta : 0, (mouse || stylus) ? event->flags : 0, MotionClassification::NONE,
+                ui::Transform{}, 1.0f, 1.0f,
+                mouse ? event->pointers[0].x : AMOTION_EVENT_INVALID_CURSOR_POSITION,
+                mouse ? event->pointers[0].y : AMOTION_EVENT_INVALID_CURSOR_POSITION,
+                ui::Transform{}, event->downTime,
                 event->eventTime, event->count, properties.data(), coords.data());
         androidEvent = &motion;
     } else return false;

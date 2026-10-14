@@ -1,7 +1,7 @@
 //! Owned FDs and Binder-token handles at the native `InputFlinger` boundary.
 use crate::input::{Engine, Event, RoutedEvent, Target};
 use droidloom_denial_ipc::{IpcError, SeqPacket, SeqPacketListener};
-use droidloom_input_protocol::{decode, Record, RECORD_BYTES};
+use droidloom_input_protocol::{RECORD_BYTES, Record, decode};
 use std::{
     collections::BTreeMap,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
@@ -385,7 +385,13 @@ fn receive(listener: &SeqPacketListener, wake: &SeqPacket) -> Result<(), String>
         let credentials = client
             .peer_credentials()
             .map_err(|error| error.to_string())?;
-        if credentials.uid != 0 && credentials.uid != 1000 {
+        // The in-process listener fixture runs under the developer's host UID;
+        // production Android still accepts only root or system.
+        #[cfg(test)]
+        let fixture_peer = credentials.uid == unsafe { libc::geteuid() };
+        #[cfg(not(test))]
+        let fixture_peer = false;
+        if credentials.uid != 0 && credentials.uid != 1000 && !fixture_peer {
             continue;
         }
         state().reset();
@@ -413,9 +419,12 @@ fn receive(listener: &SeqPacketListener, wake: &SeqPacket) -> Result<(), String>
                         0,
                     );
                 }
-                Record::Input(sample) => match state.engine.process(sample) {
-                    Ok(Some(event)) => state.dispatch_routed(&event),
-                    Ok(None) => {} // stale incarnation or a task no longer attached
+                Record::Input(sample) => match state.engine.process_batch(sample) {
+                    Ok(events) => {
+                        for event in events {
+                            state.dispatch_routed(&event);
+                        }
+                    }
                     Err(error) => {
                         eprintln!("Droidloom native input sample rejected: {error}");
                         state.reset();
@@ -511,6 +520,44 @@ mod tests {
         // SAFETY: live Handle and listener; destroy is called once after all I/O.
         assert!(unsafe { droidloom_input_listen(handle, listener.as_fd().as_raw_fd()) });
         let client = SeqPacket::connect(dir.path().join("input")).unwrap();
+        for (action, button, expected) in [
+            (0, 0, &[9][..]),
+            (3, 0x111, &[0, 11][..]),
+            (5, 0, &[8][..]),
+            (4, 0x111, &[12, 1][..]),
+            (2, 0, &[10][..]),
+        ] {
+            let scroll = if action == 5 { -128 } else { 0 };
+            client
+                .send_record(
+                    &droidloom_input_protocol::encode_mouse(
+                        0,
+                        42,
+                        90,
+                        action,
+                        button,
+                        2 << 16,
+                        3 << 16,
+                        0,
+                        scroll,
+                        7,
+                    )
+                    .unwrap(),
+                    &[],
+                )
+                .unwrap();
+            for expected_action in expected {
+                let mouse = received.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(
+                    (mouse.kind, mouse.action, mouse.count),
+                    (7, *expected_action, 1)
+                );
+                assert_eq!((mouse.pointers[0].x, mouse.pointers[0].y), (32.0, 43.0));
+                if action == 5 {
+                    assert_eq!(mouse.pointers[1].y, -0.5);
+                }
+            }
+        }
         client
             .send_record(
                 &encode_touch(0, 42, 100, 0, 0, 2 << 16, 3 << 16, u16::MAX, 7).unwrap(),
@@ -618,10 +665,12 @@ mod tests {
         let symlink = dir.path().join("symlink");
         std::os::unix::fs::symlink(&ordinary_file, &symlink).unwrap();
         assert!(!start_at(unsafe { &*handle }, &symlink));
-        assert!(std::fs::symlink_metadata(&symlink)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(!owned_path.exists());
         // SAFETY: stop joins the worker before its callback context is freed.
         unsafe {

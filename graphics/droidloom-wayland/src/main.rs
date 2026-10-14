@@ -8,16 +8,32 @@ mod clipboard;
 mod fence_wakeup;
 mod gesture;
 mod gesture_feedback;
+mod immersion;
 mod imports;
 mod input;
 mod insets;
+mod interaction;
 mod layers;
 mod notifications;
 mod presentation_audit;
 mod readiness;
 mod resize;
 mod session;
+mod tablet_input;
 mod text_input;
+
+macro_rules! tablet_trace {
+    ($($arg:tt)*) => {
+        if input_trace_enabled() { eprintln!($($arg)*); }
+    };
+}
+
+fn input_trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| {
+        env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
@@ -51,20 +67,24 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{
     PresentTime, PresentationTimeHandler, PresentationTimeState,
 };
+use smithay_client_toolkit::reexports::csd_frame::WindowManagerCapabilities;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    AxisScroll, CursorIcon, PointerData, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec,
+    ThemedPointer,
+};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
-use smithay_client_toolkit::reexports::csd_frame::WindowManagerCapabilities;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
     Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
+use tablet_input::tilt_degrees;
 use thiserror::Error;
 use wayland_client::globals::{BindError, registry_queue_init};
 use wayland_client::protocol::{
@@ -88,21 +108,19 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{
     self, WpPresentationFeedback,
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    self as tablet, zwp_tablet_manager_v2::ZwpTabletManagerV2,
+    zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+    zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+    zwp_tablet_pad_v2::ZwpTabletPadV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    zwp_tablet_tool_v2::ZwpTabletToolV2, zwp_tablet_v2::ZwpTabletV2,
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
     zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
-};
-use wayland_protocols::wp::tablet::zv2::client::{
-    self as tablet, zwp_tablet_manager_v2::ZwpTabletManagerV2,
-    zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
-    zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
-    zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
-    zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
-    zwp_tablet_pad_v2::ZwpTabletPadV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
-    zwp_tablet_tool_v2::ZwpTabletToolV2, zwp_tablet_v2::ZwpTabletV2,
 };
 
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
@@ -222,6 +240,10 @@ struct FrameFeedback {
 }
 
 struct TaskWindow {
+    chrome: Option<chrome::Chrome>,
+    gesture_feedback: Option<gesture_feedback::Feedback>,
+    controls_until: Option<Instant>,
+    fullscreen: bool,
     layers: Option<layers::Stream>,
     package: String,
     android_task: Option<u64>,
@@ -261,6 +283,28 @@ impl TaskWindow {
     fn surface(&self) -> Option<&wl_surface::WlSurface> {
         self.window.as_ref().map(Window::wl_surface)
     }
+
+    fn contains_surface(&self, surface: &wl_surface::WlSurface) -> bool {
+        if self.surface().is_some_and(|candidate| candidate == surface) {
+            return true;
+        }
+        if let Some(stream) = self.layers.as_ref() {
+            if stream.contains_surface(surface) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn surface_offset(&self, surface: &wl_surface::WlSurface) -> Option<(f64, f64)> {
+        if self.surface().is_some_and(|candidate| candidate == surface) {
+            return Some((0.0, 0.0));
+        }
+        if let Some(stream) = self.layers.as_ref() {
+            return stream.surface_offset(surface);
+        }
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -296,6 +340,12 @@ struct TabletToolState {
     pending_up: bool,
     pending_proximity_out: bool,
     dirty_motion: bool,
+    native_entered: bool,
+    eraser: bool,
+    supported: bool,
+    tilt: (i8, i8),
+    buttons: u8,
+    dirty_buttons: bool,
 }
 
 impl TabletToolState {
@@ -311,6 +361,12 @@ impl TabletToolState {
             pending_up: false,
             pending_proximity_out: false,
             dirty_motion: false,
+            native_entered: false,
+            eraser: false,
+            supported: true,
+            tilt: (0, 0),
+            buttons: 0,
+            dirty_buttons: false,
         }
     }
 }
@@ -350,11 +406,24 @@ struct App {
     tasks: BTreeMap<TaskObjectId, TaskWindow>,
     task_work: readiness::Tasks,
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
+    keyboard_seat: Option<wl_seat::WlSeat>,
+    pointer_constraints: smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState,
+    shortcuts_inhibit_manager: Option<wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
+    immersion: Option<immersion::Capture>,
+    modifiers: Modifiers,
+    pointer: Option<ThemedPointer<PointerData>>,
     touch: Option<wl_touch::WlTouch>,
     focused: Option<TaskObjectId>,
+    pressed_keys: input::Keys,
+    mouse_focus: Option<TaskObjectId>,
+    mouse_buttons: u32,
+    mouse_position: (f64, f64),
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
+    swipe_back: Option<gesture::SwipeBackCandidate>,
+    top_pull: Option<gesture::TopPullCandidate>,
+    chrome_press: Option<(TaskObjectId, chrome::Action)>,
+    chrome_touches: BTreeMap<i32, (TaskObjectId, chrome::Action)>,
     next_buffer_id: u64,
     next_input_serial: u64,
     direct_input: input::DirectInput,
@@ -404,11 +473,9 @@ impl App {
     }
 
     fn task_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<TaskObjectId> {
-        self.tasks.iter().find_map(|(object, task)| {
-            task.surface()
-                .is_some_and(|candidate| candidate == surface)
-                .then_some(*object)
-        })
+        self.tasks
+            .iter()
+            .find_map(|(object, task)| task.contains_surface(surface).then_some(*object))
     }
 
     fn task_refresh_millihz(&self, object: TaskObjectId) -> u32 {
@@ -634,6 +701,10 @@ impl App {
         self.tasks.insert(
             object,
             TaskWindow {
+                chrome: None,
+                gesture_feedback: None,
+                controls_until: None,
+                fullscreen: false,
                 layers: None,
                 package: package.to_owned(),
                 android_task: None,
@@ -731,6 +802,7 @@ impl App {
         let scale_120 = configure.scale_120;
         let buffer_width = scale_dimension(width, scale_120)?;
         let buffer_height = scale_dimension(height, scale_120)?;
+        self.configure_controls(qh, object, width, scale_120);
         let needs_configure = {
             let task = self
                 .tasks
@@ -1366,6 +1438,7 @@ impl App {
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.release_task_inputs(object);
         self.task_work.remove(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
@@ -1392,10 +1465,13 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
-        let target_surface = self.tasks.get(&object).and_then(TaskWindow::surface).cloned();
-        if let Some(target) = target_surface {
+        if let Some(task) = self.tasks.get(&object) {
             for tool in &mut self.tablet_tools {
-                if tool.surface.as_ref() == Some(&target) {
+                if tool
+                    .surface
+                    .as_ref()
+                    .is_some_and(|s| task.contains_surface(s))
+                {
                     tool.is_down = false;
                     tool.surface = None;
                 }
@@ -1409,6 +1485,7 @@ impl App {
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.release_task_inputs(object);
         self.activation.remove(object);
         let task = self
             .tasks
@@ -1490,6 +1567,7 @@ impl App {
     }
 
     fn destroy_task(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.release_task_inputs(object);
         let task = self
             .tasks
             .get_mut(&object)
@@ -1525,7 +1603,13 @@ impl App {
                     .attach(generation, wire, socket)
                     .map_err(PresenterError::Wayland)?
                 {
+                    self.clear_input_tracking();
                     eprintln!("Droidloom direct input: connected to InputFlinger, wire ABI {wire}");
+                    if wire == droidloom_input_protocol::LEGACY_PROTOCOL_MAJOR {
+                        eprintln!(
+                            "Droidloom mouse: Android receiver has legacy ABI 7; native mouse requires matching ABI 8 Android and Composer"
+                        );
+                    }
                 }
             }
             EndpointAction::BindInputRoute {
@@ -1534,12 +1618,21 @@ impl App {
                 display,
                 incarnation,
             } => {
+                let next = input::Route {
+                    task: task.0,
+                    display,
+                    incarnation,
+                };
+                if self
+                    .tasks
+                    .get(&object)
+                    .and_then(|window| window.input_route)
+                    .is_some_and(|old| old != next)
+                {
+                    self.release_task_inputs(object);
+                }
                 if let Some(window) = self.tasks.get_mut(&object) {
-                    window.input_route = Some(input::Route {
-                        task: task.0,
-                        display,
-                        incarnation,
-                    });
+                    window.input_route = Some(next);
                 }
             }
             EndpointAction::RequestActivation { object } => {
@@ -1658,6 +1751,7 @@ impl App {
         self.text_input.disconnect();
         self.endpoint = None;
         self.direct_input.disconnect();
+        self.clear_input_tracking();
         self.published_display_power = None;
         for object in self.tasks.keys().copied().collect::<Vec<_>>() {
             self.remove_task(object);
@@ -1667,6 +1761,9 @@ impl App {
         self.touch_contacts.clear();
         for tool in &mut self.tablet_tools {
             tool.is_down = false;
+            tool.native_entered = false;
+            tool.buttons = 0;
+            tool.dirty_buttons = false;
             tool.surface = None;
         }
     }
@@ -1675,11 +1772,18 @@ impl App {
         &mut self,
         object: TaskObjectId,
         event: InputEvent,
-    ) -> Result<(), PresenterError> {
+    ) -> Result<bool, PresenterError> {
         static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if self.clipboard.blocked() && self.clipboard_inputs.len() < 512 {
+        let direct = self.endpoint.as_ref().is_some_and(DenialEndpoint::direct_input);
+        // Native key/touch/mouse/pen records share one connection-owned FIFO.
+        self.direct_input.set_blocked(self.clipboard.blocked());
+        if !direct && self.clipboard.blocked() {
+            if self.clipboard_inputs.len() >= 512 {
+                self.disconnect_endpoint();
+                return Ok(false);
+            }
             self.clipboard_inputs.push_back((object, event));
-            return Ok(());
+            return Ok(true);
         }
         self.next_input_serial = self
             .next_input_serial
@@ -1709,12 +1813,12 @@ impl App {
                 .get(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             if window.closing {
-                return Ok(());
+                return Ok(false);
             }
             let Some(route) = window.input_route else {
                 // The task binding and native route arrive in ordered records,
                 // but Wayland may dispatch input between their receipt.
-                return Ok(());
+                return Ok(false);
             };
             if let Err(error) = self.direct_input.send(
                 route,
@@ -1726,19 +1830,255 @@ impl App {
                 // The native receiver cancels held input on EOF. Recover this
                 // connection without taking down unrelated app windows.
                 eprintln!("Droidloom direct input: {error}");
+                self.direct_input.disconnect();
+                self.clear_input_tracking();
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
         self.endpoint
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
             .send_input(object, self.next_input_serial, timestamp, event)?;
+        Ok(true)
+    }
+
+    fn clear_input_tracking(&mut self) {
+        self.clipboard_inputs.clear();
+        self.abandon_gestures();
+        self.clear_control_presses();
+        self.end_capture();
+        self.pressed_keys.clear();
+        self.pointer_contact = None;
+        self.touch_contacts.clear();
+        self.mouse_focus = None;
+        self.mouse_buttons = 0;
+        for tool in &mut self.tablet_tools {
+            tool.is_down = false;
+            tool.native_entered = false;
+            tool.buttons = 0;
+            tool.dirty_buttons = false;
+            tool.pending_down = false;
+            tool.pending_up = false;
+            tool.pending_proximity_out = false;
+            tool.dirty_motion = false;
+        }
+    }
+
+    fn release_task_inputs(&mut self, object: TaskObjectId) {
+        self.clipboard_inputs.retain(|(owner, _)| *owner != object);
+        self.abandon_gestures();
+        self.clear_control_presses();
+        if self
+            .immersion
+            .as_ref()
+            .is_some_and(|capture| capture.object == object)
+        {
+            self.end_capture();
+        }
+        // Discard deferred presses before queuing releases to this old route.
+        if let Some(route) = self.tasks.get(&object).and_then(|task| task.input_route) {
+            if let Ok(now) = monotonic_timestamp_nanos() {
+                if let Err(error) = self.direct_input.cancel_route(route, now) {
+                    eprintln!("Droidloom input route cancellation: {error}");
+                    self.direct_input.disconnect();
+                    self.clear_input_tracking();
+                }
+            }
+        }
+        for keycode in self.pressed_keys.take_task(object) {
+            let _ = self.send_input(
+                object,
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode,
+                    repeat: 0,
+                },
+            );
+        }
+        if self.mouse_focus == Some(object) {
+            let _ = self.send_mouse(
+                object,
+                input::MouseAction::Cancel,
+                self.mouse_position,
+                0,
+                (0, 0),
+            );
+            self.mouse_focus = None;
+            self.mouse_buttons = 0;
+        }
+        self.pointer_contact = self
+            .pointer_contact
+            .filter(|contact| contact.object != object);
+        self.touch_contacts
+            .retain(|_, contact| contact.object != object);
+        if let Some(task) = self.tasks.get(&object) {
+            for tool in &mut self.tablet_tools {
+                if tool
+                    .surface
+                    .as_ref()
+                    .is_some_and(|s| task.contains_surface(s))
+                {
+                    tool.is_down = false;
+                    tool.native_entered = false;
+                    tool.buttons = 0;
+                    tool.dirty_buttons = false;
+                    tool.surface = None;
+                    tool.pending_down = false;
+                    tool.pending_up = false;
+                    tool.pending_proximity_out = false;
+                    tool.dirty_motion = false;
+                }
+            }
+        }
+    }
+
+    fn surface_position(
+        &self,
+        object: TaskObjectId,
+        surface: &wl_surface::WlSurface,
+        position: (f64, f64),
+    ) -> (f64, f64) {
+        let offset = self
+            .tasks
+            .get(&object)
+            .and_then(|task| task.surface_offset(surface))
+            .unwrap_or((0.0, 0.0));
+        (position.0 + offset.0, position.1 + offset.1)
+    }
+
+    fn send_mouse(
+        &mut self,
+        object: TaskObjectId,
+        action: input::MouseAction,
+        position: (f64, f64),
+        button: u32,
+        scroll: (i16, i16),
+    ) -> Result<(), PresenterError> {
+        if !self.direct_input.supports_mouse() {
+            return Ok(());
+        }
+        let Some(window) = self.tasks.get(&object).filter(|window| !window.closing) else {
+            return Ok(());
+        };
+        let Some(route) = window.input_route else {
+            return Ok(());
+        };
+        let scale = (window.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR);
+        let fixed = self.fixed_position(object, position);
+        self.direct_input.set_blocked(self.clipboard.blocked());
+        if let Err(error) = self.direct_input.send_mouse(
+            route,
+            scale,
+            monotonic_timestamp_nanos()?,
+            action,
+            button,
+            fixed,
+            scroll,
+        ) {
+            eprintln!("Droidloom native mouse: {error}");
+            self.direct_input.disconnect();
+            self.clear_input_tracking();
+        }
         Ok(())
     }
 
+    fn route_mouse(&mut self, event: &PointerEvent) {
+        use input::MouseAction;
+        let object = self.task_for_surface(&event.surface);
+        let Some(target) = self.mouse_focus.or(object) else {
+            return;
+        };
+        let position = self.surface_position(target, &event.surface, event.position);
+        self.mouse_position = position;
+        let result = match event.kind {
+            PointerEventKind::Enter { .. } => {
+                if let Some(previous) = self
+                    .mouse_focus
+                    .filter(|previous| Some(*previous) != object)
+                {
+                    let _ = self.send_mouse(
+                        previous,
+                        MouseAction::Leave,
+                        self.mouse_position,
+                        0,
+                        (0, 0),
+                    );
+                    self.mouse_buttons = 0;
+                }
+                self.mouse_focus = object;
+                if let Some(object) = object {
+                    self.send_mouse(
+                        object,
+                        MouseAction::Enter,
+                        self.surface_position(object, &event.surface, event.position),
+                        0,
+                        (0, 0),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            PointerEventKind::Leave { .. } => {
+                if object.is_some_and(|object| object != target) {
+                    return;
+                }
+                self.mouse_focus = None;
+                self.mouse_buttons = 0;
+                self.send_mouse(target, MouseAction::Leave, position, 0, (0, 0))
+            }
+            PointerEventKind::Motion { .. } => {
+                self.mouse_focus = Some(target);
+                self.send_mouse(target, MouseAction::Motion, position, 0, (0, 0))
+            }
+            PointerEventKind::Press { button, .. } => {
+                let Some(mask) = droidloom_input_protocol::mouse_button(button) else {
+                    return;
+                };
+                if self.mouse_buttons & mask != 0 {
+                    let _ = self.send_mouse(target, MouseAction::Cancel, position, 0, (0, 0));
+                    self.mouse_buttons = 0;
+                }
+                self.mouse_focus = Some(target);
+                self.mouse_buttons |= mask;
+                self.text_input.note_touch();
+                self.send_mouse(target, MouseAction::Press, position, button, (0, 0))
+            }
+            PointerEventKind::Release { button, .. } => {
+                let Some(mask) = droidloom_input_protocol::mouse_button(button) else {
+                    return;
+                };
+                if self.mouse_buttons & mask == 0 {
+                    return;
+                }
+                self.mouse_buttons &= !mask;
+                self.send_mouse(target, MouseAction::Release, position, button, (0, 0))
+            }
+            PointerEventKind::Axis {
+                ref horizontal,
+                ref vertical,
+                ..
+            } => {
+                let scroll = (
+                    mouse_scroll(horizontal),
+                    mouse_scroll(vertical).saturating_neg(),
+                );
+                if scroll == (0, 0) {
+                    return;
+                }
+                self.send_mouse(target, MouseAction::Scroll, position, 0, scroll)
+            }
+        };
+        if let Err(error) = result {
+            self.fail(&error);
+        }
+    }
+
     fn pump_direct_input(&mut self) -> Result<(), PresenterError> {
+        self.direct_input.set_blocked(self.clipboard.blocked());
         if let Err(error) = self.direct_input.flush() {
             eprintln!("Droidloom input: {error}");
+            self.clear_input_tracking();
         }
         if let Some(endpoint) = self
             .endpoint
@@ -1773,6 +2113,25 @@ impl App {
     fn set_focus(&mut self, object: Option<TaskObjectId>) -> Result<(), PresenterError> {
         if self.focused == object {
             return Ok(());
+        }
+        if self
+            .immersion
+            .as_ref()
+            .is_some_and(|capture| Some(capture.object) != object)
+        {
+            self.end_capture();
+        }
+        if let Some(previous) = self.focused {
+            for keycode in self.pressed_keys.take_task(previous) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode,
+                        repeat: 0,
+                    },
+                );
+            }
         }
         if let Some(previous) = self.focused
             && let Some(task) = self.tasks.get_mut(&previous)
@@ -1824,7 +2183,7 @@ impl CompositorHandler for App {
         surface: &wl_surface::WlSurface,
         _new_factor: i32,
     ) {
-        surface.set_buffer_scale(1);
+        apply_content_buffer_scale(surface, self.tasks.values().any(|task| task.contains_surface(surface)));
     }
 
     fn transform_changed(
@@ -1981,6 +2340,10 @@ impl WindowHandler for App {
             && !configure.is_resizing()
             && !configure.is_maximized()
             && !configure.is_fullscreen();
+        self.tasks
+            .get_mut(&object)
+            .expect("surface has a task")
+            .fullscreen = configure.is_fullscreen();
         self.tasks
             .get_mut(&object)
             .expect("surface has a task")
@@ -2317,11 +2680,20 @@ impl SeatHandler for App {
             Capability::Keyboard if self.keyboard.is_none() => self
                 .seat_state
                 .get_keyboard(qh, &seat, None)
-                .map(|keyboard| self.keyboard = Some(keyboard))
+                .map(|keyboard| {
+                    self.keyboard = Some(keyboard);
+                    self.keyboard_seat = Some(seat.clone());
+                })
                 .map_err(|error| error.to_string()),
             Capability::Pointer if self.pointer.is_none() => self
                 .seat_state
-                .get_pointer(qh, &seat)
+                .get_pointer_with_theme(
+                    qh,
+                    &seat,
+                    &self.layer_globals.shm,
+                    self.compositor.create_surface(qh),
+                    ThemeSpec::default(),
+                )
                 .map(|pointer| self.pointer = Some(pointer))
                 .map_err(|error| error.to_string()),
             Capability::Touch if self.touch.is_none() => self
@@ -2345,14 +2717,39 @@ impl SeatHandler for App {
     ) {
         match capability {
             Capability::Keyboard => {
+                if let Err(error) = self.set_focus(None) {
+                    self.fail(&error);
+                }
                 self.keyboard = None;
+                self.keyboard_seat = None;
                 self.text_input.remove_resource();
             }
             Capability::Pointer => {
+                self.end_capture();
+                if let Some(object) = self.mouse_focus {
+                    let _ = self.send_mouse(
+                        object,
+                        input::MouseAction::Cancel,
+                        self.mouse_position,
+                        0,
+                        (0, 0),
+                    );
+                }
+                if let Some(contact) = self.pointer_contact.take() {
+                    let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+                }
+                self.mouse_focus = None;
+                self.mouse_buttons = 0;
                 self.pointer = None;
                 self.pointer_contact = None;
             }
             Capability::Touch => {
+                self.abandon_gestures();
+                self.clear_control_presses();
+                let contacts = std::mem::take(&mut self.touch_contacts);
+                for (_, contact) in contacts {
+                    let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+                }
                 self.touch = None;
                 self.touch_contacts.clear();
             }
@@ -2361,9 +2758,12 @@ impl SeatHandler for App {
     }
 
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.direct_input.disconnect();
+        self.clear_input_tracking();
         self.unbind_tablet_seat(&seat);
         self.text_input.remove_resource();
         self.keyboard = None;
+        self.keyboard_seat = None;
         self.pointer = None;
         self.touch = None;
         self.pointer_contact = None;
@@ -2374,10 +2774,14 @@ impl SeatHandler for App {
 impl App {
     fn bind_tablet_seat(&mut self, seat: wl_seat::WlSeat, qh: &QueueHandle<Self>) {
         if self.tablet_manager.is_none()
-            || self.tablet_seats.iter().any(|(existing, _)| *existing == seat)
+            || self
+                .tablet_seats
+                .iter()
+                .any(|(existing, _)| *existing == seat)
         {
             return;
         }
+        tablet_trace!("Droidloom tablet: binding tablet seat for {:?}", seat.id());
         let tablet_seat = self
             .tablet_manager
             .as_ref()
@@ -2403,6 +2807,9 @@ impl App {
     }
 
     fn cancel_tablet_tool(&mut self, tool_id: u32) {
+        if self.direct_input.supports_mouse() {
+            let _ = self.send_native_pen(tool_id, 5);
+        }
         let (surface, is_down) = {
             let Some(tool) = self.tablet_tools.iter_mut().find(|t| t.tool_id == tool_id) else {
                 return;
@@ -2412,9 +2819,11 @@ impl App {
             (surface, is_down)
         };
         if is_down
+            && !self.direct_input.supports_mouse()
             && let Some(surface) = surface
             && let Some(object) = self.task_for_surface(&surface)
         {
+            tablet_trace!("Droidloom tablet: cancel_tablet_tool {tool_id} on {object:?}");
             let pointer_id = 0x8000_0000 | tool_id;
             let _ = self.send_input(
                 object,
@@ -2430,6 +2839,13 @@ impl App {
     }
 
     fn flush_tablet_tool(&mut self, tool_id: u32) {
+        if !self.tablet_tool_mut(tool_id).supported {
+            return;
+        }
+        if self.direct_input.supports_mouse() {
+            self.flush_native_pen(tool_id);
+            return;
+        }
         let tool = self.tablet_tool_mut(tool_id);
         let pending_down = std::mem::take(&mut tool.pending_down);
         let pending_up = std::mem::take(&mut tool.pending_up);
@@ -2443,6 +2859,30 @@ impl App {
         let pointer_id = 0x8000_0000 | tool_id;
 
         if pending_down {
+            if self.tablet_tool_mut(tool_id).is_down {
+                if let Some(surface) = &surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    let offset = self
+                        .tasks
+                        .get(&object)
+                        .and_then(|t| t.surface_offset(surface))
+                        .unwrap_or((0.0, 0.0));
+                    let (x_fixed, y_fixed) =
+                        self.fixed_position(object, (x + offset.0, y + offset.1));
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Up,
+                            pointer_id,
+                            x_fixed,
+                            y_fixed,
+                            pressure: 0,
+                        },
+                    );
+                }
+                self.tablet_tool_mut(tool_id).is_down = false;
+            }
             if let Some(surface) = &surface
                 && let Some(object) = self.task_for_surface(surface)
             {
@@ -2450,9 +2890,17 @@ impl App {
                 if self.focused != Some(object) {
                     let _ = self.set_focus(Some(object));
                 }
-                let (x_fixed, y_fixed) = self.fixed_position(object, (x, y));
+                let offset = self
+                    .tasks
+                    .get(&object)
+                    .and_then(|t| t.surface_offset(surface))
+                    .unwrap_or((0.0, 0.0));
+                let (x_fixed, y_fixed) = self.fixed_position(object, (x + offset.0, y + offset.1));
                 let press = if pressure > 0 { pressure } else { u16::MAX };
-                if let Err(error) = self.send_input(
+                tablet_trace!(
+                    "Droidloom tablet: send Down to {object:?} (x={x_fixed}, y={y_fixed}, pressure={press})"
+                );
+                match self.send_input(
                     object,
                     InputEvent::Touch {
                         action: TouchAction::Down,
@@ -2462,10 +2910,18 @@ impl App {
                         pressure: press,
                     },
                 ) {
-                    self.fail(&error);
-                } else {
-                    self.tablet_tool_mut(tool_id).is_down = true;
+                    Ok(true) => self.tablet_tool_mut(tool_id).is_down = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("Droidloom tablet: send Down failed: {error}");
+                        self.fail(&error);
+                    }
                 }
+            } else {
+                tablet_trace!(
+                    "Droidloom tablet: pending_down but surface {:?} matched no task!",
+                    surface.as_ref().map(|s| s.id())
+                );
             }
         }
 
@@ -2473,7 +2929,12 @@ impl App {
             if let Some(surface) = &surface
                 && let Some(object) = self.task_for_surface(surface)
             {
-                let (x_fixed, y_fixed) = self.fixed_position(object, (x, y));
+                let offset = self
+                    .tasks
+                    .get(&object)
+                    .and_then(|t| t.surface_offset(surface))
+                    .unwrap_or((0.0, 0.0));
+                let (x_fixed, y_fixed) = self.fixed_position(object, (x + offset.0, y + offset.1));
                 let _ = self.send_input(
                     object,
                     InputEvent::Touch {
@@ -2493,7 +2954,16 @@ impl App {
                 if let Some(surface) = &surface
                     && let Some(object) = self.task_for_surface(surface)
                 {
-                    let (x_fixed, y_fixed) = self.fixed_position(object, (x, y));
+                    let offset = self
+                        .tasks
+                        .get(&object)
+                        .and_then(|t| t.surface_offset(surface))
+                        .unwrap_or((0.0, 0.0));
+                    let (x_fixed, y_fixed) =
+                        self.fixed_position(object, (x + offset.0, y + offset.1));
+                    tablet_trace!(
+                        "Droidloom tablet: send Up to {object:?} (x={x_fixed}, y={y_fixed})"
+                    );
                     let _ = self.send_input(
                         object,
                         InputEvent::Touch {
@@ -2515,6 +2985,7 @@ impl App {
                 if let Some(surface) = &surface
                     && let Some(object) = self.task_for_surface(surface)
                 {
+                    tablet_trace!("Droidloom tablet: send Cancel to {object:?}");
                     let _ = self.send_input(
                         object,
                         InputEvent::Touch {
@@ -2557,11 +3028,13 @@ impl Dispatch<ZwpTabletSeatV2, ()> for App {
         let seat_id = proxy.id().protocol_id();
         match &event {
             tablet::zwp_tablet_seat_v2::Event::TabletAdded { id } => {
+                tablet_trace!("Droidloom tablet: TabletAdded id={:?}", id.id());
                 state
                     .tablet_proxies
                     .insert(id.id().protocol_id(), (seat_id, id.clone()));
             }
             tablet::zwp_tablet_seat_v2::Event::ToolAdded { id } => {
+                tablet_trace!("Droidloom tablet: ToolAdded id={:?}", id.id());
                 let tool_id = id.id().protocol_id();
                 state.tablet_tool_proxies.insert(tool_id, id.clone());
             }
@@ -2591,18 +3064,77 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
     ) {
         let tool_id = proxy.id().protocol_id();
         match event {
-            tablet::zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+            tablet::zwp_tablet_tool_v2::Event::Type { tool_type } => {
                 let tool = state.tablet_tool_mut(tool_id);
+                tool.eraser = matches!(
+                    tool_type,
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::Type::Eraser)
+                );
+                tool.supported = matches!(
+                    tool_type,
+                    WEnum::Value(
+                        tablet::zwp_tablet_tool_v2::Type::Pen
+                            | tablet::zwp_tablet_tool_v2::Type::Eraser
+                            | tablet::zwp_tablet_tool_v2::Type::Brush
+                            | tablet::zwp_tablet_tool_v2::Type::Pencil
+                            | tablet::zwp_tablet_tool_v2::Type::Airbrush
+                    )
+                );
+            }
+            tablet::zwp_tablet_tool_v2::Event::Tilt { tilt_x, tilt_y } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.tilt = (tilt_degrees(tilt_x), tilt_degrees(tilt_y));
+                tool.dirty_motion = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+                state.abandon_gestures();
+                if state.direct_input.supports_mouse() {
+                    state.cancel_tablet_tool(tool_id);
+                }
+                let prev_surface = state.tablet_tool_mut(tool_id).surface.take();
+                let was_down = state.tablet_tool_mut(tool_id).is_down;
+                if was_down
+                    && let Some(prev) = prev_surface
+                    && let Some(object) = state.task_for_surface(&prev)
+                {
+                    let pointer_id = 0x8000_0000 | tool_id;
+                    let _ = state.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Cancel,
+                            pointer_id,
+                            x_fixed: 0,
+                            y_fixed: 0,
+                            pressure: 0,
+                        },
+                    );
+                }
+                tablet_trace!(
+                    "Droidloom tablet: ProximityIn tool_id={tool_id}, surface={:?}, task={:?}",
+                    surface.id(),
+                    state.task_for_surface(&surface)
+                );
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.is_down = false;
                 tool.surface = Some(surface);
                 tool.pressure = 0;
+                tool.native_entered = false;
+                tool.buttons = 0;
+                tool.tilt = (0, 0);
+                tool.pending_down = false;
+                tool.pending_up = false;
+                tool.pending_proximity_out = false;
             }
             tablet::zwp_tablet_tool_v2::Event::ProximityOut => {
+                tablet_trace!("Droidloom tablet: ProximityOut tool_id={tool_id}");
                 state.tablet_tool_mut(tool_id).pending_proximity_out = true;
             }
             tablet::zwp_tablet_tool_v2::Event::Down { .. } => {
+                tablet_trace!("Droidloom tablet: Down tool_id={tool_id}");
                 state.tablet_tool_mut(tool_id).pending_down = true;
             }
             tablet::zwp_tablet_tool_v2::Event::Up => {
+                tablet_trace!("Droidloom tablet: Up tool_id={tool_id}");
                 state.tablet_tool_mut(tool_id).pending_up = true;
             }
             tablet::zwp_tablet_tool_v2::Event::Motion { x, y } => {
@@ -2622,6 +3154,21 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 state: button_state,
                 ..
             } => {
+                if state.direct_input.supports_mouse() && matches!(button, 0x14b | 0x14c) {
+                    let bit = if button == 0x14b { 1 } else { 2 };
+                    let tool = state.tablet_tool_mut(tool_id);
+                    match button_state {
+                        WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                            tool.buttons |= bit
+                        }
+                        WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Released) => {
+                            tool.buttons &= !bit
+                        }
+                        _ => return,
+                    }
+                    tool.dirty_buttons = true;
+                    return;
+                }
                 let action = match button_state {
                     WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
                         KeyAction::Down
@@ -2639,6 +3186,9 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 if let Some(surface) = surface
                     && let Some(object) = state.task_for_surface(&surface)
                 {
+                    tablet_trace!(
+                        "Droidloom tablet: Button tool_id={tool_id}, button={button}, action={action:?}"
+                    );
                     let _ = state.send_input(
                         object,
                         InputEvent::Key {
@@ -2653,6 +3203,7 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 state.flush_tablet_tool(tool_id);
             }
             tablet::zwp_tablet_tool_v2::Event::Removed => {
+                tablet_trace!("Droidloom tablet: Removed tool_id={tool_id}");
                 state.cancel_tablet_tool(tool_id);
                 state.tablet_tools.retain(|tool| tool.tool_id != tool_id);
                 state.tablet_tool_proxies.remove(&tool_id);
@@ -2690,10 +3241,7 @@ impl Dispatch<ZwpTabletPadV2, ()> for App {
         App,
         ZwpTabletPadV2,
         [
-            0 => (ZwpTabletPadRingV2, ()),
-            1 => (ZwpTabletPadStripV2, ()),
-            2 => (ZwpTabletPadGroupV2, ()),
-            3 => (ZwpTabletPadDialV2, ())
+            0 => (ZwpTabletPadGroupV2, ())
         ]
     );
 }
@@ -2708,6 +3256,12 @@ impl Dispatch<ZwpTabletPadGroupV2, ()> for App {
         _qh: &QueueHandle<Self>,
     ) {
     }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletPadGroupV2,
+        [1 => (ZwpTabletPadRingV2, ()), 2 => (ZwpTabletPadStripV2, ()), 6 => (ZwpTabletPadDialV2, ())]
+    );
 }
 
 impl Dispatch<ZwpTabletPadRingV2, ()> for App {
@@ -2754,7 +3308,7 @@ impl KeyboardHandler for App {
         _keyboard: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
         serial: u32,
-        _raw: &[u32],
+        raw: &[u32],
         _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
     ) {
         self.clipboard.focus(true);
@@ -2762,6 +3316,34 @@ impl KeyboardHandler for App {
         let object = self.task_for_surface(surface);
         if let Err(error) = self.set_focus(object) {
             self.fail(&error);
+        }
+        if let Some(object) = object {
+            // Wayland enter lists physically held keys but does not replay
+            // their presses. Restore only modifiers, never type a held letter.
+            for keycode in raw
+                .iter()
+                .copied()
+                .filter(|key| matches!(key, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126))
+            {
+                if self.pressed_keys.owner(keycode) == Some(object) {
+                    continue;
+                }
+                self.pressed_keys.press(keycode, object);
+                match self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Down,
+                        keycode,
+                        repeat: 0,
+                    },
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.pressed_keys.release(keycode);
+                    }
+                    Err(error) => self.fail(&error),
+                }
+            }
         }
     }
 
@@ -2784,12 +3366,36 @@ impl KeyboardHandler for App {
     fn press_key(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         serial: u32,
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
+        if event.raw_code == 87
+            && self.immersion.is_none()
+            && let Some(object) = self.focused
+        {
+            self.control_action(object, chrome::Action::Fullscreen);
+            self.pressed_keys.consume(event.raw_code, object);
+            return;
+        }
+        if immersion::shortcut(event.raw_code, self.modifiers)
+            && let Some(object) = self.focused
+        {
+            self.toggle_capture(qh);
+            if let Some(previous) = self.pressed_keys.consume(event.raw_code, object) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                );
+            }
+            return;
+        }
         if let Some(data) =
             _keyboard.data::<smithay_client_toolkit::seat::keyboard::KeyboardData<App>>()
             && let Some(surface) = self
@@ -2799,17 +3405,31 @@ impl KeyboardHandler for App {
         {
             self.activation.input(serial, data.seat(), surface);
         }
-        if let Some(object) = self.focused
-            && let Err(error) = self.send_input(
+        if let Some(object) = self.focused {
+            if let Some(previous) = self.pressed_keys.press(event.raw_code, object) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                );
+            }
+            match self.send_input(
                 object,
                 InputEvent::Key {
                     action: KeyAction::Down,
                     keycode: event.raw_code,
                     repeat: 0,
                 },
-            )
-        {
-            self.fail(&error);
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.pressed_keys.release(event.raw_code);
+                }
+                Err(error) => self.fail(&error),
+            }
         }
     }
 
@@ -2822,7 +3442,11 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
+        if self.pressed_keys.is_consumed(event.raw_code) {
+            return;
+        }
         if let Some(object) = self.focused
+            && self.pressed_keys.owner(event.raw_code) == Some(object)
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
@@ -2845,7 +3469,7 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
-        if let Some(object) = self.focused
+        if let Some(object) = self.pressed_keys.release(event.raw_code)
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
@@ -2865,10 +3489,11 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _modifiers: Modifiers,
+        modifiers: Modifiers,
         _raw_modifiers: RawModifiers,
         _layout: u32,
     ) {
+        self.modifiers = modifiers;
     }
 
     fn update_repeat_info(
@@ -2890,6 +3515,28 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if self.immersion.is_none()
+                && matches!(
+                    event.kind,
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
+                )
+                && let Some(object) = self.task_for_surface(&event.surface)
+            {
+                let position = self.surface_position(object, &event.surface, event.position);
+                if (0.0..=8.0).contains(&position.1) {
+                    self.reveal_controls(object);
+                }
+            }
+            if self.control_pointer(event) {
+                continue;
+            }
+            if matches!(event.kind, PointerEventKind::Enter { .. }) {
+                if let Some(pointer) = self.pointer.as_ref() {
+                    if let Err(error) = pointer.set_cursor(_conn, CursorIcon::Default) {
+                        eprintln!("Droidloom cursor: {error}");
+                    }
+                }
+            }
             if let PointerEventKind::Press { serial, .. } = event.kind
                 && let Some(data) =
                     _pointer.data::<smithay_client_toolkit::seat::pointer::PointerData>()
@@ -2902,18 +3549,24 @@ impl PointerHandler for App {
                 self.clipboard.serial(serial);
             }
             let object = self.task_for_surface(&event.surface);
+            if self.direct_input.supports_mouse() {
+                self.route_mouse(event);
+                continue;
+            }
             match event.kind {
                 PointerEventKind::Press { button, .. }
                     if button == LEFT_BUTTON && self.pointer_contact.is_none() =>
                 {
                     let Some(object) = object else { continue };
-                    let (x_fixed, y_fixed) = self.fixed_position(object, event.position);
+                    self.text_input.note_touch();
+                    let position = self.surface_position(object, &event.surface, event.position);
+                    let (x_fixed, y_fixed) = self.fixed_position(object, position);
                     let contact = Contact {
                         object,
                         pointer_id: u32::MAX,
                         position_fixed: (x_fixed, y_fixed),
                     };
-                    if let Err(error) = self.send_input(
+                    match self.send_input(
                         object,
                         InputEvent::Touch {
                             action: TouchAction::Down,
@@ -2923,16 +3576,18 @@ impl PointerHandler for App {
                             pressure: u16::MAX,
                         },
                     ) {
-                        self.fail(&error);
-                    } else {
-                        self.pointer_contact = Some(contact);
+                        Ok(true) => self.pointer_contact = Some(contact),
+                        Ok(false) => {}
+                        Err(error) => self.fail(&error),
                     }
                 }
                 PointerEventKind::Motion { .. } => {
                     let Some(contact) = self.pointer_contact else {
                         continue;
                     };
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, event.position);
+                    let position =
+                        self.surface_position(contact.object, &event.surface, event.position);
+                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, position);
                     if let Err(error) = self.send_input(
                         contact.object,
                         InputEvent::Touch {
@@ -2950,7 +3605,9 @@ impl PointerHandler for App {
                     let Some(contact) = self.pointer_contact.take() else {
                         continue;
                     };
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, event.position);
+                    let position =
+                        self.surface_position(contact.object, &event.surface, event.position);
+                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, position);
                     if let Err(error) = self.send_input(
                         contact.object,
                         InputEvent::Touch {
@@ -2962,6 +3619,11 @@ impl PointerHandler for App {
                         },
                     ) {
                         self.fail(&error);
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    if let Some(contact) = self.pointer_contact.take() {
+                        let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
                     }
                 }
                 _ => {}
@@ -2982,6 +3644,17 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if let Some(hit) = self.control_at(&surface, position) {
+            self.chrome_touches.insert(id, hit);
+            if let Some(chrome) = self
+                .tasks
+                .get_mut(&hit.0)
+                .and_then(|task| task.chrome.as_mut())
+            {
+                chrome.press(hit.1);
+            }
+            return;
+        }
         let Some(object) = self.task_for_surface(&surface) else {
             return;
         };
@@ -2992,16 +3665,20 @@ impl TouchHandler for App {
         if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
             self.activation.input(_serial, data.seat(), &surface);
         }
+        let position = self.surface_position(object, &surface, position);
+        self.begin_gesture(_qh, object, pointer_id, position, _time);
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
         let contact = Contact {
             object,
             pointer_id,
             position_fixed: (x_fixed, y_fixed),
         };
-        if let Err(error) = self.send_input(object, contact.event(TouchAction::Down)) {
-            self.fail(&error);
-        } else {
-            self.touch_contacts.insert(id, contact);
+        match self.send_input(object, contact.event(TouchAction::Down)) {
+            Ok(true) => {
+                self.touch_contacts.insert(id, contact);
+            }
+            Ok(false) => {}
+            Err(error) => self.fail(&error),
         }
     }
 
@@ -3014,6 +3691,14 @@ impl TouchHandler for App {
         _time: u32,
         id: i32,
     ) {
+        if let Some((object, action)) = self.chrome_touches.remove(&id) {
+            self.clear_control_presses();
+            if self.tasks.get(&object).is_some_and(|task| task.controls_until.is_some()) {
+                self.control_action(object, action);
+            }
+            return;
+        }
+        self.finish_gesture(id);
         let Some(contact) = self.touch_contacts.remove(&id) else {
             return;
         };
@@ -3033,14 +3718,26 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if self.chrome_touches.contains_key(&id) {
+            if !chrome::button_contains(position.0, position.1) {
+                self.chrome_touches.remove(&id);
+                self.clear_control_presses();
+            }
+            return;
+        }
+        if self.motion_gesture(id, position, _time) {
+            return;
+        }
         let Some(mut contact) = self.touch_contacts.get(&id).copied() else {
             return;
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
-        if let Err(error) = self.send_input(contact.object, contact.event(TouchAction::Motion)) {
-            self.fail(&error);
-        } else {
-            self.touch_contacts.insert(id, contact);
+        match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+            Ok(true) => {
+                self.touch_contacts.insert(id, contact);
+            }
+            Ok(false) => {}
+            Err(error) => self.fail(&error),
         }
     }
 
@@ -3066,6 +3763,8 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        self.abandon_gestures();
+        self.clear_control_presses();
         let contacts = std::mem::take(&mut self.touch_contacts);
         for (_, contact) in contacts {
             if let Err(error) = self.send_input(
@@ -3113,6 +3812,21 @@ wayland_client::delegate_noop!(App: ignore WpViewporter);
 wayland_client::delegate_noop!(App: ignore WpViewport);
 wayland_client::delegate_noop!(App: ignore ZwlrOutputPowerManagerV1);
 
+fn mouse_scroll(axis: &AxisScroll) -> i16 {
+    let detents = if axis.value120 != 0 {
+        f64::from(axis.value120) / 120.0
+    } else if axis.discrete != 0 {
+        f64::from(axis.discrete)
+    } else {
+        axis.absolute / 10.0
+    };
+    // Preserve high-resolution fractions, including on v5 seats. The caller
+    // reverses only vertical scrolling: Android's positive VSCROLL points up.
+    (detents * 256.0)
+        .round()
+        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
+
 fn main() {
     eprintln!("DROIDLOOM_DIRECT_INPUT_ABI=1;");
     eprintln!("DROIDLOOM_HOST_CHANNELS_ABI=1;");
@@ -3132,10 +3846,10 @@ fn main() {
 }
 
 fn run() -> Result<(), PresenterError> {
-    let runtime_root = PathBuf::from(
-        env::var("XDG_RUNTIME_DIR")
-            .map_err(|_| PresenterError::Configuration("XDG_RUNTIME_DIR is missing"))?,
-    );
+    // Own the session before inspecting or replacing any IPC endpoint. Keep
+    // the lease through run_presenter_loop so another presenter cannot race it.
+    let lease = session::SessionLease::acquire_from_environment()?;
+    let runtime_root = lease.runtime_dir().to_owned();
     let socket_path = env::var_os("DROIDLOOM_HOST_SOCKET").map_or_else(
         || runtime_root.join("droidloom/native-bridge.sock"),
         PathBuf::from,
@@ -3184,6 +3898,7 @@ fn run() -> Result<(), PresenterError> {
     .with_session_mode(session_mode);
 
     let conn = Connection::connect_to_env()?;
+    lease.verify_connection(conn.as_fd())?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
     let compositor = CompositorState::bind(&globals, &qh)?;
@@ -3253,11 +3968,27 @@ fn run() -> Result<(), PresenterError> {
         tasks: BTreeMap::new(),
         task_work: readiness::Tasks::default(),
         keyboard: None,
+        keyboard_seat: None,
+        pointer_constraints:
+            smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState::bind(
+                &globals, &qh,
+            ),
+        shortcuts_inhibit_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        immersion: None,
+        modifiers: Modifiers::default(),
         pointer: None,
         touch: None,
         focused: None,
+        pressed_keys: input::Keys::default(),
+        mouse_focus: None,
+        mouse_buttons: 0,
+        mouse_position: (0.0, 0.0),
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
+        swipe_back: None,
+        top_pull: None,
+        chrome_press: None,
+        chrome_touches: BTreeMap::new(),
         next_buffer_id: 0,
         next_input_serial: 0,
         direct_input: input::DirectInput::default(),
@@ -3285,6 +4016,7 @@ fn run_presenter_loop(
     let mut layer_tasks = Vec::new();
     loop {
         event_queue.dispatch_pending(&mut app)?;
+        app.expire_controls();
         app.task_work.notify_fallback(Instant::now());
         app.unmap_requested_tasks()?;
         if let Some(error) = app.fatal.take() {
@@ -3297,6 +4029,7 @@ fn run_presenter_loop(
         app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();
         app.clipboard.pump(&qh);
+        app.pump_direct_input()?;
         if !app.clipboard.blocked() {
             while let Some((object, input)) = app.clipboard_inputs.pop_front() {
                 if app.tasks.contains_key(&object) {
@@ -3443,12 +4176,11 @@ fn poll_sources(
             }
         }
     }
-    let clipboard_deadline = (!app.clipboard_inputs.is_empty())
-        .then(|| app.clipboard.unblock_deadline())
-        .flatten();
+    let clipboard_deadline = app.clipboard.unblock_deadline().filter(|_| app.clipboard.blocked());
     let deadline = clipboard_deadline
         .into_iter()
         .chain(fallback_deadline)
+        .chain(app.tasks.values().filter_map(|task| task.controls_until))
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.
@@ -3472,6 +4204,9 @@ fn poll_sources(
     }
     app.clipboard.notify_ready(descriptors);
     app.direct_input.notify_ready(descriptors);
+    if app.direct_input.fd().is_none() {
+        app.clear_input_tracking();
+    }
     app.task_work.notify_fallback(Instant::now());
     for (event, owner) in descriptors.iter().zip(owners.iter().copied()) {
         if owner.notify(&mut app.task_work, event.revents) {
@@ -3585,6 +4320,14 @@ fn fixed_16_16(value: f64) -> i32 {
         i32::MAX
     } else {
         scaled as i32
+    }
+}
+
+fn apply_content_buffer_scale(surface: &wl_surface::WlSurface, viewport_content: bool) {
+    // Controls, feedback, decorations and themed pointers own their buffer
+    // pixel scale. Only our viewport-mapped Android content stays at scale 1.
+    if viewport_content {
+        surface.set_buffer_scale(1);
     }
 }
 
@@ -3752,6 +4495,20 @@ fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_mouse_scroll_matches_the_previous_sheng_port() {
+        let axis = |value120, discrete, absolute| AxisScroll {
+            value120,
+            discrete,
+            absolute,
+            ..AxisScroll::default()
+        };
+        assert_eq!(mouse_scroll(&axis(360, 3, 500.0)), 3 * 256);
+        assert_eq!(mouse_scroll(&axis(0, -2, 500.0)), -2 * 256);
+        assert_eq!(mouse_scroll(&axis(0, 0, -25.0)), -640);
+        assert_eq!(mouse_scroll(&AxisScroll::default()), 0);
+    }
 
     #[test]
     fn display_power_waits_for_all_outputs_and_tracks_any_powered_output() {
