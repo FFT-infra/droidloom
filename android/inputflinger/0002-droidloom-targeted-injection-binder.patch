@@ -155,7 +155,7 @@ diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/r
 index 2ac37b6..cb56f03 100644
 --- a/services/inputflinger/reader/EventHub.cpp
 +++ b/services/inputflinger/reader/EventHub.cpp
-@@ -2967,6 +2967,29 @@ void EventHub::createVirtualKeyboardLocked() {
+@@ -2967,6 +2967,32 @@ void EventHub::createVirtualKeyboardLocked() {
              InputDeviceClass::DPAD | InputDeviceClass::VIRTUAL;
      device->loadKeyMapLocked();
      addDeviceLocked(std::move(device));
@@ -181,6 +181,9 @@ index 2ac37b6..cb56f03 100644
 +    hostKeyboard->classes = InputDeviceClass::KEYBOARD | InputDeviceClass::ALPHAKEY |
 +            InputDeviceClass::EXTERNAL;
 +    hostKeyboard->loadKeyMapLocked();
++    for (size_t sc = 0; sc <= KEY_MAX; ++sc) {
++        hostKeyboard->keyBitmask.set(sc, true);
++    }
 +    addDeviceLocked(std::move(hostKeyboard));
  }
  
