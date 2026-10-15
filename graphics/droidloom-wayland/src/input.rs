@@ -20,6 +20,34 @@ pub(super) struct Keys {
 }
 
 impl Keys {
+    /// An IME may consume a modifier's raw key while retaining its seat mask.
+    pub fn modifier(
+        &mut self,
+        task: TaskObjectId,
+        active: bool,
+        left: u32,
+        right: u32,
+    ) -> Vec<(u32, droidloom_denial_protocol::KeyAction)> {
+        use droidloom_denial_protocol::KeyAction::{Down, Up};
+        let held: Vec<_> = [left, right]
+            .into_iter()
+            .filter(|key| self.owner(*key) == Some(task))
+            .collect();
+        if active && held.is_empty() {
+            self.press(left, task);
+            vec![(left, Down)]
+        } else if !active {
+            held.into_iter()
+                .map(|key| {
+                    self.release(key);
+                    (key, Up)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn press(&mut self, key: u32, task: TaskObjectId) -> Option<TaskObjectId> {
         // A new physical press supersedes a shortcut whose release was lost.
         self.consumed.remove(&key);
@@ -451,6 +479,26 @@ fn is_release_record(record: &[u8; RECORD_BYTES]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn modifier_mask_recovers_ime_filtered_shift_without_duplicate_physical_keys() {
+        use droidloom_denial_protocol::KeyAction::{Down, Up};
+        let task = TaskObjectId(42);
+        let mut keys = Keys::default();
+        assert_eq!(keys.modifier(task, true, 42, 54), [(42, Down)]);
+        assert!(keys.modifier(task, true, 42, 54).is_empty());
+        assert_eq!(keys.modifier(task, false, 42, 54), [(42, Up)]);
+        keys.press(54, task);
+        assert!(keys.modifier(task, true, 42, 54).is_empty());
+        keys.press(42, task);
+        keys.release(54);
+        assert!(keys.modifier(task, true, 42, 54).is_empty());
+        keys.release(42);
+        assert!(keys.modifier(task, false, 42, 54).is_empty());
+        keys.modifier(task, true, 42, 54);
+        assert_eq!(keys.take_task(task), [42]);
+        assert!(keys.modifier(task, false, 42, 54).is_empty());
+    }
+
     use super::*;
     use droidloom_denial_ipc::ProtocolSocket;
     use droidloom_denial_protocol::{AndroidMessage, KeyAction};

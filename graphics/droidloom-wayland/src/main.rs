@@ -3507,6 +3507,26 @@ impl KeyboardHandler for App {
         _layout: u32,
     ) {
         self.modifiers = modifiers;
+        // Input methods can filter Shift's raw transitions while publishing
+        // its effective seat mask. Native Android input needs actual modifier
+        // transitions; preserve a known side and infer left only if absent.
+        if let Some(object) = self.focused {
+            for (keycode, action) in self
+                .pressed_keys
+                .modifier(object, modifiers.shift, 42, 54)
+            {
+                match self.send_input(
+                    object,
+                    InputEvent::Key { action, keycode, repeat: 0 },
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.pressed_keys.release(keycode);
+                    }
+                    Err(error) => self.fail(&error),
+                }
+            }
+        }
     }
 
     fn update_repeat_info(
