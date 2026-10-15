@@ -11,7 +11,7 @@ use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -2044,10 +2044,86 @@ pub(crate) fn refresh_pen_input_nodes(
     devices: &[PenInputDevice],
 ) -> Result<(), DevelopmentError> {
     let input = PathBuf::from(format!("/proc/{namespace_pid}/root/dev/input"));
-    run_cell_mount(namespace_pid, "remount,bind,rw,nosuid")?;
-    let result = create_pen_input_nodes(&input, generation, devices);
-    let remount = run_cell_mount(namespace_pid, "remount,bind,ro,nosuid");
-    result.and(remount)
+    let view = writable_pen_input_mount(namespace_pid, input)
+        .map_err(|source| io_error("clone private pen input mount", source))?;
+    // mknod/chown run as children: name the parent's descriptor so CLOEXEC
+    // cannot invalidate the detached mount path in those helpers.
+    let input = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        view.as_raw_fd()
+    ));
+    create_pen_input_nodes(&input, generation, devices)
+}
+
+#[repr(C)]
+struct InputMountAttributes {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+fn writable_pen_input_mount(namespace_pid: u32, input: PathBuf) -> io::Result<OwnedFd> {
+    // A detached clone shares the directory's inotify events, while Android's
+    // original bind mount stays read-only. Remounting Android's own path would
+    // let ueventd import unrelated host devices during the writable interval.
+    // open_tree requires the source's namespace. Only this worker enters it;
+    // unsharing CLONE_FS leaves the daemon's filesystem and namespace intact.
+    thread::Builder::new()
+        .name("pen-input-mount".into())
+        .spawn(move || {
+            let namespace = File::open(format!("/proc/{namespace_pid}/ns/mnt"))?;
+            let input = File::open(input)?;
+            // SAFETY: these calls operate on this worker's filesystem context
+            // and a live mount-namespace descriptor, retaining no pointers.
+            if unsafe { libc::unshare(libc::CLONE_FS) } != 0
+                || unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNS) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            const OPEN_TREE_CLONE: libc::c_uint = 1;
+            let flags = OPEN_TREE_CLONE
+                | libc::O_CLOEXEC as libc::c_uint
+                | libc::AT_EMPTY_PATH as libc::c_uint;
+            // SAFETY: input is a live directory descriptor; the empty path
+            // selects it and open_tree returns a fresh detached mount FD.
+            let raw = unsafe {
+                libc::syscall(libc::SYS_open_tree, input.as_raw_fd(), c"".as_ptr(), flags)
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful open_tree transferred this fresh descriptor.
+            let view = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
+            const MOUNT_ATTR_RDONLY: u64 = 1;
+            const MOUNT_ATTR_NOSUID: u64 = 2;
+            let attributes = InputMountAttributes {
+                attr_set: MOUNT_ATTR_NOSUID,
+                attr_clr: MOUNT_ATTR_RDONLY,
+                propagation: libc::MS_PRIVATE,
+                userns_fd: 0,
+            };
+            // SAFETY: attributes matches Linux mount_attr's four u64 fields;
+            // the descriptor names only the detached clone, never Android's
+            // original mount. Closing the descriptor disposes of the clone.
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_mount_setattr,
+                    view.as_raw_fd(),
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                    &attributes,
+                    std::mem::size_of_val(&attributes),
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(view)
+        })?
+        .join()
+        .map_err(|_| io::Error::other("pen input mount worker panicked"))?
 }
 
 fn create_pen_input_nodes(
@@ -2091,23 +2167,6 @@ fn pen_input_node_name(phys: &str, generation: u64) -> Option<String> {
         _ => return None,
     };
     Some(format!("{base}-{generation}"))
-}
-
-fn run_cell_mount(namespace_pid: u32, options: &str) -> Result<(), DevelopmentError> {
-    let mut args = vec![
-        OsString::from("--target"),
-        OsString::from(namespace_pid.to_string()),
-        OsString::from("--mount"),
-        OsString::from("--root"),
-        OsString::from("--wd"),
-        OsString::from("--"),
-        OsString::from("/system/bin/toybox"),
-        OsString::from("mount"),
-        OsString::from("-o"),
-        OsString::from(options),
-        OsString::from("/dev/input"),
-    ];
-    run_os("nsenter", args.drain(..))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2611,6 +2670,64 @@ mod tests {
             Some("droidloom-pen-gestures-5")
         );
         assert!(pen_input_node_name("unrelated-device", 5).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root under unshare --mount --propagation private"]
+    fn pen_refresh_view_preserves_android_read_only_input_mount() {
+        assert_eq!(effective_uid().unwrap(), 0);
+        let namespace = fs::read_link("/proc/self/ns/mnt").unwrap();
+        assert_ne!(namespace, fs::read_link("/proc/1/ns/mnt").unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        fs::create_dir(&input).unwrap();
+        bind_mount(&input, &input, false).unwrap();
+        run_os(
+            "mount",
+            [
+                OsString::from("-o"),
+                OsString::from("remount,bind,ro,nosuid"),
+                input.as_os_str().to_owned(),
+            ],
+        )
+        .unwrap();
+
+        let view = writable_pen_input_mount(std::process::id(), input.clone()).unwrap();
+        assert_eq!(fs::read_link("/proc/self/ns/mnt").unwrap(), namespace);
+        let view_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            view.as_raw_fd()
+        ));
+        let device = PenInputDevice {
+            phys: "waydroid-pen-buttons".into(),
+            event_name: "event12".into(),
+            major: 13,
+            minor: 76,
+        };
+        create_pen_input_nodes(&view_path, 1, &[device]).unwrap();
+        assert!(
+            fs::symlink_metadata(input.join("droidloom-pen-buttons-1"))
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+        assert_eq!(
+            fs::write(input.join("unrelated-host-device"), b"must fail")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        create_pen_input_nodes(&view_path, 2, &[]).unwrap();
+        assert!(!input.join("droidloom-pen-buttons-1").exists());
+        drop(view);
+        assert_eq!(
+            fs::write(input.join("still-read-only"), b"must fail")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        run_os("umount", [input.as_os_str().to_owned()]).unwrap();
     }
 
     #[test]

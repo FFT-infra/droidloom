@@ -3926,6 +3926,11 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        tablet_trace!(
+            "Droidloom touch trace: stage=down id={id} surface={:?} task={:?} position={position:?}",
+            surface.id(),
+            self.task_for_surface(&surface)
+        );
         if let Some(hit) = self.control_at(&surface, position) {
             self.chrome_touches.insert(id, hit);
             if let Some(chrome) = self
@@ -4045,6 +4050,10 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        tablet_trace!(
+            "Droidloom touch trace: stage=cancel contacts={}",
+            self.touch_contacts.len()
+        );
         self.abandon_gestures();
         self.clear_control_presses();
         let objects = self
