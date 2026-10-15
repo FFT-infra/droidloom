@@ -1,7 +1,7 @@
 [Unit]
 Description=Droidloom host audio broker
 Wants=pipewire.socket
-After=pipewire.socket
+After=pipewire.socket pipewire.service wireplumber.service
 PartOf=droidloom.service
 Requires=droidloom-audio.socket
 
