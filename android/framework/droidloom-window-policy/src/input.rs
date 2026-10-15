@@ -628,7 +628,7 @@ impl Engine {
             scan_code: i32::try_from(sample.code).map_err(|_| "key scan code")?,
             repeat: i32::from(repeat),
             meta: self.meta(sample.task),
-            flags: 0x48,
+            flags: 0x08,
             down_time: key.down_time,
             event_time: key.last_time,
             serial,
@@ -694,7 +694,7 @@ impl Engine {
                     action: 1,
                     key_code: key.code,
                     scan_code: i32::try_from(identity.1).unwrap(),
-                    flags: 0x68,
+                    flags: 0x28,
                     meta: self.meta(task),
                     down_time: key.down_time,
                     event_time: now.max(key.last_time),
@@ -860,6 +860,8 @@ mod tests {
         let mut engine = Engine::default();
         engine.publish(target(), 1);
         let lock = engine.process(key(69, 0, 0)).unwrap().unwrap().event;
+        assert_eq!(lock.flags, 0x08);
+        assert_eq!(lock.flags & 0x40, 0);
         assert_eq!((lock.key_code, lock.meta & 0x20_0000), (143, 0x20_0000));
         engine.process(key(69, 1, 0)).unwrap();
         for (scan, android) in [
@@ -1142,6 +1144,7 @@ mod tests {
         assert_eq!(cancelled.len(), 2);
         assert!(cancelled.iter().all(|event| event.target.token == 9));
         assert_eq!(cancelled[0].event.action, 3);
+        assert_eq!(cancelled[1].event.flags, 0x28);
         assert_eq!(cancelled[1].event.flags & 0x20, 0x20);
         assert!(engine.process(touch(0, 0)).unwrap().is_none());
         assert!(engine.retire(42, 7, 201).is_empty());
