@@ -63,7 +63,6 @@ pub fn sources() -> io::Result<[Option<String>; 2]> {
         })?;
     provider.start().map_err(failure)?;
     let mut sources = [None, None];
-    let mut counts = [0_u32; 2];
     for device in provider.devices() {
         let Some(properties) = device.properties() else {
             continue;
@@ -82,17 +81,22 @@ pub fn sources() -> io::Result<[Option<String>; 2]> {
             Some("front") => 1,
             _ => continue,
         };
-        if let Ok(name) = properties.get::<String>("node.name") {
-            counts[index] += 1;
+        let Ok(name) = properties.get::<String>("node.name") else {
+            continue;
+        };
+        let nick = properties.get::<String>("node.nick").ok();
+        // If multiple cameras share a location (e.g. rear main sensor + aux depth),
+        // prioritize known primary sensors (s5kjn1 for rear, ov32d40 for front).
+        let is_primary = match (index, nick.as_deref()) {
+            (0, Some("s5kjn1")) => true,
+            (1, Some("ov32d40")) => true,
+            _ => false,
+        };
+        if sources[index].is_none() || is_primary {
             sources[index] = Some(name);
         }
     }
     provider.stop();
-    for (index, count) in counts.iter().enumerate() {
-        if *count != 1 {
-            sources[index] = None;
-        }
-    }
     Ok(sources)
 }
 
