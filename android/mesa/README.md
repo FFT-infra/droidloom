@@ -43,6 +43,12 @@ Runtime patches under `android/aosp-patches/`:
   `803731f7ed4aa8e8265fe0aff08b85efb3f3c7e9`, also used by the validated host
   Turnip build. It retains upstream's initial A730-derived register settings.
 
+- `0034-turnip-android-deferred-binding.patch`: complete Turnip's Android
+  deferred-image binding. AOSP swapchains pass `VkNativeBufferANDROID` with a
+  null `memory`; the pinned release dereferenced it on the first ANGLE swap.
+  The patch validates the native handle, imports the gralloc layout and
+  image-owned memory through Mesa's existing Android path, and orders layout
+  transition before binding.
 - `0013-mesa-texture-upload-span.patch`: preserve the threaded staging layout
   while copying only the valid source span, excluding trailing row/layer
   padding. Prevents guard-page overreads during Skia glyph-atlas uploads on
@@ -71,6 +77,16 @@ cargo test --locked -j 1 -p droidloom-update --test panfrost_model -- --ignored
 This covers the reported 576x1024 YV12 import failure, even widths through
 4096, plane alignment/overlap, Android stride requirements, and unchanged
 RGB/NV12/P010 layouts. GPU import and app behavior require device validation.
+`tests/turnip_deferred_binding.rs` extracts the patched Android bind branch
+from a prepared Mesa tree, compiles it against a stub Vulkan interface and
+asserts the layout/import order plus invalid-handle and descriptor errors. Run
+it with `DROIDLOOM_MESA_SOURCE` pointing at the prepared source; set
+`DROIDLOOM_TEST_UNPATCHED=1` to reproduce the pre-patch failure:
+
+```sh
+cargo test --locked -j 1 -p droidloom-update --test turnip_deferred_binding -- --ignored
+```
+
 The libdrm test compiles its actual pinned implementation with the patch and
 injects DRM version replies covering Panthor's empty date, an empty description,
 all-empty strings and ordinary nonempty strings. It opens no device.

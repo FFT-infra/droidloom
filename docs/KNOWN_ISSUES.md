@@ -6,10 +6,10 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 
 ## sheng device acceptance
 
-The paired ABI 8 bundle `1792027172676683445-258282` is installed on sheng.
-The earlier ABI 7 presenter override is obsolete. Host mouse, keyboard and
-native tablet-tool transport are compiled together with InputFlinger; this is
-still a development deployment, not a published release.
+The paired ABI 8 bundle `1792038829852603867-440284` is active on sheng. The
+earlier ABI 7 presenter override is obsolete. Host mouse, keyboard and native
+tablet-tool transport are compiled together with InputFlinger; this is still a
+development deployment, not a published release.
 
 An ordinary-UID input probe confirms `Droidloom Host Keyboard` is alphabetic
 (type 2) and `hasKeys(SPACE, ENTER, A, Z)` returns four true values. These
@@ -20,10 +20,10 @@ so desktop shortcuts may still be handled by the host.
 
 Host uinput tablet events traversed Denial, Wayland and the Android native
 input receiver: the app received STYLUS source, pen/eraser tools, hover,
-pressure and barrel-button state. Tilt accuracy and the physical pen still
-need acceptance. Distance, rotation and tablet-wheel axes are outside ABI 8.
-F11/fullscreen, top-edge reveal and immersive side-swipe UI acceptance also
-remain pending. Local protocol tests do not replace these checks.
+pressure, barrel-button state and a 0.567 rad tilt sample. The physical pen
+still needs acceptance. Distance, rotation and tablet-wheel axes are outside
+ABI 8. F11/fullscreen and top-edge reveal passed; the immersive side swipe
+delivered Cancel plus Back to Android on the deployed bundle.
 
 The ordinary app's default accelerometer is the virtual stationary sensor:
 `[0, 0, 9.8]`, accuracy UNRELIABLE. It supplies the API capability, not physical
@@ -41,8 +41,12 @@ Native GLES shader draw/readback passes on FD740 / Mesa 26.1.7. Merely enabling
 Turnip's unimplemented Android deferred image-memory binding. Patch 0034 imports
 the gralloc layout and image-owned memory through Mesa's existing Android path.
 The source-extracted regression fails on the original code and passes with the
-patch. A rebuilt paired bundle and live ANGLE swap test are required before
-claiming that fix verified on-device.
+patch. On bundle `1792038829852603867-440284` the per-app ANGLE selection
+rendered `ANGLE (Qualcomm, Vulkan 1.4.354 (Turnip Adreno 740), turnip Mesa
+driver-538.1.7)` with `GL_PIXEL pass=true error=0` and no crash, so the first
+swap is verified on-device. Native FD740 / Mesa 26.1.7 still passes after
+clearing the per-app selection. Other applications and sustained workloads
+remain separate checks.
 
 `/data/vendor/mesa_shader_cache` being configured is not evidence of persistent
 shader caching: pinned Mesa disables its standalone Android disk cache by
@@ -52,17 +56,19 @@ path; do not turn on a world-writable shared cache. No cold-start or gameplay
 performance improvement has been measured. The GPU exposes `simple_ondemand`
 and `userspace`, with no `performance` governor.
 
-Audio startup ordering now includes PipeWire and WirePlumber services in the
-source unit; deployed ordering and first playback after restart still require
-verification. Audio quality, recording, latency and xrun claims require separate
-evidence. Preserve user data and a complete previous release during activation.
+The deployed audio unit now orders after PipeWire and WirePlumber. First
+playback after restart delivered 48000/2 PCM16 through four shared buffers; the
+stream and its link to the speaker sink reached `running`. Host speaker volume
+was 0 before and after the test, so this proves the graph, not audibility.
+Audio quality, recording, latency and xrun claims require separate evidence.
+Preserve user data and a complete previous release during activation.
 
 Automated task replacement also exposed a presenter retirement race: Android
 can remove an endpoint object before host direct-layer releases finish. Late
 output/focus/presentation callbacks must not send new messages to that retired
 object. Closing windows now skip refresh/focus/presentation publication while
-host buffers continue draining; regression and runtime replacement checks gate
-this change.
+host buffers continue draining. Eight forced-stop/reopen cycles on the deployed
+bundle kept the presenter PID and left `NRestarts=0`.
 
 ## Application compatibility
 
