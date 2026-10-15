@@ -74,6 +74,7 @@ impl Wire {
         let viewport = self.viewporter.get_viewport(&surface, &self.qh, ());
         let alpha = self.alpha.get_surface(&surface, &self.qh, ());
         View {
+            timeline: None,
             surface,
             role,
             viewport,

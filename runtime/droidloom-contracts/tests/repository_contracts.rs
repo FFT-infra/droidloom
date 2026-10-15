@@ -18,6 +18,39 @@ fn json(path: &Path) -> Value {
 }
 
 #[test]
+fn shared_wayland_protocols_match_denial() {
+    // CI supplies its independent Denial checkout. Ordinary source-only tests
+    // do not require a second repository, but an explicit path must be valid.
+    let Some(denial) = std::env::var_os("DROIDLOOM_DENIAL_SOURCE") else {
+        return;
+    };
+    let root = repository_root();
+    let denial = PathBuf::from(denial).join("compositor/protocol");
+    for (local, name) in [
+        (
+            "graphics/droidloom-wayland/protocol/denial-insets-v1.xml",
+            "denial-insets-v1.xml",
+        ),
+        (
+            "graphics/droidloom-wayland/protocol/denial-text-input-panel-v1.xml",
+            "denial-text-input-panel-v1.xml",
+        ),
+        (
+            "protocol/denial-frame-timeline-v1.xml",
+            "denial-frame-timeline-v1.xml",
+        ),
+    ] {
+        let local_bytes = fs::read(root.join(local)).unwrap();
+        let upstream_bytes = fs::read(denial.join(name))
+            .unwrap_or_else(|error| panic!("cannot read Denial {name}: {error}"));
+        assert!(
+            local_bytes == upstream_bytes,
+            "{local} differs from Denial compositor/protocol/{name}; update both canonical copies together"
+        );
+    }
+}
+
+#[test]
 fn checked_in_json_contracts_are_well_formed() {
     let root = repository_root();
     for relative in [

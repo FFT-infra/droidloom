@@ -472,6 +472,9 @@ impl DenialTaskBinding {
             }
             DenialMessage::Presented {
                 timestamp_nanos, ..
+            }
+            | DenialMessage::ScenePresented {
+                timestamp_nanos, ..
             } => {
                 let sample = session
                     .windows_mut()
@@ -489,8 +492,7 @@ impl DenialTaskBinding {
                 timestamp_nanos: *timestamp_nanos,
                 event: *event,
             }),
-            DenialMessage::ScenePresented { .. }
-            | DenialMessage::ServerHello { .. }
+            DenialMessage::ServerHello { .. }
             | DenialMessage::RequestInputChannel { .. }
             | DenialMessage::DisplayPower { .. }
             | DenialMessage::Error { .. }
@@ -532,6 +534,51 @@ mod tests {
     use droidloom_transport::{BufferId, BufferMetadata, Damage, FormatModifier, PlaneMetadata};
 
     use super::*;
+
+    #[test]
+    fn direct_scene_feedback_samples_timing_without_releasing_targets() {
+        let (mut session, mut binding) = setup();
+        configure(&mut session, &mut binding);
+        let composer = session
+            .windows_mut()
+            .composer_for_display_mut(DisplayId(9))
+            .unwrap();
+        composer
+            .set_power_mode(DisplayId(9), PowerMode::On)
+            .unwrap();
+        composer.set_vsync_enabled(DisplayId(9), true).unwrap();
+        let message = DenialMessage::ScenePresented {
+            object: TaskObjectId(7),
+            scene: 99,
+            timestamp_nanos: 1_000_000_000,
+            refresh_period_nanos: 16_666_666,
+            sequence: 5,
+        };
+        assert!(matches!(
+            binding.apply_event(&mut session, &message).unwrap(),
+            AppliedDenialEvent::Presented(Some(_))
+        ));
+        assert_eq!(
+            binding.apply_event(&mut session, &message).unwrap(),
+            AppliedDenialEvent::Presented(None)
+        );
+        assert_eq!(
+            session
+                .windows()
+                .composer_for_display(DisplayId(9))
+                .unwrap()
+                .in_flight_count(),
+            0
+        );
+        let mut wrong_object = message;
+        if let DenialMessage::ScenePresented { object, .. } = &mut wrong_object {
+            *object = TaskObjectId(8);
+        }
+        assert!(matches!(
+            binding.apply_event(&mut session, &wrong_object),
+            Err(DenialBridgeError::WrongObject { .. })
+        ));
+    }
 
     #[test]
     fn target_demand_is_bounded_by_configuration_and_not_gpu_busyness() {

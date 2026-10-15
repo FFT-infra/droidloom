@@ -200,14 +200,19 @@ fallback. Waking alone never releases a buffer: the actual release timeline
 point must have completed. Presentation feedback is independent and never
 holds a reusable target. At most 64 outstanding feedback requests per task
 retain frame identities and timing metadata, without retaining buffers or
-fences. When full, new frames omit the optional timing request until capacity
-returns. Late `Presented` events remain valid after `BufferReleased`.
+fences. In portable mode, full queues omit the optional timing request until
+capacity returns. Exact timeline mode waits for capacity so every consumed
+grant has a completion record. Late `Presented` events remain valid after
+`BufferReleased`. The optional [frame timeline](contracts/frame-timeline-v1.md)
+targets ordinary root and changed child buffer commits with compositor-issued
+identities; missing globals retain the portable presentation path.
 
 Negotiated protocol 1.8 `SCENE_PRESENTATION` extends timing feedback to direct
 layer scenes. The presenter requests feedback on one changed, nontransparent
 child before its synchronized commit; an occluded carrier root is not used as
 the timing source. Up to eight callbacks per task retain only scene/configure
-identities and feedback proxies. Full queues omit optional observations, and
+identities and feedback proxies. Portable mode omits optional observations when
+full; exact mode waits for callback capacity. In either mode,
 unchanged layers acquire no extra commits. Discarded, unmapped, stale-configure
 and departed-output observations are dropped. `ScenePresented` feeds Composer's
 host timing observer using the real monotonic display timestamp; it neither

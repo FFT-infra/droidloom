@@ -5,6 +5,7 @@
 mod activation;
 mod clipboard;
 mod fence_wakeup;
+mod frame_timeline;
 mod imports;
 mod input;
 mod insets;
@@ -203,6 +204,7 @@ struct FrameFeedback {
     frame: FrameId,
     buffer: BufferId,
     submitted_nanos: u64,
+    grant: Option<frame_timeline::Identity>,
 }
 
 // Bounded optional timing metadata: no buffer, FD, or release fence ownership.
@@ -210,10 +212,12 @@ struct SceneFeedback {
     proxy: WpPresentationFeedback,
     scene: u64,
     configure_serial: u32,
+    grant: Option<frame_timeline::Identity>,
 }
 const MAX_SCENE_FEEDBACK: usize = 8;
 
 struct TaskWindow {
+    timeline: frame_timeline::Timeline,
     layers: Option<layers::Stream>,
     package: String,
     android_task: Option<u64>,
@@ -304,12 +308,14 @@ struct App {
     host_display_powered: Option<bool>,
     published_display_power: Option<bool>,
     presentation_time: PresentationTimeState,
+    presentation_clock: Option<u32>,
     seat_state: SeatState,
     dmabuf_state: DmabufState,
     feedback: Option<DmabufFeedback>,
     compositor: CompositorState,
     xdg_shell: XdgShell,
     insets_manager: Option<insets::DenialInsetsManagerV1>,
+    frame_timeline_manager: Option<frame_timeline::Manager>,
     viewporter: WpViewporter,
     fractional_scale_manager: WpFractionalScaleManagerV1,
     sync_manager: WpLinuxDrmSyncobjManagerV1,
@@ -657,6 +663,11 @@ impl App {
         self.tasks.insert(
             object,
             TaskWindow {
+                timeline: frame_timeline::Timeline::new(
+                    self.frame_timeline_manager.as_ref(),
+                    window.as_ref().map(Window::wl_surface),
+                    qh,
+                ),
                 layers: None,
                 package: package.to_owned(),
                 android_task: None,
@@ -769,6 +780,7 @@ impl App {
             return Ok(());
         }
 
+        self.abort_timeline_work(object, frame_timeline::Terminal::Configure)?;
         self.retire_host_targets(object)?;
         let serial = self
             .tasks
@@ -1065,6 +1077,7 @@ impl App {
         qh: &QueueHandle<Self>,
         frame: &AcceptedWireFrame,
         acquire_fence: &OwnedFd,
+        target_grant: Option<frame_timeline::Target>,
     ) -> Result<(), PresenterError> {
         let object = frame.object;
         let mut frame_trace = presentation_audit::FrameTrace::new(
@@ -1255,6 +1268,9 @@ impl App {
         if let Some(trace) = frame_trace.as_mut() {
             trace.commit();
         }
+        if let (Some(timeline), Some(grant)) = (&task.timeline.surface, &target_grant) {
+            timeline.target(grant);
+        }
         surface.commit();
         self.activation.mapped(object, &surface);
         target.busy = true;
@@ -1267,6 +1283,7 @@ impl App {
         });
         if let Some(feedback) = feedback {
             task.presentation_feedback.push(FrameFeedback {
+                grant: target_grant.map(|g| g.identity),
                 proxy: feedback,
                 frame: frame.frame,
                 buffer: frame.buffer,
@@ -1392,10 +1409,12 @@ impl App {
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.retire_feedback(object, frame_timeline::Terminal::Epoch);
         self.retire_contacts(Some(object));
         self.task_work.remove(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
+            task.timeline.stop();
             if let Some(fractional_scale) = task.fractional_scale.take() {
                 fractional_scale.destroy();
             }
@@ -1422,6 +1441,7 @@ impl App {
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.abort_timeline_work(object, frame_timeline::Terminal::Configure)?;
         self.retire_contacts(Some(object));
         self.activation.remove(object);
         let task = self
@@ -1439,12 +1459,7 @@ impl App {
         // already submitted before its task removal completed.
         surface.attach(None, 0, 0);
         surface.commit();
-        task.scene_feedback.clear();
-        for feedback in task.presentation_feedback.drain(..) {
-            if let Some(endpoint) = self.endpoint.as_mut() {
-                endpoint.forget_presentation(object, feedback.frame);
-            }
-        }
+        task.timeline.stop();
         if let Some(stream) = task.layers.as_mut() {
             stream.hide();
         }
@@ -1632,7 +1647,7 @@ impl App {
             EndpointAction::Present {
                 frame,
                 acquire_fence,
-            } => self.present(qh, &frame, &acquire_fence)?,
+            } => self.queue_present(qh, frame, acquire_fence)?,
         }
         Ok(())
     }
@@ -2276,8 +2291,16 @@ impl PresentationTimeHandler for App {
                 || output.is_none()
                 || time.clk_id != libc::CLOCK_MONOTONIC as u32
             {
+                task.timeline
+                    .finish(observed.grant, frame_timeline::Terminal::Configure);
+                self.task_work
+                    .mark(object, readiness::TIMELINE | readiness::RELEASES);
                 return;
             }
+            task.timeline
+                .finish(observed.grant, frame_timeline::Terminal::Presented);
+            self.task_work
+                .mark(object, readiness::TIMELINE | readiness::RELEASES);
             let changed = task.presentation_output != output;
             task.presentation_output = output;
             let result = (|| {
@@ -2287,10 +2310,18 @@ impl PresentationTimeHandler for App {
                 let refresh =
                     presentation_refresh_period(refresh, self.tasks[&object].refresh_millihz)?;
                 let timestamp = presentation_timestamp_nanos(time.tv_sec, time.tv_nsec)?;
-                self.endpoint
-                    .as_mut()
-                    .ok_or(PresenterError::Configuration("endpoint is absent"))?
-                    .send_scene_presented(object, observed.scene, timestamp, refresh, sequence)?;
+                if observed.scene != 0 {
+                    self.endpoint
+                        .as_mut()
+                        .ok_or(PresenterError::Configuration("endpoint is absent"))?
+                        .send_scene_presented(
+                            object,
+                            observed.scene,
+                            timestamp,
+                            refresh,
+                            sequence,
+                        )?;
+                }
                 Ok::<(), PresenterError>(())
             })();
             if let Err(error) = result {
@@ -2302,6 +2333,14 @@ impl PresentationTimeHandler for App {
             return;
         };
         let task = self.tasks.get_mut(&object).expect("surface has a task");
+        // Retired callbacks can still arrive after resize/epoch/unmap cleanup.
+        if !task
+            .presentation_feedback
+            .iter()
+            .any(|f| f.proxy == *feedback)
+        {
+            return;
+        }
         // Presentation feedback identifies the timing output for overlapping
         // surfaces. Ignore late feedback from an output already left.
         if let Some(output) = outputs
@@ -2335,6 +2374,10 @@ impl PresentationTimeHandler for App {
                         "presentation feedback has no submitted frame",
                     ))?;
                 let completed = task.presentation_feedback.swap_remove(index);
+                task.timeline
+                    .finish(completed.grant, frame_timeline::Terminal::Presented);
+                self.task_work
+                    .mark(object, readiness::TIMELINE | readiness::RELEASES);
                 (completed, task.refresh_millihz)
             };
             let frame = completed.frame;
@@ -2402,11 +2445,12 @@ impl PresentationTimeHandler for App {
                 .position(|f| f.proxy == *feedback)
                 .map(|index| (*object, index))
         }) {
-            self.tasks
-                .get_mut(&object)
-                .unwrap()
-                .scene_feedback
-                .swap_remove(index);
+            let task = self.tasks.get_mut(&object).unwrap();
+            let completed = task.scene_feedback.swap_remove(index);
+            task.timeline
+                .finish(completed.grant, frame_timeline::Terminal::Missed);
+            self.task_work
+                .mark(object, readiness::TIMELINE | readiness::RELEASES);
             return;
         }
         let Some(object) = self.task_for_surface(surface) else {
@@ -2421,6 +2465,10 @@ impl PresentationTimeHandler for App {
             .position(|candidate| candidate.proxy == *feedback)
         {
             let completed = task.presentation_feedback.swap_remove(index);
+            task.timeline
+                .finish(completed.grant, frame_timeline::Terminal::Missed);
+            self.task_work
+                .mark(object, readiness::TIMELINE | readiness::RELEASES);
             let frame = completed.frame;
             if droidloom_syncobj::frame_trace::sampled(frame.0) {
                 droidloom_syncobj::frame_trace::event(
@@ -2873,7 +2921,7 @@ impl ProvidesRegistryState for App {
         &mut self.registry_state
     }
 
-    registry_handlers![OutputState, SeatState];
+    registry_handlers![OutputState, SeatState, frame_timeline::Registry];
 }
 
 smithay_client_toolkit::delegate_compositor!(App);
@@ -2881,7 +2929,7 @@ smithay_client_toolkit::delegate_output!(App);
 smithay_client_toolkit::delegate_xdg_shell!(App);
 smithay_client_toolkit::delegate_xdg_window!(App);
 smithay_client_toolkit::delegate_dmabuf!(App);
-smithay_client_toolkit::delegate_presentation_time!(App);
+wayland_client::delegate_dispatch!(App: [WpPresentationFeedback: smithay_client_toolkit::presentation_time::PresentationTimeData] => PresentationTimeState);
 smithay_client_toolkit::delegate_seat!(App);
 smithay_client_toolkit::delegate_keyboard!(App);
 smithay_client_toolkit::delegate_pointer!(App);
@@ -3004,12 +3052,14 @@ fn run() -> Result<(), PresenterError> {
         host_display_powered: None,
         published_display_power: None,
         presentation_time,
+        presentation_clock: None,
         seat_state: SeatState::new(&globals, &qh),
         dmabuf_state,
         feedback: None,
         compositor,
         xdg_shell,
         insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
         viewporter,
         fractional_scale_manager,
         sync_manager,
@@ -3061,6 +3111,8 @@ fn run_presenter_loop(
         app.apply_pending_resizes(&qh)?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
+        app.refresh_frame_timelines(&qh)?;
+        app.flush_timeline_frames(&qh)?;
         app.pump_direct_input()?;
         app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();

@@ -1,4 +1,4 @@
-# Droidloom Android-to-host protocol version 1
+# Droidloom Android-to-host protocol version 1.8
 
 Status: accepted transport contract  
 Byte order: little endian  
@@ -56,7 +56,7 @@ are impossible at the protocol layer; truncation (`MSG_TRUNC` or
 | ---: | --- | --- | --- |
 | 0 | `[u8; 4]` | magic | ASCII `DLOM` |
 | 4 | `u16` | major | `1` |
-| 6 | `u16` | minor | `3` for existing records; `4` activation, `5` power, `6` direct input, `7` target demand |
+| 6 | `u16` | minor | `3` for existing records; `4` activation, `5` power, `6` direct input, `7` target demand, `8` scene presentation |
 | 8 | `u16` | opcode | direction-specific value |
 | 10 | `u16` | descriptor count | must equal ancillary descriptors |
 | 12 | `u32` | flags | zero in version 1 |
@@ -128,6 +128,12 @@ direct-input peers without it. Existing records retain their original headers.
 SurfaceFlinger prepares geometry and tries direct layers before dequeue, so
 direct presentation needs no composition target. Its bootstrap dequeue can
 request targets too when the normally elided hidden draw is needed.
+
+Protocol minor 8 adds optional bit 12 (`SCENE_PRESENTATION`). Both peers must
+advertise it before the host sends `ScenePresented` (`0x8010`). ServerHello
+selects minor 8 with mutual scene-presentation support; peers without it keep
+their previously negotiated minor. Existing records retain their original
+headers so older decoders can complete negotiation.
 
 `BindTimelines` transfers exactly two DRM syncobj opaque descriptors. The first
 exports the acquire timeline; the second exports the release timeline. Both
@@ -241,6 +247,11 @@ no synchronous protocol reply or per-frame socket descriptor.
 | `0x8009` | `Input` | task | none |
 | `0x800a` | `Error` | connection or task | none |
 | `0x800b` | `Ping` | connection | none |
+| `0x800c` | `RegisterRenderTarget` | task | DMA-BUF plane descriptors |
+| `0x800d` | `UnregisterRenderTarget` | task | none |
+| `0x800e` | `DisplayPower` | connection | none |
+| `0x800f` | `RequestInputChannel` | connection | none |
+| `0x8010` | `ScenePresented` | task | none |
 
 `FormatFeedback` atomically replaces the accepted explicit FourCC/modifier set
 for its generation. At most 256 pairs are sent. `DRM_FORMAT_MOD_INVALID` is not
@@ -262,6 +273,16 @@ sequence, and whether the frame was composed or directly scanned out.
 It may arrive after `BufferReleased`; its timing metadata must not delay safe
 buffer reuse. The Wayland presenter bounds outstanding timing requests to 64
 per task and omits optional requests when full, without blocking presentation.
+
+`ScenePresented` reports a displayed asynchronous direct-layer scene without
+accessing composed-frame ownership or signalling a release timeline. Its
+32-byte payload contains four `u64` values in order: nonzero accepted scene ID
+(not a `FrameId`), nonzero CLOCK_MONOTONIC timestamp in nanoseconds, nonzero
+refresh period in nanoseconds, and host presentation sequence. It has no
+descriptors or presentation flags. The presenter bounds outstanding scene
+feedback to eight per task and drops observations from stale configures or
+departed outputs. Android uses the observation as timing input independently
+of layer read completion, which remains on the layer stream.
 
 `Input` carries a monotonic host sequence and timestamp plus a typed touch, key,
 or navigation event. Android never receives the host's physical input

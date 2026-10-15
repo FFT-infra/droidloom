@@ -36,6 +36,7 @@ struct Source {
     availability_wakeup: crate::fence_wakeup::FenceWakeup,
 }
 struct View {
+    timeline: Option<frame_timeline::Surface>,
     surface: wl_surface::WlSurface,
     role: wl_subsurface::WlSubsurface,
     viewport: WpViewport,
@@ -176,6 +177,7 @@ impl Geometry {
 }
 impl Drop for View {
     fn drop(&mut self) {
+        self.timeline = None;
         if let Some(sync) = self.sync.take() {
             sync.destroy();
         }
@@ -224,6 +226,18 @@ struct PendingCommit {
 }
 
 impl Stream {
+    pub(super) fn abort_timeline_wait(&mut self) -> Result<(), PresenterError> {
+        if let Some(commit) = self.waiting.take() {
+            self.staged.clear();
+            if let Some(scene) = commit.scene {
+                self.events
+                    .send_record(&wire::commit_result(scene, -11), &[])?;
+            } else {
+                self.ack(-11)?;
+            }
+        }
+        Ok(())
+    }
     pub fn busy(&self) -> bool {
         !self.reads.is_empty()
     }
@@ -880,7 +894,31 @@ impl App {
             }
             return stream.ack(-95);
         }
-        self.commit_layers(qh, object, stream, width, height, scene)?;
+        let task = self.tasks.get_mut(&object).unwrap();
+        // A newer accepted direct scene supersedes a composed frame which has
+        // not yet consumed a grant; never display that old fallback afterward.
+        if let Some(queued) = task.timeline.queued.take() {
+            self.endpoint
+                .as_mut()
+                .ok_or(PresenterError::Configuration("endpoint disappeared"))?
+                .discard_frame(object, queued.frame.frame)?;
+        }
+        if task.timeline.exact && task.scene_feedback.len() >= MAX_SCENE_FEEDBACK {
+            stream.waiting = Some(commit);
+            return Ok(());
+        }
+        let Some(target) = task.timeline.reserve(monotonic_timestamp_nanos()?) else {
+            stream.waiting = Some(commit);
+            return Ok(());
+        };
+        self.commit_layers(
+            qh,
+            object,
+            stream,
+            (width, height),
+            scene,
+            target.target.as_ref(),
+        )?;
         if let Some(scene) = scene {
             stream
                 .events
@@ -895,10 +933,11 @@ impl App {
         qh: &QueueHandle<Self>,
         object: TaskObjectId,
         stream: &mut Stream,
-        width: u32,
-        height: u32,
+        size: (u32, u32),
         scene: Option<u64>,
+        target_grant: Option<&frame_timeline::Target>,
     ) -> Result<(), PresenterError> {
+        let (width, height) = size;
         let timing = droidloom_timing::Span::new(
             "timing_presenter_commit",
             object.0,
@@ -940,12 +979,13 @@ impl App {
         // may be fully occluded, so asking for its feedback could be discarded
         // even while the game is displayed. Never force unchanged children to
         // commit solely for timing, and bound callbacks independently of credits.
-        let feedback_layer = if scene.is_some()
-            && task.scene_feedback.len() < MAX_SCENE_FEEDBACK
-            && self
-                .endpoint
-                .as_ref()
-                .is_some_and(|e| e.scene_presentation())
+        let feedback_layer = if target_grant.is_some()
+            || scene.is_some()
+                && task.scene_feedback.len() < MAX_SCENE_FEEDBACK
+                && self
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(|e| e.scene_presentation())
         {
             staged
                 .iter()
@@ -981,10 +1021,15 @@ impl App {
                         .unwrap()
                         .get_surface(&surface, qh, ());
                 let sync = None;
+                let timeline = self
+                    .frame_timeline_manager
+                    .as_ref()
+                    .map(|m| frame_timeline::Surface::new(m, &surface, qh));
                 // Route input to the root, retaining task-relative Android coordinates.
                 let empty = Region::new(&self.compositor)?;
                 surface.set_input_region(Some(empty.wl_region()));
                 Ok(View {
+                    timeline,
                     surface,
                     role,
                     viewport,
@@ -1000,10 +1045,20 @@ impl App {
                 if feedback_layer == Some(l.id) {
                     let proxy = self.presentation_time.feedback(&v.surface, qh)?;
                     task.scene_feedback.push(SceneFeedback {
+                        grant: target_grant.map(|g| g.identity),
                         proxy,
-                        scene: scene.unwrap(),
+                        scene: scene.unwrap_or(0),
                         configure_serial: task.configure_serial,
                     });
+                }
+                if (l.buffer == 0
+                    || stream
+                        .buffers
+                        .get(&l.buffer)
+                        .is_some_and(|b| b.ticket.is_none()))
+                    && let (Some(timeline), Some(grant)) = (&v.timeline, target_grant)
+                {
+                    timeline.target(grant);
                 }
                 if geometry_changed {
                     v.role.place_above(&previous);
@@ -1116,7 +1171,25 @@ impl App {
             );
             root.attach(stream.root.as_ref().map(|(_, buffer)| buffer), 0, 0);
             root.damage_buffer(0, 0, size.0 as i32, size.1 as i32);
+            if let (Some(timeline), Some(grant)) = (&task.timeline.surface, target_grant) {
+                timeline.target(grant);
+            }
             task.composed_root = false;
+        }
+        if let Some(grant) = target_grant {
+            if feedback_layer.is_none() {
+                if backing.is_some_and(|(_, attach)| attach) {
+                    task.scene_feedback.push(SceneFeedback {
+                        proxy: self.presentation_time.feedback(&root, qh)?,
+                        scene: scene.unwrap_or(0),
+                        configure_serial: task.configure_serial,
+                        grant: Some(grant.identity),
+                    });
+                } else {
+                    task.timeline
+                        .finish(Some(grant.identity), frame_timeline::Terminal::Skipped);
+                }
+            }
         }
         root.commit();
         self.activation.mapped(object, &root);
