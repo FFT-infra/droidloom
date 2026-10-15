@@ -13,10 +13,12 @@ development deployment, not a published release.
 
 An ordinary-UID input probe confirms `Droidloom Host Keyboard` is alphabetic
 (type 2) and `hasKeys(SPACE, ENTER, A, Z)` returns four true values. These
-capability checks do not prove UU sends keys to a connected remote computer.
-Physical keyboard/mouse input in a real UU session remains user acceptance.
-The compositor advertises pointer constraints but no keyboard-shortcut inhibitor,
-so desktop shortcuts may still be handled by the host.
+capability checks match verified live behavior: physical keyboard input
+functions in live UU Remote sessions after clearing `FLAG_VIRTUAL_HARD_KEY`
+(0x40). However, the compositor advertises pointer constraints but no
+keyboard-shortcut inhibitor (`zwp_keyboard_shortcuts_inhibit_v1`), so `Super`
+(Meta/Logo) and desktop window-management shortcuts are consumed by Denial
+instead of reaching the remote host.
 
 Host uinput tablet events traversed Denial, Wayland and the Android native
 input receiver: the app received STYLUS source, pen/eraser tools, hover,
