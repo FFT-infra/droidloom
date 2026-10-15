@@ -67,6 +67,21 @@ Only narrowly reviewed Android framework patches belong here. Package/task,
 notification, clipboard, inset, lifecycle, and power-policy integration should
 prefer a Droidloom system service over broad framework changes.
 
+`0007-droidloom-detected-vulkan-capabilities.patch` fills Vulkan package features
+during SystemConfig initialization, gated to the Droidloom product and system
+process. The native probe uses Android's loader and checks hardware device type,
+graphics queues, Android hardware levels and version-specific buffer/sync interop.
+The detected version comes from a device supporting the detected level; separate
+GPUs cannot contribute unrelated maxima. Missing loaders, failed queries and
+CPU-only implementations leave the features absent. Explicit unavailable-feature
+rules still apply after detection. No dEQP, compute or Vulkan profile certification
+is inferred. The Java adapter and native probe ship as a matched services/InputFlinger
+pair, checked by the bundle's Vulkan capability ABI marker.
+
+Run the driver-independent native fixtures and Java failure-boundary checks with
+`cargo test --locked -j 1 -p droidloom-update --test vulkan_capabilities -- --ignored`.
+These checks require the prepared AOSP Vulkan headers and a host JDK/C++ compiler.
+
 `droidloom-window-policy` implements the Droidloom replacement for
 PhoneWindowManager. `0004-droidloom-window-policy.patch` selects it at the existing
 SystemServer policy injection point only for the Droidloom task-window product.

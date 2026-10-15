@@ -2,7 +2,7 @@
 Description=Droidloom Android application runtime
 PartOf=graphical-session.target
 After=graphical-session-pre.target wayland-session-waitenv.service
-Wants=droidloom-applications.service droidloom-audio.socket
+Wants=droidloom-applications.service droidloom-audio.socket droidloom-recovery.service
 After=droidloom-audio.socket
 ConditionPathExists=/etc/droidloom/cell.json
 
@@ -15,7 +15,7 @@ EnvironmentFile=-%t/droidloom/session.env
 ExecStartPre=/usr/bin/systemctl start droidloomd.service
 ExecStart=/usr/bin/droidloom-wayland
 ExecStartPost=/usr/bin/droidloomctl start --cell
-ExecStopPost=/usr/bin/droidloomctl stop --cell
+# The daemon owns cell teardown; signal it directly so busy RPCs can cancel.
 ExecStopPost=/usr/bin/systemctl stop droidloomd.service
 Restart=on-failure
 RestartSec=1

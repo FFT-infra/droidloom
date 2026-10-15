@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -41,32 +41,134 @@ struct ProgressFrame {
 }
 
 #[derive(Default)]
-pub(super) struct Reporter(Option<UnixStream>);
+pub(super) struct Reporter {
+    client: Option<UnixStream>,
+    enabled: bool,
+    shutdown: Option<OwnedFd>,
+}
 
 impl Reporter {
     pub fn new(stream: &UnixStream, enabled: bool) -> Result<Self, ControlError> {
-        Ok(Self(if enabled {
-            Some(
+        Ok(Self {
+            client: Some(
                 stream
                     .try_clone()
                     .map_err(|e| io_error("open lifecycle progress stream", e))?,
-            )
-        } else {
-            None
-        }))
+            ),
+            enabled,
+            shutdown: None,
+        })
+    }
+
+    pub fn with_shutdown(mut self, shutdown: &super::Shutdown) -> Result<Self, ControlError> {
+        // SAFETY: shutdown owns this descriptor throughout duplication.
+        let fd = unsafe { BorrowedFd::borrow_raw(shutdown.as_raw_fd()) };
+        self.shutdown = Some(
+            fd.try_clone_to_owned()
+                .map_err(|e| io_error("watch request cancellation", e))?,
+        );
+        Ok(self)
+    }
+
+    fn poll(&self, input: Option<&UnixStream>, timeout: Duration) -> io::Result<bool> {
+        let entry = |fd, events| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let mut fds = [
+            entry(input.map_or(-1, AsRawFd::as_raw_fd), libc::POLLIN),
+            entry(
+                self.shutdown.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                libc::POLLIN,
+            ),
+            // Clients normally half-close their write side after the request.
+            // Only full disconnect (HUP), not RDHUP, cancels their wait.
+            entry(self.client.as_ref().map_or(-1, AsRawFd::as_raw_fd), 0),
+        ];
+        let deadline = Instant::now() + timeout;
+        loop {
+            let millis = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            let millis = i32::try_from(millis).unwrap_or(i32::MAX);
+            // SAFETY: every descriptor stays owned until poll returns.
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if fds[1].revents != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "daemon is shutting down",
+                ));
+            }
+            if fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "request client disconnected",
+                ));
+            }
+            if fds[0].revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::other("framework descriptor became invalid"));
+            }
+            return Ok(fds[0].revents != 0);
+        }
+    }
+
+    pub fn check_cancelled(&self) -> io::Result<()> {
+        self.poll(None, Duration::ZERO).map(|_| ())
+    }
+
+    pub fn reader<'a>(
+        &'a self,
+        stream: &'a mut UnixStream,
+        timeout: Duration,
+    ) -> CancellableReader<'a> {
+        CancellableReader {
+            context: self,
+            stream,
+            deadline: Instant::now() + timeout,
+        }
     }
 
     pub fn report(&self, message: &str) {
-        if let Some(mut stream) = self.0.as_ref() {
+        if !self.enabled {
+            return;
+        }
+        if let Some(mut stream) = self.client.as_ref() {
             let mut encoded = serde_json::to_vec(&ProgressFrame {
                 progress: message.into(),
             })
             .expect("progress strings serialize");
             encoded.push(b'\n');
-            // A disconnected client must not tear down Android. The socket's
-            // write timeout also bounds clients that stop reading progress.
             let _ = stream.write_all(&encoded);
         }
+    }
+}
+
+pub(super) struct CancellableReader<'a> {
+    context: &'a Reporter,
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+impl Read for CancellableReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !self.context.poll(Some(self.stream), remaining)? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "framework response deadline expired",
+            ));
+        }
+        self.stream.read(buffer)
     }
 }
 
@@ -413,5 +515,105 @@ mod tests {
         let error = connect(&socket).unwrap_err().to_string();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(error.contains("request queue is full"));
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::{net::Shutdown as SocketShutdown, sync::Arc, thread};
+
+    #[test]
+    fn half_closed_request_still_receives_framework_response() {
+        let (client, server) = UnixStream::pair().unwrap();
+        client.shutdown(SocketShutdown::Write).unwrap();
+        let context = Reporter::new(&server, false).unwrap();
+        context.check_cancelled().unwrap();
+        let (mut framework, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"response").unwrap();
+        let mut received = [0; 8];
+        context
+            .reader(&mut framework, Duration::from_secs(1))
+            .read_exact(&mut received)
+            .unwrap();
+        assert_eq!(&received, b"response");
+    }
+
+    #[test]
+    fn shutdown_interrupts_stalled_framework_reply() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let shutdown = Arc::new(super::super::Shutdown::new().unwrap());
+        let context = Reporter::new(&server, false)
+            .unwrap()
+            .with_shutdown(&shutdown)
+            .unwrap();
+        let (mut framework, _peer) = UnixStream::pair().unwrap();
+        let trigger = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            trigger.request().unwrap();
+        });
+        let start = Instant::now();
+        let error = context
+            .reader(&mut framework, Duration::from_secs(120))
+            .read_exact(&mut [0; 1])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        worker.join().unwrap();
+        drop(client);
+    }
+
+    #[test]
+    fn client_disconnect_interrupts_partial_framework_frame() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let context = Reporter::new(&server, false).unwrap();
+        let (mut framework, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"partial").unwrap();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(client);
+        });
+        let start = Instant::now();
+        let error = context
+            .reader(&mut framework, Duration::from_secs(120))
+            .read_exact(&mut [0; 32])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn response_deadline_is_not_reset_by_partial_reads() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let context = Reporter::new(&server, false).unwrap();
+        let (mut framework, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"x").unwrap();
+        let mut reader = context.reader(&mut framework, Duration::from_millis(30));
+        reader.read_exact(&mut [0; 1]).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        peer.write_all(b"y").unwrap();
+        assert_eq!(
+            reader.read_exact(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn shutdown_remains_cancelled_for_readiness_checks() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let shutdown = super::super::Shutdown::new().unwrap();
+        let context = Reporter::new(&server, false)
+            .unwrap()
+            .with_shutdown(&shutdown)
+            .unwrap();
+        shutdown.request().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_cancelled().unwrap_err().kind(),
+                io::ErrorKind::ConnectionAborted
+            );
+        }
     }
 }

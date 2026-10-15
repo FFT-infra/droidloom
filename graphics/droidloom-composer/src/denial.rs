@@ -489,7 +489,8 @@ impl DenialTaskBinding {
                 timestamp_nanos: *timestamp_nanos,
                 event: *event,
             }),
-            DenialMessage::ServerHello { .. }
+            DenialMessage::ScenePresented { .. }
+            | DenialMessage::ServerHello { .. }
             | DenialMessage::RequestInputChannel { .. }
             | DenialMessage::DisplayPower { .. }
             | DenialMessage::Error { .. }
@@ -513,6 +514,7 @@ fn message_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Close { object }
         | DenialMessage::BufferReleased { object, .. }
         | DenialMessage::Presented { object, .. }
+        | DenialMessage::ScenePresented { object, .. }
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
         DenialMessage::ServerHello { .. }

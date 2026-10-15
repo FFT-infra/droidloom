@@ -377,40 +377,75 @@ pub fn validate_scene<'a>(
     width: u32,
     height: u32,
     last_ticket: u64,
+    source: impl FnMut(u64) -> Option<SourceState<'a>>,
+    attached: impl FnMut(u64) -> Option<(u64, u64)>,
+) -> bool {
+    assess_scene(layers, count, width, height, last_ticket, source, attached) == SceneStatus::Ready
+}
+
+/// Whether a complete scene can be submitted, must wait for a preceding GPU
+/// read, or is invalid. A waiting scene has passed every other validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneStatus {
+    /// All source allocations can be attached now.
+    Ready,
+    /// At least one new read needs its allocation's preceding read to finish.
+    Busy,
+    /// The scene violates the transport or current attachment contract.
+    Invalid,
+}
+
+/// Check a complete scene without modifying allocations or surface state.
+pub fn assess_scene<'a>(
+    layers: impl ExactSizeIterator<Item = (&'a Layer, bool)>,
+    count: u32,
+    width: u32,
+    height: u32,
+    last_ticket: u64,
     mut source: impl FnMut(u64) -> Option<SourceState<'a>>,
     mut attached: impl FnMut(u64) -> Option<(u64, u64)>,
-) -> bool {
+) -> SceneStatus {
     use std::collections::BTreeSet;
     if count == 0 || count as usize != layers.len() || layers.len() > MAX_LAYERS {
-        return false;
+        return SceneStatus::Invalid;
     }
     let mut ids = BTreeSet::new();
     let mut buffers = BTreeSet::new();
     let mut tickets = BTreeSet::new();
+    let mut busy = false;
     for (l, has_acquire) in layers {
         let allocation = source(l.buffer);
         if !ids.insert(l.id) || !l.validate(width, height, allocation.as_ref().map(|b| b.buffer)) {
-            return false;
+            return SceneStatus::Invalid;
         }
         if l.buffer == 0 {
             if has_acquire {
-                return false;
+                return SceneStatus::Invalid;
             }
             continue;
         }
-        let b = allocation.expect("buffer validated above");
+        let Some(b) = allocation else {
+            return SceneStatus::Invalid;
+        };
         if !b.imported || !buffers.insert(l.buffer) {
-            return false;
+            return SceneStatus::Invalid;
         }
-        if let Some(ticket) = b.ticket {
-            if ticket != l.ticket || has_acquire || attached(l.id) != Some((l.buffer, l.ticket)) {
-                return false;
+        if b.ticket == Some(l.ticket) {
+            if has_acquire || attached(l.id) != Some((l.buffer, l.ticket)) {
+                return SceneStatus::Invalid;
             }
-        } else if l.ticket <= last_ticket || !tickets.insert(l.ticket) {
-            return false;
+        } else {
+            if l.ticket <= last_ticket || !tickets.insert(l.ticket) {
+                return SceneStatus::Invalid;
+            }
+            busy |= b.ticket.is_some();
         }
     }
-    true
+    if busy {
+        SceneStatus::Busy
+    } else {
+        SceneStatus::Ready
+    }
 }
 
 /// Decode a complete record with exact ancillary descriptor accounting.
@@ -971,6 +1006,108 @@ mod tests {
         assert!(!validate(&[base], false, 0, false));
         assert!(!validate(&[], false, 0, false));
     }
+
+    #[test]
+    fn new_read_waits_for_the_preceding_read_but_same_ticket_reuse_stays_strict() {
+        let b = buffer();
+        let mut l = layer();
+        l.ticket = 10;
+        let assess = |ticket, has_acquire, attached| {
+            assess_scene(
+                [(&l, has_acquire)].into_iter(),
+                1,
+                800,
+                600,
+                9,
+                |_| {
+                    Some(SourceState {
+                        buffer: &b,
+                        imported: true,
+                        ticket,
+                    })
+                },
+                |_| attached,
+            )
+        };
+        assert_eq!(assess(Some(9), true, Some((8, 9))), SceneStatus::Busy);
+        assert_eq!(assess(None, true, Some((8, 9))), SceneStatus::Ready);
+        assert_eq!(assess(Some(10), false, Some((8, 10))), SceneStatus::Ready);
+        assert_eq!(assess(Some(10), true, Some((8, 10))), SceneStatus::Invalid);
+        assert_eq!(assess(Some(10), false, None), SceneStatus::Invalid);
+    }
+
+    #[test]
+    fn busy_scene_must_still_validate_every_layer_before_it_can_wait() {
+        let b = buffer();
+        let base = layer();
+        let mut overlay = base.clone();
+        overlay.id = 3;
+        overlay.buffer = 0;
+        overlay.ticket = 0;
+        let assess = |scene: &[Layer]| {
+            assess_scene(
+                scene.iter().map(|l| (l, l.buffer != 0)),
+                scene.len() as u32,
+                800,
+                600,
+                8,
+                |id| {
+                    (id == b.id).then_some(SourceState {
+                        buffer: &b,
+                        imported: true,
+                        ticket: Some(8),
+                    })
+                },
+                |_| None,
+            )
+        };
+        assert_eq!(assess(&[base.clone(), overlay.clone()]), SceneStatus::Busy);
+        overlay.destination[2] += 1;
+        assert_eq!(assess(&[base.clone(), overlay]), SceneStatus::Invalid);
+        assert_eq!(assess(&[base.clone(), base.clone()]), SceneStatus::Invalid);
+        let mut stale = base;
+        stale.ticket = 7;
+        assert_eq!(assess(&[stale]), SceneStatus::Invalid);
+    }
+
+    #[test]
+    fn waiting_scene_preserves_unchanged_peer_reads_and_rechecks_expired_tickets() {
+        let a = buffer();
+        let mut b = a.clone();
+        b.id = 10;
+        let mut changing = layer();
+        changing.ticket = 12;
+        let mut unchanged = changing.clone();
+        unchanged.id = 3;
+        unchanged.buffer = 10;
+        unchanged.ticket = 11;
+        let scene = [changing, unchanged];
+        let assess = |changing_ticket, unchanged_ticket| {
+            assess_scene(
+                scene.iter().map(|l| (l, l.id == 2)),
+                2,
+                800,
+                600,
+                11,
+                |id| {
+                    Some(SourceState {
+                        buffer: if id == 8 { &a } else { &b },
+                        imported: true,
+                        ticket: if id == 8 {
+                            changing_ticket
+                        } else {
+                            unchanged_ticket
+                        },
+                    })
+                },
+                |id| (id == 3).then_some((10, 11)),
+            )
+        };
+        assert_eq!(assess(Some(9), Some(11)), SceneStatus::Busy);
+        assert_eq!(assess(None, Some(11)), SceneStatus::Ready);
+        assert_eq!(assess(None, None), SceneStatus::Invalid);
+    }
+
     #[test]
     fn malformed_or_cross_version_packets_are_rejected() {
         let mut p = response(1, &[]);

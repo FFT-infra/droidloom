@@ -151,12 +151,15 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
             coords[i].setAxisValue(AMOTION_EVENT_AXIS_SIZE, 1.0f);
         }
         motion.initialize(ids.nextId(), 0, AINPUT_SOURCE_TOUCHSCREEN, ui::LogicalDisplayId{event->display},
-                {}, event->action, 0, {}, 0, 0, 0, MotionClassification::NONE,
+                {}, event->action, 0, ftl::Flags<MotionFlag>(event->flags), 0, 0, 0, MotionClassification::NONE,
                 ui::Transform{}, 1.0f, 1.0f, AMOTION_EVENT_INVALID_CURSOR_POSITION,
                 AMOTION_EVENT_INVALID_CURSOR_POSITION, ui::Transform{}, event->downTime,
                 event->eventTime, event->count, properties.data(), coords.data());
         androidEvent = &motion;
     } else return false;
+    // The pinned dispatcher validates and updates its injection verifier before
+    // enqueueing even in NONE mode. FAILED therefore must reach Rust; a socket
+    // reconnect alone cannot retire Android's accepted pointer identities.
     const auto result = input.mDispatcher.injectInputEventToApplication(androidEvent, std::nullopt,
             android::os::InputEventInjectionSync::NONE, std::chrono::milliseconds(30'000),
             POLICY_FLAG_DISABLE_KEY_REPEAT, target);

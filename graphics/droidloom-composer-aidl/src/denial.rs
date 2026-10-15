@@ -19,8 +19,8 @@ use droidloom_composer::{
 };
 use droidloom_denial_ipc::{AttachedDescriptor, IpcError, ProtocolSocket};
 use droidloom_denial_protocol::{AndroidMessage, DenialMessage, DescriptorKind, TaskObjectId};
-use droidloom_syncobj::{AndroidTaskTimelines, SyncobjDevice, SyncobjError};
 use droidloom_syncobj::frame_trace;
+use droidloom_syncobj::{AndroidTaskTimelines, SyncobjDevice, SyncobjError};
 use droidloom_transport::{AcceptedFrame, BufferId, BufferMetadata};
 use thiserror::Error;
 
@@ -149,10 +149,15 @@ impl DenialPresentationSink {
     pub fn request_activation(&self, display: DisplayId) -> Result<(), DenialSinkError> {
         if self.activation_requests {
             let tasks = self.lock_tasks()?;
-            let channel = tasks.get(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
-            self.socket.send_android(&AndroidMessage::RequestActivation {
-                object: channel.binding.object(),
-            }, &[])?;
+            let channel = tasks
+                .get(&display)
+                .ok_or(DenialSinkError::UnknownDisplay(display))?;
+            self.socket.send_android(
+                &AndroidMessage::RequestActivation {
+                    object: channel.binding.object(),
+                },
+                &[],
+            )?;
         }
         Ok(())
     }
@@ -253,8 +258,11 @@ impl DenialPresentationSink {
     /// Rejects an unknown display and preserves state on transport failure.
     pub fn request_task_removal(&self, display: DisplayId) -> Result<(), DenialSinkError> {
         let mut tasks = self.lock_tasks()?;
-        let task = tasks.get_mut(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
-        task.binding.request_destroy(|message| self.socket.send_android(&message, &[]))?;
+        let task = tasks
+            .get_mut(&display)
+            .ok_or(DenialSinkError::UnknownDisplay(display))?;
+        task.binding
+            .request_destroy(|message| self.socket.send_android(&message, &[]))?;
         Ok(())
     }
 
@@ -264,7 +272,10 @@ impl DenialPresentationSink {
     /// Rejects premature removal or a poisoned task map.
     pub fn unregister_task(&self, display: DisplayId) -> Result<(), DenialSinkError> {
         let mut tasks = self.lock_tasks()?;
-        if tasks.get(&display).is_some_and(|task| !task.binding.destroy_requested()) {
+        if tasks
+            .get(&display)
+            .is_some_and(|task| !task.binding.destroy_requested())
+        {
             return Err(DenialBridgeError::UnexpectedMessage.into());
         }
         tasks.remove(&display);
@@ -303,7 +314,11 @@ impl DenialPresentationSink {
         session: &mut Session,
         message: &DenialMessage,
     ) -> Result<AppliedDenialEvent, DenialSinkError> {
-        let received = if frame_trace::enabled() { frame_trace::now_ns() } else { 0 };
+        let received = if frame_trace::enabled() {
+            frame_trace::now_ns()
+        } else {
+            0
+        };
         let object = task_object(message).ok_or(DenialSinkError::ConnectionMessage)?;
         let mut tasks = self.lock_tasks()?;
         let task = tasks
@@ -311,7 +326,13 @@ impl DenialPresentationSink {
             .find(|task| task.binding.object() == object)
             .ok_or(DenialSinkError::UnknownObject(object))?;
         let event = task.binding.apply_event(session, message)?;
-        if let AppliedDenialEvent::Configure { width, height, serial, .. } = &event {
+        if let AppliedDenialEvent::Configure {
+            width,
+            height,
+            serial,
+            ..
+        } = &event
+        {
             pin_android_display_extent(&mut task.android_display_extent, *width, *height)?;
             task.target_demand.configure(*serial);
         }
@@ -335,14 +356,32 @@ impl DenialPresentationSink {
                 task.render_targets.remove(buffer);
             }
             if frame_trace::sampled(frame.0) {
-                frame_trace::event("android_reusable", object.0, frame.0, buffer.0,
-                    &[("receive_ns", received), ("reusable_ns", frame_trace::now_ns())]);
+                frame_trace::event(
+                    "android_reusable",
+                    object.0,
+                    frame.0,
+                    buffer.0,
+                    &[
+                        ("receive_ns", received),
+                        ("reusable_ns", frame_trace::now_ns()),
+                    ],
+                );
                 if let Some(fence) = task.trace_fences.remove(frame) {
                     match frame_trace::fence_signal_ns(fence.as_fd()) {
-                        Ok(Some(signal)) => frame_trace::event("android_gpu_complete", object.0,
-                            frame.0, buffer.0, &[("signal_ns", signal)]),
-                        _ => frame_trace::event("android_gpu_timestamp_unavailable", object.0,
-                            frame.0, buffer.0, &[]),
+                        Ok(Some(signal)) => frame_trace::event(
+                            "android_gpu_complete",
+                            object.0,
+                            frame.0,
+                            buffer.0,
+                            &[("signal_ns", signal)],
+                        ),
+                        _ => frame_trace::event(
+                            "android_gpu_timestamp_unavailable",
+                            object.0,
+                            frame.0,
+                            buffer.0,
+                            &[],
+                        ),
                     }
                 }
             }
@@ -437,7 +476,9 @@ impl DenialPresentationSink {
             return Err(DenialSinkError::NoRenderTarget(display));
         }
         self.ensure_render_targets(task)?;
-        let newest_serial = task.target_demand.serial()
+        let newest_serial = task
+            .target_demand
+            .serial()
             .ok_or(DenialSinkError::NoRenderTarget(display))?;
         let target = task
             .render_targets
@@ -505,9 +546,13 @@ impl DenialPresentationSink {
             let next = point
                 .checked_add(1)
                 .ok_or_else(|| std::io::Error::other("headless completion timeline exhausted"))?;
-            timelines.signal_acquire(next).map_err(std::io::Error::other)?;
+            timelines
+                .signal_acquire(next)
+                .map_err(std::io::Error::other)?;
             *point = next; // A failed export must not reuse the signalled point.
-            timelines.export_acquire_fence(next).map_err(std::io::Error::other)
+            timelines
+                .export_acquire_fence(next)
+                .map_err(std::io::Error::other)
         })
         .map_err(|error| DenialSinkError::Graphics(format!("headless present fence: {error}")))?;
         task.surfaceflinger_present_fence = Some(fence);
@@ -562,7 +607,8 @@ impl DenialPresentationSink {
             }
         };
 
-        if let Err(error) = self.send_surfaceflinger_frame(display, &frame, &target, acquire_fence, opaque)
+        if let Err(error) =
+            self.send_surfaceflinger_frame(display, &frame, &target, acquire_fence, opaque)
         {
             if let Ok(composer) = session.windows_mut().composer_for_display_mut(display) {
                 let _ = composer.cancel_unsubmitted_target(frame.frame_id);
@@ -574,13 +620,24 @@ impl DenialPresentationSink {
     }
 
     /// Delegate an authenticated pair of sockets to the task's presenter.
-    pub fn bind_layer_stream(&self, display: DisplayId, sockets: &[std::os::fd::BorrowedFd<'_>]) -> Result<(), DenialSinkError> {
+    pub fn bind_layer_stream(
+        &self,
+        display: DisplayId,
+        sockets: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), DenialSinkError> {
         let tasks = self.lock_tasks()?;
-        let task = tasks.get(&display).ok_or(DenialSinkError::UnknownDisplay(display))?;
+        let task = tasks
+            .get(&display)
+            .ok_or(DenialSinkError::UnknownDisplay(display))?;
         if task.binding.destroy_requested() {
             return Err(DenialBridgeError::UnexpectedMessage.into());
         }
-        self.socket.send_android(&AndroidMessage::BindLayerStream { object: task.binding.object() }, sockets)?;
+        self.socket.send_android(
+            &AndroidMessage::BindLayerStream {
+                object: task.binding.object(),
+            },
+            sockets,
+        )?;
         Ok(())
     }
 
@@ -725,10 +782,17 @@ impl DenialPresentationSink {
         // Send metadata before this exact frame on the ordered transport. A
         // transparent successor must clear a preceding frame's opaque proof.
         if task.content_opaque != Some(opaque) {
-            self.socket.send_android(&AndroidMessage::SetContentState {
-                object: task.binding.object(),
-                flags: if opaque { droidloom_denial_protocol::content_state::OPAQUE } else { 0 },
-            }, &[])?;
+            self.socket.send_android(
+                &AndroidMessage::SetContentState {
+                    object: task.binding.object(),
+                    flags: if opaque {
+                        droidloom_denial_protocol::content_state::OPAQUE
+                    } else {
+                        0
+                    },
+                },
+                &[],
+            )?;
             task.content_opaque = Some(opaque);
         }
         let prepared = task.binding.prepare_present(display, frame)?;
@@ -770,10 +834,20 @@ impl DenialPresentationSink {
             if let Some(fence) = acquire_fence.as_ref().and_then(|fd| fd.try_clone().ok()) {
                 task.trace_fences.insert(frame.frame_id, fence);
             }
-            frame_trace::event("android_submit", task.binding.object().0, frame.frame_id.0,
-                frame.buffer.id.0, &[("display", display.0), ("begin_ns", begin),
-                    ("import_begin_ns", import_begin), ("send_begin_ns", send_begin),
-                    ("send_done_ns", frame_trace::now_ns()), ("acquire_point", prepared.acquire_point)]);
+            frame_trace::event(
+                "android_submit",
+                task.binding.object().0,
+                frame.frame_id.0,
+                frame.buffer.id.0,
+                &[
+                    ("display", display.0),
+                    ("begin_ns", begin),
+                    ("import_begin_ns", import_begin),
+                    ("send_begin_ns", send_begin),
+                    ("send_done_ns", frame_trace::now_ns()),
+                    ("acquire_point", prepared.acquire_point),
+                ],
+            );
         }
         Ok(())
     }
@@ -838,13 +912,24 @@ impl DenialPresentationSink {
     // Called only from an actual composition dequeue, never from direct-layer
     // export. Busy targets already exist and must wait for real GPU release.
     fn ensure_render_targets(&self, task: &mut TaskChannel) -> Result<(), DenialSinkError> {
-        let Some(serial) = task.target_demand.serial() else { return Ok(()); };
-        let has_pool = task.render_targets.values()
+        let Some(serial) = task.target_demand.serial() else {
+            return Ok(());
+        };
+        let has_pool = task
+            .render_targets
+            .values()
             .any(|target| !target.revoked && target.configure_serial == serial);
-        if let Some(serial) = task.target_demand.request(self.lazy_render_targets, has_pool) {
-            self.socket.send_android(&AndroidMessage::RequestRenderTargets {
-                object: task.binding.object(), configure_serial: serial,
-            }, &[])?;
+        if let Some(serial) = task
+            .target_demand
+            .request(self.lazy_render_targets, has_pool)
+        {
+            self.socket.send_android(
+                &AndroidMessage::RequestRenderTargets {
+                    object: task.binding.object(),
+                    configure_serial: serial,
+                },
+                &[],
+            )?;
             task.target_demand.sent(serial);
         }
         Ok(())
@@ -858,9 +943,9 @@ impl PresentationSink for DenialPresentationSink {
         if task.binding.destroy_requested() {
             return Err(ErrorCode::NoResources);
         }
-        self.ensure_render_targets(task).map_err(|error| error.error_code())?;
-        let newest_serial = task.target_demand.serial()
-            .ok_or(ErrorCode::NoResources)?;
+        self.ensure_render_targets(task)
+            .map_err(|error| error.error_code())?;
+        let newest_serial = task.target_demand.serial().ok_or(ErrorCode::NoResources)?;
         let target = task
             .render_targets
             .values_mut()
@@ -964,6 +1049,7 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Close { object }
         | DenialMessage::BufferReleased { object, .. }
         | DenialMessage::Presented { object, .. }
+        | DenialMessage::ScenePresented { object, .. }
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
         DenialMessage::ServerHello { .. }
@@ -990,7 +1076,6 @@ fn pin_android_display_extent(
 #[cfg(test)]
 mod tests {
     use super::pin_android_display_extent;
-
 
     #[test]
     fn android_display_extent_remains_the_hotplug_size() {

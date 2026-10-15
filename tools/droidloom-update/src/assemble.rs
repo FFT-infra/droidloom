@@ -516,6 +516,7 @@ pub fn assemble_artifacts(
         "system/droidloomd.service",
         "user/droidloom.service",
         "user/droidloom-applications.service",
+        "user/droidloom-recovery.service",
         "user/droidloom-audio.service",
         "user/droidloom-audio.socket",
     ] {

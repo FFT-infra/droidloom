@@ -31,6 +31,10 @@ pub const STATUS: u32 = 6;
 pub const ERROR: u32 = 7;
 /// Successful operation response.
 pub const ACK: u32 = 8;
+/// Acquire a buffer and a coherent host position snapshot in one exchange.
+pub const ACQUIRE_POSITION: u32 = 9;
+/// Submit a buffer and return its host position snapshot instead of an empty ACK.
+pub const SUBMIT_POSITION: u32 = 10;
 /// Enable graph processing.
 pub const START: u64 = 1;
 /// Pause graph processing without discarding queued data.
@@ -43,6 +47,26 @@ pub const DRAIN: u64 = 4;
 pub const STANDBY: u64 = 5;
 /// Shared pool accepted directly by PipeWire; no sample copy in the broker.
 pub const SHARED_POOL: u64 = 1;
+/// Optional OPEN/CONFIG feature: timing snapshots on buffer exchanges.
+pub const BURST_POSITION: u64 = 1 << 1;
+
+/// Pack a bounded credit into one field, leaving four fields for position.
+/// Slot and frame count occupy 16 bits each; byte offset occupies 32 bits.
+pub fn pack_credit(slot: u32, frames: u32, offset: u32) -> io::Result<u64> {
+    if slot as usize >= BUFFERS || frames == 0 || frames > MAX_FRAMES {
+        return Err(invalid("invalid audio credit"));
+    }
+    Ok(u64::from(slot) | (u64::from(frames) << 16) | (u64::from(offset) << 32))
+}
+
+/// Decode credit metadata; the endpoint must also validate format-specific bounds.
+pub fn unpack_credit(value: u64) -> io::Result<(u32, u32, u32)> {
+    let slot = (value & 0xffff) as u32;
+    let frames = ((value >> 16) & 0xffff) as u32;
+    let offset = (value >> 32) as u32;
+    pack_credit(slot, frames, offset)?;
+    Ok((slot, frames, offset))
+}
 
 /// Stream direction from Android's perspective.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,7 +156,7 @@ impl Record {
         }
         let op = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         let request = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        if !(OPEN..=ACK).contains(&op) || request == 0 {
+        if !(OPEN..=SUBMIT_POSITION).contains(&op) || request == 0 {
             return Err(invalid("unknown operation or zero request"));
         }
         let generation = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
@@ -149,7 +173,7 @@ impl Record {
     }
     /// Parse the opening format without narrowing untrusted integers.
     pub fn format(self) -> io::Result<Format> {
-        if self.op != OPEN || self.generation != 0 || self.values[4] != 0 {
+        if self.op != OPEN || self.generation != 0 || self.values[4] & !BURST_POSITION != 0 {
             return Err(invalid("invalid audio open request"));
         }
         Format {

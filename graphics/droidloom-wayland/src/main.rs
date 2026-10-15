@@ -205,6 +205,14 @@ struct FrameFeedback {
     submitted_nanos: u64,
 }
 
+// Bounded optional timing metadata: no buffer, FD, or release fence ownership.
+struct SceneFeedback {
+    proxy: WpPresentationFeedback,
+    scene: u64,
+    configure_serial: u32,
+}
+const MAX_SCENE_FEEDBACK: usize = 8;
+
 struct TaskWindow {
     layers: Option<layers::Stream>,
     package: String,
@@ -225,9 +233,11 @@ struct TaskWindow {
     targets: BTreeMap<BufferId, RenderTarget>,
     pending: VecDeque<PendingFrame>,
     presentation_feedback: Vec<FrameFeedback>,
+    scene_feedback: Vec<SceneFeedback>,
     presentation_audit: Option<presentation_audit::Audit>,
     content_opaque: bool,
     applied_opaque: Option<bool>,
+    composed_root: bool,
     focused: bool,
     unmap_requested: bool,
     closing: bool,
@@ -267,6 +277,18 @@ impl Contact {
             },
         }
     }
+}
+
+// A cancelled/replaced shared stream also invalidates contacts waiting behind
+// clipboard synchronization. Preserve keyboard events, which are independent.
+fn clear_contact_state(
+    pointer: &mut Option<Contact>,
+    touches: &mut BTreeMap<i32, Contact>,
+    deferred: &mut VecDeque<(TaskObjectId, InputEvent)>,
+) {
+    *pointer = None;
+    touches.clear();
+    deferred.retain(|(_, event)| !matches!(event, InputEvent::Touch { .. }));
 }
 
 struct App {
@@ -313,8 +335,57 @@ struct App {
 
 struct OutputPowerState {
     output: wl_output::WlOutput,
-    control: ZwlrOutputPowerV1,
+    control: Option<ZwlrOutputPowerV1>,
     powered: Option<bool>,
+}
+
+// A failed power control belongs to one output, not the Wayland transport.
+// Keep the output unknown until wl_output removal: failure can also mean that
+// power management is unsupported on an output which is still connected.
+fn update_output_power(
+    states: &mut [OutputPowerState],
+    control: &ZwlrOutputPowerV1,
+    event: zwlr_output_power_v1::Event,
+) -> bool {
+    let Some(output) = states
+        .iter_mut()
+        .find(|output| output.control.as_ref() == Some(control))
+    else {
+        return false; // Late events after control/global retirement.
+    };
+    match event {
+        zwlr_output_power_v1::Event::Mode { mode } => {
+            output.powered = match mode {
+                WEnum::Value(zwlr_output_power_v1::Mode::On) => Some(true),
+                WEnum::Value(zwlr_output_power_v1::Mode::Off) => Some(false),
+                _ => None,
+            };
+        }
+        zwlr_output_power_v1::Event::Failed => {
+            // The protocol requires destruction even when the output has gone.
+            // Taking ownership prevents a second destroy on global removal.
+            if let Some(control) = output.control.take() {
+                control.destroy();
+            }
+            output.powered = None;
+            eprintln!("Droidloom output-power control retired; waiting for output topology");
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn remove_output_power(states: &mut Vec<OutputPowerState>, output: &wl_output::WlOutput) {
+    states.retain_mut(|state| {
+        if state.output == *output {
+            if let Some(control) = state.control.take() {
+                control.destroy();
+            }
+            false
+        } else {
+            true
+        }
+    });
 }
 
 impl Drop for App {
@@ -347,6 +418,9 @@ impl App {
             }
         } else {
             endpoint.send_display_power(powered)?;
+        }
+        if !powered || (endpoint.direct_input() && self.direct_input.fd().is_none()) {
+            self.clear_contacts();
         }
         self.published_display_power = Some(powered);
         Ok(())
@@ -602,8 +676,10 @@ impl App {
                 targets: BTreeMap::new(),
                 pending: VecDeque::new(),
                 presentation_feedback: Vec::new(),
+                scene_feedback: Vec::new(),
                 content_opaque: false,
                 applied_opaque: None,
+                composed_root: false,
                 presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref()
                     == Some(std::ffi::OsStr::new("1")))
                 .then(presentation_audit::Audit::default),
@@ -1157,6 +1233,7 @@ impl App {
             None
         };
         surface.attach(target.wayland.as_ref(), 0, 0);
+        task.composed_root = true;
         if layers_hidden {
             // Android damage compares app frames, not our constant root backing.
             // Replacing that root with a composed target changes the whole image.
@@ -1315,6 +1392,7 @@ impl App {
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.retire_contacts(Some(object));
         self.task_work.remove(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
@@ -1336,11 +1414,6 @@ impl App {
         if self.focused == Some(object) {
             self.focused = None;
         }
-        self.pointer_contact = self
-            .pointer_contact
-            .filter(|contact| contact.object != object);
-        self.touch_contacts
-            .retain(|_, contact| contact.object != object);
         if self.endpoint.is_some() {
             if let Err(error) = self.update_output_refreshes() {
                 self.fail(&error);
@@ -1349,6 +1422,7 @@ impl App {
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.retire_contacts(Some(object));
         self.activation.remove(object);
         let task = self
             .tasks
@@ -1365,6 +1439,7 @@ impl App {
         // already submitted before its task removal completed.
         surface.attach(None, 0, 0);
         surface.commit();
+        task.scene_feedback.clear();
         for feedback in task.presentation_feedback.drain(..) {
             if let Some(endpoint) = self.endpoint.as_mut() {
                 endpoint.forget_presentation(object, feedback.frame);
@@ -1399,11 +1474,6 @@ impl App {
         if self.focused == Some(object) {
             self.focused = None;
         }
-        self.pointer_contact = self
-            .pointer_contact
-            .filter(|contact| contact.object != object);
-        self.touch_contacts
-            .retain(|_, contact| contact.object != object);
         eprintln!(
             "Droidloom destroyed terminal Android xdg_toplevel object={}",
             object.0
@@ -1465,6 +1535,7 @@ impl App {
                     .attach(generation, wire, socket)
                     .map_err(PresenterError::Wayland)?
                 {
+                    self.clear_contacts();
                     eprintln!("Droidloom direct input: connected to InputFlinger, wire ABI {wire}");
                 }
             }
@@ -1474,6 +1545,19 @@ impl App {
                 display,
                 incarnation,
             } => {
+                let route = input::Route {
+                    task: task.0,
+                    display,
+                    incarnation,
+                };
+                if self
+                    .tasks
+                    .get(&object)
+                    .and_then(|window| window.input_route)
+                    .is_some_and(|previous| previous != route)
+                {
+                    self.retire_contacts(Some(object));
+                }
                 if let Some(window) = self.tasks.get_mut(&object) {
                     window.input_route = Some(input::Route {
                         task: task.0,
@@ -1564,7 +1648,10 @@ impl App {
                 } else {
                     endpoint
                 };
-                let endpoint = endpoint.with_direct_input().with_lazy_render_targets();
+                let endpoint = endpoint
+                    .with_direct_input()
+                    .with_lazy_render_targets()
+                    .with_scene_presentation();
                 endpoint.socket().socket().set_nonblocking(true)?;
                 self.endpoint = Some(endpoint);
             }
@@ -1607,15 +1694,94 @@ impl App {
         self.touch_contacts.clear();
     }
 
+    fn clear_contacts(&mut self) {
+        clear_contact_state(
+            &mut self.pointer_contact,
+            &mut self.touch_contacts,
+            &mut self.clipboard_inputs,
+        );
+    }
+
+    fn retire_contacts(&mut self, object: Option<TaskObjectId>) {
+        if let Some(object) = object {
+            let route = self.tasks.get(&object).and_then(|task| task.input_route);
+            if let Some(route) = route {
+                match monotonic_timestamp_nanos() {
+                    Ok(timestamp) => {
+                        if let Err(error) = self.direct_input.retire_route(route, timestamp) {
+                            eprintln!("Droidloom input retirement: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Droidloom input retirement: {error}");
+                        self.direct_input.disconnect();
+                    }
+                }
+            }
+            if !self
+                .pointer_contact
+                .is_some_and(|contact| contact.object == object)
+                && !self
+                    .touch_contacts
+                    .values()
+                    .any(|contact| contact.object == object)
+                && !self.clipboard_inputs.iter().any(|(owner, event)| {
+                    *owner == object && matches!(event, InputEvent::Touch { .. })
+                })
+            {
+                return;
+            }
+        }
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input)
+        {
+            match monotonic_timestamp_nanos() {
+                Ok(timestamp) => {
+                    if let Err(error) = self.direct_input.cancel_all(timestamp) {
+                        eprintln!("Droidloom input retirement: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Droidloom input retirement: {error}");
+                    self.direct_input.disconnect();
+                }
+            }
+        } else if self.endpoint.is_some() {
+            let mut contacts: Vec<_> = self.touch_contacts.values().copied().collect();
+            contacts.extend(self.pointer_contact);
+            // Legacy policy groups by task. Every route needs retirement.
+            contacts.sort_by_key(|contact| contact.object);
+            contacts.dedup_by_key(|contact| contact.object);
+            for contact in contacts {
+                if let Err(error) =
+                    self.send_input(contact.object, contact.event(TouchAction::Cancel))
+                {
+                    eprintln!("Droidloom input retirement: {error}");
+                }
+            }
+        }
+        self.clear_contacts();
+    }
+
     fn send_input(
         &mut self,
         object: TaskObjectId,
         event: InputEvent,
-    ) -> Result<(), PresenterError> {
+    ) -> Result<bool, PresenterError> {
         static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if self.clipboard.blocked() && self.clipboard_inputs.len() < 512 {
+        if !matches!(
+            event,
+            InputEvent::Touch {
+                action: TouchAction::Cancel,
+                ..
+            }
+        ) && self.clipboard.blocked()
+            && self.clipboard_inputs.len() < 512
+        {
             self.clipboard_inputs.push_back((object, event));
-            return Ok(());
+            return Ok(true);
         }
         self.next_input_serial = self
             .next_input_serial
@@ -1644,13 +1810,21 @@ impl App {
                 .tasks
                 .get(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
-            if window.closing {
-                return Ok(());
+            if window.closing
+                && !matches!(
+                    event,
+                    InputEvent::Touch {
+                        action: TouchAction::Cancel,
+                        ..
+                    }
+                )
+            {
+                return Ok(false);
             }
             let Some(route) = window.input_route else {
                 // The task binding and native route arrive in ordered records,
                 // but Wayland may dispatch input between their receipt.
-                return Ok(());
+                return Ok(false);
             };
             if let Err(error) = self.direct_input.send(
                 route,
@@ -1662,19 +1836,29 @@ impl App {
                 // The native receiver cancels held input on EOF. Recover this
                 // connection without taking down unrelated app windows.
                 eprintln!("Droidloom direct input: {error}");
+                self.clear_contacts();
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
         self.endpoint
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
             .send_input(object, self.next_input_serial, timestamp, event)?;
-        Ok(())
+        Ok(true)
     }
 
     fn pump_direct_input(&mut self) -> Result<(), PresenterError> {
         if let Err(error) = self.direct_input.flush() {
             eprintln!("Droidloom input: {error}");
+        }
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input)
+            && self.direct_input.fd().is_none()
+        {
+            self.clear_contacts();
         }
         if let Some(endpoint) = self
             .endpoint
@@ -1985,7 +2169,7 @@ impl OutputHandler for App {
             .get_output_power(&output, qh, output.clone());
         self.output_power.push(OutputPowerState {
             output,
-            control,
+            control: Some(control),
             powered: None,
         });
         if let Err(error) = self
@@ -2016,14 +2200,7 @@ impl OutputHandler for App {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.output_power.retain(|state| {
-            if state.output == output {
-                state.control.destroy();
-                false
-            } else {
-                true
-            }
-        });
+        remove_output_power(&mut self.output_power, &output);
         if let Err(error) = self.recompute_display_power() {
             self.fail(&error);
         }
@@ -2051,33 +2228,10 @@ impl Dispatch<ZwlrOutputPowerV1, wl_output::WlOutput> for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        match event {
-            zwlr_output_power_v1::Event::Mode {
-                mode: WEnum::Value(mode),
-            } => {
-                let powered = match mode {
-                    zwlr_output_power_v1::Mode::On => true,
-                    zwlr_output_power_v1::Mode::Off => false,
-                    _ => return,
-                };
-                if let Some(output) = state
-                    .output_power
-                    .iter_mut()
-                    .find(|output| output.control == *control)
-                {
-                    output.powered = Some(powered);
-                }
-                if let Err(error) = state.recompute_display_power() {
-                    state.fail(&error);
-                }
+        if update_output_power(&mut state.output_power, control, event) {
+            if let Err(error) = state.recompute_display_power() {
+                state.fail(&error);
             }
-            zwlr_output_power_v1::Event::Mode {
-                mode: WEnum::Unknown(_),
-            }
-            | zwlr_output_power_v1::Event::Failed => {
-                state.fail(&"compositor output-power state became unavailable");
-            }
-            _ => unreachable!(),
         }
     }
 }
@@ -2099,6 +2253,51 @@ impl PresentationTimeHandler for App {
         sequence: u64,
         flags: WEnum<wp_presentation_feedback::Kind>,
     ) {
+        if let Some((object, index)) = self.tasks.iter().find_map(|(object, task)| {
+            task.scene_feedback
+                .iter()
+                .position(|f| f.proxy == *feedback)
+                .map(|index| (*object, index))
+        }) {
+            let task = self.tasks.get_mut(&object).unwrap();
+            let observed = task.scene_feedback.swap_remove(index);
+            // Late feedback may belong to a previous configure or removed output.
+            // The actual buffer-release path remains completely independent.
+            let output = outputs
+                .iter()
+                .find(|o| task.entered_outputs.contains(o))
+                .cloned()
+                .or_else(|| {
+                    (outputs.is_empty() && task.entered_outputs.len() == 1)
+                        .then(|| task.entered_outputs[0].clone())
+                });
+            if !task.accepts_present()
+                || observed.configure_serial != task.configure_serial
+                || output.is_none()
+                || time.clk_id != libc::CLOCK_MONOTONIC as u32
+            {
+                return;
+            }
+            let changed = task.presentation_output != output;
+            task.presentation_output = output;
+            let result = (|| {
+                if changed {
+                    self.update_task_refresh(object)?;
+                }
+                let refresh =
+                    presentation_refresh_period(refresh, self.tasks[&object].refresh_millihz)?;
+                let timestamp = presentation_timestamp_nanos(time.tv_sec, time.tv_nsec)?;
+                self.endpoint
+                    .as_mut()
+                    .ok_or(PresenterError::Configuration("endpoint is absent"))?
+                    .send_scene_presented(object, observed.scene, timestamp, refresh, sequence)?;
+                Ok::<(), PresenterError>(())
+            })();
+            if let Err(error) = result {
+                self.fail(&error);
+            }
+            return;
+        }
         let Some(object) = self.task_for_surface(surface) else {
             return;
         };
@@ -2197,6 +2396,19 @@ impl PresentationTimeHandler for App {
         feedback: &WpPresentationFeedback,
         surface: &wl_surface::WlSurface,
     ) {
+        if let Some((object, index)) = self.tasks.iter().find_map(|(object, task)| {
+            task.scene_feedback
+                .iter()
+                .position(|f| f.proxy == *feedback)
+                .map(|index| (*object, index))
+        }) {
+            self.tasks
+                .get_mut(&object)
+                .unwrap()
+                .scene_feedback
+                .swap_remove(index);
+            return;
+        }
         let Some(object) = self.task_for_surface(surface) else {
             return;
         };
@@ -2274,33 +2486,54 @@ impl SeatHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
+        seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
         match capability {
-            Capability::Keyboard => {
+            Capability::Keyboard
+                if self
+                    .keyboard
+                    .as_ref()
+                    .and_then(|keyboard| {
+                        keyboard.data::<smithay_client_toolkit::seat::keyboard::KeyboardData<App>>()
+                    })
+                    .is_some_and(|data| data.seat() == &seat) =>
+            {
                 self.keyboard = None;
                 self.text_input.remove_resource();
             }
-            Capability::Pointer => {
+            Capability::Pointer
+                if self
+                    .pointer
+                    .as_ref()
+                    .and_then(|pointer| {
+                        pointer.data::<smithay_client_toolkit::seat::pointer::PointerData>()
+                    })
+                    .is_some_and(|data| data.seat() == &seat) =>
+            {
+                self.retire_contacts(None);
                 self.pointer = None;
-                self.pointer_contact = None;
             }
-            Capability::Touch => {
+            Capability::Touch
+                if self
+                    .touch
+                    .as_ref()
+                    .and_then(|touch| {
+                        touch.data::<smithay_client_toolkit::seat::touch::TouchData>()
+                    })
+                    .is_some_and(|data| data.seat() == &seat) =>
+            {
+                self.retire_contacts(None);
                 self.touch = None;
-                self.touch_contacts.clear();
             }
             _ => {}
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
-        self.text_input.remove_resource();
-        self.keyboard = None;
-        self.pointer = None;
-        self.touch = None;
-        self.pointer_contact = None;
-        self.touch_contacts.clear();
+    fn remove_seat(&mut self, conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        for capability in [Capability::Keyboard, Capability::Pointer, Capability::Touch] {
+            self.remove_capability(conn, qh, seat.clone(), capability);
+        }
     }
 }
 
@@ -2447,6 +2680,9 @@ impl PointerHandler for App {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        if self.pointer.as_ref() != Some(_pointer) {
+            return;
+        }
         for event in events {
             if let PointerEventKind::Press { serial, .. } = event.kind
                 && let Some(data) =
@@ -2461,9 +2697,10 @@ impl PointerHandler for App {
             }
             let object = self.task_for_surface(&event.surface);
             match event.kind {
-                PointerEventKind::Press { button, .. }
-                    if button == LEFT_BUTTON && self.pointer_contact.is_none() =>
-                {
+                PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
+                    if self.pointer_contact.is_some() {
+                        self.retire_contacts(None);
+                    }
                     let Some(object) = object else { continue };
                     let (x_fixed, y_fixed) = self.fixed_position(object, event.position);
                     let contact = Contact {
@@ -2471,54 +2708,38 @@ impl PointerHandler for App {
                         pointer_id: u32::MAX,
                         position_fixed: (x_fixed, y_fixed),
                     };
-                    if let Err(error) = self.send_input(
-                        object,
-                        InputEvent::Touch {
-                            action: TouchAction::Down,
-                            pointer_id: contact.pointer_id,
-                            x_fixed,
-                            y_fixed,
-                            pressure: u16::MAX,
-                        },
-                    ) {
-                        self.fail(&error);
-                    } else {
-                        self.pointer_contact = Some(contact);
+                    match self.send_input(object, contact.event(TouchAction::Down)) {
+                        Err(error) => self.fail(&error),
+                        Ok(true) => self.pointer_contact = Some(contact),
+                        Ok(false) => {}
                     }
                 }
                 PointerEventKind::Motion { .. } => {
-                    let Some(contact) = self.pointer_contact else {
+                    let Some(mut contact) = self.pointer_contact else {
                         continue;
                     };
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, event.position);
-                    if let Err(error) = self.send_input(
-                        contact.object,
-                        InputEvent::Touch {
-                            action: TouchAction::Motion,
-                            pointer_id: contact.pointer_id,
-                            x_fixed,
-                            y_fixed,
-                            pressure: u16::MAX,
-                        },
-                    ) {
-                        self.fail(&error);
+                    // Coordinates belong to event.surface, not a newly focused task.
+                    if object == Some(contact.object) {
+                        contact.position_fixed =
+                            self.fixed_position(contact.object, event.position);
+                    }
+                    match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+                        Err(error) => self.fail(&error),
+                        Ok(true) => self.pointer_contact = Some(contact),
+                        Ok(false) => {}
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
-                    let Some(contact) = self.pointer_contact.take() else {
+                    let Some(mut contact) = self.pointer_contact.take() else {
                         continue;
                     };
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, event.position);
-                    if let Err(error) = self.send_input(
-                        contact.object,
-                        InputEvent::Touch {
-                            action: TouchAction::Up,
-                            pointer_id: contact.pointer_id,
-                            x_fixed,
-                            y_fixed,
-                            pressure: 0,
-                        },
-                    ) {
+                    if object == Some(contact.object) {
+                        contact.position_fixed =
+                            self.fixed_position(contact.object, event.position);
+                    }
+                    if let Err(error) =
+                        self.send_input(contact.object, contact.event(TouchAction::Up))
+                    {
                         self.fail(&error);
                     }
                 }
@@ -2540,6 +2761,12 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
+        if id < 0 || self.touch_contacts.contains_key(&id) {
+            self.retire_contacts(None);
+        }
         let Some(object) = self.task_for_surface(&surface) else {
             return;
         };
@@ -2556,10 +2783,12 @@ impl TouchHandler for App {
             pointer_id,
             position_fixed: (x_fixed, y_fixed),
         };
-        if let Err(error) = self.send_input(object, contact.event(TouchAction::Down)) {
-            self.fail(&error);
-        } else {
-            self.touch_contacts.insert(id, contact);
+        match self.send_input(object, contact.event(TouchAction::Down)) {
+            Err(error) => self.fail(&error),
+            Ok(true) => {
+                self.touch_contacts.insert(id, contact);
+            }
+            Ok(false) => {}
         }
     }
 
@@ -2572,6 +2801,9 @@ impl TouchHandler for App {
         _time: u32,
         id: i32,
     ) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
         let Some(contact) = self.touch_contacts.remove(&id) else {
             return;
         };
@@ -2591,14 +2823,19 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
         let Some(mut contact) = self.touch_contacts.get(&id).copied() else {
             return;
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
-        if let Err(error) = self.send_input(contact.object, contact.event(TouchAction::Motion)) {
-            self.fail(&error);
-        } else {
-            self.touch_contacts.insert(id, contact);
+        match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+            Err(error) => self.fail(&error),
+            Ok(true) => {
+                self.touch_contacts.insert(id, contact);
+            }
+            Ok(false) => {}
         }
     }
 
@@ -2624,22 +2861,10 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        let contacts = std::mem::take(&mut self.touch_contacts);
-        for (_, contact) in contacts {
-            if let Err(error) = self.send_input(
-                contact.object,
-                InputEvent::Touch {
-                    action: TouchAction::Cancel,
-                    pointer_id: contact.pointer_id,
-                    x_fixed: 0,
-                    y_fixed: 0,
-                    pressure: 0,
-                },
-            ) {
-                self.fail(&error);
-                break;
-            }
+        if self.touch.as_ref() != Some(_touch) {
+            return;
         }
+        self.retire_contacts(None);
     }
 }
 
@@ -3015,6 +3240,14 @@ fn poll_sources(
     }
     app.clipboard.notify_ready(descriptors);
     app.direct_input.notify_ready(descriptors);
+    if app
+        .endpoint
+        .as_ref()
+        .is_some_and(DenialEndpoint::direct_input)
+        && app.direct_input.fd().is_none()
+    {
+        app.clear_contacts();
+    }
     app.task_work.notify_fallback(Instant::now());
     for (event, owner) in descriptors.iter().zip(owners.iter().copied()) {
         if owner.notify(&mut app.task_work, event.revents) {
@@ -3281,24 +3514,75 @@ fn select_surface_refresh<T: PartialEq>(
 
 fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
     let mut saw_output = false;
-    let mut any_powered = false;
+    let mut unknown = false;
     for state in states {
         saw_output = true;
         match state {
-            Some(powered) => any_powered |= powered,
-            None => return None,
+            Some(true) => return Some(true),
+            Some(false) => (),
+            None => unknown = true,
         }
     }
-    saw_output.then_some(any_powered)
+    // One known powered output is enough to keep Android awake. Sleep only
+    // when every remaining output explicitly reports off; unknown/empty is
+    // not evidence of screen-off.
+    (saw_output && !unknown).then_some(false)
 }
+
+#[cfg(test)]
+mod output_power_test;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn display_power_waits_for_all_outputs_and_tracks_any_powered_output() {
+    fn contact_retirement_clears_shared_task_routes_pointer_and_deferred_touches() {
+        let first = Contact {
+            object: TaskObjectId(1),
+            pointer_id: 0,
+            position_fixed: (10, 20),
+        };
+        let second = Contact {
+            object: TaskObjectId(2),
+            pointer_id: 1,
+            ..first
+        };
+        let mouse = Contact {
+            pointer_id: u32::MAX,
+            ..first
+        };
+        let mut pointer = Some(mouse);
+        let mut touches = BTreeMap::from([(0, first), (1, second)]);
+        let key = InputEvent::Key {
+            action: KeyAction::Down,
+            keycode: 30,
+            repeat: 0,
+        };
+        let mut deferred = VecDeque::from([
+            (first.object, first.event(TouchAction::Down)),
+            (second.object, second.event(TouchAction::Motion)),
+            (mouse.object, mouse.event(TouchAction::Up)),
+            (first.object, key.clone()),
+        ]);
+        clear_contact_state(&mut pointer, &mut touches, &mut deferred);
+        assert!(pointer.is_none() && touches.is_empty());
+        assert_eq!(deferred, VecDeque::from([(first.object, key)]));
+        // Late UP/MOTION callbacks cannot find an old owner after reconnect,
+        // surface removal or seat/capability retirement.
+        assert!(touches.remove(&0).is_none());
+        assert!(touches.get(&1).is_none());
+        touches.insert(0, first);
+        pointer = Some(mouse);
+        assert_eq!(touches[&0].object, first.object);
+        assert_eq!(pointer.unwrap().pointer_id, u32::MAX);
+    }
+
+    #[test]
+    fn display_power_sleeps_only_when_all_outputs_are_known_off() {
         assert_eq!(aggregate_display_power([]), None);
+        assert_eq!(aggregate_display_power([None, Some(true)]), Some(true));
+        assert_eq!(aggregate_display_power([Some(true), None]), Some(true));
         assert_eq!(aggregate_display_power([Some(false), None]), None);
         assert_eq!(
             aggregate_display_power([Some(false), Some(false)]),

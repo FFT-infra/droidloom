@@ -20,7 +20,7 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 7;
+pub const PROTOCOL_MINOR: u16 = 8;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
 /// Wire version introducing task activation.
@@ -70,6 +70,8 @@ pub mod capability {
     pub const DIRECT_INPUT: u64 = 1 << 10;
     /// Allocate composition targets only after a configure-scoped request.
     pub const LAZY_RENDER_TARGETS: u64 = 1 << 11;
+    /// Real presentation observations for direct layer scenes, independent of targets.
+    pub const SCENE_PRESENTATION: u64 = 1 << 12;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -395,6 +397,19 @@ pub enum DenialMessage {
         sequence: u64,
         /// Presentation flags from [`presentation_flag`].
         flags: u32,
+    },
+    /// Report a direct layer scene's display time without releasing any buffer.
+    ScenePresented {
+        /// Owning task.
+        object: TaskObjectId,
+        /// Accepted asynchronous layer scene identity, not a composed FrameId.
+        scene: u64,
+        /// Actual CLOCK_MONOTONIC presentation timestamp.
+        timestamp_nanos: u64,
+        /// Actual refresh period.
+        refresh_period_nanos: u64,
+        /// Host display sequence.
+        sequence: u64,
     },
     /// Route one typed native input event to an Android task.
     Input {
@@ -1200,6 +1215,7 @@ const OP_REGISTER_RENDER_TARGET: u16 = 0x800c;
 const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
 const OP_DISPLAY_POWER: u16 = 0x800e;
 const OP_REQUEST_INPUT_CHANNEL: u16 = 0x800f;
+const OP_SCENE_PRESENTED: u16 = 0x8010;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1799,6 +1815,22 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
             payload.u32(*flags);
             (OP_PRESENTED, valid_object(*object)?)
         }
+        DenialMessage::ScenePresented {
+            object,
+            scene,
+            timestamp_nanos,
+            refresh_period_nanos,
+            sequence,
+        } => {
+            nonzero("scene ID", *scene)?;
+            nonzero("presentation timestamp", *timestamp_nanos)?;
+            nonzero("refresh period", *refresh_period_nanos)?;
+            payload.u64(*scene);
+            payload.u64(*timestamp_nanos);
+            payload.u64(*refresh_period_nanos);
+            payload.u64(*sequence);
+            (OP_SCENE_PRESENTED, valid_object(*object)?)
+        }
         DenialMessage::Input {
             object,
             serial,
@@ -2034,6 +2066,23 @@ pub fn decode_denial(
                 flags,
             }
         }
+        OP_SCENE_PRESENTED => {
+            valid_object(object)?;
+            let scene = payload.u64()?;
+            let timestamp_nanos = payload.u64()?;
+            let refresh_period_nanos = payload.u64()?;
+            let sequence = payload.u64()?;
+            nonzero("scene ID", scene)?;
+            nonzero("presentation timestamp", timestamp_nanos)?;
+            nonzero("refresh period", refresh_period_nanos)?;
+            DenialMessage::ScenePresented {
+                object,
+                scene,
+                timestamp_nanos,
+                refresh_period_nanos,
+                sequence,
+            }
+        }
         OP_INPUT => {
             valid_object(object)?;
             let serial = payload.u64()?;
@@ -2203,6 +2252,7 @@ fn finish_packet(
         OP_DISPLAY_POWER => 5,
         OP_BIND_INPUT_CHANNEL | OP_BIND_INPUT_ROUTE | OP_REQUEST_INPUT_CHANNEL => 6,
         OP_REQUEST_RENDER_TARGETS => 7,
+        OP_SCENE_PRESENTED => 8,
         _ => BASE_PROTOCOL_MINOR,
     };
     bytes.extend_from_slice(&minor.to_le_bytes());
@@ -3132,5 +3182,36 @@ mod tests {
                 actual: 7,
             })
         );
+    }
+
+    #[test]
+    fn direct_scene_timing_has_its_own_identity_and_no_descriptors() {
+        let message = DenialMessage::ScenePresented {
+            object: OBJECT,
+            scene: 17,
+            timestamp_nanos: 123_456_789,
+            refresh_period_nanos: 8_333_333,
+            sequence: 42,
+        };
+        let packet = encode_denial(&message).unwrap();
+        assert!(packet.descriptors.is_empty());
+        assert_eq!(
+            u16::from_le_bytes(packet.bytes[6..8].try_into().unwrap()),
+            8
+        );
+        assert_eq!(decode_denial(&packet.bytes, 0).unwrap().message, message);
+        assert!(decode_denial(&packet.bytes, 1).is_err());
+        for (scene, timestamp, period) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+            assert!(
+                encode_denial(&DenialMessage::ScenePresented {
+                    object: OBJECT,
+                    scene,
+                    timestamp_nanos: timestamp,
+                    refresh_period_nanos: period,
+                    sequence: 0
+                })
+                .is_err()
+            );
+        }
     }
 }

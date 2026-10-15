@@ -178,7 +178,8 @@ fn host_presentation_is_ordinary_wayland_without_plugin_artifacts() {
     assert!(service.contains("Type=notify"));
     assert!(service.contains("ExecStart=/usr/bin/droidloom-wayland"));
     assert!(service.contains("ExecStartPost=/usr/bin/droidloomctl start"));
-    assert!(service.contains("ExecStopPost=/usr/bin/droidloomctl stop"));
+    assert!(service.contains("ExecStopPost=/usr/bin/systemctl stop droidloomd.service"));
+    assert!(!service.contains("ExecStopPost=/usr/bin/droidloomctl stop"));
     assert!(service.contains("Wants=droidloom-applications.service"));
 
     let catalog_service =

@@ -80,8 +80,8 @@ pub enum MountKind {
     ErofsImage,
     /// Read-only raw ext4 Android partition image.
     Ext4Image,
-    /// Read-write raw ext4 image containing Android-controlled state.
-    DataImage,
+    /// Direct host directory containing Android-controlled state.
+    HostStorage,
     /// Private tmpfs.
     Tmpfs,
     /// Private procfs.
@@ -102,6 +102,8 @@ pub enum MountKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum LinuxOperation {
+    /// Install the inherited filesystem protection before Android can run.
+    InstallSharedFilesystemGuard,
     /// Reserve the subordinate identities and runtime path for one cell.
     ReserveIdentity {
         /// Owning host user.
@@ -319,8 +321,11 @@ pub struct PlanInvariants {
     pub private_network_namespace: bool,
     /// Always true by construction.
     pub immutable_android_partitions: bool,
-    /// True only when the user explicitly configured shared host storage.
+    /// Always true: Android writable state uses the host filesystem.
     pub android_writable_host_filesystems: bool,
+    /// Mandatory inherited filter prevents filesystem-wide shutdown, freeze,
+    /// trim, quota and superblock reconfiguration by Android.
+    pub shared_filesystem_guard: bool,
     /// Always true by construction.
     pub pidfd_lifecycle_authority: bool,
 }
@@ -386,7 +391,7 @@ pub fn build_linux_plan(spec: &CellSpec) -> Result<LinuxCellPlan, SpecError> {
         }
     }
     Ok(LinuxCellPlan {
-        schema_version: 2,
+        schema_version: 3,
         cell: spec.id(),
         construction: backend.construction.clone(),
         teardown: backend.teardown.clone(),
@@ -403,7 +408,8 @@ pub fn build_linux_plan(spec: &CellSpec) -> Result<LinuxCellPlan, SpecError> {
             private_binderfs: true,
             private_network_namespace: true,
             immutable_android_partitions: true,
-            android_writable_host_filesystems: !spec.shared_storage_directories.is_empty(),
+            android_writable_host_filesystems: true,
+            shared_filesystem_guard: true,
             pidfd_lifecycle_authority: true,
         },
     })
@@ -480,11 +486,14 @@ fn construction_operations(spec: &CellSpec, step: LifecycleStep) -> Vec<LinuxOpe
             pids_max: 32_768,
             memory_max: 4 * 1024 * 1024 * 1024,
         }],
-        LifecycleStep::StartAndroidInit => vec![LinuxOperation::StartAndroidInit {
-            executable: "/system/bin/init".into(),
-            arguments: vec!["/system/bin/init".into()],
-            no_new_privileges_before_exec: false,
-        }],
+        LifecycleStep::StartAndroidInit => vec![
+            LinuxOperation::InstallSharedFilesystemGuard,
+            LinuxOperation::StartAndroidInit {
+                executable: "/system/bin/init".into(),
+                arguments: vec!["/system/bin/init".into()],
+                no_new_privileges_before_exec: false,
+            },
+        ],
         LifecycleStep::PublishHandle => vec![LinuxOperation::PublishHandle {
             path: spec.runtime_dir.join("control.sock"),
             owner_uid: spec.host_uid,
@@ -613,8 +622,8 @@ fn partition_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
 fn private_filesystem_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
     vec![
         mount(
-            MountKind::DataImage,
-            Some(spec.data_dir.join("data.img")),
+            MountKind::HostStorage,
+            Some(spec.data_dir.join("data")),
             Path::new("/data"),
             false,
             true,
@@ -622,8 +631,8 @@ fn private_filesystem_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             false,
         ),
         mount(
-            MountKind::DataImage,
-            Some(spec.data_dir.join("metadata.img")),
+            MountKind::HostStorage,
+            Some(spec.data_dir.join("metadata")),
             Path::new("/metadata"),
             false,
             true,
@@ -654,6 +663,15 @@ fn private_filesystem_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             Path::new("/dev"),
             false,
             false,
+            true,
+            true,
+        ),
+        mount(
+            MountKind::Tmpfs,
+            None,
+            Path::new("/dev/input"),
+            true,
+            true,
             true,
             true,
         ),
@@ -806,6 +824,7 @@ fn teardown_operations(spec: &CellSpec, step: LifecycleStep) -> Vec<LinuxOperati
             targets.extend(
                 [
                     "/dev/pts",
+                    "/dev/input",
                     "/dev",
                     "/sys",
                     "/proc",
@@ -936,6 +955,17 @@ mod tests {
         );
         assert!(!plan.invariants.drm_card_nodes);
         assert!(!plan.invariants.physical_input_nodes);
+        assert!(
+            plan.construction
+                .iter()
+                .flat_map(|step| &step.operations)
+                .any(|op| {
+                    matches!(op, LinuxOperation::Mount {
+                kind: MountKind::Tmpfs, source: None, target,
+                read_only: true, nodev: true, nosuid: true, noexec: true,
+            } if target == Path::new("/dev/input"))
+                })
+        );
 
         let sources: Vec<_> = plan
             .construction
@@ -977,10 +1007,11 @@ mod tests {
     }
 
     #[test]
-    fn android_writable_storage_uses_dedicated_images() {
+    fn android_writable_storage_uses_host_directories() {
         let spec = spec();
         let plan = build_linux_plan(&spec).unwrap();
-        assert!(!plan.invariants.android_writable_host_filesystems);
+        assert!(plan.invariants.android_writable_host_filesystems);
+        assert!(plan.invariants.shared_filesystem_guard);
 
         let data_mounts: Vec<_> = plan
             .construction
@@ -988,7 +1019,7 @@ mod tests {
             .flat_map(|step| &step.operations)
             .filter_map(|operation| match operation {
                 LinuxOperation::Mount {
-                    kind: MountKind::DataImage,
+                    kind: MountKind::HostStorage,
                     source: Some(source),
                     target,
                     ..
@@ -999,11 +1030,8 @@ mod tests {
         assert_eq!(
             data_mounts,
             [
-                (spec.data_dir.join("data.img"), PathBuf::from("/data")),
-                (
-                    spec.data_dir.join("metadata.img"),
-                    PathBuf::from("/metadata")
-                )
+                (spec.data_dir.join("data"), PathBuf::from("/data")),
+                (spec.data_dir.join("metadata"), PathBuf::from("/metadata"))
             ]
         );
     }

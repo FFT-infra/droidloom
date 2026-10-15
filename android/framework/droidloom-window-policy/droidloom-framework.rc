@@ -1,6 +1,17 @@
 on post-fs-data
     mkdir /dev/socket/droidloom-framework 0700 system system
     setprop sys.droidloom.framework_ready 0
+    # PackageManager applies these to all installers, including app stores,
+    # sideloads, updates and bulk restores. No profile is required for speed.
+    setprop pm.dexopt.install speed
+    setprop pm.dexopt.install-fast speed
+    setprop pm.dexopt.install-bulk speed
+    setprop pm.dexopt.install-bulk-secondary speed
+    setprop pm.dexopt.install-bulk-downgraded speed
+    setprop pm.dexopt.install-bulk-secondary-downgraded speed
+    # Keep future scheduled maintenance from replacing full AOT with a
+    # profile-only compilation. Inactive-app storage reclamation is unchanged.
+    setprop pm.dexopt.bg-dexopt speed
 
 on property:init.svc.zygote=stopped
     setprop sys.droidloom.framework_ready 0
@@ -16,5 +27,18 @@ service droidloom-ime-setup /system/bin/sh /droidloom/ime/setup
     oneshot
     stdio_to_kmsg
 
+# Android's normal dexopt job waits for phone-style screen idle, which the
+# host-owned desktop need not enter. Reconcile existing/preloaded apps after
+# each cell boot; ART skips valid artifacts (deliberately no -f or --reset).
+service droidloom-app-optimize /system/bin/cmd package compile -m speed -p PRIORITY_BACKGROUND --primary-dex -a
+    class late_start
+    user shell
+    group shell
+    priority 10
+    disabled
+    oneshot
+    stdio_to_kmsg
+
 on property:sys.boot_completed=1
     start droidloom-ime-setup
+    start droidloom-app-optimize

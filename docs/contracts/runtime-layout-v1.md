@@ -5,7 +5,7 @@ implements the fail-closed transaction, emits the complete typed Linux
 construction/reverse-teardown plan, and provides the executable Android
 cell path. `droidloomd` retains the exact namespace child handle while
 `droidloomctl` supplies idempotent lifecycle operations. Production user-ID
-mapping, cgroup limits, seccomp, and complete packaging hardening remain later
+mapping, cgroup limits, general seccomp sandboxing, and complete packaging hardening remain later
 work; the executable path does not claim those unfinished isolation layers.
 
 ## Intended production identity
@@ -34,14 +34,20 @@ scans are never lifecycle authority.
 | immutable partition file override | optional package-owned compatibility file at its original Android path | read-only, nosuid, nodev, executable mappings allowed |
 | `/vendor` | activated package artifact | read-only, nodev |
 | `/product` | activated package artifact | read-only, nodev |
-| `/data` | per-user `data.img` raw ext4 filesystem | read-write, nodev, nosuid |
-| `/metadata` | per-user `metadata.img` raw ext4 filesystem | read-write, nodev, nosuid |
+| `/data` | direct host `data_dir/data` directory | read-write, nodev, nosuid |
+| `/metadata` | direct host `data_dir/metadata` directory | read-write, nodev, nosuid |
 | `/data/media/0/<collection>` | explicitly configured host-user directory | read-write idmapped bind, nodev, nosuid, noexec |
 | `/proc` | private procfs | nosuid, nodev, noexec, hide host processes |
 | `/sys` | minimal read-only projection/synthetic tree | read-only, nosuid, nodev, noexec |
 | `/dev` | private tmpfs | nosuid, strict modes |
+| `/dev/input` | empty private tmpfs; host owns physical input | read-only, nosuid, nodev, noexec |
 | `/dev/pts` | private devpts | nosuid, noexec, newinstance |
 | `/dev/binderfs` | private binderfs | three named devices only |
+
+Host hotplug uevents can reach Android even with synthetic sysfs. The sealed
+`/dev/input` mount prevents ueventd from recreating physical keyboard/mouse nodes
+that would bypass Wayland focus and duplicate forwarded input. The synthetic
+Host Keyboard and targeted input protocol do not use evdev nodes.
 
 The Droidloom system-server policy is a paired file override:
 `/system/framework/services.jar` supplies the Java `WindowManagerPolicy` adapter,
@@ -79,17 +85,22 @@ Read-only Android image mounts detect raw ext4 or EROFS from the filesystem
 magic, including the selected add-on images.
 
 The first GApps activation refuses already initialized Android data. A marker
-inside the cell-owned data image records selected packages, signers and manifest
+inside the cell-owned data directory records selected packages, signers and manifest
 identity. Changing signers/selection or disabling the add-on requires fresh data
 or a suitable backup; images alone cannot roll back Google updates in `/data`.
 Manifest changes invalidate only the selected Google applications' parser cache.
 The runtime never deletes accounts or installed app updates as a side effect.
 
-The supervisor builds the complete tree before exec. Android receives neither
-`CAP_SYS_ADMIN` nor a general view of host mounts to finish construction.
-Android-controlled system state remains confined to loop-backed filesystems.
-Only explicit shared-storage collections may be writable host-directory bind
-mounts. They map the host UID to MediaProvider's recorded app UID and the host
+The supervisor builds the complete tree before exec. Writable Android state is
+bind-mounted from root-private host directories, sharing host capacity without
+loop images. A mandatory inherited seccomp filter blocks filesystem-wide
+shutdown/freeze/trim, quota operations, ext4 resize/tuning, ordinary superblock
+remounts and fsconfig reconfiguration. Bind remounts and per-file operations
+remain available. It covers native and compat ABIs and fails startup if it
+cannot be installed. The preview still retains capabilities needed by Android
+APEX/FUSE setup; this targeted guard is not a complete privileged-container
+sandbox. Explicit shared-storage collections remain idmapped host directories.
+They map the host UID to MediaProvider's recorded app UID and the host
 GID to Android `media_rw`, and are mounted
 `nodev,nosuid,noexec`, and placed behind Android's ordinary emulated-storage
 service rather than exposed as Android system state.
@@ -98,7 +109,7 @@ The host kernel must provide FUSE. The packaged `vold` recursively binds its
 MediaProvider lower view so configured collection submounts remain visible;
 both volume teardown paths detach the whole lower tree. A non-recursive bind
 exposes the underlying empty mountpoint instead of the host collection.
-The supervisor reads MediaProvider's UID once from the initialized data image's
+The supervisor reads MediaProvider's UID once from the initialized data directory's
 `/data/system/packages.list`; it never guesses an app UID. The test collection
 uses setgid directory inheritance so Android-created files retain the mapped
 host group. MediaProvider's primary GID is also mapped to a reserved subordinate
@@ -128,8 +139,8 @@ links.
 - ephemeral: `/run/droidloom/cells/u<uid>` and the user's mode-0700 runtime
   directory socket endpoint;
 - system state: `/var/lib/droidloom/images` and activation metadata;
-- per-user Android data: a platform-owned directory containing `data.img` and
-  `metadata.img`, retained on normal package removal and deleted only by
+- per-user Android data: a platform-owned parent containing `data` and
+  `metadata` directories, retained on normal package removal and deleted only by
   explicit wipe; the containing host filesystem is never exposed to Android.
 - per-user shared storage: an explicit allowlist of host-owned directories,
   each mapped to one top-level collection below `/storage/emulated/0`; an
@@ -217,6 +228,11 @@ the `Droidloom` model / `droidloom` device identity. Boot parameters supply
 `ro.serialno=droidloom`. The generated init policy starts the existing AOSP
 adbd service independently of USB configuration and retains the previously
 projected classpath and CPU policy. Persistent Android data is preserved.
+
+The product-property projection also clears `traced.relay_producer_port`: the
+cell uses Android’s local Perfetto producer and consumer Unix sockets, without
+an incoming VM relay listener. This avoids a `traced` restart loop on hosts
+without AF_VSOCK while preserving normal tracing and its enable setting.
 
 A connection worker uses bounded requests to the standard ADB host protocol
 to retry registration with the user's server, including after server restarts.

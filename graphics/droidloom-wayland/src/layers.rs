@@ -101,6 +101,40 @@ impl View {
     }
 }
 
+fn recycle_views(views: &mut BTreeMap<u64, View>, spare: &mut Vec<View>, ids: &BTreeSet<u64>) {
+    let removed: Vec<_> = views
+        .keys()
+        .filter(|id| !ids.contains(id))
+        .copied()
+        .collect();
+    for id in removed {
+        let mut view = views.remove(&id).expect("removed view exists");
+        view.hide();
+        // Subsurface destruction unmaps immediately, even while the parent's
+        // replacement transaction is blocked on an acquire fence. Retain the
+        // role and synchronize its detach/reassignment with that transaction.
+        // Reassignment also needs fresh stacking relative to the new peers.
+        view.geometry = None;
+        spare.push(view);
+    }
+}
+
+fn view_for_layer<'a>(
+    views: &'a mut BTreeMap<u64, View>,
+    spare: &mut Vec<View>,
+    id: u64,
+    create: impl FnOnce() -> Result<View, PresenterError>,
+) -> Result<&'a mut View, PresenterError> {
+    use std::collections::btree_map::Entry;
+    match views.entry(id) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => Ok(entry.insert(match spare.pop() {
+            Some(view) => view,
+            None => create()?,
+        })),
+    }
+}
+
 /// Persistent Wayland state, independent of the producer's rotating buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Geometry {
@@ -165,7 +199,9 @@ pub(super) struct Stream {
     events: SeqPacket,
     buffers: BTreeMap<u64, Source>,
     staged: wire::Staging<OwnedFd>,
+    waiting: Option<PendingCommit>,
     views: BTreeMap<u64, View>,
+    spare_views: Vec<View>,
     reads: Vec<Read>,
     imports: imports::Imports<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1>,
     root: Option<((u32, u32), wl_buffer::WlBuffer)>,
@@ -177,6 +213,16 @@ pub(super) struct Stream {
     last_import: u64,
     configuration: wire::ConfigPublisher,
 }
+
+#[derive(Clone, Copy)]
+struct PendingCommit {
+    scene: Option<u64>,
+    serial: u32,
+    width: u32,
+    height: u32,
+    count: u32,
+}
+
 impl Stream {
     pub fn busy(&self) -> bool {
         !self.reads.is_empty()
@@ -266,6 +312,7 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.views.clear();
+        self.spare_views.clear();
         for source in self.buffers.values_mut() {
             if let Some(b) = source.buffer.take() {
                 b.destroy();
@@ -307,6 +354,24 @@ fn carrier_size(width: u32, height: u32) -> Result<(u32, u32), PresenterError> {
     Ok((width / a, height / a))
 }
 
+fn covered_by_opaque_layer<'a>(
+    mut layers: impl Iterator<Item = &'a Layer>,
+    width: u32,
+    height: u32,
+) -> bool {
+    let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+        return false;
+    };
+    width > 0
+        && height > 0
+        && layers.any(|layer| {
+            layer.opaque
+                && layer.alpha == u32::MAX
+                && (layer.buffer != 0 || layer.color >> 24 == 0xff)
+                && layer.destination == [0, 0, width, height]
+        })
+}
+
 fn carrier(
     globals: &Globals,
     qh: &QueueHandle<App>,
@@ -317,8 +382,20 @@ fn carrier(
         .and_then(|stride| stride.checked_mul(height))
         .and_then(|bytes| i32::try_from(bytes).ok())
         .ok_or(PresenterError::Configuration("layer root buffer too large"))?;
-    let file = tempfile::tempfile()?;
+    let mut file = tempfile::tempfile()?;
     file.set_len(bytes as u64)?;
+    // Opt-in visual diagnosis: distinguish an exposed carrier from black app
+    // pixels without capturing or inspecting the user's screen.
+    if env::var_os("DROIDLOOM_DEBUG_LAYER_BACKING").as_deref()
+        == Some(std::ffi::OsStr::new("magenta"))
+    {
+        let length = usize::try_from(bytes)
+            .map_err(|_| PresenterError::Configuration("layer root buffer too large"))?;
+        let pixels = 0x00ff00ff_u32.to_ne_bytes().repeat(1024);
+        for offset in (0..length).step_by(pixels.len()) {
+            file.write_all(&pixels[..pixels.len().min(length - offset)])?;
+        }
+    }
     let pool = globals.shm.create_pool(file.as_fd(), bytes, qh, ());
     let buffer = pool.create_buffer(
         0,
@@ -373,7 +450,9 @@ impl App {
             events,
             buffers: BTreeMap::new(),
             staged: wire::Staging::default(),
+            waiting: None,
             views: BTreeMap::new(),
+            spare_views: Vec::new(),
             reads: Vec::new(),
             imports: imports::Imports::default(),
             root: None,
@@ -397,10 +476,17 @@ impl App {
     ) -> Result<(), PresenterError> {
         let mut receive_buffer = [0; droidloom_surface_bridge::layers::MAX_LAYER_PACKET];
         while let Some(object) = self.task_work.pop(readiness::RELEASES) {
-            if let Some(stream) = self.tasks.get_mut(&object).and_then(|t| t.layers.as_mut()) {
+            if let Some(mut stream) = self.tasks.get_mut(&object).and_then(|t| t.layers.take()) {
                 stream.release()?;
+                let result = if let Some(commit) = stream.waiting.take() {
+                    self.submit_layer_scene(qh, object, &mut stream, commit)
+                } else {
+                    Ok(())
+                };
                 self.task_work
                     .layer_fallback(object, stream.poll_fallback());
+                self.tasks.get_mut(&object).unwrap().layers = Some(stream);
+                result?;
                 if self.tasks[&object].closing {
                     self.task_work.mark(object, readiness::CLEANUP);
                 }
@@ -421,6 +507,7 @@ impl App {
                     Err(IpcError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(IpcError::PeerClosed) => {
                         stream.connected = false;
+                        stream.waiting = None;
                         stream.staged.clear();
                         stream.hide();
                         if let Some(surface) = self.tasks[&object].surface() {
@@ -470,6 +557,11 @@ impl App {
             if let Some(stream) = self.tasks.get_mut(&object).and_then(|t| t.layers.as_mut())
                 && stream.connected
             {
+                if stream.waiting.is_some() {
+                    // Revalidate stale geometry or a closing window without
+                    // waiting for an unrelated GPU release.
+                    self.task_work.mark(object, readiness::RELEASES);
+                }
                 let update = stream.configuration.update(config).map_err(|_| {
                     PresenterError::Configuration("layer configuration revision exhausted")
                 })?;
@@ -490,6 +582,17 @@ impl App {
         request: Request,
         fds: Vec<OwnedFd>,
     ) -> Result<(), PresenterError> {
+        // A waiting commit owns the bounded staging area. Continue observing
+        // disconnects and servicing configuration/cancellation on this socket;
+        // a peer cannot overwrite its pending scene or queue a second one.
+        if stream.waiting.is_some()
+            && !matches!(
+                request,
+                Request::Config | Request::SubscribeConfig | Request::Abort
+            )
+        {
+            return Err(PresenterError::Configuration("layer scene already waiting"));
+        }
         let async_scene = if let Request::CommitAsync { scene, .. }
         | Request::CommitBatch { scene, .. } = &request
         {
@@ -661,6 +764,11 @@ impl App {
             }
             Request::Abort => {
                 stream.staged.clear();
+                if let Some(scene) = stream.waiting.take().and_then(|commit| commit.scene) {
+                    stream
+                        .events
+                        .send_record(&wire::commit_result(scene, -95), &[])?;
+                }
                 stream.ack(0)?;
             }
             Request::Commit {
@@ -676,67 +784,109 @@ impl App {
                 count,
                 ..
             } => {
-                let task = &self.tasks[&object];
-                let exact_geometry = stream.staged.layers().iter().all(|(l, _)| {
-                    let Some((lw, lh)) = task.logical_size else {
-                        return false;
-                    };
-                    let [x, y, w, h] = l.destination;
-                    [
-                        (i64::from(x), lw, width),
-                        (i64::from(y), lh, height),
-                        (i64::from(x) + i64::from(w), lw, width),
-                        (i64::from(y) + i64::from(h), lh, height),
-                    ]
-                    .iter()
-                    .all(|&(edge, logical, physical)| {
-                        physical > 0 && edge * i64::from(logical) % i64::from(physical) == 0
-                    })
-                });
-                let valid = !stream.staged.failed()
-                    && self.layer_globals.alpha.is_some()
-                    && task.accepts_present()
-                    && task.configure_serial == serial
-                    && task.buffer_size == (width, height)
-                    && exact_geometry
-                    && wire::validate_scene(
-                        stream
-                            .staged
-                            .layers()
-                            .iter()
-                            .map(|(l, fd)| (l, fd.is_some())),
-                        count,
+                self.submit_layer_scene(
+                    qh,
+                    object,
+                    stream,
+                    PendingCommit {
+                        scene: async_scene,
+                        serial,
                         width,
                         height,
-                        stream.last_ticket,
-                        |id| {
-                            stream.buffers.get(&id).map(|b| wire::SourceState {
-                                buffer: &b.metadata,
-                                imported: b.buffer.is_some(),
-                                ticket: b.ticket,
-                            })
-                        },
-                        |id| stream.views.get(&id).and_then(View::source),
-                    );
-                if !valid {
-                    stream.staged.clear();
-                    if let Some(scene) = async_scene {
-                        stream
-                            .events
-                            .send_record(&wire::commit_result(scene, -95), &[])?;
-                        return Ok(());
-                    }
-                    return stream.ack(-95);
-                }
-                self.commit_layers(qh, object, stream, width, height)?;
-                if let Some(scene) = async_scene {
-                    stream
-                        .events
-                        .send_record(&wire::commit_result(scene, 0), &[])?;
-                } else {
-                    stream.ack(0)?;
-                }
+                        count,
+                    },
+                )?;
             }
+        }
+        Ok(())
+    }
+
+    fn submit_layer_scene(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        object: TaskObjectId,
+        stream: &mut Stream,
+        commit: PendingCommit,
+    ) -> Result<(), PresenterError> {
+        let PendingCommit {
+            scene,
+            serial,
+            width,
+            height,
+            count,
+        } = commit;
+        let task = &self.tasks[&object];
+        let exact_geometry = stream.staged.layers().iter().all(|(l, _)| {
+            let Some((lw, lh)) = task.logical_size else {
+                return false;
+            };
+            let [x, y, w, h] = l.destination;
+            [
+                (i64::from(x), lw, width),
+                (i64::from(y), lh, height),
+                (i64::from(x) + i64::from(w), lw, width),
+                (i64::from(y) + i64::from(h), lh, height),
+            ]
+            .iter()
+            .all(|&(edge, logical, physical)| {
+                physical > 0 && edge * i64::from(logical) % i64::from(physical) == 0
+            })
+        });
+        let valid = !stream.staged.failed()
+            && self.layer_globals.alpha.is_some()
+            && task.accepts_present()
+            && task.configure_serial == serial
+            && task.buffer_size == (width, height)
+            && exact_geometry;
+        let status = if valid {
+            wire::assess_scene(
+                stream
+                    .staged
+                    .layers()
+                    .iter()
+                    .map(|(l, fd)| (l, fd.is_some())),
+                count,
+                width,
+                height,
+                stream.last_ticket,
+                |id| {
+                    stream.buffers.get(&id).map(|b| wire::SourceState {
+                        buffer: &b.metadata,
+                        imported: b.buffer.is_some(),
+                        ticket: b.ticket,
+                    })
+                },
+                |id| stream.views.get(&id).and_then(View::source),
+            )
+        } else {
+            wire::SceneStatus::Invalid
+        };
+        if status == wire::SceneStatus::Busy && scene.is_some() {
+            // Keep the current scene visible and retain this scene's
+            // metadata/acquire FDs. SF's one outstanding Commit bounds
+            // admission and pins producer reads until actual attachment
+            // or explicit rejection. Real release eventfds retry it;
+            // no wait, polling spin, or fallback render is introduced.
+            stream.waiting = Some(commit);
+            return Ok(());
+        }
+        if status != wire::SceneStatus::Ready {
+            stream.staged.clear();
+            if let Some(scene) = scene {
+                stream
+                    .events
+                    .send_record(&wire::commit_result(scene, -95), &[])?;
+                return Ok(());
+            }
+            return stream.ack(-95);
+        }
+        self.commit_layers(qh, object, stream, width, height, scene)?;
+        if let Some(scene) = scene {
+            stream
+                .events
+                .send_record(&wire::commit_result(scene, 0), &[])?;
+        } else {
+            stream.ack(0)?;
         }
         Ok(())
     }
@@ -747,6 +897,7 @@ impl App {
         stream: &mut Stream,
         width: u32,
         height: u32,
+        scene: Option<u64>,
     ) -> Result<(), PresenterError> {
         let timing = droidloom_timing::Span::new(
             "timing_presenter_commit",
@@ -759,31 +910,63 @@ impl App {
         let (lw, lh) = task.logical_size.ok_or(PresenterError::Configuration(
             "layer task has no logical size",
         ))?;
-        // The task root owns input and the XDG role. Its zero-filled XRGB buffer
-        // supplies the same opaque black backing as SF's composed task target.
-        // Gaps and transparent app pixels blend over black in either mode.
-        let root_size = carrier_size(lw, lh)?;
-        let root_changed = stream
-            .root
-            .as_ref()
-            .is_none_or(|(size, _)| *size != root_size);
-        if root_changed {
-            let buffer = carrier(&self.layer_globals, qh, root_size)?;
-            if let Some((_, old)) = stream.root.replace((root_size, buffer)) {
-                old.destroy();
+        // Retain the last composed image when direct children fully cover it.
+        // Some compositors publish root textures and child layouts separately;
+        // replacing the root with black can expose it during that handoff.
+        // Partial/transparent scenes still require black, and an initial direct
+        // scene needs a carrier to map its XDG root. No target is copied or
+        // released here: normal compositor release fences retain ownership.
+        let preserve_composed = task.composed_root
+            && covered_by_opaque_layer(
+                stream.staged.layers().iter().map(|(layer, _)| layer),
+                width,
+                height,
+            );
+        let backing = if preserve_composed {
+            None
+        } else {
+            let size = carrier_size(lw, lh)?;
+            let changed = stream.root.as_ref().is_none_or(|(old, _)| *old != size);
+            if changed {
+                let buffer = carrier(&self.layer_globals, qh, size)?;
+                if let Some((_, old)) = stream.root.replace((size, buffer)) {
+                    old.destroy();
+                }
             }
-        }
+            Some((size, changed || !stream.active || task.composed_root))
+        };
         let mut staged = stream.staged.take();
+        // Observe one changed child in the synchronized scene. The carrier root
+        // may be fully occluded, so asking for its feedback could be discarded
+        // even while the game is displayed. Never force unchanged children to
+        // commit solely for timing, and bound callbacks independently of credits.
+        let feedback_layer = if scene.is_some()
+            && task.scene_feedback.len() < MAX_SCENE_FEEDBACK
+            && self
+                .endpoint
+                .as_ref()
+                .is_some_and(|e| e.scene_presentation())
+        {
+            staged
+                .iter()
+                .rev()
+                .find(|(layer, _)| {
+                    layer.alpha != 0
+                        && stream
+                            .views
+                            .get(&layer.id)
+                            .is_none_or(|view| view.content != Some(Content::new(layer)))
+                })
+                .map(|(layer, _)| layer.id)
+        } else {
+            None
+        };
         let ids: BTreeSet<_> = staged.iter().map(|(l, _)| l.id).collect();
-        for (id, v) in &mut stream.views {
-            if !ids.contains(id) {
-                v.hide();
-            }
-        }
+        recycle_views(&mut stream.views, &mut stream.spare_views, &ids);
         let mut previous = root.clone();
         let mut previous_id = None;
         for (l, acquire) in staged.drain(..) {
-            if !stream.views.contains_key(&l.id) {
+            let v = view_for_layer(&mut stream.views, &mut stream.spare_views, l.id, || {
                 let surface = self.compositor.create_surface(qh);
                 let role = self
                     .layer_globals
@@ -801,23 +984,27 @@ impl App {
                 // Route input to the root, retaining task-relative Android coordinates.
                 let empty = Region::new(&self.compositor)?;
                 surface.set_input_region(Some(empty.wl_region()));
-                stream.views.insert(
-                    l.id,
-                    View {
-                        surface,
-                        role,
-                        viewport,
-                        alpha,
-                        sync,
-                        content: None,
-                        solid: None,
-                        geometry: None,
-                    },
-                );
-            }
-            let v = stream.views.get_mut(&l.id).unwrap();
+                Ok(View {
+                    surface,
+                    role,
+                    viewport,
+                    alpha,
+                    sync,
+                    content: None,
+                    solid: None,
+                    geometry: None,
+                })
+            })?;
             let geometry = Geometry::new(&l, previous_id, (lw, lh), (width, height));
             v.update(geometry, Content::new(&l), |v, geometry_changed| {
+                if feedback_layer == Some(l.id) {
+                    let proxy = self.presentation_time.feedback(&v.surface, qh)?;
+                    task.scene_feedback.push(SceneFeedback {
+                        proxy,
+                        scene: scene.unwrap(),
+                        configure_serial: task.configure_serial,
+                    });
+                }
                 if geometry_changed {
                     v.role.place_above(&previous);
                     let [dx, dy, dw, dh] = geometry.destination;
@@ -901,44 +1088,52 @@ impl App {
         }
         // Retain the bounded layer capacity across buffer-only frames.
         stream.staged.recycle(staged);
-        // Removed roles can be destroyed after their detach is committed with
-        // the root. Keep them through this transaction to avoid partial updates.
-        if let Some(sync) = task.sync_surface.take() {
-            sync.destroy();
-        }
-        if !stream.active || root_changed || stream.root_logical_size != Some((lw, lh)) {
+        // Hidden roles remain reusable until the task retires. Their total is
+        // bounded by the largest accepted scene (MAX_LAYERS), not frame count.
+        if !stream.active
+            || backing.is_some_and(|(_, attach)| attach)
+            || stream.root_logical_size != Some((lw, lh))
+        {
             let region = Region::new(&self.compositor)?;
             region.add(0, 0, lw as i32, lh as i32);
             root.set_opaque_region(Some(region.wl_region()));
             root.set_buffer_transform(wl_output::Transform::Normal);
-            task.viewport.as_ref().unwrap().set_source(
-                0.0,
-                0.0,
-                f64::from(root_size.0),
-                f64::from(root_size.1),
-            );
             task.viewport
                 .as_ref()
                 .unwrap()
                 .set_destination(lw as i32, lh as i32);
             stream.root_logical_size = Some((lw, lh));
         }
-        if root_changed || !stream.active {
+        if let Some((size, true)) = backing {
+            if let Some(sync) = task.sync_surface.take() {
+                sync.destroy();
+            }
+            task.viewport.as_ref().unwrap().set_source(
+                0.0,
+                0.0,
+                f64::from(size.0),
+                f64::from(size.1),
+            );
             root.attach(stream.root.as_ref().map(|(_, buffer)| buffer), 0, 0);
-            root.damage_buffer(0, 0, root_size.0 as i32, root_size.1 as i32);
+            root.damage_buffer(0, 0, size.0 as i32, size.1 as i32);
+            task.composed_root = false;
         }
         root.commit();
         self.activation.mapped(object, &root);
         if !stream.active {
             eprintln!(
-                "Droidloom task {}: direct Wayland composition, {} layers",
+                "Droidloom task {}: direct Wayland composition, {} layers, backing={}",
                 object.0,
-                ids.len()
+                ids.len(),
+                if preserve_composed {
+                    "composed"
+                } else {
+                    "black"
+                },
             );
         }
         task.applied_opaque = Some(true);
         stream.active = true;
-        stream.views.retain(|id, _| ids.contains(id));
         timing.finish(1);
         Ok(())
     }
@@ -1004,7 +1199,7 @@ mod update_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{Geometry, Layer, carrier_size};
+    use super::{Geometry, Layer, carrier_size, covered_by_opaque_layer};
 
     fn fixture() -> Layer {
         Layer {
@@ -1018,6 +1213,47 @@ mod tests {
             opaque: true,
             color: 0,
         }
+    }
+
+    #[test]
+    fn composed_backing_requires_proven_opaque_coverage_of_the_entire_task() {
+        let layer = fixture();
+        let covered = |layer: &Layer| covered_by_opaque_layer([layer].into_iter(), 800, 600);
+        assert!(covered(&layer));
+        let mut translucent_peer = layer.clone();
+        translucent_peer.id = 2;
+        translucent_peer.opaque = false;
+        translucent_peer.destination = [10, 10, 20, 20];
+        assert!(covered_by_opaque_layer(
+            [&layer, &translucent_peer].into_iter(),
+            800,
+            600
+        ));
+        for change in 0..5 {
+            let mut changed = layer.clone();
+            match change {
+                0 => changed.opaque = false,
+                1 => changed.alpha -= 1,
+                2 => changed.destination[0] = 1,
+                3 => changed.destination[2] -= 1,
+                _ => changed.destination[3] -= 1,
+            }
+            assert!(!covered(&changed));
+        }
+        let mut solid = layer.clone();
+        solid.buffer = 0;
+        solid.color = 0xff00ff00;
+        assert!(covered(&solid));
+        solid.color = 0xfe00ff00;
+        assert!(!covered(&solid));
+        assert!(!covered_by_opaque_layer([&layer].into_iter(), 801, 600));
+        assert!(!covered_by_opaque_layer([&layer].into_iter(), 0, 600));
+        assert!(!covered_by_opaque_layer(
+            [&layer].into_iter(),
+            u32::MAX,
+            600
+        ));
+        assert!(!covered_by_opaque_layer(std::iter::empty(), 800, 600));
     }
 
     #[test]

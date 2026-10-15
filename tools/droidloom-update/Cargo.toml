@@ -13,6 +13,7 @@ hex.workspace = true
 tempfile.workspace = true
 libc.workspace = true
 droidloom-source = { path = "../droidloom-source" }
+droidloom-supervisor = { path = "../../runtime/droidloom-supervisor" }
 
 
 droidloom-image = { path = "../droidloom-image" }

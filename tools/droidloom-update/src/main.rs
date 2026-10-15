@@ -69,8 +69,11 @@ enum Action {
         #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
         product: String,
         /// Rebuild task, graphics and input peers alongside the framework pair.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "surfaceflinger_only")]
         tasks: bool,
+        /// Rebuild only SurfaceFlinger and its native dependency closure.
+        #[arg(long)]
+        surfaceflinger_only: bool,
     },
     /// Compile the audio HAL APEX and client library in a prepared Android workspace.
     AudioBuild {
@@ -332,6 +335,14 @@ fn execute(args: Args) -> Result<()> {
     }
     if matches!(args.command, Some(Action::FrameworkBuild { .. })) {
         let targets: &[&str] = if matches!(
+            args.command,
+            Some(Action::FrameworkBuild {
+                surfaceflinger_only: true,
+                ..
+            })
+        ) {
+            &["surfaceflinger"]
+        } else if matches!(
             args.command,
             Some(Action::FrameworkBuild { tasks: true, .. })
         ) {

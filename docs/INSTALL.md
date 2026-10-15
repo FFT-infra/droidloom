@@ -83,6 +83,12 @@ time queued behind another request, stops waiting after 250 seconds. Service
 startup is a separate step bounded at 160 seconds; authentication prompts wait
 for your response.
 
+Stopping `droidloom.service` stops the lifecycle daemon directly. A pending
+Android readiness wait or framework reply is cancelled before cell teardown,
+so logout does not wait for its 120-second request deadline. Disconnecting a
+control client also cancels those waits; Android itself keeps running unless
+a stop was requested. Graceful cell teardown can still take about ten seconds.
+
 If Android does not become ready, the command exits with `Android looks stuck`,
 the last observed boot stage, and journal commands. A readiness timeout does not
 stop Android. After inspecting the logs you can follow its progress again:
@@ -96,6 +102,23 @@ its success message explicitly says Android readiness has not been checked.
 `--json` keeps a single JSON result on stdout and suppresses progress messages.
 If a request times out while an app operation is in progress, it may still finish
 in the background; check its result before retrying.
+
+To start Android automatically with your graphical session, run:
+
+```console
+systemctl --user enable droidloom.service
+```
+
+While Droidloom is running, an event-driven recovery service watches the Android
+cell owner. If the cell or lifecycle daemon crashes, it starts Android again
+after five seconds; presenter crashes use the main service’s restart policy.
+Five rapid recovery failures within five minutes stop further attempts to avoid
+a crash loop. Inspect `journalctl --user -u droidloom-recovery.service`, then use
+`systemctl --user reset-failed droidloom-recovery.service` and
+`droidloomctl restart` after correcting the cause. An intentional
+`droidloomctl stop` stops recovery too. Recovery restores Android, not unsaved
+application state. This watches process exits; a live but hung Android process
+still needs diagnosis.
 
 ## 4. Try a built-in app
 
@@ -146,17 +169,36 @@ usually means the APK needs an unsupported CPU architecture. A `.apkm`, `.apks`
 or `.xapk` bundle is not a standalone APK: renaming it will not work. Split-package
 and additional game-data installation are not covered by this preview guide.
 
-Android storage is limited by the cell's `data.img`, independently of the free
-space on the Linux host. First-time setup creates a 12 GiB data disk, which can
-be too small for games that download additional assets. If Android reports
-insufficient storage, check `/data` and `/storage/emulated/0` inside the cell.
-To enlarge an existing disk, stop Droidloom, verify its loop devices are detached,
-back up the selected `data_dir` and cell configuration, run an offline writable
-ext4 check, enlarge the image file, and grow its filesystem with `resize2fs`.
-Check the filesystem again before restarting. Growth preserves installed apps
-and accounts; package setup retains existing image sizes. A sparse image still
-needs enough host space for future writes. The development desktop's disk was
-expanded to 64 GiB for NTE's additional assets.
+Android writable storage uses ordinary host directories: `data_dir/data` is
+mounted at `/data`, and `data_dir/metadata` at `/metadata`. App installations,
+accounts, game downloads and emulated storage share the host filesystem's free
+space. There is no writable disk image, fixed capacity or automatic resizing.
+The parent is private to root; Android retains its normal inner ownership and
+permissions. Read-only Android system/APEX artifacts remain image based.
+
+An inherited syscall filter blocks filesystem-wide shutdown, freeze, trim,
+quota changes and superblock remount/reconfiguration before Android starts.
+It applies to Android descendants, including native and compat processes;
+ordinary per-file I/O, FUSE and graphics operations remain available. This is a
+specific shared-filesystem guard, not a claim of a complete container sandbox.
+
+Existing image-backed installations must be migrated explicitly, with Droidloom
+stopped. The runtime refuses legacy images rather than creating empty app data:
+
+```console
+systemctl --user stop droidloom.service
+sudo systemctl stop droidloomd.service
+sudo droidloom-supervisor migrate-storage --source /var/lib/droidloom/users/1000/data --destination /var/lib/droidloom/users/1000/host-storage
+```
+
+Use the actual selected `data_dir` and an unused destination. The migration needs
+`rsync`, `e2fsprogs` and `util-linux`; it refuses attached images, checks them
+read-only, copies through read-only mounts in a private namespace, and verifies
+file checksums, ownership, permissions, hard links and xattrs. It publishes the
+new directory only after verification and retains the source images. Back up
+`/etc/droidloom/cell.json`, change only `data_dir` to the new destination, then
+start `droidloom.service`. Verify apps and accounts before retiring the old
+backup. A rollback needs the previous runtime and configuration together.
 
 ## 6. Launch the installed app
 

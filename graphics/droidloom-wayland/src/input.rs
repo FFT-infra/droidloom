@@ -77,6 +77,54 @@ impl DirectInput {
         if self.socket.is_some() {
             self.enqueue(encode_display_power(power))?;
         }
+        if !power {
+            self.pointers.clear(); // The receiver resets its shared gesture on power-off.
+        }
+        Ok(())
+    }
+
+    pub fn cancel_all(&mut self, timestamp: u64) -> Result<(), String> {
+        while let Some((_, (_, route))) = self.pointers.first_key_value() {
+            let display = route.display;
+            self.cancel_display(display, timestamp)?;
+        }
+        Ok(())
+    }
+
+    pub fn retire_route(&mut self, route: Route, timestamp: u64) -> Result<(), String> {
+        if self.pointers.values().any(|(_, owner)| *owner == route) {
+            self.cancel_display(route.display, timestamp)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_display(&mut self, display: u32, timestamp: u64) -> Result<(), String> {
+        // Android's injected device/verifier stream is shared across task routes.
+        // Cancel each route, including the accepted owner and any ignored
+        // cross-task lifetimes. Mouse-as-touch participates in the same stream.
+        let mut routes = Vec::new();
+        for ((owned_display, _), (id, route)) in &self.pointers {
+            if *owned_display == display && !routes.iter().any(|(_, owner)| owner == route) {
+                routes.push((*id, *route));
+            }
+        }
+        for (id, route) in routes {
+            let record = encode_touch(
+                display,
+                route.task,
+                timestamp,
+                TouchAction::Cancel as u8,
+                id,
+                0,
+                0,
+                0,
+                route.incarnation,
+            )
+            .map_err(|e| e.to_string())?;
+            self.enqueue(record)?;
+        }
+        self.pointers
+            .retain(|(owned_display, _), _| *owned_display != display);
         Ok(())
     }
 
@@ -99,6 +147,18 @@ impl DirectInput {
                 y_fixed,
                 pressure,
             } => {
+                if action == TouchAction::Cancel {
+                    return self.cancel_display(route.display, timestamp);
+                }
+                // Validate before changing ownership; invalid input must not leave
+                // a local pointer that was never delivered to the receiver.
+                let (x, y) = match (
+                    scale_fixed(x_fixed, scale.0, scale.1),
+                    scale_fixed(y_fixed, scale.0, scale.1),
+                ) {
+                    (Ok(x), Ok(y)) => (x, y),
+                    _ => return self.fail("invalid touch scale or coordinates"),
+                };
                 let key = (route.display, pointer_id);
                 let android_id = match action {
                     TouchAction::Down => {
@@ -123,14 +183,9 @@ impl DirectInput {
                         if action == TouchAction::Up {
                             self.pointers.remove(&key);
                         }
-                        if action == TouchAction::Cancel {
-                            self.pointers.retain(|(_, _), (_, owned)| *owned != route);
-                        }
                         id
                     }
                 };
-                let x = scale_fixed(x_fixed, scale.0, scale.1).map_err(|e| e.to_string())?;
-                let y = scale_fixed(y_fixed, scale.0, scale.1).map_err(|e| e.to_string())?;
                 encode_touch(
                     route.display,
                     route.task,
@@ -161,7 +216,7 @@ impl DirectInput {
                 return Err("navigation injection is not implemented".into());
             }
         }
-        .map_err(|e| e.to_string())?;
+        .or_else(|error| self.fail(&format!("invalid native input: {error}")))?;
         self.enqueue(record)
     }
 
@@ -452,5 +507,185 @@ mod tests {
             Record::DisplayPower(false)
         );
         assert_eq!(input.fd().unwrap().1, libc::POLLIN);
+    }
+
+    #[test]
+    fn route_retirement_cancels_shared_display_routes_and_pointer_but_not_other_displays() {
+        let (mut input, receiver) = connected();
+        let other = Route {
+            task: 43,
+            incarnation: 8,
+            ..route()
+        };
+        let separate = Route {
+            display: 1,
+            ..route()
+        };
+        // Owner's ID is deliberately not the first key in the contact map.
+        for (owner, id) in [(route(), 9), (route(), u32::MAX), (other, 1), (separate, 3)] {
+            input
+                .send(owner, (1, 1), 0, 100, touch(id, TouchAction::Down))
+                .unwrap();
+            sample(&receiver);
+        }
+        input.retire_route(other, 101).unwrap();
+        let first = sample(&receiver);
+        let second = sample(&receiver);
+        assert_eq!(
+            (first.action, second.action),
+            (TouchAction::Cancel as u8, TouchAction::Cancel as u8)
+        );
+        assert_eq!((first.task, second.task), (43, 42));
+        assert_eq!((first.incarnation, second.incarnation), (8, 7));
+        assert_eq!(input.pointers.len(), 1);
+        assert!(input.pointers.contains_key(&(1, 3)));
+        for (owner, id) in [(route(), 9), (route(), u32::MAX), (other, 1)] {
+            input
+                .send(owner, (1, 1), 0, 102, touch(id, TouchAction::Up))
+                .unwrap();
+        }
+        input
+            .send(route(), (1, 1), 0, 103, touch(9, TouchAction::Down))
+            .unwrap();
+        let next = sample(&receiver);
+        assert_eq!((next.action, next.code), (TouchAction::Down as u8, 0));
+        input
+            .send(route(), (1, 1), 0, 104, touch(9, TouchAction::Up))
+            .unwrap();
+        assert_eq!(sample(&receiver).action, TouchAction::Up as u8);
+        input.retire_route(other, 105).unwrap(); // Already retired, no duplicate CANCEL.
+        receiver.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(receiver.receive_record(), Err(IpcError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn cancel_after_two_completed_down_records_retires_all_contacts_and_mouse() {
+        let (mut input, receiver) = connected();
+        for id in [0, 1, u32::MAX] {
+            input
+                .send(route(), (1, 1), 0, 100, touch(id, TouchAction::Down))
+                .unwrap();
+            sample(&receiver); // Each event is fully flushed, like down; frame().
+        }
+        input
+            .send(route(), (0, 0), 0, 101, touch(99, TouchAction::Cancel))
+            .unwrap();
+        assert_eq!(sample(&receiver).action, TouchAction::Cancel as u8);
+        assert!(input.pointers.is_empty());
+        input
+            .send(route(), (1, 1), 0, 102, touch(0, TouchAction::Down))
+            .unwrap();
+        assert_eq!(sample(&receiver).code, 0);
+        input
+            .send(route(), (1, 1), 0, 103, touch(0, TouchAction::Up))
+            .unwrap();
+        assert_eq!(sample(&receiver).action, TouchAction::Up as u8);
+    }
+
+    #[test]
+    fn capability_or_seat_retirement_orders_cancel_after_queued_downs() {
+        let (mut input, receiver) = connected();
+        small_send_buffer(&input);
+        for serial in 1..=80 {
+            input.send(route(), (1, 1), serial, serial, key()).unwrap();
+        }
+        for id in [0, 1, u32::MAX] {
+            input
+                .send(route(), (1, 1), 0, 100, touch(id, TouchAction::Down))
+                .unwrap();
+        }
+        input.cancel_all(101).unwrap();
+        assert!(input.pointers.is_empty());
+        input
+            .send(route(), (1, 1), 0, 102, touch(0, TouchAction::Down))
+            .unwrap();
+        for _ in 0..80 {
+            sample(&receiver);
+            input.flush().unwrap();
+        }
+        for code in 0..3 {
+            let down = sample(&receiver);
+            assert_eq!((down.action, down.code), (TouchAction::Down as u8, code));
+            input.flush().unwrap();
+        }
+        assert_eq!(sample(&receiver).action, TouchAction::Cancel as u8);
+        let down = sample(&receiver);
+        assert_eq!((down.action, down.code), (TouchAction::Down as u8, 0));
+    }
+
+    #[test]
+    fn duplicate_and_invalid_downs_disconnect_without_phantom_contacts_then_recover() {
+        for failure in 0..4 {
+            let (mut input, receiver) = connected();
+            input
+                .send(route(), (1, 1), 0, 100, touch(0, TouchAction::Down))
+                .unwrap();
+            sample(&receiver);
+            let (owner, scale, id) = match failure {
+                0 => (route(), (1, 1), 0), // Duplicate identity.
+                1 => (route(), (0, 1), 1),
+                2 => (route(), (u32::MAX, 1), 1),
+                _ => (
+                    Route {
+                        incarnation: 0,
+                        ..route()
+                    },
+                    (1, 1),
+                    1,
+                ),
+            };
+            assert!(
+                input
+                    .send(owner, scale, 0, 101, touch(id, TouchAction::Down))
+                    .is_err()
+            );
+            assert!(input.fd().is_none() && input.pointers.is_empty() && input.queue.is_empty());
+            assert!(receiver.receive_record().is_err()); // EOF retires receiver's stream.
+            let generation = input.next_request().unwrap();
+            let (writer, next_receiver) = SeqPacket::pair().unwrap();
+            input
+                .attach(
+                    generation,
+                    PROTOCOL_MAJOR,
+                    writer.as_fd().try_clone_to_owned().unwrap(),
+                )
+                .unwrap();
+            input
+                .send(route(), (1, 1), 0, 102, touch(0, TouchAction::Down))
+                .unwrap();
+            assert_eq!(sample(&next_receiver).code, 0);
+            input
+                .send(route(), (1, 1), 0, 103, touch(0, TouchAction::Up))
+                .unwrap();
+            assert_eq!(sample(&next_receiver).action, TouchAction::Up as u8);
+        }
+    }
+
+    #[test]
+    fn power_off_retires_contacts_and_pointer_then_accepts_a_fresh_down() {
+        let (mut input, receiver) = connected();
+        for id in [0, u32::MAX] {
+            input
+                .send(route(), (1, 1), 0, 100, touch(id, TouchAction::Down))
+                .unwrap();
+            sample(&receiver);
+        }
+        input.set_power(false).unwrap();
+        assert_eq!(
+            decode(&receiver.receive_record().unwrap().bytes).unwrap(),
+            Record::DisplayPower(false)
+        );
+        assert!(input.pointers.is_empty());
+        input.set_power(true).unwrap();
+        assert_eq!(
+            decode(&receiver.receive_record().unwrap().bytes).unwrap(),
+            Record::DisplayPower(true)
+        );
+        input
+            .send(route(), (1, 1), 0, 102, touch(0, TouchAction::Down))
+            .unwrap();
+        assert_eq!(sample(&receiver).code, 0);
     }
 }

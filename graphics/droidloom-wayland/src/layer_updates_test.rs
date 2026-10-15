@@ -302,3 +302,78 @@ fn unsuccessful_update_does_not_cache_uncommitted_geometry_or_content() {
     wire.update(&mut view, changed, content);
     assert_eq!(count(&wire.requests(), &view.surface, "commit"), 1);
 }
+
+#[test]
+fn replacement_scene_keeps_old_roles_alive_until_synchronized_state_applies() {
+    let mut wire = Wire::new();
+    let mut views = BTreeMap::new();
+    let mut spare = Vec::new();
+    let view = view_for_layer(&mut views, &mut spare, 1, || Ok(wire.view())).unwrap();
+    wire.update(view, geometry(), Content::Buffer { id: 10, ticket: 1 });
+    let surface = view.surface.clone();
+    let role = view.role.clone();
+    wire.root.commit();
+    wire.requests();
+
+    recycle_views(&mut views, &mut spare, &BTreeSet::from([2]));
+    assert_eq!(spare.len(), 1);
+    assert_eq!(spare[0].geometry, None);
+    let view = view_for_layer(&mut views, &mut spare, 2, || {
+        panic!("replacement must reuse the synchronized role")
+    })
+    .unwrap();
+    assert_eq!(view.surface, surface);
+    assert_eq!(view.role, role);
+    wire.update(view, geometry(), Content::Buffer { id: 11, ticket: 2 });
+    wire.root.commit();
+    // The peer sends no events: no replacement frame has completed. A destroy
+    // here would unmap the preceding frame immediately despite its parent's
+    // GPU acquire blocker; attach(NULL) and the new buffer remain synchronized.
+    let requests = wire.requests();
+    assert_eq!(count(&requests, &surface, "destroy"), 0);
+    assert!(!requests.iter().any(|(object, opcode)| {
+        *object == role.id().protocol_id()
+            && wl_subsurface::WlSubsurface::interface().requests[usize::from(*opcode)].name
+                == "destroy"
+    }));
+    assert_eq!(count(&requests, &surface, "attach"), 2);
+    assert_eq!(count(&requests, &surface, "commit"), 2);
+    assert_eq!(count(&requests, &wire.root, "commit"), 1);
+}
+
+#[test]
+fn changing_layer_ids_reuses_a_bounded_pool_and_hidden_views_do_not_resurrect() {
+    let mut wire = Wire::new();
+    let mut views = BTreeMap::new();
+    let mut spare = Vec::new();
+    let mut allocations = 0;
+    for scene in 0..100_u64 {
+        let ids: BTreeSet<_> = (0..1 + scene % 3).map(|id| scene * 3 + id).collect();
+        recycle_views(&mut views, &mut spare, &ids);
+        for id in &ids {
+            let view = view_for_layer(&mut views, &mut spare, *id, || {
+                allocations += 1;
+                Ok(wire.view())
+            })
+            .unwrap();
+            wire.update(view, geometry(), Content::Solid(0xff112233));
+        }
+        wire.root.commit();
+        assert!(views.len() + spare.len() <= 3);
+        assert!(spare.iter().all(|view| view.content.is_none()));
+        let requests = wire.requests();
+        for hidden in &spare {
+            assert_eq!(count(&requests, &hidden.surface, "destroy"), 0);
+            // A role detached in an earlier scene must produce no requests.
+            if count(&requests, &hidden.surface, "attach") == 0 {
+                assert_eq!(count(&requests, &hidden.surface, "commit"), 0);
+            }
+        }
+    }
+    assert_eq!(allocations, 3);
+    recycle_views(&mut views, &mut spare, &BTreeSet::new());
+    wire.root.commit();
+    assert!(views.is_empty());
+    assert_eq!(spare.len(), 3);
+    assert!(spare.iter().all(|view| view.content.is_none()));
+}

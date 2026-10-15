@@ -19,6 +19,17 @@ directly from that slot into FMQ. Capture grants use read-only descriptors.
 The broker registers those same allocations with PipeWire's application-buffer
 API and performs no PCM copy. Mute and master volume affect only Droidloom PCM.
 
+Playback remains clocked when no host sink exists: PipeWire's dummy driver
+paces the stream, while WirePlumber's `node.linger` policy waits for an output
+without sending a fatal no-target error. This does not retain the node after
+client close. When output routing recreates PipeWire's buffer wrappers, the
+same sealed sample allocations remain live. An Android write that was already
+borrowed can finish; its invalidated credit is discarded and counted as a
+discontinuity instead of queuing stale samples. Capture still fails closed on
+renegotiation, since its producer could otherwise overwrite a live reader.
+The isolated integration test covers no sink, sink arrival/removal, a borrowed
+credit during port reconfiguration, monotonic progress and node cleanup.
+
 The separate `droidloom-audio.socket` user unit owns
 `%t/droidloom/audio.sock`; the supervisor projects its inode at
 `/dev/socket/droidloom/audio`. Socket activation preserves this inode across
@@ -50,6 +61,15 @@ larger than an Android burst is filled through successive credits at increasing
 offsets in the same memfd, without copying PCM. Drain queues a partial final
 block; flush and standby discard it. All four immutable allocations remain
 available; device delay does not consume credits.
+
+The optional `BURST_POSITION` feature carries a coherent host position snapshot
+in each acquire/submit reply. The HAL's existing position queries reuse that
+snapshot for at most one 256-frame quantum, preserving its original monotonic
+timestamp. Standalone queries after expiry still contact the host, and every
+stream control invalidates cached timing. A normal burst therefore needs two
+control exchanges without increasing buffer size or changing release ownership.
+Legacy brokers remain supported through a fresh legacy OPEN after feature
+rejection; legacy clients retain their original replies on a new broker.
 
 Playback uses a 256-frame HAL minimum and bursts at 48 kHz (approximately
 5.3 ms), with a 5 ms nominal buffer hint. The explicit frame minimum avoids

@@ -68,6 +68,32 @@ The host presenter still allocates final Wayland targets. Linear images add no
 required CPU copy, but their bandwidth cost needs workload-specific measurement.
 Passing host feedback/syncobj checks alone does not establish guest GPU support.
 
+## Input ownership and recovery
+
+Android verifies injected touchscreen state per display/device, not per task.
+The native policy therefore permits one active task gesture on each display;
+other tasks' contacts on that display stay suppressed until their physical
+UP or CANCEL, even if the owner releases first. Separate displays retain
+independent gestures. Pointer IDs and actions are validated before mutation.
+
+Motion state advances only after InputDispatcher accepts the injected event.
+CANCEL carries Android's `FLAG_CANCELED` and the exact held pointer set; the
+native adapter preserves these flags. Injection uses asynchronous dispatch
+(`NONE`), whose return still includes synchronous input-verifier acceptance,
+not eventual delivery to an application. A rejected cancellation retains its
+route token and contacts for retry, blocks fresh input until recovery succeeds,
+and defers route retirement. This applies to reconnect, task replacement and
+display-off recovery, rather than assuming an empty local map resets Android.
+
+The presenter retires shared-display contacts, mouse-as-touch ownership and
+deferred clipboard touches on task unmap/removal, route replacement, seat or
+touch-capability removal and disconnect. Display-off and invalid input also
+clear contact bookkeeping. Compositor cancellation must reach the client even
+after its last touch frame was delivered; Denial retains the client grab for
+that retirement. Completed-frame, cross-task and rejected-cancellation paths
+have executable regressions. These contracts do not establish physical device
+or application-level delivery qualification.
+
 ## Wayland and Denial
 
 The presenter requires `xdg-shell`, `linux-dmabuf` v4 feedback and
@@ -176,6 +202,17 @@ holds a reusable target. At most 64 outstanding feedback requests per task
 retain frame identities and timing metadata, without retaining buffers or
 fences. When full, new frames omit the optional timing request until capacity
 returns. Late `Presented` events remain valid after `BufferReleased`.
+
+Negotiated protocol 1.8 `SCENE_PRESENTATION` extends timing feedback to direct
+layer scenes. The presenter requests feedback on one changed, nontransparent
+child before its synchronized commit; an occluded carrier root is not used as
+the timing source. Up to eight callbacks per task retain only scene/configure
+identities and feedback proxies. Full queues omit optional observations, and
+unchanged layers acquire no extra commits. Discarded, unmapped, stale-configure
+and departed-output observations are dropped. `ScenePresented` feeds Composer's
+host timing observer using the real monotonic display timestamp; it neither
+creates a composed frame nor releases a buffer. The existing unreliable-present-
+fence declaration remains necessary because GPU completion is not display time.
 
 With negotiated protocol 1.7 demand allocation, geometry changes publish a new
 configure without allocating a composition pool. SurfaceFlinger prepares output
@@ -349,6 +386,20 @@ fallback. Layer staging retains its allocation across commits. Idle cached
 source imports no longer incur an eventfd read on every presenter wakeup.
 Acquire/release dependencies and per-buffer attachment rules remain unchanged.
 
+SurfaceFlinger retires imports from removed layers or obsolete allocation sizes
+on the next scene, instead of keeping every resize allocation until the 128-entry
+protocol cap. Compatible producer pools retain up to three recent spare imports
+per layer, with a task-wide spare budget of 12 imports and 96 MiB of mapper-reported
+allocation storage. Current and host-busy allocations are exempt from eviction;
+only a successful host unregister permits dropping the owning GraphicBuffer.
+Busy or pending imports retry after completion, including when the visible scene
+is otherwise unchanged. The existing protocol cap still bounds total admission.
+These limits bound spare retention per task, not all GPU memory or all clients'
+descriptor usage. Focused regressions cover repeated resizing, delayed releases,
+removed layers, count/byte pressure, actual descriptor closure and stable rotating
+producer pools; they do not substitute for device resize validation.
+
+
 The timeline bridge now retains one private binary transfer syncobj per timeline,
 created lazily and reused under exclusive mutable access. After the first use,
 each fence import/export avoids a syncobj create/destroy pair (four fewer DRM
@@ -418,6 +469,31 @@ geometry or color, and switching between buffered and solid content still
 commit. Detach clears the content identity so returning from composed fallback
 reattaches unchanged solids as well as buffered layers. GPU reads and releases
 remain independently tracked; skipping a child commit never releases a read.
+
+When Android removes a layer, the presenter detaches its buffer through the
+synchronized child state and retains the subsurface for reuse. Destroying a
+subsurface unmaps it immediately, so destruction after queuing a parent commit
+could expose the black backing while replacement buffers wait on GPU fences.
+Reassigned views refresh geometry and stacking. The retained pool is bounded
+by the largest accepted scene (at most 64 layers) and is destroyed when the
+task retires.
+
+When a direct scene contains a fully opaque layer covering the entire task,
+the root retains its last composed image beneath the synchronized children.
+This avoids exposing a blank root while the compositor switches textures and
+child layouts, and avoids the SHM attachment and upload on that transition.
+Partial or transparent scenes still attach the constant black backing, as do
+initial direct scenes without a preceding composed image. The retained root
+uses the existing render target and normal release fences; no copy, additional
+target or early release is introduced.
+
+An asynchronous scene that needs an allocation whose previous GPU read is
+still pending waits in the task's existing bounded staging area. The presenter
+keeps the preceding scene visible and retries on real release events; it sends
+the commit result only after attachment or explicit rejection. Configuration,
+cancellation and disconnect handling remain active while it waits. Resize and
+close revalidate the pending scene. Unsupported content and legacy synchronous
+peers retain composed fallback. No additional render targets or timer are used.
 
 SurfaceFlinger also gates each task before copying its layer snapshots or
 preparing its output. Retained ordered layer/buffer/frame identities and Android

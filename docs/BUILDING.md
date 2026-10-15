@@ -74,6 +74,13 @@ the previous database remains live until deployment succeeds.
 and package checks; it must be an absolute path. The Rust runner tool sets it to the persistent
 cache above, outside checkout cleanup; machine paths stay out of the workflow. Do not use `--clean` for normal releases.
 The first build needs the full download/compile; later builds reuse the cache.
+For a SurfaceFlinger-only change, reuse a prepared ARM64 workspace with
+`cargo run --locked -j 2 -p droidloom-update -- --jobs 4 framework-build --work .work/arch/build --product droidloom_arm64 --surfaceflinger-only`.
+This selects the native SurfaceFlinger target and its dependencies, without
+building system_server, Android images or the complete runtime bundle. It does
+not install or activate the output; verify compatibility and package the changed
+component through the device's normal override/update path before validation.
+
 The builder leaves two logical CPUs free and the host Cargo build uses one job.
 
 To prepare the Pages tree locally after building, without publishing:
@@ -508,7 +515,7 @@ selecting that mode does not prove every instruction used the heavy optimizer.
 ## Focused audio checks
 
 Host audio builds need the `libpipewire-0.3` development headers (`libpipewire`
-on Arch). Integration tests also need `pipewire`, `pw-link`, `pw-dump` and
+on Arch). Integration tests also need `pipewire`, `wireplumber`, `pw-cli`, `pw-link`, `pw-dump` and
 `systemd-socket-activate`. They create a private server and null-sink graph in
 temporary storage; they do not change the user's audio session or record a mic.
 
@@ -594,6 +601,35 @@ ownership and security xattrs. Before staging, it re-extracts the rebuilt image
 and compares every retained file’s contents, permissions, ownership, timestamps,
 symlink target and extended attributes. Missing expected VNDK files or any other
 content/metadata change fails the build. A full package build is required.
+
+## Automatic app compilation
+
+Droidloom requests ART's `speed` compiler filter for normal installs, updates,
+fast installs and bulk restores. This policy lives in
+`android/framework/droidloom-window-policy/droidloom-framework.rc` and uses
+PackageManager's shared installation path, covering app stores, APK sideloads
+and ADB installs. It compiles eligible Java/Kotlin app code for the guest ABI
+without waiting for a usage profile. Existing native libraries are unchanged.
+
+After each Android cell boot, `droidloom-app-optimize` runs a background-priority
+catch-up pass over installed apps, including preloaded apps. It does not depend
+on Android's phone-style screen-idle job, which a host-managed desktop may never
+satisfy. Valid compiled artifacts are reused: the command uses neither `-f` nor
+`--reset`. Scheduled background dexopt also uses `speed`; ART's inactive-app
+storage reclamation and installation exceptions remain in place.
+
+Compilation adds install time and code-cache storage; the initial catch-up pass
+also consumes CPU. Apps can remain open and use the new artifacts on their next
+launch. Android still controls exclusions such as debuggable, incremental and
+embedded-DEX installs, explicit installer compiler overrides and missing class
+loader contexts. The catch-up pass covers APK DEX code, including code-bearing
+splits; it does not force compilation of dynamically downloaded secondary DEX.
+
+Inside Android, inspect `getprop pm.dexopt.install` and
+`cmd package art dump PACKAGE`. After the next cell start,
+`getprop init.svc.droidloom-app-optimize` reports `running` during catch-up and
+`stopped` once the one-shot service exits; its exit status is recorded by init.
+A stopped service alone does not prove every package compiled successfully.
 
 ## Optional Google apps
 
@@ -706,9 +742,9 @@ The supervisor verifies root ownership and every base/output hash before boot.
 An incompatible or missing selected add-on fails startup without falling back.
 
 **First activation requires fresh Android data.** Configure a separately
-provisioned fresh `data_dir` (with its `data.img` and `metadata.img`), or enable
+provisioned fresh `data_dir` (with its `data` and `metadata` directories), or enable
 GApps before the installation's first Android boot. Existing data is never wiped.
-The runtime records Google-app selection and signers in the cell's data image;
+The runtime records Google-app selection and signers in the cell's data directory;
 updates with the same selection/signers refresh only Google parser caches.
 Changing selection or signers requires fresh data or a separately validated
 migration. To disable GApps, stop Droidloom, remove `gapps_dir` and select fresh
@@ -741,6 +777,19 @@ verified Moto and x86_64 AMD rendering paths. Both window orientations are
 declared for freeform Android tasks. When validating another graphics backend, compare
 the advertised version with SurfaceFlinger's actual GLES implementation.
 
+Vulkan features are detected at each `system_server` start through Android's
+Vulkan loader, before PackageManager publishes its feature list. Hardware GPUs
+with a graphics queue and ETC2 support provide `android.hardware.vulkan.version`
+and `android.hardware.vulkan.level`; CPU renderers are excluded. The version is
+bounded by both the loader and the GPU at the reported hardware level. Reporting
+1.1 or newer also requires Android hardware-buffer, YCbCr and SYNC_FD interop;
+otherwise the version is capped at 1.0.3. A failed probe leaves these features
+absent. This detection does not declare Vulkan dEQP certification, compute levels
+or Android Vulkan profile conformance. Compare `cmd package list features` with
+`cmd gpu vkjson`; the latter can expose a higher native API version when Android
+interop requirements limit the package feature. Rebuild and ship `services.jar`
+and `libinputflinger.so` together.
+
 From inside the Android cell, `cmd package list features` should include the
 touch features and a nonzero `reqGlEsVersion`; `cmd activity get-config` should
 report `finger` for a touch-enabled Droidloom product. A feature XML alone does
@@ -750,3 +799,119 @@ sign-in does not guarantee that Google has refreshed its device profile or that
 every app is compatible. Only declare capabilities the runtime implements;
 Google certification and missing camera, microphone or sensor integration are
 not repaired by adding feature names.
+
+### Play Store catalog refresh
+
+After changing Android capabilities, restarting the cell activates the new
+feature report but can leave Play Store's cached compatibility result unchanged.
+Use this sequence:
+
+1. Restart the cell after deploying the matching framework artifacts, then
+   verify the new features with `/system/bin/cmd package list features`.
+2. In Android Settings, open **Apps → Google Play Store → Storage & cache** and
+   select **Clear cache**. Verify that **Cache** reaches **0 bytes**. Preserve
+   **User data**; **Clear storage** is a different operation and is not needed.
+3. Force-stop the Store with
+   `/system/bin/cmd activity force-stop com.android.vending`.
+4. Reopen the affected app's Play Store listing. For Endfield:
+
+   ```console
+   /system/bin/cmd activity start --user 0 -a android.intent.action.VIEW -d 'market://details?id=com.gryphline.endfield.gp' -p com.android.vending
+   ```
+
+From an Android root/system context, step 2 can instead use
+`/system/bin/cmd package clear --user 0 --cache-only com.android.vending`.
+Plain ADB shell (UID 2000) lacks `android.permission.INTERNAL_DELETE_CACHE_FILES`
+on the pinned Android 17 build. PackageManager logs that it is silently ignoring
+the request, and the shell command waits indefinitely for a callback. Use the
+Settings button in that case; Settings has the required permission. A hung
+shell command does not establish that the cache was cleared.
+
+On the OnePlus Pad 4, Endfield 1.5.3 required
+`android.hardware.vulkan.version`, which Droidloom originally omitted. After
+deploying the detected Vulkan capabilities, Android reported version `4210688`
+(Vulkan 1.4) and hardware level `1`, but Play still reported incompatibility.
+Clearing the Store cache from 12.05 MB to zero through Settings, force-stopping
+the Store and reopening Endfield's listing changed it to **Install**; the user
+confirmed the fix. Google sign-in and Store user data were retained. This
+verifies catalog availability, not installation or gameplay.
+
+### Endfield startup workaround
+
+After the CPU-discovery fix described below, the user relaunched Endfield from
+its normal launcher without `-force-gfx-direct` and confirmed it started.
+Inspection found a fresh process, a standard launcher intent without extras,
+three job workers and an active `UnityGfxDeviceW` thread. The historical flag
+below is therefore no longer required for the tested startup/introduction path;
+longer gameplay remains under validation.
+
+On the OnePlus Pad 4, the Play-installed Endfield 1.5.3 (version code 50,
+ARM64, Unity 2021.3.34f5) repeatedly crashed about three seconds after launch.
+Its native traces showed a null-pointer access at `libunity.so+0xe5146c`
+on `Job.Worker 0`, followed by another at `+0xa4eed8` on `UnityMain`.
+An Endfield-only Vulkan trace and Khronos validation reproduced those failures
+after successful instance/device creation, swapchain creation and all traced
+resource/memory allocations, without a recorded validation error.
+
+Passing Unity's `-force-gfx-direct` argument selects single-threaded rendering.
+This passed startup with diagnostic layers disabled, and the user confirmed the
+game started. To apply it from an Android shell, restart only the game:
+
+```console
+/system/bin/cmd activity force-stop com.gryphline.endfield.gp
+/system/bin/cmd activity start --user 0 -n com.gryphline.endfield.gp/com.u8.sdk.U8UnityContext --es unity -force-gfx-direct
+```
+
+The extra is a per-launch argument and is not persisted by Droidloom's normal
+launcher. No game data reset, APK patch or cell restart was needed for that
+workaround. Single-threaded rendering may affect performance. Initially it
+passed startup but did not fix gameplay loading: loading the saved server's
+game state reproduced a separate allocation failure on 2026-10-14. A PID-filtered kernel
+syscall trace captured `UnityMain` growing allocations through roughly 16, 32,
+64, 128, 256, 512 and 1024 MiB, then passing length `0xffffffff80001000` to
+`madvise` (returns `EINVAL`) and `mprotect` (returns `ENOMEM`). This is a malformed
+unsigned length with a 32-bit sign-extension pattern, not evidence that the
+host exhausted its RAM. The failure snapshot still had approximately 4.1 GiB
+available, and the trace reported no dropped events or overruns.
+
+The original game tombstone places the failure in
+`UnsafeList<EntityQueryV2.BlockRange>.Realloc`, called by `GetBlockRanges` and
+`RemoteFactoryGameWorldControllerV2.LateUpdateGameWorld`. Unity logs
+“Commit memory failed” and raises `SIGTRAP`; CrashSight subsequently crashes
+while building its report, producing a secondary `SIGSEGV`.
+
+Function-entry probes subsequently measured `worker_count=0` in
+`QueryResultWrapper.Wrapper`, followed by repeated empty-list growth. Droidloom's
+synthetic `/sys` omitted `/sys/devices/system/cpu/{possible,present,online}`.
+Bionic's `get_nprocs`/`get_nprocs_conf` therefore returned their fallback of one
+CPU despite an eight-core affinity mask. Unity also reads per-CPU capacity and
+maximum-frequency attributes when classifying workers.
+
+The supervisor now projects those discovery masks, `cpuN/cpu_capacity`, and
+`cpuN/cpufreq/cpuinfo_max_freq` as individual read-only binds. It exposes no CPU
+hotplug, frequency-control or uevent files. Activate the matched supervisor tools
+with a Droidloom-only restart. Verify `getconf _NPROCESSORS_ONLN` and
+`getconf _NPROCESSORS_CONF` inside Android against the host CPU masks.
+On the Pad 4 both now return 8. With the existing rendering argument retained,
+Endfield created three job workers; all 198 gameplay queries in the bounded
+probe sample received `worker_count=3` without the runaway reallocation. The user
+confirmed the game loaded and continued its new-account introduction. This
+validated the loading fix; a subsequent user-initiated normal launch also
+passed startup without the rendering flag, as described above. Sustained
+gameplay remains to be established. No game binaries, data, memory limits or
+kernel settings were changed.
+
+An earlier reproduction also exposed a separate whole-desktop GPU stall after
+the game crashed. Logs recorded a GMU timeout and GPU translation fault;
+Denial and SurfaceFlinger then waited indefinitely on GPU fences. The GPU
+recovery worker and fault-capture IRQ stacks suggest a recovery lock cycle.
+That freeze preceded the four-worker override test and temporary CPU projection,
+so those attempts were not valid behavioral tests. Logs were saved, the user
+restarted the tablet, and the successful CPU fix validation used the healthy
+new boot. No GPU recovery fix has been applied in this change.
+Evidence is in the Pad 4 workspace under
+`out/droidloom-optimization-20261014/allocation-trace.jsonl`,
+`allocation-failure-excerpt.log`, and `tomb_1792000119393.txt`.
+
+A temporary `-force-gles30` launch instead showed
+“Unable to initialize the Unity Engine Gfx API,” so it was not a working fallback.

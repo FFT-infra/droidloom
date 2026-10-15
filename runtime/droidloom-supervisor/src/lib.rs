@@ -11,9 +11,13 @@ pub mod control;
 mod cpu_placement;
 pub mod development;
 mod development_network;
+mod filesystem_guard;
 pub mod gapps;
+pub mod host_storage;
 pub mod linux_plan;
 mod package_cache;
+pub mod storage_migration;
+mod tracing;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
@@ -168,8 +172,8 @@ pub struct CellSpec {
     /// storage. Omission keeps every host directory private.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_storage_directories: Vec<SharedStorageDirectory>,
-    /// Host-owned directory containing the per-user `data.img` and
-    /// `metadata.img` filesystems; the directory itself is never exposed.
+    /// Private host parent containing direct `data` and `metadata` directories.
+    /// Android shares their host filesystem capacity; no writable disk images.
     pub data_dir: PathBuf,
     /// Ephemeral cell directory below `/run/droidloom/cells`.
     pub runtime_dir: PathBuf,

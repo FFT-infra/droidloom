@@ -6,6 +6,18 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 
 ## Application compatibility
 
+- **Monitor removal restarted Android on the OnePlus Pad 4.** Disconnecting
+  DisplayPort made the compositor send `zwlr_output_power_v1.failed` for the
+  removed output. The presenter incorrectly treated that per-output notification
+  as a fatal transport failure, so service recovery restarted the whole Android
+  cell and closed its apps. The presenter now destroys only the failed control,
+  tolerates either ordering of failure/global removal, and keeps unknown power
+  state separate from screen-off. Any known powered output keeps Android awake;
+  only all-known-off outputs request sleep. The 78 presenter tests pass, including
+  protocol-object retirement, late notifications and remaining-panel DPMS.
+  The cached ARM64 presenter is installed and running on the tablet without a
+  host reboot or Denial restart; physical unplug/reconnect validation is pending. This does not claim that every Android app handles the
+  resulting window resize correctly.
 - **Clash of Clans on the x86_64 desktop.** Version 18.600.5 rejected inherited
   Cuttlefish product identities (`02`), then rejected the ARM64 phone-specific
   `readlink` wrapper exported by Droidloom's compatibility library (`16`).
@@ -159,6 +171,49 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
   incompatible in Play Store. After clearing only Play Store's cache, stopping
   the Store process and reopening the listing, the user confirmed compatibility
   was resolved. This does not establish gameplay or integrity-check support.
+  On the OnePlus Pad 4, Endfield 1.5.3's manifest required
+  `android.hardware.vulkan.version`. Droidloom's runtime probe now reports
+  Vulkan 1.4 and hardware level 1 on that device. The cell restart alone left
+  Play's incompatibility result cached. Clearing only Play Store's cache through
+  Android Settings, force-stopping it and reopening Endfield's listing exposed
+  **Install**, which the user confirmed. Store user data and sign-in were kept.
+  Plain ADB shell's cache-only clear hangs on the pinned Android 17 build because
+  it lacks `INTERNAL_DELETE_CACHE_FILES`; use Settings or an Android root/system
+  context. See the [catalog refresh sequence](BUILDING.md#play-store-catalog-refresh).
+  Endfield 1.5.3 then repeatedly crashed during startup in Unity 2021.3.34f5:
+  `Job.Worker 0` dereferenced a null pointer at `libunity.so+0xe5146c`
+  (`0x1a0`), and `UnityMain` also failed at `+0xa4eed8` (`0xb8`). An
+  Endfield-only Vulkan trace and Khronos validation reproduced the crash while
+  device creation, swapchain creation and the traced memory/resource allocations
+  succeeded, with no validation error recorded. Launching with Unity's
+  `-force-gfx-direct` argument enabled single-threaded rendering and passed
+  startup; the user confirmed the game started. This isolates a workaround in
+  Unity's threaded graphics path but does not establish the underlying driver
+  or engine defect, sustained gameplay or performance. OpenGL ES forcing instead
+  produced “Unable to initialize the Unity Engine Gfx API.” See the
+  [startup command](BUILDING.md#endfield-startup-workaround); the argument is
+  supplied per launch and is not yet persisted by Droidloom's normal launcher.
+  Gameplay loading has since reproduced a separate failure with that flag:
+  `EntityQueryV2.GetBlockRanges` repeatedly grows an unsafe list, then Unity
+  passes length `0xffffffff80001000` to `madvise`/`mprotect`; the kernel rejects
+  those calls with `EINVAL`/`ENOMEM`. Approximately 4.1 GiB of host memory was
+  still available. The original tombstone shows `UnsafeList.Realloc` and a
+  deliberate Unity `SIGTRAP`; the later CrashSight `SIGSEGV` is secondary.
+  Function probes traced the growth to a zero worker count. Droidloom omitted
+  CPU discovery masks from its synthetic sysfs, causing Bionic to report one
+  CPU despite eight usable cores. The supervisor now exposes only the CPU masks,
+  capacities and maximum-frequency metadata through read-only binds. With the
+  fixed supervisor and rendering argument, Android reports eight CPUs, Endfield
+  creates three workers, and 198 captured gameplay queries used three workers
+  without runaway allocation. The user confirmed successful game loading, then
+  accidentally closed and reopened the game normally without the flag; startup
+  succeeded. Inspection confirmed a fresh process, a standard launcher intent
+  without extras, three job workers and `UnityGfxDeviceW`. The flag is no longer
+  required for the tested startup/introduction path; sustained gameplay remains
+  unverified. An earlier crash reproduction also triggered a separate kernel GPU
+  recovery stall that froze the desktop; its logs and blocked stacks are saved,
+  but this supervisor change does not fix GPU recovery. The building guide
+  records both failures and the CPU-discovery validation.
   On the Moto cell, Play reports an uncertified device. TikTok 46.8.3 became
   available after a device-local test added generic location and Bluetooth
   declarations to the corrected touch/GLES profile. Play completed the base

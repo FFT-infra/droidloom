@@ -168,6 +168,16 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
     }
     let policy_abi = b"DROIDLOOM_WINDOW_POLICY_ABI=1;";
     let policy_native = fs::read(runtime.join("lib64/libinputflinger.so"))?;
+    let vulkan_abi = b"DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;";
+    if !services.windows(vulkan_abi.len()).any(|w| w == vulkan_abi)
+        || !policy_native
+            .windows(vulkan_abi.len())
+            .any(|w| w == vulkan_abi)
+    {
+        return fail(
+            "services.jar and libinputflinger.so lack paired Vulkan capability probe ABI 1",
+        );
+    }
     let framework_abi = b"DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;";
     for (name, data) in [
         ("services.jar", services.clone()),
@@ -405,7 +415,7 @@ mod artifact_tests {
         elf.extend(format!("DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_INPUT_ABI={composer};DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_DIRECT_INPUT_ABI=1;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_HOST_CHANNELS_ABI=1;").bytes());
         write(&root.join("usr/bin/droidloom-wayland"), &elf).unwrap();
         write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"), &elf).unwrap();
-        elf.extend(format!("DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_INPUT_ABI={java};").bytes());
+        elf.extend(format!("DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_INPUT_ABI={java};").bytes());
         write(
             &root.join("usr/lib/droidloom/runtime/lib64/libinputflinger.so"),
             elf,
@@ -420,7 +430,7 @@ mod artifact_tests {
         }
         let d = tempfile::tempdir().unwrap();
         let payload = format!(
-            "DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_HOST_CHANNELS_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;Lcom/android/server/wm/DroidloomApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks"
+            "DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_HOST_CHANNELS_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;Lcom/android/server/wm/DroidloomApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks"
         );
         write(
             &d.path().join("classes.dex"),
@@ -510,6 +520,14 @@ mod artifact_tests {
     #[test]
     fn direct_channels_and_owned_input_require_every_matching_peer() {
         for (relative, marker) in [
+            (
+                "framework/services.jar",
+                b"DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;".as_slice(),
+            ),
+            (
+                "lib64/libinputflinger.so",
+                b"DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;".as_slice(),
+            ),
             (
                 "framework/services.jar",
                 b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),

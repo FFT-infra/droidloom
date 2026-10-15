@@ -44,6 +44,10 @@ const ALIASES: &[(&str, &str)] = &[
         "usr/lib/systemd/user/droidloom-applications.service",
     ),
     (
+        "/usr/lib/systemd/user/droidloom-recovery.service",
+        "usr/lib/systemd/user/droidloom-recovery.service",
+    ),
+    (
         "/usr/lib/environment.d/60-droidloom.conf",
         "usr/lib/environment.d/60-droidloom.conf",
     ),
@@ -269,21 +273,7 @@ pub fn apply(payload: &Path, uid: u32, start_runtime: bool) -> Result<()> {
     }
     fs::create_dir_all(&data)?;
     mode(&data, 0o700)?;
-    for (name, size) in [
-        ("data.img", 12_u64 * 1024 * 1024 * 1024),
-        ("metadata.img", 128_u64 * 1024 * 1024),
-    ] {
-        let destination = data.join(name);
-        if !destination.exists() {
-            let scratch = tempfile::NamedTempFile::new_in(&data)?;
-            scratch.as_file().set_len(size)?;
-            run(Command::new("mkfs.ext4")
-                .args(["-F", "-q"])
-                .arg(scratch.path()))?;
-            scratch.as_file().sync_all()?;
-            scratch.persist(destination)?;
-        }
-    }
+    droidloom_supervisor::host_storage::prepare(&data)?;
     let active = Command::new("systemctl")
         .args(["is-active", "--quiet", "droidloomd.service"])
         .status()?

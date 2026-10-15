@@ -18,6 +18,8 @@ struct dl_pw {
     uint32_t capture_offset, capture_left;
     struct pw_buffer *playback_buffer;
     uint32_t playback_filled, playback_target;
+    bool playback_borrowed, playback_invalidated, renegotiating;
+    uint32_t playback_slot;
     void *samples[POOL];
     int fds[POOL];
     uint32_t bytes, channels, rate, direction;
@@ -33,11 +35,14 @@ struct dl_position { uint64_t frames, monotonic_ns, latency_ns, discontinuities;
 
 static void state_changed(void *opaque, enum pw_stream_state old,
         enum pw_stream_state state, const char *error) {
-    (void)old; (void)error;
+    (void)old;
     struct dl_pw *p = opaque;
     p->state = state;
-    if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED)
+    if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) {
+        if (state == PW_STREAM_STATE_ERROR)
+            pw_log_warn("Droidloom stream failed: %s", error ? error : "unknown error");
         p->error = EPIPE;
+    }
     pw_thread_loop_signal(p->loop, false);
 }
 
@@ -83,6 +88,9 @@ static void add_buffer(void *opaque, struct pw_buffer *buffer) {
     d->data = p->samples[slot];
     p->buffers[slot] = buffer;
     buffer->user_data = (void *)(uintptr_t)(slot + 1);
+    bool complete = true;
+    for (unsigned i = 0; i < POOL; i++) complete &= p->buffers[i] != NULL;
+    if (complete) p->renegotiating = false;
     pw_thread_loop_signal(p->loop, false);
 }
 
@@ -90,8 +98,27 @@ static void remove_buffer(void *opaque, struct pw_buffer *buffer) {
     struct dl_pw *p = opaque;
     unsigned slot = (uintptr_t)buffer->user_data - 1;
     if (slot < POOL && p->buffers[slot] == buffer) p->buffers[slot] = NULL;
-    // A registered pool is immutable for one connection. Renegotiation closes it.
-    p->error = EPIPE;
+    pw_log_debug("Droidloom shared pool slot %u removed in state %s", slot, pw_stream_state_as_string(p->state));
+    if (p->direction == 1) {
+        // PipeWire recreates wrapper buffers when session policy changes ports.
+        // The exported memfds stay immutable and alive. Playback buffers cannot
+        // be consumed until we queue them, so an outstanding Android write may
+        // finish safely; its invalidated credit is discarded on submit.
+        if (!p->renegotiating) {
+            p->renegotiating = true;
+            p->dropped = p->submitted - p->presented;
+            p->discontinuities++;
+        }
+        if (p->playback_buffer == buffer) {
+            p->playback_buffer = NULL;
+            p->playback_filled = p->playback_target = 0;
+            p->playback_invalidated = p->playback_borrowed;
+        }
+    } else {
+        // A capture producer could overwrite a region Android is still reading.
+        // End that generation instead of silently reusing its live mappings.
+        p->error = EPIPE;
+    }
     pw_thread_loop_signal(p->loop, false);
 }
 static void process(void *opaque) {
@@ -137,6 +164,17 @@ int dl_pw_open(uint32_t direction, uint32_t rate, uint32_t channels, uint32_t by
         PW_KEY_NODE_DESCRIPTION, "Droidloom Android audio",
         "adapter.auto-port-config", "{ mode = dsp }",
         PW_KEY_NODE_LATENCY, "256/48000", PW_KEY_NODE_PAUSE_ON_IDLE, "true", NULL);
+    // Playback must keep its clock when the host has no output device. Let
+    // PipeWire schedule it on the dummy driver until a real sink is linked.
+    // Capture remains linked-device driven and does not synthesize microphone data.
+    if (direction == 1) {
+        pw_properties_set(props, PW_KEY_NODE_ALWAYS_PROCESS, "true");
+        pw_properties_set(props, PW_KEY_NODE_WANT_DRIVER, "true");
+        // WirePlumber must wait for a sink instead of sending a fatal no-target
+        // error. This is policy node.linger, not PipeWire object.linger: the
+        // stream still disappears when its client closes.
+        pw_properties_set(props, "node.linger", "true");
+    }
     if (target && *target) pw_properties_set(props, PW_KEY_TARGET_OBJECT, target);
     if (remote && *remote) pw_properties_set(props, PW_KEY_REMOTE_NAME, remote);
     if (capture_sink && direction == 2) pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
@@ -239,7 +277,14 @@ int dl_pw_acquire(struct dl_pw *p, uint32_t requested, struct dl_region *region)
             if (count > requested) count = requested;
             if (offset % stride || offset > p->bytes || count > (p->bytes - offset) / stride || !count)
                 result = EPROTO;
-            else if (!result) *region = (struct dl_region){slot, count, offset};
+            else if (!result) {
+                *region = (struct dl_region){slot, count, offset};
+                if (p->direction == 1) {
+                    p->playback_borrowed = true;
+                    p->playback_invalidated = false;
+                    p->playback_slot = slot;
+                }
+            }
         }
         if (result) {
             pw_stream_return_buffer(p->stream, b);
@@ -279,8 +324,19 @@ int dl_pw_submit(struct dl_pw *p, uint32_t slot, uint32_t frames) {
     if (slot >= POOL || frames > p->bytes / (p->channels * 2)) return -EINVAL;
     pw_thread_loop_lock(p->loop);
     int result = p->error ? -p->error : 0;
+    if (!result && p->direction == 1) {
+        if (!p->playback_borrowed || slot != p->playback_slot) result = -EPROTO;
+        else if (p->playback_invalidated) {
+            p->submitted += frames;
+            p->dropped += frames;
+            p->playback_borrowed = p->playback_invalidated = false;
+            pw_thread_loop_unlock(p->loop);
+            return 0;
+        }
+        p->playback_borrowed = false;
+    }
     struct pw_buffer *b = p->buffers[slot];
-    if (!b) result = -EPIPE;
+    if (!b && !result) result = -EPIPE;
     if (!result) {
         if (p->direction == 1) {
             if (b != p->playback_buffer || frames > p->playback_target - p->playback_filled)

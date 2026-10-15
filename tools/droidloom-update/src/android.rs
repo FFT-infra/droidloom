@@ -210,6 +210,10 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "frameworks/native",
+        "android/surfaceflinger/0018-droidloom-import-retention.patch",
+    ),
+    (
+        "frameworks/native",
         "android/inputflinger/0001-application-token-targeted-injection.patch",
     ),
     (
@@ -223,6 +227,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/native",
         "android/inputflinger/0004-droidloom-native-input.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/inputflinger/0005-droidloom-vulkan-probe.patch",
     ),
     (
         "",
@@ -259,6 +267,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/base",
         "android/framework/0006-droidloom-direct-host-channels.patch",
+    ),
+    (
+        "frameworks/base",
+        "android/framework/0007-droidloom-detected-vulkan-capabilities.patch",
     ),
 ];
 #[derive(Serialize, Deserialize)]
@@ -622,8 +634,9 @@ pub fn build_targets(
     droidloom_source::verify_materialized(&lock, &source_lock, source)?;
     // Focused audio/framework builds neither rebuild nor record a translator
     // artifact. Keep existing translator development provenance intact.
-    let framework_only =
-        targets == ["services", "libinputflinger"] || targets == TASK_BACKEND_TARGETS;
+    let framework_only = targets == ["services", "libinputflinger"]
+        || targets == ["surfaceflinger"]
+        || targets == TASK_BACKEND_TARGETS;
     let audio_only = targets == AUDIO_TARGETS;
     if !audio_only {
         remove_retired_input_support(&out.join("target/product").join(product))?;

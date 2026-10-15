@@ -6,6 +6,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// One sample region retained until submit. Never retain its pointer afterward.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +40,10 @@ pub struct Client {
     generation: u64,
     request: u32,
     region: Option<Region>,
+    burst_position: bool,
+    // Only snapshots received with a completed buffer operation are reusable.
+    // Their original host timestamp is retained; control operations invalidate them.
+    position_snapshot: Option<(Position, Instant)>,
 }
 // SAFETY: moving the entire client transfers its socket, mappings and any buffer
 // credit together. It cannot be shared; dereferencing exported PCM pointers is unsafe.
@@ -59,6 +64,16 @@ impl Client {
     }
     /// Connect and verify server identity, stream format and descriptor access.
     pub fn connect(path: &Path, format: Format) -> io::Result<Self> {
+        match Self::connect_with_features(path, format, BURST_POSITION) {
+            // Version-1 brokers rejected OPEN's reserved feature field before
+            // creating a stream. Retry a fresh connection with the legacy format.
+            Err(error) if error.raw_os_error() == Some(libc::EPROTO) => {
+                Self::connect_with_features(path, format, 0)
+            }
+            result => result,
+        }
+    }
+    fn connect_with_features(path: &Path, format: Format, features: u64) -> io::Result<Self> {
         format.validate()?;
         let metadata = std::fs::symlink_metadata(path)?;
         let socket = SeqPacket::connect(path).map_err(ipc)?;
@@ -75,7 +90,7 @@ impl Client {
                 u64::from(format.rate),
                 u64::from(format.channels),
                 u64::from(format.frames),
-                0,
+                features,
             ],
         };
         socket.send_record(&open.encode(), &[]).map_err(ipc)?;
@@ -86,14 +101,15 @@ impl Client {
         if record.op != CONFIG
             || record.request != 1
             || record.generation == 0
-            || record.values
+            || record.values[..4]
                 != [
                     u64::from(format.rate),
                     u64::from(format.channels),
                     u64::from(format.frames),
                     BUFFERS as u64,
-                    SHARED_POOL,
                 ]
+            || record.values[4] & SHARED_POOL == 0
+            || record.values[4] & !(SHARED_POOL | features) != 0
             || received.descriptors.len() != BUFFERS
         {
             return Err(invalid("invalid audio configuration or descriptors"));
@@ -112,6 +128,8 @@ impl Client {
             generation: record.generation,
             request: 1,
             region: None,
+            burst_position: record.values[4] & BURST_POSITION != 0,
+            position_snapshot: None,
         })
     }
     fn exchange(&mut self, op: u32, values: [u64; 5]) -> io::Result<Record> {
@@ -147,21 +165,33 @@ impl Client {
         if self.region.is_some() || frames == 0 {
             return Err(invalid("audio buffer already held or zero burst"));
         }
-        let reply = self.exchange(
-            ACQUIRE,
-            [u64::from(frames.min(self.format.frames)), 0, 0, 0, 0],
-        )?;
-        if reply.op != ACQUIRE || reply.values[4] != 0 {
+        self.position_snapshot = None;
+        let op = if self.burst_position {
+            ACQUIRE_POSITION
+        } else {
+            ACQUIRE
+        };
+        let reply = self.exchange(op, [u64::from(frames.min(self.format.frames)), 0, 0, 0, 0])?;
+        if reply.op != op {
             return Err(invalid("invalid buffer response"));
         }
-        let slot = usize::try_from(reply.values[0]).map_err(|_| invalid("slot overflow"))?;
-        let count = u32::try_from(reply.values[1]).map_err(|_| invalid("frame overflow"))?;
-        let offset = usize::try_from(reply.values[2]).map_err(|_| invalid("offset overflow"))?;
+        let (slot, count, offset) = if self.burst_position {
+            let (slot, count, offset) = unpack_credit(reply.values[0])?;
+            (slot as usize, count, offset as usize)
+        } else {
+            if reply.values[3] != u64::from(self.format.frames) || reply.values[4] != 0 {
+                return Err(invalid("invalid buffer response"));
+            }
+            (
+                usize::try_from(reply.values[0]).map_err(|_| invalid("slot overflow"))?,
+                u32::try_from(reply.values[1]).map_err(|_| invalid("frame overflow"))?,
+                usize::try_from(reply.values[2]).map_err(|_| invalid("offset overflow"))?,
+            )
+        };
         if slot >= self.buffers.len()
             || count == 0
             || count > frames
             || count > self.format.frames
-            || reply.values[3] != u64::from(self.format.frames)
             || offset % self.format.frame_bytes() != 0
             || offset
                 .checked_add(count as usize * self.format.frame_bytes())
@@ -177,6 +207,17 @@ impl Client {
             slot,
         };
         self.region = Some(region);
+        if self.burst_position {
+            self.position_snapshot = Some((
+                Position {
+                    frames: reply.values[1],
+                    monotonic_ns: reply.values[2],
+                    latency_ns: reply.values[3],
+                    discontinuities: reply.values[4],
+                },
+                Instant::now(),
+            ));
+        }
         Ok(region)
     }
     /// Publish playback or return capture memory after all sample access finishes.
@@ -187,8 +228,16 @@ impl Client {
         if frames > region.frames {
             return Err(invalid("submit exceeds buffer credit"));
         }
-        let reply = self.exchange(SUBMIT, [region.slot as u64, u64::from(frames), 0, 0, 0])?;
-        if reply.op != ACK || reply.values != [0; 5] {
+        self.position_snapshot = None;
+        let op = if self.burst_position {
+            SUBMIT_POSITION
+        } else {
+            SUBMIT
+        };
+        let reply = self.exchange(op, [region.slot as u64, u64::from(frames), 0, 0, 0])?;
+        if self.burst_position {
+            self.position_snapshot = Some((decode_position(reply)?, Instant::now()));
+        } else if reply.op != ACK || reply.values != [0; 5] {
             return Err(invalid("invalid submit acknowledgement"));
         }
         self.region = None;
@@ -199,6 +248,7 @@ impl Client {
         if self.region.is_some() {
             return Err(invalid("control while holding sample memory"));
         }
+        self.position_snapshot = None;
         let reply = self.exchange(CONTROL, [command, 0, 0, 0, 0])?;
         if reply.op != ACK || reply.values != [0; 5] {
             return Err(invalid("invalid control acknowledgement"));
@@ -207,17 +257,32 @@ impl Client {
     }
     /// Query graph-derived progress and total buffering delay.
     pub fn position(&mut self) -> io::Result<Position> {
-        let reply = self.exchange(STATUS, [0; 5])?;
-        if reply.op != STATUS || reply.values[4] != 0 {
-            return Err(invalid("invalid position response"));
+        // At most one 256-frame playback quantum of caching. Standalone
+        // position polling still reaches the host once the snapshot expires.
+        // Never extrapolate or manufacture a presentation timestamp here.
+        let lifetime = Duration::from_nanos(
+            u64::from(self.format.frames.min(256)) * 1_000_000_000 / u64::from(self.format.rate),
+        );
+        if let Some((position, received)) = self.position_snapshot {
+            if received.elapsed() < lifetime {
+                return Ok(position);
+            }
         }
-        Ok(Position {
-            frames: reply.values[0],
-            monotonic_ns: reply.values[1],
-            latency_ns: reply.values[2],
-            discontinuities: reply.values[3],
-        })
+        self.position_snapshot = None;
+        decode_position(self.exchange(STATUS, [0; 5])?)
     }
+}
+
+fn decode_position(reply: Record) -> io::Result<Position> {
+    if reply.op != STATUS || reply.values[4] != 0 {
+        return Err(invalid("invalid position response"));
+    }
+    Ok(Position {
+        frames: reply.values[0],
+        monotonic_ns: reply.values[1],
+        latency_ns: reply.values[2],
+        discontinuities: reply.values[3],
+    })
 }
 
 fn ipc(error: IpcError) -> io::Error {
