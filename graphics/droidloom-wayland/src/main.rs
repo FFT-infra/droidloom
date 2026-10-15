@@ -3507,13 +3507,15 @@ impl KeyboardHandler for App {
         _layout: u32,
     ) {
         self.modifiers = modifiers;
-        // Input methods can filter Shift's raw transitions while publishing
+        // Input methods can filter raw modifier transitions while publishing
         // its effective seat mask. Native Android input needs actual modifier
         // transitions; preserve a known side and infer left only if absent.
+        // After focus enters, this also clears Ctrl from a stale enter key
+        // array when an input method filtered its release outside that task.
         if let Some(object) = self.focused {
             for (keycode, action) in self
                 .pressed_keys
-                .modifier(object, modifiers.shift, 42, 54)
+                .modifiers(object, modifiers.shift, modifiers.ctrl)
             {
                 match self.send_input(
                     object,

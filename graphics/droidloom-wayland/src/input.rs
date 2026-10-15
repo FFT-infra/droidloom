@@ -20,6 +20,17 @@ pub(super) struct Keys {
 }
 
 impl Keys {
+    pub fn modifiers(
+        &mut self,
+        task: TaskObjectId,
+        shift: bool,
+        ctrl: bool,
+    ) -> Vec<(u32, droidloom_denial_protocol::KeyAction)> {
+        let mut events = self.modifier(task, shift, 42, 54);
+        events.extend(self.modifier(task, ctrl, 29, 97));
+        events
+    }
+
     /// An IME may consume a modifier's raw key while retaining its seat mask.
     pub fn modifier(
         &mut self,
@@ -479,6 +490,27 @@ fn is_release_record(record: &[u8; RECORD_BYTES]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_ctrl_mask_releases_stale_enter_key_after_filtered_release() {
+        use droidloom_denial_protocol::KeyAction::{Down, Up};
+        let previous = TaskObjectId(41);
+        let current = TaskObjectId(42);
+        let mut keys = Keys::default();
+        keys.press(29, previous);
+        assert_eq!(keys.take_task(previous), [29]);
+        // Fcitx can leave Ctrl in wl_keyboard.enter's key array even after
+        // consuming its release. The following modifiers event has Ctrl off.
+        keys.press(29, current);
+        assert_eq!(keys.modifiers(current, false, false), [(29, Up)]);
+        assert!(keys.owner(29).is_none());
+        assert_eq!(keys.modifiers(current, false, true), [(29, Down)]);
+        assert!(keys.modifiers(current, false, true).is_empty());
+        assert_eq!(keys.modifiers(current, false, false), [(29, Up)]);
+        keys.press(97, current);
+        assert!(keys.modifiers(current, false, true).is_empty());
+        assert_eq!(keys.modifiers(current, false, false), [(97, Up)]);
+    }
+
     #[test]
     fn modifier_mask_recovers_ime_filtered_shift_without_duplicate_physical_keys() {
         use droidloom_denial_protocol::KeyAction::{Down, Up};
