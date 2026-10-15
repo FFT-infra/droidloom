@@ -26,6 +26,7 @@ private:
     InputReaderInterface& mReader;
     int32_t mKeyboardDeviceId = -1;
     int32_t mMouseDeviceId = 0;
+    int32_t mStylusDeviceId = 0;
     JavaVM* const mVm;
     std::mutex mRegistrationLock;
     std::mutex mPowerLock;

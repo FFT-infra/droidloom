@@ -1,7 +1,7 @@
 diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/reader/EventHub.cpp
 --- a/services/inputflinger/reader/EventHub.cpp
 +++ b/services/inputflinger/reader/EventHub.cpp
-@@ -2990,4 +2990,20 @@ void EventHub::createVirtualKeyboardLocked() {
+@@ -2990,4 +2990,36 @@ void EventHub::createVirtualKeyboardLocked() {
      addDeviceLocked(std::move(hostKeyboard));
 +
 +    InputDeviceIdentifier hostMouseIdentifier;
@@ -19,6 +19,22 @@ diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/r
 +            /*associatedDevice=*/nullptr);
 +    hostMouse->classes = InputDeviceClass::CURSOR | InputDeviceClass::EXTERNAL;
 +    addDeviceLocked(std::move(hostMouse));
++
++    InputDeviceIdentifier hostStylusIdentifier;
++    hostStylusIdentifier.name = "Droidloom Host Stylus";
++    hostStylusIdentifier.location = "droidloom/host-stylus";
++    hostStylusIdentifier.uniqueId = "<droidloom-host-stylus>";
++    hostStylusIdentifier.bus = 0x0005;
++    hostStylusIdentifier.vendor = 0x2717;
++    hostStylusIdentifier.product = 0x3655;
++    hostStylusIdentifier.version = 0x0001;
++    assignDescriptorLocked(hostStylusIdentifier);
++
++    auto hostStylus = std::make_unique<Device>(
++            -1, mNextDeviceId++, "<droidloom-host-stylus>", hostStylusIdentifier,
++            /*associatedDevice=*/nullptr);
++    hostStylus->classes = InputDeviceClass::EXTERNAL_STYLUS | InputDeviceClass::EXTERNAL;
++    addDeviceLocked(std::move(hostStylus));
  }
  
  void EventHub::addDeviceLocked(std::unique_ptr<Device> device) {

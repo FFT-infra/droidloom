@@ -432,7 +432,11 @@ impl Engine {
             let mut event = pen.event;
             event.action = action;
             event.scan_code = button;
-            event.flags = i32::from(buttons) << 5;
+            event.flags = if action == 3 {
+                0x20
+            } else {
+                i32::from(buttons) << 5
+            };
             event.down_time = if matches!(action, 7 | 9 | 10) {
                 pen.last_time
             } else {
@@ -459,7 +463,7 @@ impl Engine {
         event.down_time = pen.down_time;
         event.event_time = now.max(pen.last_time);
         event.pointers[0].pressure = 0.0;
-        event.flags = 0;
+        event.flags = if pen.down { 0x20 } else { 0 };
         event.scan_code = 0;
         let mut result = Vec::new();
         if pen.down {
@@ -570,6 +574,7 @@ impl Engine {
             kind: 1,
             display: target.display,
             action,
+            flags: if action == 3 { 0x20 } else { 0 },
             count: i32::try_from(gesture.pointers.len()).unwrap(),
             down_time: gesture.down_time,
             event_time: gesture.last_time,
@@ -667,9 +672,13 @@ impl Engine {
             let action = if mouse.buttons == 0 { 10 } else { 3 };
             mouse.buttons = 0;
             mouse.last_time = now.max(mouse.last_time);
+            let mut event = Self::mouse_event(target, &mouse, action, 0, self.meta(task));
+            if action == 3 {
+                event.flags = 0x20;
+            }
             cancelled.push(RoutedEvent {
                 target,
-                event: Self::mouse_event(target, &mouse, action, 0, self.meta(task)),
+                event,
             });
         }
         if let Some(mut gesture) = self.gestures.remove(&task) {
@@ -807,9 +816,10 @@ mod tests {
             (
                 cancelled[0].target.token,
                 cancelled[0].event.kind,
-                cancelled[0].event.action
+                cancelled[0].event.action,
+                cancelled[0].event.flags,
             ),
-            (9, 8, 3)
+            (9, 8, 3, 0x20)
         );
         assert_eq!(engine.reset(300)[0].target.task, 43);
         assert!(
@@ -1144,6 +1154,7 @@ mod tests {
         assert_eq!(cancelled.len(), 2);
         assert!(cancelled.iter().all(|event| event.target.token == 9));
         assert_eq!(cancelled[0].event.action, 3);
+        assert_eq!(cancelled[0].event.flags, 0x20);
         assert_eq!(cancelled[1].event.flags, 0x28);
         assert_eq!(cancelled[1].event.flags & 0x20, 0x20);
         assert!(engine.process(touch(0, 0)).unwrap().is_none());

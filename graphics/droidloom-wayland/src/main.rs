@@ -1855,8 +1855,13 @@ impl App {
         self.clear_control_presses();
         self.end_capture();
         self.pressed_keys.clear();
-        self.pointer_contact = None;
-        self.touch_contacts.clear();
+        if let Some(contact) = self.pointer_contact.take() {
+            let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+        }
+        let contacts = std::mem::take(&mut self.touch_contacts);
+        for (_, contact) in contacts {
+            let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+        }
         self.mouse_focus = None;
         self.mouse_buttons = 0;
         for tool in &mut self.tablet_tools {

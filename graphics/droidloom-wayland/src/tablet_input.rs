@@ -86,6 +86,21 @@ impl App {
         }
         if down {
             self.text_input.note_touch();
+            let tool_surface = self.tablet_tool_mut(tool_id).surface.clone();
+            if let Some(surface) = tool_surface
+                && let Some(object) = self.task_for_surface(&surface)
+            {
+                let cancelled: Vec<_> = self
+                    .touch_contacts
+                    .iter()
+                    .filter(|(_, contact)| contact.object == object)
+                    .map(|(id, contact)| (*id, contact.event(TouchAction::Cancel)))
+                    .collect();
+                for (id, event) in cancelled {
+                    let _ = self.send_input(object, event);
+                    self.touch_contacts.remove(&id);
+                }
+            }
             if self.send_native_pen(tool_id, 3) {
                 self.tablet_tool_mut(tool_id).is_down = true;
             }

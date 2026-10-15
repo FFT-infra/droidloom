@@ -136,10 +136,12 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
     // them lazily after startup, outside InputDispatcher's lock, then reuse
     // their real IDs so applications can query the event's InputDevice.
     if ((event->kind == 2 && input.mKeyboardDeviceId < 0)
-            || (event->kind == 7 && input.mMouseDeviceId == 0)) {
+            || (event->kind == 7 && input.mMouseDeviceId == 0)
+            || (event->kind == 8 && input.mStylusDeviceId == 0)) {
         for (const auto& device : input.mReader.getInputDevices()) {
             if (device.getDisplayName() == "Droidloom Host Keyboard") input.mKeyboardDeviceId = device.getId();
             if (device.getDisplayName() == "Droidloom Host Mouse") input.mMouseDeviceId = device.getId();
+            if (device.getDisplayName() == "Droidloom Host Stylus") input.mStylusDeviceId = device.getId();
         }
     }
     KeyEvent key;
@@ -175,10 +177,14 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
             coords[0].setAxisValue(AMOTION_EVENT_AXIS_TILT, event->pointers[1].x);
             coords[0].setAxisValue(AMOTION_EVENT_AXIS_ORIENTATION, event->pointers[1].y);
         }
-        motion.initialize(ids.nextId(), mouse ? input.mMouseDeviceId : 0,
+        int32_t flags = event->flags;
+        if ((event->action & AMOTION_EVENT_ACTION_MASK) == AMOTION_EVENT_ACTION_CANCEL) {
+            flags |= AMOTION_EVENT_FLAG_CANCELED;
+        }
+        motion.initialize(ids.nextId(), mouse ? input.mMouseDeviceId : stylus ? input.mStylusDeviceId : 0,
                 mouse ? AINPUT_SOURCE_MOUSE : stylus ? AINPUT_SOURCE_STYLUS : AINPUT_SOURCE_TOUCHSCREEN, ui::LogicalDisplayId{event->display},
                 {}, event->action, mouse ? event->keyCode : stylus ? event->scanCode : 0, {}, 0,
-                (mouse || stylus) ? event->meta : 0, (mouse || stylus) ? event->flags : 0, MotionClassification::NONE,
+                (mouse || stylus) ? event->meta : 0, flags, MotionClassification::NONE,
                 ui::Transform{}, 1.0f, 1.0f,
                 mouse ? event->pointers[0].x : AMOTION_EVENT_INVALID_CURSOR_POSITION,
                 mouse ? event->pointers[0].y : AMOTION_EVENT_INVALID_CURSOR_POSITION,
