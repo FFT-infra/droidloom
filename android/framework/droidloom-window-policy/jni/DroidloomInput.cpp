@@ -177,14 +177,18 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
             coords[0].setAxisValue(AMOTION_EVENT_AXIS_TILT, event->pointers[1].x);
             coords[0].setAxisValue(AMOTION_EVENT_AXIS_ORIENTATION, event->pointers[1].y);
         }
-        int32_t flags = event->flags;
+        // The ABI's single flags word carries the mouse/stylus button state and
+        // is unused for touch streams. A cancel is expressed by the action, but
+        // InputDispatcher rejects injected cancels that lack MotionFlag::CANCELED
+        // and then keeps the stale pointers down for the device forever.
+        ftl::Flags<MotionFlag> motionFlags;
         if ((event->action & AMOTION_EVENT_ACTION_MASK) == AMOTION_EVENT_ACTION_CANCEL) {
-            flags |= AMOTION_EVENT_FLAG_CANCELED;
+            motionFlags |= MotionFlag::CANCELED;
         }
         motion.initialize(ids.nextId(), mouse ? input.mMouseDeviceId : stylus ? input.mStylusDeviceId : 0,
                 mouse ? AINPUT_SOURCE_MOUSE : stylus ? AINPUT_SOURCE_STYLUS : AINPUT_SOURCE_TOUCHSCREEN, ui::LogicalDisplayId{event->display},
-                {}, event->action, mouse ? event->keyCode : stylus ? event->scanCode : 0, {}, 0,
-                (mouse || stylus) ? event->meta : 0, flags, MotionClassification::NONE,
+                {}, event->action, mouse ? event->keyCode : stylus ? event->scanCode : 0, motionFlags, 0,
+                (mouse || stylus) ? event->meta : 0, (mouse || stylus) ? event->flags : 0, MotionClassification::NONE,
                 ui::Transform{}, 1.0f, 1.0f,
                 mouse ? event->pointers[0].x : AMOTION_EVENT_INVALID_CURSOR_POSITION,
                 mouse ? event->pointers[0].y : AMOTION_EVENT_INVALID_CURSOR_POSITION,
