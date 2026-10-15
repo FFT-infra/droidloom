@@ -68,8 +68,20 @@ impl WaitSources {
         }
         Ok(())
     }
-    /// False means shutdown; true means a client or the child became ready.
+    /// Used by readiness tests without an external descriptor.
+    #[cfg(test)]
     pub fn wait(&self, listener: &UnixListener, shutdown: &Shutdown) -> io::Result<bool> {
+        self.wait_with_fd(listener, shutdown, None)
+    }
+
+    /// False means shutdown. True means an FD became ready or the one-second
+    /// probe interval elapsed.
+    pub fn wait_with_fd(
+        &self,
+        listener: &UnixListener,
+        shutdown: &Shutdown,
+        external: Option<RawFd>,
+    ) -> io::Result<bool> {
         let entry = |fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -79,10 +91,11 @@ impl WaitSources {
             entry(listener.as_raw_fd()),
             entry(shutdown.as_raw_fd()),
             entry(self.child.as_ref().map_or(-1, |(_, fd)| fd.as_raw_fd())),
+            entry(external.unwrap_or(-1)),
         ];
         loop {
-            // SAFETY: three initialized descriptors remain owned throughout poll.
-            let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            // SAFETY: four initialized descriptors remain owned throughout poll.
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -101,7 +114,7 @@ impl WaitSources {
             if fds[0].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
                 return Err(io::Error::other("lifecycle listener became unavailable"));
             }
-            if fds[0].revents != 0 || fds[2].revents != 0 {
+            if result == 0 || fds[0].revents != 0 || fds[2].revents != 0 || fds[3].revents != 0 {
                 return Ok(true);
             }
         }

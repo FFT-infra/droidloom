@@ -112,8 +112,29 @@ pub(super) fn android_keycode(scan: u32) -> Option<i32> {
         139 => 82,  // MENU
         158 => 4,   // BACK
         159 => 125, // FORWARD
+        262 => 194, // BUTTON_7, tablet-pad fallback
+        263 => 195, // BUTTON_8, tablet-pad fallback
+        264 => 196, // BUTTON_9, tablet-pad fallback
+        265 => 197, // BUTTON_10, tablet-pad fallback
+        331 => 194, // STYLUS_BUTTON_PRIMARY
+        332 => 195, // STYLUS_BUTTON_SECONDARY
         0x113 | 0x116 => 4, // Mouse side/back button navigation
         0x114 | 0x115 => 125, // Mouse extra/forward button navigation
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::android_keycode;
+
+    #[test]
+    fn pen_and_tablet_pad_buttons_map_to_android_generic_buttons() {
+        assert_eq!(android_keycode(262), Some(194));
+        assert_eq!(android_keycode(263), Some(195));
+        assert_eq!(android_keycode(264), Some(196));
+        assert_eq!(android_keycode(265), Some(197));
+        assert_eq!(android_keycode(331), Some(194));
+        assert_eq!(android_keycode(332), Some(195));
+    }
 }

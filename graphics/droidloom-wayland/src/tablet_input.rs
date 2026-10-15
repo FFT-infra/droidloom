@@ -68,6 +68,28 @@ impl App {
     }
 
     pub(super) fn flush_native_pen(&mut self, tool_id: u32) {
+        // Smithay 0.7 can swallow wl_touch.cancel when no touch frame is
+        // pending. A pen entering the same application is a safe resync point:
+        // cancel its current touch contacts before sending stylus input, and
+        // retain the pending pen frame if Android cannot accept the cancel yet.
+        if self.tablet_tool_mut(tool_id).pending_down {
+            self.text_input.note_touch();
+            let surface = self.tablet_tool_mut(tool_id).surface.clone();
+            if let Some(surface) = surface
+                && let Some(object) = self.task_for_surface(&surface)
+            {
+                match self.cancel_task_touch_contacts(object) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => {
+                        eprintln!("Droidloom pen touch cancellation: {error}");
+                        self.fail(&error);
+                        return;
+                    }
+                }
+            }
+        }
+
         let tool = self.tablet_tool_mut(tool_id);
         let down = std::mem::take(&mut tool.pending_down);
         let up = std::mem::take(&mut tool.pending_up);
@@ -85,22 +107,6 @@ impl App {
             }
         }
         if down {
-            self.text_input.note_touch();
-            let tool_surface = self.tablet_tool_mut(tool_id).surface.clone();
-            if let Some(surface) = tool_surface
-                && let Some(object) = self.task_for_surface(&surface)
-            {
-                let cancelled: Vec<_> = self
-                    .touch_contacts
-                    .iter()
-                    .filter(|(_, contact)| contact.object == object)
-                    .map(|(id, contact)| (*id, contact.event(TouchAction::Cancel)))
-                    .collect();
-                for (id, event) in cancelled {
-                    let _ = self.send_input(object, event);
-                    self.touch_contacts.remove(&id);
-                }
-            }
             if self.send_native_pen(tool_id, 3) {
                 self.tablet_tool_mut(tool_id).is_down = true;
             }

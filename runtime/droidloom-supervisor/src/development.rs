@@ -1745,11 +1745,7 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     let input = dev.join("input");
     fs::create_dir_all(&input)
         .map_err(|source| io_error("create private input directory", source))?;
-    for (index, device) in discover_pen_input_devices()?.into_iter().enumerate() {
-        let node = input.join(format!("event{index}"));
-        make_device_node(&node, "c", device.major, device.minor, "660")?;
-        set_owner(&node, 0, ANDROID_INPUT_GID)?;
-    }
+    create_pen_input_nodes(&input, 0, &discover_pen_input_devices()?)?;
     bind_mount(&input, &input, false)?;
     run_os(
         "mount",
@@ -1980,15 +1976,18 @@ fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), Developm
 }
 
 /// One host input device the pen relay created for an Android reader.
-struct PenInputDevice {
-    major: u32,
-    minor: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PenInputDevice {
+    pub(crate) phys: String,
+    pub(crate) event_name: String,
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
 }
 
 /// The pen relay's Android-facing input devices, matched by their physical
 /// device path. The relay keeps the pen's own device tree to itself and
 /// publishes these for the platform that reads them.
-fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError> {
+pub(crate) fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError> {
     const PEN_PHYS: [&str; 2] = ["waydroid-pen-buttons", "waydroid-gesture-android"];
     let Ok(entries) = fs::read_dir("/sys/class/input") else {
         return Ok(Vec::new());
@@ -2016,7 +2015,15 @@ fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError>
             if let Ok((major, minor)) =
                 verified_char_device_numbers(&Path::new("/dev/input").join(&name))
             {
-                map.insert(phys, PenInputDevice { major, minor });
+                map.insert(
+                    phys.clone(),
+                    PenInputDevice {
+                        phys,
+                        event_name: name,
+                        major,
+                        minor,
+                    },
+                );
             }
         }
     }
@@ -2027,6 +2034,80 @@ fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError>
         }
     }
     Ok(devices)
+}
+
+/// Refresh the Android-facing pen devices using new filenames so EventHub's
+/// inotify watcher opens the new kernel device generation.
+pub(crate) fn refresh_pen_input_nodes(
+    namespace_pid: u32,
+    generation: u64,
+    devices: &[PenInputDevice],
+) -> Result<(), DevelopmentError> {
+    let input = PathBuf::from(format!("/proc/{namespace_pid}/root/dev/input"));
+    run_cell_mount(namespace_pid, "remount,bind,rw,nosuid")?;
+    let result = create_pen_input_nodes(&input, generation, devices);
+    let remount = run_cell_mount(namespace_pid, "remount,bind,ro,nosuid");
+    result.and(remount)
+}
+
+fn create_pen_input_nodes(
+    input: &Path,
+    generation: u64,
+    devices: &[PenInputDevice],
+) -> Result<(), DevelopmentError> {
+    let mut active_nodes = Vec::new();
+    for device in devices {
+        let Some(name) = pen_input_node_name(&device.phys, generation) else {
+            continue;
+        };
+        let node = input.join(&name);
+        make_device_node(&node, "c", device.major, device.minor, "660")?;
+        set_owner(&node, 0, ANDROID_INPUT_GID)?;
+        active_nodes.push(name);
+    }
+
+    for entry in
+        fs::read_dir(input).map_err(|source| io_error("list private input devices", source))?
+    {
+        let entry = entry.map_err(|source| io_error("read private input entry", source))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if matches!(name, "event0" | "event1")
+            || ((name.starts_with("droidloom-pen-buttons-")
+                || name.starts_with("droidloom-pen-gestures-"))
+                && !active_nodes.iter().any(|active| active == name))
+        {
+            fs::remove_file(entry.path())
+                .map_err(|source| io_error("remove retired private pen device", source))?;
+        }
+    }
+    Ok(())
+}
+
+fn pen_input_node_name(phys: &str, generation: u64) -> Option<String> {
+    let base = match phys {
+        "waydroid-pen-buttons" => "droidloom-pen-buttons",
+        "waydroid-gesture-android" => "droidloom-pen-gestures",
+        _ => return None,
+    };
+    Some(format!("{base}-{generation}"))
+}
+
+fn run_cell_mount(namespace_pid: u32, options: &str) -> Result<(), DevelopmentError> {
+    let mut args = vec![
+        OsString::from("--target"),
+        OsString::from(namespace_pid.to_string()),
+        OsString::from("--mount"),
+        OsString::from("--root"),
+        OsString::from("--wd"),
+        OsString::from("--"),
+        OsString::from("/system/bin/toybox"),
+        OsString::from("mount"),
+        OsString::from("-o"),
+        OsString::from(options),
+        OsString::from("/dev/input"),
+    ];
+    run_os("nsenter", args.drain(..))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2518,6 +2599,19 @@ fn io_error(context: &str, source: io::Error) -> DevelopmentError {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn pen_input_node_names_change_with_kernel_device_generation() {
+        let first = pen_input_node_name("waydroid-pen-buttons", 4).unwrap();
+        let next = pen_input_node_name("waydroid-pen-buttons", 5).unwrap();
+        assert_eq!(first, "droidloom-pen-buttons-4");
+        assert_ne!(first, next);
+        assert_eq!(
+            pen_input_node_name("waydroid-gesture-android", 5).as_deref(),
+            Some("droidloom-pen-gestures-5")
+        );
+        assert!(pen_input_node_name("unrelated-device", 5).is_none());
+    }
 
     #[test]
     fn loop_device_minors_follow_host_partition_geometry() {

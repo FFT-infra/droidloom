@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::CellSpec;
-use crate::development::{DevelopmentCell, recover_development_cell, start_development_cell};
+use crate::development::{
+    DevelopmentCell, PenInputDevice, discover_pen_input_devices, recover_development_cell,
+    refresh_pen_input_nodes, start_development_cell,
+};
 
 #[path = "diagnostics.rs"]
 mod diagnostics;
@@ -240,6 +243,9 @@ struct ActiveCell {
     spec: CellSpec,
     cell: DevelopmentCell,
     ready_init: std::cell::Cell<Option<u32>>,
+    pen_devices: Vec<PenInputDevice>,
+    pen_generation: u64,
+    pen_refresh_pending: bool,
 }
 impl ActiveCell {
     fn ready_init(&self, progress: &Reporter) -> Result<u32, ControlError> {
@@ -257,32 +263,179 @@ struct Daemon {
     active: Option<ActiveCell>,
     last_exit: Option<String>,
     progress: Reporter,
+    pen_input_watcher: Option<PenInputWatcher>,
+}
+
+struct PenInputWatcher {
+    fd: OwnedFd,
+}
+
+impl PenInputWatcher {
+    fn new() -> io::Result<Self> {
+        // SAFETY: inotify_init1 takes flags only and returns a fresh descriptor.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful inotify_init1 transferred its descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let path = std::ffi::CString::new("/dev/input").expect("static path has no NUL");
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                fd.as_raw_fd(),
+                path.as_ptr(),
+                libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+            )
+        };
+        if watch < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    fn drain(&self) -> io::Result<Vec<(u32, String)>> {
+        let mut events = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            // SAFETY: read writes at most buffer.len() bytes into a valid buffer.
+            let count = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                match error.kind() {
+                    io::ErrorKind::WouldBlock => break,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return Err(error),
+                }
+            }
+            if count == 0 {
+                break;
+            }
+            events.extend(parse_pen_input_events(
+                &buffer[..usize::try_from(count).expect("nonnegative read length")],
+            ));
+        }
+        Ok(events)
+    }
+}
+
+fn parse_pen_input_events(bytes: &[u8]) -> Vec<(u32, String)> {
+    let mut parsed = Vec::new();
+    let mut offset = 0;
+    while offset + 16 <= bytes.len() {
+        let mask = u32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let name_length = usize::try_from(u32::from_ne_bytes(
+            bytes[offset + 12..offset + 16].try_into().unwrap(),
+        ))
+        .expect("inotify name length fits usize");
+        let name_start = offset + 16;
+        let Some(name_end) = name_start.checked_add(name_length) else {
+            break;
+        };
+        if name_end > bytes.len() {
+            break;
+        }
+        let name = bytes[name_start..name_end]
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        if mask & libc::IN_Q_OVERFLOW != 0 {
+            parsed.push((mask, String::new()));
+        } else if let Ok(name) = std::str::from_utf8(name)
+            && is_host_event_name(name)
+        {
+            parsed.push((mask, name.to_owned()));
+        }
+        offset = name_end;
+    }
+    parsed
+}
+
+fn is_host_event_name(name: &str) -> bool {
+    name.strip_prefix("event")
+        .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 impl Daemon {
     fn new(config: DaemonConfig) -> Self {
+        let pen_input_watcher = PenInputWatcher::new()
+            .map_err(|error| {
+                eprintln!("droidloomd: pen device hotplug watch unavailable: {error}");
+                error
+            })
+            .ok();
         Self {
             config,
             active: None,
             last_exit: None,
             progress: Reporter::default(),
+            pen_input_watcher,
         }
     }
 
     fn poll(&mut self) -> Result<(), ControlError> {
+        if let Some(active) = self.active.as_mut() {
+            match active.cell.try_wait().map_err(development_error) {
+                Ok(Some(status)) => {
+                    self.last_exit = Some(format!("Android cell exited with {status}"));
+                    self.active = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.last_exit = Some(format!("Android cell teardown failed: {error}"));
+                    self.active = None;
+                    return Err(error);
+                }
+            }
+        }
+
+        let events = self
+            .pen_input_watcher
+            .as_ref()
+            .map(PenInputWatcher::drain)
+            .transpose()
+            .map_err(|source| io_error("read host pen device events", source))?
+            .unwrap_or_default();
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
-        match active.cell.try_wait().map_err(development_error) {
-            Ok(Some(status)) => {
-                self.last_exit = Some(format!("Android cell exited with {status}"));
-                self.active = None;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.last_exit = Some(format!("Android cell teardown failed: {error}"));
-                self.active = None;
-                return Err(error);
+        let devices = discover_pen_input_devices().map_err(development_error)?;
+        let previous_names = active
+            .pen_devices
+            .iter()
+            .map(|device| device.event_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let current_names = devices
+            .iter()
+            .map(|device| device.event_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let hotplugged_pen = events.iter().any(|(mask, name)| {
+            mask & libc::IN_Q_OVERFLOW != 0
+                || previous_names.contains(name.as_str())
+                || current_names.contains(name.as_str())
+        });
+        if hotplugged_pen || devices != active.pen_devices {
+            active.pen_refresh_pending = true;
+        }
+        if active.pen_refresh_pending {
+            let generation = active
+                .pen_generation
+                .checked_add(1)
+                .ok_or_else(|| ControlError::Invalid("pen device generation exhausted".into()))?;
+            active.pen_generation = generation;
+            match refresh_pen_input_nodes(active.cell.host_pid(), generation, &devices) {
+                Ok(()) => {
+                    active.pen_devices = devices;
+                    active.pen_refresh_pending = false;
+                }
+                Err(error) => {
+                    eprintln!("droidloomd: could not refresh Android pen devices: {error}");
+                }
             }
         }
         Ok(())
@@ -367,11 +520,15 @@ impl Daemon {
         let cell = start_development_cell(spec_path, &spec, &self.config.supervisor)
             .map_err(development_error)?;
         let pid = cell.host_pid();
+        let pen_devices = discover_pen_input_devices().map_err(development_error)?;
         self.active = Some(ActiveCell {
             spec_path: spec_path.to_owned(),
             spec: spec.clone(),
             cell,
             ready_init: std::cell::Cell::new(None),
+            pen_devices,
+            pen_generation: 0,
+            pen_refresh_pending: false,
         });
         self.last_exit = None;
         Ok(ControlResponse {
@@ -790,7 +947,14 @@ fn run_loop(
             .child(daemon.active.as_ref().map(|active| active.cell.host_pid()))
             .map_err(|source| io_error("watch lifecycle child", source))?;
         if !sources
-            .wait(listener, shutdown)
+            .wait_with_fd(
+                listener,
+                shutdown,
+                daemon
+                    .pen_input_watcher
+                    .as_ref()
+                    .map(|watcher| watcher.fd.as_raw_fd()),
+            )
             .map_err(|source| io_error("wait for lifecycle readiness", source))?
         {
             return Ok(());
@@ -1379,6 +1543,32 @@ fn io_error(context: &str, source: io::Error) -> ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pen_input_watch_keeps_event_node_changes_and_queue_overflow() {
+        let mut bytes = Vec::new();
+        let name = b"event12\0";
+        bytes.extend_from_slice(&1_i32.to_ne_bytes());
+        bytes.extend_from_slice(&libc::IN_DELETE.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&(-1_i32).to_ne_bytes());
+        bytes.extend_from_slice(&libc::IN_Q_OVERFLOW.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+
+        assert_eq!(
+            parse_pen_input_events(&bytes),
+            [
+                (libc::IN_DELETE, "event12".to_owned()),
+                (libc::IN_Q_OVERFLOW, String::new())
+            ]
+        );
+        assert!(!is_host_event_name("by-path"));
+        assert!(!is_host_event_name("event12x"));
+    }
+
     use std::sync::Arc;
 
     #[test]

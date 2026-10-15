@@ -35,7 +35,7 @@ fn input_trace_enabled() -> bool {
     })
 }
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -127,6 +127,8 @@ const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
 const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const LEFT_BUTTON: u32 = 0x110;
+const PAD_BUTTON_BASE: u32 = 0x106;
+const PAD_BUTTON_COUNT: u32 = 4;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
 
@@ -377,6 +379,32 @@ impl TabletToolState {
     }
 }
 
+enum TabletPadChild {
+    Group(ZwpTabletPadGroupV2),
+    Ring(ZwpTabletPadRingV2),
+    Strip(ZwpTabletPadStripV2),
+    Dial(ZwpTabletPadDialV2),
+}
+
+impl TabletPadChild {
+    fn destroy(self) {
+        match self {
+            Self::Group(proxy) => proxy.destroy(),
+            Self::Ring(proxy) => proxy.destroy(),
+            Self::Strip(proxy) => proxy.destroy(),
+            Self::Dial(proxy) => proxy.destroy(),
+        }
+    }
+}
+
+struct TabletPadState {
+    tablet_seat_id: u32,
+    proxy: ZwpTabletPadV2,
+    children: Vec<TabletPadChild>,
+    focus: Option<TaskObjectId>,
+    pressed: BTreeSet<u32>,
+}
+
 struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
@@ -396,6 +424,8 @@ struct App {
     tablet_tools: Vec<TabletToolState>,
     tablet_tool_proxies: BTreeMap<u32, ZwpTabletToolV2>,
     tablet_proxies: BTreeMap<u32, (u32, ZwpTabletV2)>,
+    tablet_pads: BTreeMap<u32, TabletPadState>,
+    tablet_pad_groups: BTreeMap<u32, u32>,
     dmabuf_state: DmabufState,
     feedback: Option<DmabufFeedback>,
     compositor: CompositorState,
@@ -1780,7 +1810,10 @@ impl App {
         event: InputEvent,
     ) -> Result<bool, PresenterError> {
         static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let direct = self.endpoint.as_ref().is_some_and(DenialEndpoint::direct_input);
+        let direct = self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input);
         // Native key/touch/mouse/pen records share one connection-owned FIFO.
         self.direct_input.set_blocked(self.clipboard.blocked());
         if !direct && self.clipboard.blocked() {
@@ -1849,6 +1882,53 @@ impl App {
         Ok(true)
     }
 
+    /// Cancel every tracked touch for a task and keep the local contacts until
+    /// Android has accepted the cancellation. A native touch's original route
+    /// remains usable even if the Wayland task route is being rebound.
+    fn cancel_task_touch_contacts(&mut self, object: TaskObjectId) -> Result<bool, String> {
+        let contacts = self
+            .touch_contacts
+            .values()
+            .filter(|contact| contact.object == object)
+            .copied()
+            .collect::<Vec<_>>();
+        if contacts.is_empty() {
+            return Ok(true);
+        }
+
+        let direct = self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input);
+        if direct {
+            let timestamp = monotonic_timestamp_nanos().map_err(|error| error.to_string())?;
+            for contact in contacts {
+                if let Err(error) =
+                    self.direct_input
+                        .cancel_task_pointer(object.0, contact.pointer_id, timestamp)
+                {
+                    self.direct_input.disconnect();
+                    self.clear_input_tracking();
+                    return Err(error);
+                }
+            }
+            self.touch_contacts
+                .retain(|_, contact| contact.object != object);
+            return Ok(true);
+        }
+
+        let contact = contacts[0];
+        match self.send_input(object, contact.event(TouchAction::Cancel)) {
+            Ok(true) => {
+                self.touch_contacts
+                    .retain(|_, contact| contact.object != object);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn clear_input_tracking(&mut self) {
         self.clipboard_inputs.clear();
         self.abandon_gestures();
@@ -1877,6 +1957,14 @@ impl App {
     }
 
     fn release_task_inputs(&mut self, object: TaskObjectId) {
+        let pad_ids = self
+            .tablet_pads
+            .iter()
+            .filter_map(|(id, pad)| (pad.focus == Some(object)).then_some(*id))
+            .collect::<Vec<_>>();
+        for pad_id in pad_ids {
+            self.release_pad_buttons(pad_id);
+        }
         self.clipboard_inputs.retain(|(owner, _)| *owner != object);
         self.abandon_gestures();
         self.clear_control_presses();
@@ -2198,7 +2286,12 @@ impl CompositorHandler for App {
         surface: &wl_surface::WlSurface,
         _new_factor: i32,
     ) {
-        apply_content_buffer_scale(surface, self.tasks.values().any(|task| task.contains_surface(surface)));
+        apply_content_buffer_scale(
+            surface,
+            self.tasks
+                .values()
+                .any(|task| task.contains_surface(surface)),
+        );
     }
 
     fn transform_changed(
@@ -2811,8 +2904,80 @@ impl App {
     fn unbind_tablet_seat(&mut self, seat: &wl_seat::WlSeat) {
         if let Some(pos) = self.tablet_seats.iter().position(|(s, _)| s == seat) {
             let (_, proxy) = self.tablet_seats.remove(pos);
+            let seat_id = proxy.id().protocol_id();
+            let pad_ids = self
+                .tablet_pads
+                .iter()
+                .filter_map(|(id, pad)| (pad.tablet_seat_id == seat_id).then_some(*id))
+                .collect::<Vec<_>>();
+            for pad_id in pad_ids {
+                self.release_pad_buttons(pad_id);
+                self.destroy_tablet_pad(pad_id);
+            }
             proxy.destroy();
         }
+    }
+
+    fn pad_button(&mut self, pad_id: u32, button: u32, pressed: bool) {
+        if button >= PAD_BUTTON_COUNT {
+            return;
+        }
+        let Some(pad) = self.tablet_pads.get_mut(&pad_id) else {
+            return;
+        };
+        let target = pad.focus.or(self.focused);
+        let Some(object) = target else { return };
+        let changed = if pressed {
+            pad.pressed.insert(button)
+        } else {
+            pad.pressed.remove(&button)
+        };
+        if !changed {
+            return;
+        }
+        if pressed {
+            pad.focus = Some(object);
+        }
+        tablet_trace!(
+            "Droidloom tablet trace: stage=pad-button pad={pad_id} button={button} pressed={pressed} task={}",
+            object.0
+        );
+        if let Err(error) = self.send_input(
+            object,
+            InputEvent::Key {
+                action: if pressed {
+                    KeyAction::Down
+                } else {
+                    KeyAction::Up
+                },
+                keycode: PAD_BUTTON_BASE + button,
+                repeat: 0,
+            },
+        ) {
+            self.fail(&error);
+        }
+    }
+
+    fn release_pad_buttons(&mut self, pad_id: u32) {
+        let Some(pad) = self.tablet_pads.get(&pad_id) else {
+            return;
+        };
+        for button in pad.pressed.iter().copied().collect::<Vec<_>>() {
+            self.pad_button(pad_id, button, false);
+        }
+        if let Some(pad) = self.tablet_pads.get_mut(&pad_id) {
+            pad.focus = None;
+        }
+    }
+
+    fn destroy_tablet_pad(&mut self, pad_id: u32) {
+        if let Some(pad) = self.tablet_pads.remove(&pad_id) {
+            for child in pad.children.into_iter().rev() {
+                child.destroy();
+            }
+            pad.proxy.destroy();
+        }
+        self.tablet_pad_groups.retain(|_, owner| *owner != pad_id);
     }
 
     fn tablet_tool_mut(&mut self, tool_id: u32) -> &mut TabletToolState {
@@ -3056,6 +3221,20 @@ impl Dispatch<ZwpTabletSeatV2, ()> for App {
                 let tool_id = id.id().protocol_id();
                 state.tablet_tool_proxies.insert(tool_id, id.clone());
             }
+            tablet::zwp_tablet_seat_v2::Event::PadAdded { id } => {
+                let pad_id = id.id().protocol_id();
+                tablet_trace!("Droidloom tablet: PadAdded id={pad_id}");
+                state.tablet_pads.insert(
+                    pad_id,
+                    TabletPadState {
+                        tablet_seat_id: seat_id,
+                        proxy: id.clone(),
+                        children: Vec::new(),
+                        focus: None,
+                        pressed: BTreeSet::new(),
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -3108,6 +3287,12 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 state.abandon_gestures();
                 if state.direct_input.supports_mouse() {
                     state.cancel_tablet_tool(tool_id);
+                }
+                if let Some(object) = state.task_for_surface(&surface)
+                    && let Err(error) = state.cancel_task_touch_contacts(object)
+                {
+                    eprintln!("Droidloom pen proximity touch cancellation: {error}");
+                    state.fail(&error);
                 }
                 let prev_surface = state.tablet_tool_mut(tool_id).surface.take();
                 let was_down = state.tablet_tool_mut(tool_id).is_down;
@@ -3246,13 +3431,49 @@ impl Dispatch<ZwpTabletV2, ()> for App {
 
 impl Dispatch<ZwpTabletPadV2, ()> for App {
     fn event(
-        _state: &mut Self,
-        _proxy: &ZwpTabletPadV2,
-        _event: tablet::zwp_tablet_pad_v2::Event,
+        state: &mut Self,
+        proxy: &ZwpTabletPadV2,
+        event: tablet::zwp_tablet_pad_v2::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        let pad_id = proxy.id().protocol_id();
+        match event {
+            tablet::zwp_tablet_pad_v2::Event::Group { pad_group } => {
+                let group_id = pad_group.id().protocol_id();
+                state.tablet_pad_groups.insert(group_id, pad_id);
+                if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                    pad.children.push(TabletPadChild::Group(pad_group));
+                }
+            }
+            tablet::zwp_tablet_pad_v2::Event::Enter { surface, .. } => {
+                let object = state.task_for_surface(&surface);
+                if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                    pad.focus = object;
+                }
+            }
+            tablet::zwp_tablet_pad_v2::Event::Leave { .. } => {
+                state.release_pad_buttons(pad_id);
+            }
+            tablet::zwp_tablet_pad_v2::Event::Button {
+                button,
+                state: button_state,
+                ..
+            } => {
+                let pressed = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_pad_v2::ButtonState::Pressed) => true,
+                    WEnum::Value(tablet::zwp_tablet_pad_v2::ButtonState::Released) => false,
+                    _ => return,
+                };
+                state.pad_button(pad_id, button, pressed);
+            }
+            tablet::zwp_tablet_pad_v2::Event::Removed => {
+                state.release_pad_buttons(pad_id);
+                state.destroy_tablet_pad(pad_id);
+            }
+            _ => {}
+        }
     }
 
     wayland_client::event_created_child!(
@@ -3266,13 +3487,34 @@ impl Dispatch<ZwpTabletPadV2, ()> for App {
 
 impl Dispatch<ZwpTabletPadGroupV2, ()> for App {
     fn event(
-        _state: &mut Self,
-        _proxy: &ZwpTabletPadGroupV2,
-        _event: tablet::zwp_tablet_pad_group_v2::Event,
+        state: &mut Self,
+        proxy: &ZwpTabletPadGroupV2,
+        event: tablet::zwp_tablet_pad_group_v2::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        let group_id = proxy.id().protocol_id();
+        let Some(pad_id) = state.tablet_pad_groups.get(&group_id).copied() else {
+            return;
+        };
+        let child = match event {
+            tablet::zwp_tablet_pad_group_v2::Event::Ring { ring } => {
+                Some(TabletPadChild::Ring(ring))
+            }
+            tablet::zwp_tablet_pad_group_v2::Event::Strip { strip } => {
+                Some(TabletPadChild::Strip(strip))
+            }
+            tablet::zwp_tablet_pad_group_v2::Event::Dial { dial } => {
+                Some(TabletPadChild::Dial(dial))
+            }
+            _ => None,
+        };
+        if let Some(child) = child
+            && let Some(pad) = state.tablet_pads.get_mut(&pad_id)
+        {
+            pad.children.push(child);
+        }
     }
 
     wayland_client::event_created_child!(
@@ -3805,20 +4047,21 @@ impl TouchHandler for App {
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
         self.abandon_gestures();
         self.clear_control_presses();
-        let contacts = std::mem::take(&mut self.touch_contacts);
-        for (_, contact) in contacts {
-            if let Err(error) = self.send_input(
-                contact.object,
-                InputEvent::Touch {
-                    action: TouchAction::Cancel,
-                    pointer_id: contact.pointer_id,
-                    x_fixed: 0,
-                    y_fixed: 0,
-                    pressure: 0,
-                },
-            ) {
-                self.fail(&error);
-                break;
+        let objects = self
+            .touch_contacts
+            .values()
+            .map(|contact| contact.object)
+            .collect::<std::collections::BTreeSet<_>>();
+        for object in objects {
+            match self.cancel_task_touch_contacts(object) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tablet_trace!(
+                        "Droidloom touch trace: cancel deferred for task={} until its route is ready",
+                        object.0
+                    );
+                }
+                Err(error) => self.fail(&error),
             }
         }
     }
@@ -3992,6 +4235,8 @@ fn run() -> Result<(), PresenterError> {
         tablet_tools: Vec::new(),
         tablet_tool_proxies: BTreeMap::new(),
         tablet_proxies: BTreeMap::new(),
+        tablet_pads: BTreeMap::new(),
+        tablet_pad_groups: BTreeMap::new(),
         dmabuf_state,
         feedback: None,
         compositor,
@@ -4535,6 +4780,13 @@ fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tablet_pad_button_scan_codes_match_android_pen_button_layouts() {
+        assert_eq!(PAD_BUTTON_BASE, 0x106);
+        assert_eq!(PAD_BUTTON_COUNT, 4);
+        assert_eq!(PAD_BUTTON_BASE + PAD_BUTTON_COUNT - 1, 0x109);
+    }
 
     #[test]
     fn closing_window_does_not_reconfigure_a_retired_android_object() {
