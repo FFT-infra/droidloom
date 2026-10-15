@@ -272,6 +272,12 @@ struct TaskWindow {
 }
 
 impl TaskWindow {
+    fn needs_refresh_update(&self, refresh: u32) -> bool {
+        // Android has already retired this object. Keep only host buffer
+        // cleanup alive; output-leave callbacks must not configure it again.
+        !self.closing && self.configure_serial != 0 && self.refresh_millihz != refresh
+    }
+
     fn headless(&self) -> bool {
         self.package == BOOTSTRAP_PACKAGE
     }
@@ -517,7 +523,7 @@ impl App {
             .tasks
             .get_mut(&object)
             .ok_or(PresenterError::UnknownTask(object))?;
-        if task.configure_serial == 0 || task.refresh_millihz == refresh {
+        if !task.needs_refresh_update(refresh) {
             return Ok(());
         }
         // A cadence change preserves the configure's allocation generation.
@@ -2137,7 +2143,9 @@ impl App {
             && let Some(task) = self.tasks.get_mut(&previous)
         {
             task.focused = false;
-            if let Some(endpoint) = self.endpoint.as_ref() {
+            if !task.closing
+                && let Some(endpoint) = self.endpoint.as_ref()
+            {
                 endpoint.send_visibility(previous, Visibility::Visible, false)?;
             }
         }
@@ -2146,8 +2154,10 @@ impl App {
         if let Some(object) = object
             && let Some(task) = self.tasks.get_mut(&object)
         {
-            task.focused = true;
-            if let Some(endpoint) = self.endpoint.as_ref() {
+            task.focused = !task.closing;
+            if !task.closing
+                && let Some(endpoint) = self.endpoint.as_ref()
+            {
                 endpoint.send_visibility(object, Visibility::Visible, true)?;
             }
         }
@@ -2530,6 +2540,9 @@ impl PresentationTimeHandler for App {
             return;
         };
         let task = self.tasks.get_mut(&object).expect("surface has a task");
+        if task.closing {
+            return;
+        }
         // Presentation feedback identifies the timing output for overlapping
         // surfaces. Ignore late feedback from an output already left.
         if let Some(output) = outputs
@@ -4495,6 +4508,47 @@ fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_window_does_not_reconfigure_a_retired_android_object() {
+        let mut task = TaskWindow {
+            chrome: None,
+            gesture_feedback: None,
+            controls_until: None,
+            fullscreen: false,
+            layers: None,
+            package: "test".into(),
+            android_task: None,
+            input_route: None,
+            window: None,
+            viewport: None,
+            fractional_scale: None,
+            sync_surface: None,
+            logical_size: None,
+            buffer_size: (1280, 720),
+            applied_scale_120: 120,
+            resize: resize::Pending::new(120),
+            configure_serial: 1,
+            refresh_millihz: 120_000,
+            entered_outputs: Vec::new(),
+            presentation_output: None,
+            targets: BTreeMap::new(),
+            pending: VecDeque::new(),
+            presentation_feedback: Vec::new(),
+            presentation_audit: None,
+            content_opaque: false,
+            applied_opaque: None,
+            focused: false,
+            unmap_requested: false,
+            closing: false,
+        };
+        assert!(task.needs_refresh_update(60_000));
+        assert!(!task.needs_refresh_update(120_000));
+        // DestroyTask removes the endpoint immediately when no legacy frame
+        // is pending. Direct layer releases can still retain this host record.
+        task.closing = true;
+        assert!(!task.needs_refresh_update(60_000));
+    }
 
     #[test]
     fn remote_mouse_scroll_matches_the_previous_sheng_port() {

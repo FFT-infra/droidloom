@@ -53,3 +53,24 @@ duplicate and forwards no touch/key records. The existing framework policy
 handler applies the low-frequency PowerManager callback. System_server delegates
 authenticated connected descriptors to the existing IME/SystemUI adapters; their
 payloads travel directly to the host. No standalone input bridge remains.
+
+## Ordinary app acceptance probe
+
+`probe/AndroidManifest.xml` and `probe/Probe.java` form a small debuggable APK
+with no permissions. Compile against the pinned public Android SDK, dex with
+D8, link the manifest with aapt2, and sign as an ordinary test application.
+Install it and launch `com.android.droidloom.inputprobe/.Probe`. Read logcat
+tag `DroidloomInputProbe` for device keyboard type/hasKeys, EditText changes,
+key/motion records and the default accelerometer sample. Use host input for
+transport acceptance: adb input bypasses the Wayland/native-input path.
+
+Launch with `--ez graphics true` to compile/link GLES shaders, draw a red point
+and check its pixel readback. Require both the expected `GL_RENDERER` and
+`GL_PIXEL pass=true error=0`; merely loading a driver is insufficient. For an
+ANGLE test, select only this package with Android's per-app ANGLE settings,
+force-stop/relaunch it and restore the original selection afterward.
+`--ez audio true` plays a quiet 250 ms output-only beep. A successful tone
+request alone does not establish audible playback or audio quality.
+
+The probe logs entered text. Use only synthetic acceptance text, retain logs
+outside the repository, and uninstall the test APK after device acceptance.

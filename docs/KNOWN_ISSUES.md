@@ -4,101 +4,65 @@ These limitations apply to the current pacman preview. Installation and APK
 commands are in [INSTALL.md](INSTALL.md); source builds are in
 [BUILDING.md](BUILDING.md).
 
-## sheng UU Remote mouse and keyboard recovery
+## sheng device acceptance
 
-The `sheng-modern-port` migration replaced the old native mouse route with a
-left-button touchscreen fallback, omitted the host mouse device registration,
-and dropped keyboard press ownership and focus-loss releases. The old remote
-client path also retained registered external device IDs through InputDispatcher,
-used relative motion axes, and offered Ctrl+Alt+M pointer confinement with an
-optional compositor keyboard-shortcut inhibitor. Reference changes are
-`44a14a5`, `f55a3d2`, `07e4965`, and `45a07f3` on `sheng-port`.
-UU's keyboard accessibility service remains enabled and bound on sheng; its
-permissions were not changed. On sheng, the
-installed full bundle `1791816149245073770-377850` is from `41f0f67` and uses
-input ABI 7; it predates the later tablet-tool changes.
+The paired ABI 8 bundle `1792027172676683445-258282` is installed on sheng.
+The earlier ABI 7 presenter override is obsolete. Host mouse, keyboard and
+native tablet-tool transport are compiled together with InputFlinger; this is
+still a development deployment, not a published release.
 
-The current working tree restores native mouse hover, buttons, wheel axes,
-relative motion and side-button navigation using input ABI 8. It also restores
-the previous external device descriptors, InputDispatcher device-ID retention,
-keypad/NumLock mapping and handling of unmapped vendor keys without resetting
-other held input. Composer and
-InputFlinger must be rebuilt together. The Android C++ adapter and EventHub
-patch still require compilation against the pinned Android source and device
-acceptance. Captured native input during a remote session and physical pen input
-have not been verified. This is not yet a verified complete bundle or a release.
+An ordinary-UID input probe confirms `Droidloom Host Keyboard` is alphabetic
+(type 2) and `hasKeys(SPACE, ENTER, A, Z)` returns four true values. These
+capability checks do not prove UU sends keys to a connected remote computer.
+Physical keyboard/mouse input in a real UU session remains user acceptance.
+The compositor advertises pointer constraints but no keyboard-shortcut inhibitor,
+so desktop shortcuts may still be handled by the host.
 
-A temporary presenter is running on sheng through
-`/run/user/1000/systemd/user/droidloom.service.d/70-input-recovery.conf`.
-Its executable is
-`/home/xinyang/.local/libexec/droidloom-input-recovery-20261014/droidloom-wayland-capture`,
-SHA-256 `dc0b53fa9989e53e8f26d4b3621378dad7c5576e0d96a5eb2e3b198b589fdfd0`.
-The packaged executable and active bundle were retained. The override disappears
-on device reboot. Remove that one drop-in, reload the user manager and restart
-only `droidloom.service` to roll back before reboot.
+Host uinput tablet events traversed Denial, Wayland and the Android native
+input receiver: the app received STYLUS source, pen/eraser tools, hover,
+pressure and barrel-button state. Tilt accuracy and the physical pen still
+need acceptance. Distance, rotation and tablet-wheel axes are outside ABI 8.
+F11/fullscreen, top-edge reveal and immersive side-swipe UI acceptance also
+remain pending. Local protocol tests do not replace these checks.
 
-With the ABI 7 image, the temporary presenter repairs key ownership/focus-loss
-releases, host cursor setup, route retirement and touch-stream recovery. Native
-mouse features remain disabled. Device checks confirmed a host mouse click opens
-Android Settings search, full keyboard text and Ctrl+A work, and holding Ctrl
-while clicking outside, releasing it outside, then returning permits a normal
-`z` input (`keyboardtestz`). No duplicate-down/input reconnection occurred during
-those checks. UU opens with the explicit launch component
-`com.netease.uuremote/com.remote.app.ui.activity.LaunchActivity` (the package-only
-launch returned activity-start error -91). Ctrl+Alt+M confinement activation and
-release were verified in UU's local window, without connecting to another device.
-The live Denial compositor advertises pointer constraints but no
-`zwp_keyboard_shortcuts_inhibit_manager_v1`; capture logs therefore correctly
-report `shortcuts-inhibited=false`. Desktop-wide shortcuts are not guaranteed
-to pass through. The local input/presenter/policy suites have 160 passing tests;
-the Android build-plan suite has nine. These checks do not validate native mouse
-dispatch on Android or replace UU remote-session acceptance.
+The ordinary app's default accelerometer is the virtual stationary sensor:
+`[0, 0, 9.8]`, accuracy UNRELIABLE. It supplies the API capability, not physical
+motion sensing. Application-specific capture pages still need acceptance.
 
-The next local recovery pass reconnects the previously unused window-control
-and gesture modules: F11 or the floating Fullscreen button toggles fullscreen,
-a top-edge pull reveals Back/Fullscreen, and an immersive side swipe cancels
-the application's touch once before sending Back. Pointer capture leaves F11
-with the remote application. Overlay controls stay above Android layer surfaces;
-their reveal timeout participates in the event-loop deadline.
+Front/back YUV and JPEG probes now validate 1280x720 output and final resource
+cleanup. Repeating YUV exposed a probe lifecycle bug: closing the device before
+the session drained lost its onClosed callback. The probe now waits for session
+closure before closing the device. Final JSON must report `status=pass`, all
+cleanup flags true and the matching run token; a capture-phase log alone is
+insufficient. Real application recording and image quality are not covered.
 
-Native stylus records now preserve pen/eraser, hover, pressure, whole-degree
-tilt and both barrel buttons, with route/EOF cancellation. Tablet Pad's Group
-and Ring/Strip/Dial child bindings follow tablet-v2. ABI 7 retains touch fallback.
-Distance, rotation and tablet-wheel axes remain outside this wire. The native
-pen decoder regression was observed failing before the change and passing
-afterward; socket routing, hover/stroke/button lifecycle, replacement and
-retirement tests pass locally. UI behavior and Android C++ dispatch have not
-yet been verified on sheng.
+Native GLES shader draw/readback passes on FD740 / Mesa 26.1.7. Merely enabling
+`ro.gfx.angle.supported=true` did not make ANGLE usable: first swap crashed in
+Turnip's unimplemented Android deferred image-memory binding. Patch 0034 imports
+the gralloc layout and image-owned memory through Mesa's existing Android path.
+The source-extracted regression fails on the original code and passes with the
+patch. A rebuilt paired bundle and live ANGLE swap test are required before
+claiming that fix verified on-device.
 
-The same pass restores camera socket startup, guest runtime projection and
-producer staging from vendor/bin, installs the missing audio socket alias,
-records native ARM64 build provenance, restores the presenter session lease,
-and fixes ARM64 diagnostic C-character types and capture-key cleanup.
+`/data/vendor/mesa_shader_cache` being configured is not evidence of persistent
+shader caching: pinned Mesa disables its standalone Android disk cache by
+default. Android EGL blob caches are present under each app's private cache
+(e.g. `com.android.opengl.shaders_cache`), including UU. Keep the private cache
+path; do not turn on a world-writable shared cache. No cold-start or gameplay
+performance improvement has been measured. The GPU exposes `simple_ondemand`
+and `userspace`, with no `performance` governor.
 
-The UU Remote physical keyboard blocker was resolved by removing `InputDeviceClass::DPAD`
-from `android/inputflinger/0002-droidloom-targeted-injection-binder.patch`: Android's
-keyboard classifier now categorizes Droidloom Host Keyboard as `KEYBOARD_TYPE_ALPHABETIC`
-(type 2), ensuring `Configuration.keyboard` exposes a positive hardware keyboard
-(`+keyb`) rather than `-keyb` (`KEYBOARD_NOKEYS`), allowing remote sessions to receive key events.
+Audio startup ordering now includes PipeWire and WirePlumber services in the
+source unit; deployed ordering and first playback after restart still require
+verification. Audio quality, recording, latency and xrun claims require separate
+evidence. Preserve user data and a complete previous release during activation.
 
-The camera bridge pipeline (`graphics/droidloom-camera/src/capture.rs`) now incorporates
-`videoconvert` and `videoscale` elements in front of the framerate limiter and RGBA appsink,
-and relaxes discovery caps to generic `video/x-raw`. This ensures physical hardware sensors
-exposing NV12, YUY2, or BGRx streams at non-contract resolutions can be discovered by PipeWire
-and normalized into 1280x720 RGBA frames for the Android virtual camera HAL.
-
-GPU and gaming best practices are integrated: `ro.gfx.angle.supported=true` is enabled
-for sheng while retaining Turnip as the primary Vulkan driver, Mesa shader cache persistence
-is configured via `/data/vendor/mesa_shader_cache` (mode 01777) and second-stage init
-environment injection (`MESA_SHADER_CACHE_DIR`), and the devfreq governor performance profile
-is documented for host deployment.
-
-These changes are local. A complete paired Android build and device
-acceptance remain pending.
-Local validation: the full Rust workspace check succeeds; input
-protocol, Android policy and presenter suites pass 168 tests, the camera-wiring,
-supervisor, and camera conversion regression test suites pass.
-The ARM64 host presenter release build is at `target/release/droidloom-wayland`.
+Automated task replacement also exposed a presenter retirement race: Android
+can remove an endpoint object before host direct-layer releases finish. Late
+output/focus/presentation callbacks must not send new messages to that retired
+object. Closing windows now skip refresh/focus/presentation publication while
+host buffers continue draining; regression and runtime replacement checks gate
+this change.
 
 ## Application compatibility
 

@@ -369,6 +369,7 @@ public final class CameraProbeActivity extends Activity {
                     phase("session_onClosed");
                     if (!finishing) finish(false, "session_closed_before_result");
                 }
+                if (finishing) closeDevice();
                 if (finishing) completeIfClosed();
             }
         };
@@ -549,7 +550,10 @@ public final class CameraProbeActivity extends Activity {
             main.removeCallbacks(softTimeout);
             show(this, "Closing camera resources…");
             closeSession();
-            closeDevice();
+            // A repeating session drains its capture sequence asynchronously.
+            // Closing the device now can discard the callbacks needed to fire
+            // session.onClosed, leaving this probe waiting until its deadline.
+            if (session == null || sessionClosed || !cleanupError.isEmpty()) closeDevice();
             if (reader != null && !readerClosed) {
                 try {
                     reader.setOnImageAvailableListener(null, null);

@@ -873,6 +873,11 @@ pub fn build_targets(
         "vendor/droidloom/mesa3d",
         &repo.join("android/aosp-patches/0014-mesa-background-cpu-placement.patch"),
     )?;
+    p.patch(
+        source,
+        "vendor/droidloom/mesa3d",
+        &repo.join("android/aosp-patches/0034-turnip-android-deferred-binding.patch"),
+    )?;
     let cross = mesa.join("android/mesa3d_cross.mk");
     let cross_text = fs::read_to_string(&cross)?;
     let python_assignment = "MESA3D_PYTHONPATH := $(AOSP_ABSOLUTE_PATH)/external/python/mako";
