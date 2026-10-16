@@ -331,6 +331,10 @@ const PATCHES: &[(&str, &str)] = &[
         "frameworks/base",
         "android/framework/0008-droidloom-skip-absent-virtualization.patch",
     ),
+    (
+        "system/keymint",
+        "android/aosp-patches/0035-keymint-allow-extended-attestation-challenge.patch",
+    ),
 ];
 #[derive(Serialize, Deserialize)]
 struct Original {
