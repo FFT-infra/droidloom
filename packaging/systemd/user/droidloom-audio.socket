@@ -1,0 +1,9 @@
+[Unit]
+Description=Droidloom private Android audio endpoint
+PartOf=droidloom.service
+
+[Socket]
+ListenSequentialPacket=%t/droidloom/audio.sock
+SocketMode=0666
+DirectoryMode=0700
+RemoveOnStop=true

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+droidloom-timing = { path = "../../runtime/droidloom-timing" }
 droidloom-cpu-placement = { path = "../../runtime/droidloom-cpu-placement" }
 drm.workspace = true
 libc.workspace = true

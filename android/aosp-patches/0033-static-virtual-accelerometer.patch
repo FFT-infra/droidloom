@@ -1,0 +1,93 @@
+diff --git a/sensors/aidl/default/Android.bp b/sensors/aidl/default/Android.bp
+--- a/sensors/aidl/default/Android.bp
++++ b/sensors/aidl/default/Android.bp
+@@ -48,7 +48,8 @@
+ cc_binary {
+     name: "android.hardware.sensors-service.example",
+     relative_install_path: "hw",
+-    installable: false, // install APEX below
++    init_rc: ["sensors-default.rc"],
++    vintf_fragments: ["sensors-default.xml"],
+ 
+     vendor: true,
+     shared_libs: [
+diff --git a/sensors/aidl/default/include/sensors-impl/Sensors.h b/sensors/aidl/default/include/sensors-impl/Sensors.h
+--- a/sensors/aidl/default/include/sensors-impl/Sensors.h
++++ b/sensors/aidl/default/include/sensors-impl/Sensors.h
+@@ -47,16 +47,9 @@
+           mReadWakeLockQueueRun(false),
+           mAutoReleaseWakeLockTime(0),
+           mHasWakeLock(false) {
++        // This cell exposes one explicitly virtual stationary accelerometer.
++        // Dynamic sensors are not returned by SensorManager::getDefaultSensor.
+         AddSensor<AccelSensor>();
+-        AddSensor<GyroSensor>();
+-        AddSensor<AmbientTempSensor>();
+-        AddSensor<PressureSensor>();
+-        AddSensor<MagnetometerSensor>();
+-        AddSensor<LightSensor>();
+-        AddSensor<ProximitySensor>();
+-        AddSensor<RelativeHumiditySensor>();
+-        AddSensor<HingeAngleSensor>();
+-        AddSensor<LowLatencyOffBodyDetectSensor>();
+     }
+ 
+     virtual ~Sensors() {
+diff --git a/sensors/aidl/default/Sensor.cpp b/sensors/aidl/default/Sensor.cpp
+--- a/sensors/aidl/default/Sensor.cpp
++++ b/sensors/aidl/default/Sensor.cpp
+@@ -45,7 +45,7 @@
+     mStopThread = true;
+     mIsEnabled = false;
+     mWaitCV.notify_all();
+-    lock.release();
++    lock.unlock();
+     mRunThread.join();
+ }
+ 
+@@ -54,6 +54,7 @@
+ }
+ 
+ void Sensor::batch(int64_t samplingPeriodNs) {
++    std::lock_guard<std::mutex> lock(mRunMutex);
+     if (samplingPeriodNs < mSensorInfo.minDelayUs * 1000LL) {
+         samplingPeriodNs = mSensorInfo.minDelayUs * 1000LL;
+     } else if (samplingPeriodNs > mSensorInfo.maxDelayUs * 1000LL) {
+@@ -211,8 +212,8 @@
+ 
+ AccelSensor::AccelSensor(int32_t sensorHandle, ISensorsEventCallback* callback) : Sensor(callback) {
+     mSensorInfo.sensorHandle = sensorHandle;
+-    mSensorInfo.name = "Accel Sensor";
+-    mSensorInfo.vendor = "Vendor String";
++    mSensorInfo.name = "Droidloom Virtual Stationary Accelerometer";
++    mSensorInfo.vendor = "Droidloom";
+     mSensorInfo.version = 1;
+     mSensorInfo.type = SensorType::ACCELEROMETER;
+     mSensorInfo.typeAsString = "";
+@@ -224,7 +225,7 @@
+     mSensorInfo.fifoReservedEventCount = 0;
+     mSensorInfo.fifoMaxEventCount = 0;
+     mSensorInfo.requiredPermission = "";
+-    mSensorInfo.flags = static_cast<uint32_t>(SensorInfo::SENSOR_FLAG_BITS_DATA_INJECTION);
++    mSensorInfo.flags = 0;  // Continuous, non-wakeup, no data injection.
+ };
+ 
+ void AccelSensor::readEventPayload(EventPayload& payload) {
+@@ -232,7 +233,7 @@
+             .x = 0,
+             .y = 0,
+             .z = 9.8,
+-            .status = SensorStatus::ACCURACY_HIGH,
++            .status = SensorStatus::UNRELIABLE,
+     };
+     payload.set<EventPayload::Tag::vec3>(vec3);
+ }
+diff --git a/sensors/aidl/default/sensors-default.rc b/sensors/aidl/default/sensors-default.rc
+--- a/sensors/aidl/default/sensors-default.rc
++++ b/sensors/aidl/default/sensors-default.rc
+@@ -1,4 +1,4 @@
+-service vendor.sensors-default /apex/com.android.hardware.sensors/bin/hw/android.hardware.sensors-service.example
++service vendor.sensors-default /vendor/bin/hw/android.hardware.sensors-service.example
+     class hal
+     user system
+     group system

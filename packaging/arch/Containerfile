@@ -5,6 +5,7 @@ RUN ["rustup", "toolchain", "install", "1.93.0", "--profile", "minimal"]
 RUN ["rustup", "default", "1.93.0"]
 RUN ["chmod", "-R", "a+rX", "/opt/rustup"]
 RUN ["pacman", "-S", "--needed", "--noconfirm", "clang", "glslang"]
+RUN ["pacman", "-S", "--needed", "--noconfirm", "libpipewire"]
 ENV CARGO_HOME=/build/cargo-home
 ENV RUSTUP_TOOLCHAIN=1.93.0
 WORKDIR /source

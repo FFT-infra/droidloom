@@ -4,6 +4,74 @@ These limitations apply to the current pacman preview. Installation and APK
 commands are in [INSTALL.md](INSTALL.md); source builds are in
 [BUILDING.md](BUILDING.md).
 
+## sheng device acceptance
+
+The paired ABI 8 bundle `1792038829852603867-440284` is active on sheng. The
+earlier ABI 7 presenter override is obsolete. Host mouse, keyboard and native
+tablet-tool transport are compiled together with InputFlinger; this is still a
+development deployment, not a published release.
+
+An ordinary-UID input probe confirms `Droidloom Host Keyboard` is alphabetic
+(type 2) and `hasKeys(SPACE, ENTER, A, Z)` returns four true values. These
+capability checks match verified live behavior: physical keyboard input
+functions in live UU Remote sessions after clearing `FLAG_VIRTUAL_HARD_KEY`
+(0x40). However, the compositor advertises pointer constraints but no
+keyboard-shortcut inhibitor (`zwp_keyboard_shortcuts_inhibit_v1`), so `Super`
+(Meta/Logo) and desktop window-management shortcuts are consumed by Denial
+instead of reaching the remote host.
+
+Host uinput tablet events traversed Denial, Wayland and the Android native
+input receiver: the app received STYLUS source, pen/eraser tools, hover,
+pressure, barrel-button state and a 0.567 rad tilt sample. The physical pen
+still needs acceptance. Distance, rotation and tablet-wheel axes are outside
+ABI 8. F11/fullscreen and top-edge reveal passed; the immersive side swipe
+delivered Cancel plus Back to Android on the deployed bundle.
+
+The ordinary app's default accelerometer is the virtual stationary sensor:
+`[0, 0, 9.8]`, accuracy UNRELIABLE. It supplies the API capability, not physical
+motion sensing. Application-specific capture pages still need acceptance.
+
+Front/back YUV and JPEG probes now validate 1280x720 output and final resource
+cleanup. Repeating YUV exposed a probe lifecycle bug: closing the device before
+the session drained lost its onClosed callback. The probe now waits for session
+closure before closing the device. Final JSON must report `status=pass`, all
+cleanup flags true and the matching run token; a capture-phase log alone is
+insufficient. Real application recording and image quality are not covered.
+
+Native GLES shader draw/readback passes on FD740 / Mesa 26.1.7. Merely enabling
+`ro.gfx.angle.supported=true` did not make ANGLE usable: first swap crashed in
+Turnip's unimplemented Android deferred image-memory binding. Patch 0034 imports
+the gralloc layout and image-owned memory through Mesa's existing Android path.
+The source-extracted regression fails on the original code and passes with the
+patch. On bundle `1792038829852603867-440284` the per-app ANGLE selection
+rendered `ANGLE (Qualcomm, Vulkan 1.4.354 (Turnip Adreno 740), turnip Mesa
+driver-538.1.7)` with `GL_PIXEL pass=true error=0` and no crash, so the first
+swap is verified on-device. Native FD740 / Mesa 26.1.7 still passes after
+clearing the per-app selection. Other applications and sustained workloads
+remain separate checks.
+
+`/data/vendor/mesa_shader_cache` being configured is not evidence of persistent
+shader caching: pinned Mesa disables its standalone Android disk cache by
+default. Android EGL blob caches are present under each app's private cache
+(e.g. `com.android.opengl.shaders_cache`), including UU. Keep the private cache
+path; do not turn on a world-writable shared cache. No cold-start or gameplay
+performance improvement has been measured. The GPU exposes `simple_ondemand`
+and `userspace`, with no `performance` governor.
+
+The deployed audio unit now orders after PipeWire and WirePlumber. First
+playback after restart delivered 48000/2 PCM16 through four shared buffers; the
+stream and its link to the speaker sink reached `running`. Host speaker volume
+was 0 before and after the test, so this proves the graph, not audibility.
+Audio quality, recording, latency and xrun claims require separate evidence.
+Preserve user data and a complete previous release during activation.
+
+Automated task replacement also exposed a presenter retirement race: Android
+can remove an endpoint object before host direct-layer releases finish. Late
+output/focus/presentation callbacks must not send new messages to that retired
+object. Closing windows now skip refresh/focus/presentation publication while
+host buffers continue draining. Eight forced-stop/reopen cycles on the deployed
+bundle kept the presenter PID and left `NRestarts=0`.
+
 ## Application compatibility
 
 - **Clash of Clans on the x86_64 desktop.** Version 18.600.5 rejected inherited
@@ -151,7 +219,7 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
   images omit touch features and report no GLES version, which can hide apps;
   see the capability checks in the optional Google-app build guide.
   The development desktop also omitted both multitouch declarations despite
-  the input bridge supporting independent contacts. The product now declares
+  the input path supporting independent contacts. The product now declares
   `android.hardware.touchscreen.multitouch` and
   `android.hardware.touchscreen.multitouch.distinct`. A matching local override
   is active on that workstation, with `input.xml.before-multitouch` alongside
@@ -169,7 +237,7 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
   it also infers Bluetooth from a legacy permission capped at API 30. Testing
   both together does not isolate which declaration affected the catalog.
   Play Store's Open button exposed a separate missing intent-to-host task path;
-  the new task observer and host activation path still require device validation.
+  the framework-owned task backend and host activation path still require device validation.
   Runtime DRM/integrity behavior remains untested.
   Installing an APK does not establish that
   its account, billing, integrity checks or other service dependencies will work.
@@ -472,7 +540,7 @@ The subsequent source fixes and full-suite results are recorded above.
   geometry are not exported through the text-input integration. Inline
   notification replies and custom Android notification layouts are unsupported.
 - **Shared host kernel.** This is an Android container runtime, not a virtual
-  machine. See [security requirements](threat-model-v1.md) for isolation boundaries.
+  machine. See [security requirements](threat-model-v2.md) for isolation boundaries.
 
 ## Performance review targets
 
@@ -491,51 +559,63 @@ investigate first, not measured shares of CPU time or latency.
    Sources: [presenter](../graphics/droidloom-wayland/src/main.rs),
    [clipboard state](../graphics/droidloom-wayland/src/clipboard/mod.rs).
 
-2. **High: slow input consumption can block graphics control reception.**
-   Composer dispatches input inline in the same receive loop that handles
-   configure, presentation and buffer-release records. Its framework sender
-   uses a blocking sequenced-packet socket while holding the input-state mutex.
-   If the Java reader stalls and the socket fills, that receive loop waits too.
-   Decouple input writes from graphics control reception with bounded,
-   order-preserving backpressure; do not indiscriminately drop input events.
-   Validate by pausing a synthetic input peer and checking continued control
-   message processing. Sources: [receive loop](../graphics/droidloom-composer-service/src/main.rs),
-   [input sender](../graphics/droidloom-composer-service/src/input.rs),
-   [socket transport](../graphics/droidloom-denial-ipc/src/lib.rs).
+2. **Direct input removes the former Composer backpressure coupling.**
+   The presenter now writes to InputFlinger on a dedicated nonblocking socket.
+   Composer forwards no input records. Ordered queuing is bounded to 512
+   records; exhaustion closes the stream so native held-input cancellation
+   precedes reconnect. Socket handoff is negotiated through DIRECT_INPUT in
+   protocol 1.6, with stale generations rejected. Headless tests cover FIFO
+   backpressure, overflow, delegated FD ownership, scaling and recovery. Live
+   input/graphics responsiveness and latency still need acceptance and measurement.
+   Sources: [direct writer](../graphics/droidloom-wayland/src/input.rs),
+   [handoff](../graphics/droidloom-composer-service/src/input_handoff.rs).
 
-3. **Medium: app catalog repeatedly scans unchanged state.**
-   The catalog queries Android and reconciles launcher files every 30 seconds
-   by default. Icon keys and write-if-changed avoid some work, but the query and
-   filesystem comparisons still run. Prefer package/user/locale change events
-   with a full snapshot at connection or recovery. Measure idle wakeups and
-   refresh cost across catalog sizes. Sources:
-   [polling loop](../runtime/droidloom-applications/src/main.rs),
+3. **Catalog polling and per-query ART startup are removed in source.**
+   The catalog subscribes to package/user/locale events through a directly
+   delegated native descriptor, snapshots on connection/events, and blocks
+   while healthy idle. Its adapter runs inside system_server; missing icons
+   are batched. Failures retry with backoff. Measure idle wakeups and refresh
+   cost across catalog sizes and validate package/locale changes on each target.
+   Sources: [event loop](../runtime/droidloom-applications/src/main.rs),
    [reconciliation](../runtime/droidloom-applications/src/lib.rs).
 
-4. **Medium: notification changes resend the full active snapshot.**
-   After coalescing callbacks, the Java writer re-encodes every active entry,
-   including each 48-by-48 RGBA icon as 9,216 JSON numbers. Icon rendering is
-   cached and the host avoids unchanged desktop Notify calls, but serialization,
-   transport and parsing still repeat. Use versioned deltas and reusable icon
-   identities, retaining full snapshots for reconnects. Measure traffic and CPU
+4. **Notification deltas remove unchanged-entry encoding.**
+   Notification ABI 2 establishes a full snapshot per connection, then sends
+   changed posts and versioned removals. Unchanged entries are not re-encoded.
+   Changed entries still include each 48-by-48 RGBA icon as 9,216 JSON numbers;
+   reusable icon identities remain a possible improvement. Icon rendering is
+   cached and the host avoids unchanged desktop Notify calls. Measure traffic and CPU
    while one notification updates among many unchanged entries. Sources:
    [Android writer](../android/framework/droidloom-systemui/src/com/android/systemui/notifications/NotificationBridge.java),
    [host reconciliation](../graphics/droidloom-wayland/src/notifications/mod.rs).
 
-The extra Composer/Java/Binder input hops are also a candidate for simplification,
-but their latency has not been isolated. Existing frame tracing starts after app
+The checkout moves input reception, gesture/key state and event construction
+into InputFlinger, removing the per-event Java/Binder path and task-bounds query.
+The presenter now bypasses Composer for input delivery; the latency gain
+has not been isolated. Existing frame tracing starts after app
 input and rendering work; it cannot establish touch-to-display latency. Preserve
 real GPU release dependencies and the existing event-driven idle waits when
 optimizing the graphics path.
 
 Updated direct-layer peers pipeline Stage records and subscribe to revisioned
-configuration changes, leaving one synchronous Commit reply per changed scene
-with cached imports and no layer requests for unchanged scenes. Older peers keep
+configuration changes. With ASYNC_COMMIT they submit changed scenes without a
+synchronous Commit reply, bounding outstanding submissions to one per task and
+coalescing newer compositions until acceptance. Rejection forces composition
+fallback and releases only new, never-attached reads; GPU release fences remain
+independent. Composed-mode transitions retain an acceptance barrier to prevent
+cross-socket reordering. Older peers keep synchronous Commit replies,
 Config queries and individual Stage acknowledgements according to capabilities.
-Commit still validates current configure identity and geometry. New allocation
-registration remains synchronous; avoiding that wait needs import readiness and
-failure handling before a scene can reference the allocation.
-Source: [SurfaceFlinger layer sender](../android/surfaceflinger/0007-droidloom-wayland-layers.patch).
+Commit still validates current configure identity and geometry. ASYNC_IMPORT
+pipelines up to 16 allocation registrations per task and returns identified
+results on the event socket. Scenes reference only confirmed imports; pending or
+failed imports use composed fallback, and batch completion schedules the latest
+scene. Failure caching avoids retries on every frame. Legacy allocation
+registration and composition-mode barriers retain their synchronous contracts.
+Source: [asynchronous SurfaceFlinger commits](../android/surfaceflinger/0011-droidloom-async-layer-commits.patch).
+The [import extension](../android/surfaceflinger/0012-droidloom-async-imports.patch)
+keeps import confirmation independent of real GPU release dependencies. Cold
+startup, resize behavior and performance still require live acceptance and
+measurement.
 
 The current source now reuses render/input receive storage, suppresses unchanged
 direct-layer geometry requests, retains layer staging capacity, skips eventfd
@@ -543,6 +623,30 @@ reads for idle source imports, retains syncobj/eventfd resources and poll storag
 and disables key tracing by default. See
 [render/input fast-path work](architecture.md#renderinput-fast-path-work) for
 validation and the limits of the local transport measurement.
+
+Presenter task processing is selected by poll readiness or explicit lifecycle and
+configuration changes. Unrelated wakeups no longer probe every task's request
+socket and release timelines. Poll still enumerates stream descriptors and
+outstanding reads. Unsupported eventfd sources retain a bounded timer for their
+owners; actual timeline progress remains mandatory before buffer reuse. The host
+tests cover readiness, disconnects and fallback deadlines, but multi-app CPU cost
+and end-to-end latency still need measurement.
+
+The presenter now coalesces window geometry within each Wayland dispatch batch.
+Intermediate sizes skip GBM pool allocation and Android geometry updates; the
+final size/scale is applied before frame processing. The bootstrap canvas and
+real GPU release rules remain unchanged. Host tests cover configure/scale
+ordering, unspecified axes, independent windows and close cancellation. The user
+confirmed the local desktop resize build works; allocation savings and latency
+gains remain unmeasured.
+
+Unchanged direct-layer children now skip attachment, damage and commit requests
+when a sibling changes, using effective geometry and buffer/read-ticket or solid
+color identity. The root still commits the scene, new tickets still establish
+GPU reads, and hide clears the cached attachment. Private-socket tests cover
+static siblings, new tickets, geometry/color changes and reappearance. This
+reduces protocol work; frame-time gains are unmeasured. Partial-damage transport
+remains deferred for the current Denial target, with full damage on changed layers.
 
 ## Build and distribution
 

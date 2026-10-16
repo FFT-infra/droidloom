@@ -1,9 +1,13 @@
 [workspace]
 members = [
-    "android/framework/droidloom-task-launcher",
+    "android/framework/droidloom-window-policy",
     "android/runtime/droidloom-classpath-wrapper",
     "runtime/droidloom-applications",
+    "runtime/droidloom-audio",
+    "runtime/droidloom-audio-protocol",
+    "android/audio/droidloom-audio-client",
     "runtime/droidloom-cpu-placement",
+    "runtime/droidloom-timing",
     "runtime/droidloom-package-support",
     "runtime/droidloom-contracts",
     "runtime/droidloom-doctor",
@@ -13,6 +17,8 @@ members = [
     "graphics/droidloom-denial-ipc",
     "graphics/droidloom-denial-endpoint",
     "graphics/droidloom-wayland",
+    "graphics/droidloom-camera",
+    "graphics/droidloom-listenfd",
     "graphics/droidloom-denial-protocol",
     "graphics/droidloom-input-protocol",
     "graphics/droidloom-minigbm",
@@ -28,6 +34,7 @@ members = [
     "tools/droidloom-source",
     "tools/droidloom-dmabuf-probe",
     "tools/droidloom-translation-bench",
+    "tools/droidloom-frame-timing",
 ]
 resolver = "3"
 

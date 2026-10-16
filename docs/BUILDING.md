@@ -89,6 +89,178 @@ installer because Android packages approach its 1 GB site limit. Pacman's
 there. Packages are currently unsigned; see [INSTALL.md](INSTALL.md) for the
 repository's explicit signing policy.
 
+## Frame-stage timing baselines
+
+Build timing instrumentation before changing frame-processing behaviour. The
+shared Rust logger samples every eighth frame, formats records on a separate
+background thread and uses a bounded nonblocking queue. Disabled stage timers
+read no clocks and create no logging thread. The first enabled sample initializes
+the logger; exclude startup from a steady-state comparison.
+
+The Android hooks are included by `framework-build --tasks`; rebuild the host
+presenter too. Install a matching instrumented build through the normal workflow
+before collecting a baseline. Source builds and the commands below for reporting
+do not install or restart anything. Enabling tracing for an installed cell needs
+the ordinary Droidloom-only restart; it closes Android application windows.
+
+Enable the presenter's `DROIDLOOM_FRAME_TRACE=1` environment for that run, for
+example with `systemctl --user set-environment DROIDLOOM_FRAME_TRACE=1` on the
+packaged user-service setup. Inside Android, set
+`persist.vendor.droidloom.frame_timing=1` before restarting Droidloom. That
+persistent property survives a cell restart. Both settings are read on the first
+trace check and remain fixed for that process. After measuring, set the Android
+property to `0`, run
+`systemctl --user unset-environment DROIDLOOM_FRAME_TRACE`, and restart Droidloom
+normally to return to the disabled path. Do not restart the desktop session.
+
+Capture Android `logcat -v raw -s DroidloomTiming:I` and the presenter's user
+journal as separate text files under ignored `.work/frame-timing/`. Android
+records use liblog, including SurfaceFlinger whose standard error may be closed;
+host records use standard error. Capture full trace records, not only `timing_`
+lines, so the sequence-gap check can distinguish omitted records. Keep a single
+process incarnation per capture file. Start from a fresh process or clear capture
+boundaries; avoid historic journal records and startup events. Record the exact
+build, app, window sizes, refresh rate and workload in the report label.
+Check process IDs at both capture boundaries. If Droidloom restarts, start new
+files and reattach both collectors; a host journal filter for the old PID and an
+Android logcat connection to the old cell can silently miss the replacement run.
+
+| Stage | Measured work |
+| --- | --- |
+| `timing_sf_composite` | One complete SurfaceFlinger `composite()` call, including nested task and bootstrap work |
+| `timing_sf_task_scan` | Task classification, bounds and work-key collection across the frame's layers |
+| `timing_sf_snapshot_copy` | Copying a changing task's complete layer snapshots |
+| `timing_sf_direct_prepare` | CompositionEngine geometry, colour and composition-state preparation before direct export |
+| `timing_sf_direct_publish` | Direct-layer eligibility, imports, scene construction and transport submission; outcome 0 selects fallback/retry, 1 accepts the direct path |
+| `timing_sf_fallback_render` | Fallback CompositionEngine `present()` CPU/submission work; GPU completion is outside this duration |
+| `timing_sf_bootstrap_present` | Invisible bootstrap output's `present()` bookkeeping, including nested request construction |
+| `timing_sf_bootstrap_requests` | Building the bootstrap's display settings and client rendering requests before its rendering shortcut |
+| `timing_sf_bootstrap_state` | Updating colour/composition state, planning layers and writing HWC state; includes the bufferless path's fence-only Composer request before validation |
+| `timing_sf_bootstrap_begin` | Beginning the bootstrap display frame |
+| `timing_sf_bootstrap_prepare` | Selecting or predicting the HWC composition strategy; prediction may include nested dequeue/request work |
+| `timing_sf_bootstrap_finish` | Completing client composition and queueing its target; includes nested dequeue/request/queue work when prediction is disabled |
+| `timing_sf_bootstrap_dequeue` | Acquiring a client target from the render surface; outcome 0 means no buffer was obtained |
+| `timing_sf_bootstrap_queue` | Queueing the client target, including display-surface advancement |
+| `timing_sf_bootstrap_hwc_present` | HWC presentation and fence retrieval on the thread executing it |
+| `timing_sf_bootstrap_complete` | Notifying the render/display surface that HWC presentation completed |
+| `timing_sf_bootstrap_release` | Assigning and merging layer release fences and clearing released layers |
+| `timing_sf_bootstrap_cache` | Scheduling cached layer-set rendering |
+| `timing_presenter_commit` | Applying a valid direct-layer scene through the parent Wayland commit; excludes earlier receive/validation and later socket flush/display |
+
+For the bufferless bootstrap path, `bootstrap_state` includes the fence-only
+Composer request and `bootstrap_queue` measures display-surface advancement;
+no `bootstrap_dequeue` occurs.
+HWC preparation, presentation and release timers remain. Set
+`persist.vendor.droidloom.bootstrap_bufferless=false`
+inside Android to restore the buffer-backed path live, then restore `true` after
+comparison. Keep each switch outside the measured interval and allow the workload
+to settle; retain the full trace for loss checks. The focused regression test is
+`cargo test --locked -j 1 -p droidloom-update --test bufferless_bootstrap`; it
+compiles the patch's real completion methods with isolated framework substitutes
+and checks fence retention, FD ownership and fallback. A matched Android build
+and real application validation remain necessary.
+
+Bootstrap stages are nested inside `bootstrap_present`; do not add parent and
+child durations. If HWC presentation is offloaded, its present/complete/release
+timers run on that worker and may overlap other stages or outlive `present()`.
+The thread CPU duration only includes the thread that owns each timer, excluding
+Binder servers and GPU work. Fine-grained tracing itself adds clock reads and
+queue operations to sampled frames; compare builds with identical tracing.
+
+SurfaceFlinger samples one in eight composite calls; task stages share that sample
+identity. The host independently samples one in eight asynchronous scene IDs.
+Those identities are different domains and cannot establish cross-process or
+input-to-display latency. A successful direct publication may reuse an unchanged
+scene, and fallback/import-pending samples are retained separately by outcome.
+Legacy synchronous scenes have no scene identity and omit the host timer.
+Outcome 1 means that the measured operation completed or accepted publication;
+it does not prove that Wayland flushed, a GPU finished or a frame was displayed.
+
+Warm the app and shader caches for at least 15 seconds, then capture a repeatable
+30–60 second workload. Keep idle, scrolling, a game and simultaneous animating
+windows in separate runs. Repeat each run at least three times with identical
+window sizes, refresh rate, tracing flags and workload. Include an idle run to
+check that instrumentation does not introduce periodic frame activity. Fixed
+one-in-eight sampling can alias periodic workloads; vary the starting phase and
+inspect multiple runs. Keep thermal and background-load differences in mind.
+
+Summarize the captured files, then compare the same workload on a later build:
+
+```console
+cargo run --locked -j 1 -p droidloom-frame-timing -- summarize .work/frame-timing/android.log .work/frame-timing/presenter.log --label "baseline BUILD_ID; APP; workload; SIZE; HZ" --output .work/frame-timing/baseline.json
+cargo run --locked -j 1 -p droidloom-frame-timing -- compare .work/frame-timing/baseline.json .work/frame-timing/candidate.json
+```
+
+Reports include sample count, mean, p50, p95, p99 and maximum for elapsed and
+thread CPU time, grouped by stage, outcome and layer count. Percentiles use
+nearest rank over observed samples. Comparisons show matching groups and flag
+missing groups; they are descriptive, not statistical significance tests.
+Use sample counts when interpreting tails (p99 from a handful of samples is
+effectively the maximum). Whole-composite samples group by the total frame layer
+count; task samples group by their task layer count. Object zero means a global
+stage and otherwise identifies an Android task or host object, not an app name.
+
+The report exposes queue drops, observed sequence gaps, duplicates, malformed
+timing records and observed 65,536-record process caps. Drops and gaps overlap
+and must not be added together. Loss or a capped capture can bias results;
+recapture a shorter run from fresh processes. Clearing logcat or starting a new
+file does not reset the per-process cap, and a full logcat ring can discard the
+start of a run even when the retained tail has no sequence gaps.
+Worker-thread formatting/logging is outside each stage
+duration but still consumes CPU, and outer spans include nested instrumentation
+costs. Compare equally instrumented builds and retain an untraced control run.
+Do not interpret wall-minus-CPU as pure IPC time or the fallback timer as GPU
+time. No real application baseline has been recorded merely by testing this
+instrumentation.
+
+### GPU client accounting
+
+Build the read-only counter tool without changing the Android image or enabling
+frame tracing:
+
+```console
+cargo build --locked -j 1 -p droidloom-frame-timing --bin droidloom-gpu-usage
+target/debug/droidloom-gpu-usage probe --output .work/gpu-probe.json
+target/debug/droidloom-gpu-usage capture --process SurfaceFlinger=HOST_PID --process Presenter=HOST_PID --process Game=HOST_PID --seconds 60 --interval-ms 500 --label "BUILD; APP; workload; SIZE; HZ" --output .work/gpu-capture
+```
+
+Use distinct live host PIDs from `probe`, including app rendering subprocesses.
+Replace the placeholders before running. Run in the host PID namespace;
+sandbox process visibility can hide the running cell. Administrator access may
+be needed to read Android processes owned by other UIDs. Capturing reads only
+`/proc` accounting and writes its new output directory; it never opens a GPU
+device, changes driver settings, launches apps or restarts services. Keep the
+raw `samples.jsonl`, process/boot metadata, JSON report and Markdown summary.
+The directory must not already exist. Samples are flushed as they arrive so
+partial data survives interruption. For a manually ended run, pass
+`--stop-file .work/gpu-capture.stop` using an initially absent marker; creating
+that file ends sampling and writes the report without signalling a process.
+The `--seconds` bound still applies. Fixed selected PIDs are not automatically
+replaced after an app or service restart; start a separate capture with the new
+identities. Probe uses kernel process names and does not collect arguments,
+environments or app contents.
+
+The tool uses the kernel's [DRM client accounting interface](https://www.kernel.org/doc/html/latest/gpu/drm-usage-stats.html).
+It deduplicates `(driver, device, drm-client-id)` across duplicated and shared
+handles, including handles in different selected processes. When several
+processes share a client, its work cannot be attributed to each owner separately.
+Reported percentages are changes in driver-reported engine busy nanoseconds,
+divided by observed wall time and the reported engine capacity (default one).
+They are not shader occupancy, power, queue delay or input latency. Do not sum
+clients or different engines into a total GPU percentage: their accounting can
+overlap. Frequency and other GPU clients can affect comparisons. A compositor
+client covers the whole desktop, so its activity alone is not Droidloom overhead.
+
+Missing or unsupported engine counters are unavailable, not zero. Cycles-only
+drivers remain visible but are not converted to nanoseconds. The report exposes
+read/identity errors, counter regressions, interrupted coverage and scan duration;
+temporarily regressing counters retain their high-water mark until they catch up.
+Resident and shared memory are retained per client; shared buffers can appear in
+several clients, and deprecated `drm-memory-*` aliases are not added again.
+This accounting does not depend on the frame logger or its per-process cap.
+Keep app sizes, refresh rate and workload fixed, record unrelated GPU load and
+repeat active and idle scenarios before claiming a GPU improvement.
+
 ## 1. Prepare an x86_64 build machine
 
 The supported package workflow uses rootless Podman with an Arch build container.
@@ -333,6 +505,26 @@ graphics, app startup and cold translation need additional dedicated workloads
 and app-level measurements. An optimizing-mode result can include fallback;
 selecting that mode does not prove every instruction used the heavy optimizer.
 
+## Focused audio checks
+
+Host audio builds need the `libpipewire-0.3` development headers (`libpipewire`
+on Arch). Integration tests also need `pipewire`, `pw-link`, `pw-dump` and
+`systemd-socket-activate`. They create a private server and null-sink graph in
+temporary storage; they do not change the user's audio session or record a mic.
+
+```console
+cargo test --locked -j 1 -p droidloom-audio -p droidloom-audio-client -p droidloom-audio-protocol
+cargo run --locked -j 1 -p droidloom-update -- -j 1 audio-build --work .work/arch/build
+```
+
+`audio-build` reuses a prepared package workspace, compiles the audio APEX and
+`libaudiobase.so`, restores its checked source projections, and does not install
+or restart services. Use `--product droidloom_arm64` for the ARM64 audio components.
+It leaves an existing translator development snapshot and its recorded artifact
+provenance unchanged. Physical
+audio and Android app validation are additional checks; see the
+[audio guide](audio-integration-proposal.md).
+
 ## 4. Exercise package installation
 
 ```console
@@ -541,7 +733,7 @@ successful image assembly; see [third-party scope](../THIRD_PARTY.md).
 
 Play Store also filters its catalog using Android's reported capabilities.
 The vendor product declares touch and distinct multitouch provided by Droidloom's
-input bridge, which preserves independent contact IDs in Android MotionEvents.
+native InputFlinger path, which preserves independent contact IDs in Android MotionEvents.
 The framework includes that routed input when computing display
 configuration, since physical input devices remain private to Denial. The Mesa
 products advertise OpenGL ES 3.2 (`ro.opengles.version=196610`), matching the

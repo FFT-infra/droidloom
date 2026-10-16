@@ -124,7 +124,7 @@ struct EglTarget<'a> {
 
 impl EglRenderer {
     fn new(gbm_device: *mut c_void) -> Result<Self, ProbeError> {
-        let mut error = [0_i8; 512];
+        let mut error = [0 as c_char; 512];
         // SAFETY: the GBM device outlives this EGL wrapper and the error array is writable.
         let renderer =
             unsafe { droidloom_egl_renderer_create(gbm_device, error.as_mut_ptr(), error.len()) };
@@ -150,7 +150,7 @@ impl EglRenderer {
         let width = i32::try_from(target.width).map_err(|_| ProbeError::Dimension)?;
         let height = i32::try_from(target.height).map_err(|_| ProbeError::Dimension)?;
         let mut fence = -1;
-        let mut error = [0_i8; 512];
+        let mut error = [0 as c_char; 512];
         // SAFETY: all pointers are valid for the call; C borrows the DMA-BUF and returns
         // ownership of a newly duplicated native-fence FD on success.
         let result = unsafe {
@@ -513,7 +513,7 @@ fn import_sync_file(
     handle: syncobj::Handle,
     sync_file: &OwnedFd,
 ) -> Result<(), ProbeError> {
-    let mut error = [0_i8; 512];
+    let mut error = [0 as c_char; 512];
     // SAFETY: both descriptors and the process-local syncobj handle are valid for
     // the ioctl; C only writes inside the provided bounded error array.
     let result = unsafe {

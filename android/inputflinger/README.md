@@ -12,7 +12,65 @@ to a different Android task.
 This is downstream of Denial's ordinary window hit testing. The patch contains
 no Denial policy and never changes Android task focus or stacking.
 
-`0002-droidloom-targeted-injection-binder.patch` adds the root/system-only
-native endpoint used by `droidloom-input-bridge`. It preserves the existing
+`0002-droidloom-targeted-injection-binder.patch` supplies the original root/system-only
+native injection endpoint. It preserves the existing
 `InputDispatcherInterface` ABI, parses the standard Android event parcel, and
 passes the resolved application token into the concrete dispatcher path.
+
+`0003-droidloom-window-policy.patch` links the Rust policy/task backend into
+`libinputflinger`. `0004-droidloom-native-input.patch` adds an in-process Rust
+input receiver and a small C++ event-construction adapter. The existing window
+policy starts InputManager's Rust-owned listener through private transaction
+`0x00444c03`, native input ABI 2. No init FD or support process is required. WMS
+publishes bounds, application tokens and task incarnations through local native
+Binder transactions `0x00444c04`/`0x00444c05`, outside its global lock.
+Only system_server can configure the listener or publish routes; socket clients are
+restricted to Android root/system. No public AIDL or stock transaction changes.
+
+InputManager's class layout remains unchanged: the prebuilt `libandroid_servers`
+allocates it with the upstream `sizeof`. Native ownership is kept in a private
+registry used only for setup and route-publication calls, outside the input-event
+path. The builder permits only its existing Binder virtual override in
+`InputManager.h` while retaining that prebuilt JNI consumer. Rust owns listener
+creation, permissions, shutdown and stale-socket cleanup in a system-private
+directory. A restarted system_server starts its own listener again.
+
+The receiver validates input ABI 8 (with touch/key-only ABI 7 compatibility) and
+rejects stale incarnations. `0005-droidloom-host-mouse.patch` restores the host
+mouse input-device registration. Native mouse events retain mouse source,
+button/hover/wheel semantics and the real registered device ID; side buttons
+also dispatch Back/Forward keys. It sleeps in
+socket polling at idle. `0006-droidloom-host-device-identities.patch` preserves
+registered external keyboard/mouse IDs for task-token-targeted injection, as
+the previous sheng UU Remote integration did. Ordinary non-targeted injection
+retains Android's original device-ID policy. It cancels keys/gestures on
+disconnect or route retirement,
+and retains Binder tokens through cancellation dispatch. Native input ABI 2
+metadata prevents mixed framework/Composer builds. The Wayland presenter writes
+directly to the native receiver. Composer delegates the connected writer FD at
+startup/recovery and publishes framework task incarnations; it keeps no writer
+duplicate and forwards no touch/key records. The existing framework policy
+handler applies the low-frequency PowerManager callback. System_server delegates
+authenticated connected descriptors to the existing IME/SystemUI adapters; their
+payloads travel directly to the host. No standalone input bridge remains.
+
+## Ordinary app acceptance probe
+
+`probe/AndroidManifest.xml` and `probe/Probe.java` form a small debuggable APK
+with no permissions. Compile against the pinned public Android SDK, dex with
+D8, link the manifest with aapt2, and sign as an ordinary test application.
+Install it and launch `com.android.droidloom.inputprobe/.Probe`. Read logcat
+tag `DroidloomInputProbe` for device keyboard type/hasKeys, EditText changes,
+key/motion records and the default accelerometer sample. Use host input for
+transport acceptance: adb input bypasses the Wayland/native-input path.
+
+Launch with `--ez graphics true` to compile/link GLES shaders, draw a red point
+and check its pixel readback. Require both the expected `GL_RENDERER` and
+`GL_PIXEL pass=true error=0`; merely loading a driver is insufficient. For an
+ANGLE test, select only this package with Android's per-app ANGLE settings,
+force-stop/relaunch it and restore the original selection afterward.
+`--ez audio true` plays a quiet 250 ms output-only beep. A successful tone
+request alone does not establish audible playback or audio quality.
+
+The probe logs entered text. Use only synthetic acceptance text, retain logs
+outside the repository, and uninstall the test APK after device acceptance.

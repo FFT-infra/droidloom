@@ -1,0 +1,252 @@
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
+@@ -109,6 +109,8 @@
+     // A null display leaves normal and screen-capture outputs unchanged.
+     std::optional<PhysicalDisplayId> droidloomHeadlessDisplay;
+     sp<Fence> droidloomHeadlessFence;
++    // Only the private, invisible Droidloom physical display can omit its target.
++    bool droidloomSkipBootstrapTarget = false;
+     // Diagnostic sample identity only; never affects presentation/release policy.
+     uint64_t droidloomTimingFrame = 0;
+ };
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+@@ -201,7 +201,10 @@
+     std::unique_ptr<HwcAsyncWorker> mHwComposerAsyncWorker;
+ 
+     // Null disables the headless path; Fence::NO_FENCE is a valid empty frame.
++    void prepareDroidloomHeadlessFrame();
++    bool finishDroidloomHeadlessFrame();
+     sp<Fence> mDroidloomHeadlessFence;
++    bool mDroidloomSkipBootstrapTarget = false;
+     uint64_t mDroidloomTimingFrame = 0;
+ 
+     bool mPredictCompositionStrategy = false;
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h
+@@ -88,6 +88,15 @@
+     // which will fire when the buffer is ready for consumption.
+     virtual void queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) = 0;
+ 
++    // Before HWC validation (which may present early), hand off the actual
++    // task completion fence for Droidloom's invisible bootstrap. False selects
++    // ordinary buffer-backed completion; unsupported surfaces do nothing.
++    virtual bool prepareDroidloomHeadlessFrame(const sp<Fence>&) { return false; }
++
++    // After successful preparation, advance only the display surface.
++    // Pending targets retain ordinary completion.
++    virtual bool queueDroidloomHeadlessFrame(float /*hdrSdrRatio*/) { return false; }
++
+     // Called after the HWC calls are made to present the display
+     virtual void onPresentDisplayCompleted() = 0;
+ 
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h
+@@ -61,6 +61,8 @@
+     std::shared_ptr<renderengine::ExternalTexture> dequeueBuffer(
+             base::unique_fd* bufferFence) override;
+     void queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) override;
++    bool prepareDroidloomHeadlessFrame(const sp<Fence>& readyFence) override;
++    bool queueDroidloomHeadlessFrame(float hdrSdrRatio) override;
+     void onPresentDisplayCompleted() override;
+     bool supportsCompositionStrategyPrediction() const override;
+ 
+@@ -86,6 +88,7 @@
+     ui::Size mSize;
+     const size_t mMaxTextureCacheSize;
+     bool mProtected{false};
++    bool mDroidloomBufferlessReported = false;
+ };
+ 
+ std::unique_ptr<compositionengine::RenderSurface> createRenderSurface(
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -457,6 +457,7 @@
+         mDroidloomHeadlessFence = refreshArgs.droidloomHeadlessFence;
+     }
+     mDroidloomTimingFrame = refreshArgs.droidloomTimingFrame;
++    mDroidloomSkipBootstrapTarget = refreshArgs.droidloomSkipBootstrapTarget;
+     DroidloomTimingSpan bootstrapTiming(DroidloomTimingStage::BootstrapPresent,
+                                        mDroidloomHeadlessFence ? mDroidloomTimingFrame : 0,
+                                        0, getOutputLayerCount());
+@@ -498,6 +499,7 @@
+     planComposition();
+     writeCompositionState(refreshArgs);
+     setColorTransform(refreshArgs);
++    prepareDroidloomHeadlessFrame();
+     stateTiming.stop();
+     DroidloomTimingSpan beginTiming(DroidloomTimingStage::BootstrapBegin, timingFrame);
+     beginFrame();
+@@ -1331,6 +1333,50 @@
+     prepareFrame();
+ }
+ 
++void Output::prepareDroidloomHeadlessFrame() {
++    // HWC can present during validation, including frames with only device
++    // composition. Its fence must exist before prepareFrame(), not just when
++    // finishFrame() happens to queue a client target.
++    mDroidloomSkipBootstrapTarget = mDroidloomSkipBootstrapTarget &&
++            mDroidloomHeadlessFence && getState().isEnabled &&
++            mRenderSurface->prepareDroidloomHeadlessFrame(mDroidloomHeadlessFence);
++}
++
++bool Output::finishDroidloomHeadlessFrame() {
++    if (!mDroidloomSkipBootstrapTarget || !mDroidloomHeadlessFence ||
++        !getState().usesClientComposition) {
++        return false;
++    }
++
++    DroidloomTimingSpan queueTiming(DroidloomTimingStage::BootstrapQueue, mDroidloomTimingFrame);
++    const bool advanced = mRenderSurface->queueDroidloomHeadlessFrame(1.0f);
++    queueTiming.outcome(advanced);
++    queueTiming.stop();
++    if (!advanced) return false;
++
++    // No bootstrap buffer is read or written. Keep exactly the client LayerFEs
++    // selected by ordinary composition and their actual, possibly unsignaled,
++    // task-read fence. HWC present and release processing still run afterwards.
++    DroidloomTimingSpan requestsTiming(DroidloomTimingStage::BootstrapRequests,
++                                      mDroidloomTimingFrame, 0, getOutputLayerCount());
++    const auto dataspace = mDisplayColorProfile->hasWideColorGamut()
++            ? getState().dataspace : ui::Dataspace::UNKNOWN;
++    std::vector<LayerFE*> clientCompositionLayersFE;
++    static_cast<void>(generateClientCompositionRequests(
++            getCompositionEngine().getRenderEngine().supportsProtectedContent(),
++            dataspace, clientCompositionLayersFE));
++    requestsTiming.stop();
++    setExpensiveRenderingExpected(false);
++    for (auto* layer : clientCompositionLayersFE) {
++        layer->setWasClientComposed(mDroidloomHeadlessFence);
++    }
++    if (isPowerHintSessionEnabled() && !isPowerHintSessionGpuReportingEnabled()) {
++        setHintSessionGpuFence(std::make_unique<FenceTime>(
++                sp<Fence>::make(mDroidloomHeadlessFence->dup())));
++    }
++    return true;
++}
++
+ void Output::finishFrame(GpuCompositionResult&& result) {
+     SFTRACE_CALL();
+     ALOGV(__FUNCTION__);
+@@ -1339,6 +1385,13 @@
+         return;
+     }
+ 
++    // Prediction can already own a target/fence; retain its original completion
++    // path. RenderSurface also declines if an older failed frame left a target.
++    if (outputState.strategyPrediction == CompositionStrategyPredictionState::DISABLED &&
++        !result.bufferAvailable() && finishDroidloomHeadlessFrame()) {
++        return;
++    }
++
+     std::optional<base::unique_fd> optReadyFence;
+     std::shared_ptr<renderengine::ExternalTexture> buffer;
+     base::unique_fd bufferFence;
+diff --git a/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp b/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+--- a/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+@@ -26,6 +26,7 @@
+ #include <compositionengine/impl/DumpHelpers.h>
+ #include <compositionengine/impl/OutputCompositionState.h>
+ #include <compositionengine/impl/RenderSurface.h>
++#include "DroidloomNativeWindow.h"
+ #include <log/log.h>
+ #include <renderengine/ExternalTexture.h>
+ #include <renderengine/RenderEngine.h>
+@@ -247,6 +248,33 @@
+     }
+ }
+ 
++bool RenderSurface::prepareDroidloomHeadlessFrame(const sp<Fence>& readyFence) {
++    if (mTexture != nullptr) return false;
++    // Preserve HWC's real completion fence without acquiring a target or
++    // sending a discarded host frame. The private operation borrows the FD;
++    // SCM_RIGHTS duplicates it, and the ACK confirms Composer stored it.
++    const status_t handoff = mNativeWindow->perform(mNativeWindow.get(),
++            DroidloomNativeWindow::kCompleteHeadlessFrame, readyFence->get());
++    if (handoff != NO_ERROR) {
++        ALOGE("Droidloom bootstrap fence handoff failed: %d", handoff);
++        return false;
++    }
++    return true;
++}
++
++bool RenderSurface::queueDroidloomHeadlessFrame(float hdrSdrRatio) {
++    if (mTexture != nullptr) return false;
++    const status_t result = mDisplaySurface->advanceFrame(hdrSdrRatio);
++    if (result != NO_ERROR) {
++        ALOGE("[%s] failed pushing headless frame to HWC: %d", mDisplay.getName().c_str(), result);
++    }
++    if (!mDroidloomBufferlessReported) {
++        ALOGI("Droidloom bootstrap: bufferless frame completion active");
++        mDroidloomBufferlessReported = true;
++    }
++    return true;
++}
++
+ void RenderSurface::onPresentDisplayCompleted() {
+     mDisplaySurface->onFrameCommitted();
+ }
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3854,6 +3854,8 @@
+             base::GetBoolProperty("persist.vendor.droidloom.elide_bootstrap", true)) {
+             refreshArgs.droidloomHeadlessDisplay = pacesetterId;
+             refreshArgs.droidloomHeadlessFence = taskCompletion;
++            refreshArgs.droidloomSkipBootstrapTarget = base::GetBoolProperty(
++                    "persist.vendor.droidloom.bootstrap_bufferless", true);
+         }
+     }
+ 
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.cpp b/services/surfaceflinger/DroidloomNativeWindow.cpp
+--- a/services/surfaceflinger/DroidloomNativeWindow.cpp
++++ b/services/surfaceflinger/DroidloomNativeWindow.cpp
+@@ -39,7 +39,7 @@
+ 
+ constexpr char kSocketPath[] = "/dev/socket/droidloom-surfaceflinger";
+ constexpr std::array<uint8_t, 4> kMagic{'D', 'L', 'S', 'F'};
+-constexpr uint16_t kVersion = 3;
++constexpr uint16_t kVersion = 4;
+ constexpr size_t kHeaderBytes = 16;
+ constexpr size_t kMaxRecordBytes = 128;
+ constexpr size_t kMaxPlanes = 4;
+@@ -89,6 +89,7 @@
+     Retire = 9,
+     PresentWithContent = 10,
+     PresentWithDamage = 11,
++    CompleteHeadless = 14,
+ };
+ 
+ struct ReceivedRecord {
+@@ -610,6 +611,13 @@
+ int DroidloomNativeWindow::perform(int operation, va_list args) {
+     std::lock_guard lock(mMutex);
+     switch (operation) {
++        case kCompleteHeadlessFrame: {
++            const int fenceFd = va_arg(args, int);
++            if (mTask != 0 || !mDequeued.empty() || fenceFd < -1) return INVALID_OPERATION;
++            const status_t status = sendRequest(static_cast<uint16_t>(Opcode::CompleteHeadless),
++                                                0, fenceFd);
++            return status == NO_ERROR ? receiveAck() : status;
++        }
+         case NATIVE_WINDOW_API_CONNECT:
+             (void)va_arg(args, int);
+             if (mConnected) return -EINVAL;
+diff --git a/services/surfaceflinger/DroidloomNativeWindow.h b/services/surfaceflinger/DroidloomNativeWindow.h
+--- a/services/surfaceflinger/DroidloomNativeWindow.h
++++ b/services/surfaceflinger/DroidloomNativeWindow.h
+@@ -35,6 +35,8 @@
+ class DroidloomNativeWindow final
+       : public ANativeObjectBase<ANativeWindow, DroidloomNativeWindow, RefBase> {
+ public:
++    // Private ANativeWindow operation; argument is a borrowed sync-file FD.
++    static constexpr int kCompleteHeadlessFrame = 0x444c0001;
+     static sp<DroidloomNativeWindow> create(uint32_t expectedWidth, uint32_t expectedHeight);
+     static sp<DroidloomNativeWindow> createForTask(uint64_t task, status_t* outStatus);
+ 

@@ -1,0 +1,180 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+index 4edbab2..78d2742 100644
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -17,11 +17,13 @@
+ #include <array>
+ #include <bit>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstring>
+ #include <map>
+ #include <mutex>
+ #include <set>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ #include "FrontEnd/LayerSnapshot.h"
+@@ -110,6 +112,51 @@ bool stage(int socket, bool pipelined, const std::vector<uint8_t>& payload,
+             reply.size() == 1 && reply[0] == 0;
+ }
+ 
++// One outstanding scene bounds queued descriptors and avoids speculative read
++// reuse. Caller holds State::mutex; no callback runs while that lock is held.
++class CommitQueue {
++    uint64_t mNext = 0, mPending = 0;
++    std::vector<uint64_t> mAdded;
++    bool mDeferred = false, mFallback = false;
++public:
++    bool busy() const { return mPending != 0; }
++    bool defer() {
++        if (!busy()) return false;
++        mDeferred = true;
++        return true;
++    }
++    bool takeFallback() { return std::exchange(mFallback, false); }
++    uint64_t begin(std::vector<uint64_t> added) {
++        if (busy() || mNext == UINT64_MAX) return 0;
++        mPending = ++mNext;
++        mAdded = std::move(added);
++        return mPending;
++    }
++    bool complete(const std::vector<uint32_t>& words, std::vector<uint64_t>* rejected,
++                  bool* repaint) {
++        if (words.size() != 3 || !busy() ||
++            (words[0] | static_cast<uint64_t>(words[1]) << 32) != mPending ||
++            static_cast<int32_t>(words[2]) > 0) return false;
++        rejected->clear();
++        if (words[2]) {
++            *rejected = std::move(mAdded);
++            mFallback = true;
++        }
++        mAdded.clear();
++        mPending = 0;
++        *repaint = mDeferred || mFallback;
++        mDeferred = false;
++        return true;
++    }
++};
++
++bool commitAsync(int socket, uint64_t scene, const std::vector<uint8_t>& payload) {
++    std::vector<uint8_t> packet;
++    put64(packet, scene);
++    packet.insert(packet.end(), payload.begin(), payload.end());
++    return send(socket, 9, packet);
++}
++
+ // Revisioned snapshots order the initial reply against asynchronous updates.
+ struct ConfigCache {
+     std::mutex mutex;
+@@ -270,6 +317,8 @@ std::optional<Export> prepare(const compositionengine::OutputLayer& layer, uint3
+ }  // namespace
+ struct DroidloomLayers::State {
+     std::mutex mutex;
++    std::condition_variable completed;
++    CommitQueue commits;
+     ConfigCache config;
+     std::map<uint64_t, std::shared_ptr<Read>> pending;
+     bool live = true;
+@@ -313,6 +362,26 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+                 if (!configurationEvent(state->config, words, repaint)) break;
+                 continue;
+             }
++            if (op == 0x8006) {
++                bool wake = false;
++                std::vector<uint64_t> rejected;
++                {
++                    std::lock_guard lock(state->mutex);
++                    if (!state->commits.complete(words, &rejected, &wake)) break;
++                    // Rejection proves only this scene's NEW reads never began.
++                    // Reused tickets still protect preceding accepted scenes.
++                    for (uint64_t ticket : rejected) {
++                        auto it = state->pending.find(ticket);
++                        LOG_ALWAYS_FATAL_IF(it == state->pending.end(),
++                                            "Rejected Droidloom read already released");
++                        reads.publish(it->second, Fence::NO_FENCE, true);
++                        state->pending.erase(it);
++                    }
++                    state->completed.notify_all();
++                }
++                if (wake && repaint) repaint();
++                continue;
++            }
+             if (words.size() != 2 || (op != 0x8003 && op != 0x8004)) break;
+             const uint64_t ticket = words[0] | static_cast<uint64_t>(words[1]) << 32;
+             std::lock_guard lock(state->mutex);
+@@ -332,6 +401,7 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+         }
+         std::lock_guard lock(state->mutex);
+         state->live = false;
++        state->completed.notify_all();
+         // Missing fences stay unresolved on disconnect. Already delivered
+         // sync-files continue protecting buffers independently of this socket.
+         if (!state->pending.empty())
+@@ -339,6 +409,14 @@ DroidloomLayers::DroidloomLayers(base::unique_fd requests, base::unique_fd event
+     }).detach();
+ }
+ DroidloomLayers::~DroidloomLayers() = default;
++void DroidloomLayers::invalidate() {
++    // Normal direct frames never wait. Only a transition to the other socket
++    // needs a barrier, otherwise its fallback can overtake an older direct scene.
++    std::unique_lock lock(mState->mutex);
++    mState->completed.wait(lock, [&] { return !mState->live || !mState->commits.busy(); });
++    mScene.clear();
++    mLayers.clear();
++}
+ bool DroidloomLayers::transact(uint32_t opcode, const std::vector<uint8_t>& payload,
+                                const std::vector<int>& fds) {
+     std::vector<uint32_t> reply;
+@@ -359,6 +437,10 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+     {
+         std::lock_guard lock(mState->mutex);
+         if (!mState->live) return false;
++        // Coalesce under pressure, without staging references to skipped
++        // frames. Acceptance wakes a new composition using the latest snapshot.
++        if (mState->commits.defer()) return true;
++        if (mState->commits.takeFallback()) return false;
+     }
+     std::vector<Export> exports;
+     std::set<uint64_t> buffers;
+@@ -493,6 +575,26 @@ bool DroidloomLayers::presentFrame(compositionengine::Output& output, uint32_t w
+     put32(p, width);
+     put32(p, height);
+     put32(p, static_cast<uint32_t>(exports.size()));
++    if ((config[0] & (4 | 8 | 16)) == (4 | 8 | 16)) {
++        uint64_t id;
++        {
++            std::lock_guard lock(mState->mutex);
++            std::vector<uint64_t> tickets;
++            for (const auto& [ticket, read] : added) tickets.push_back(ticket);
++            id = mState->commits.begin(std::move(tickets));
++        }
++        if (!id) return reject();
++        if (!commitAsync(mRequests.get(), id, p)) {
++            std::lock_guard lock(mState->mutex);
++            mState->live = false;
++            mState->completed.notify_all();
++            return false; // Ambiguous transport loss never releases reads.
++        }
++        if (id == 1) ALOGI("Droidloom asynchronous layer commits enabled (one scene in flight)");
++        mLayers = std::move(next);
++        mScene = std::move(scene);
++        return true;
++    }
+     // Distinguish an explicit rejection from a lost commit acknowledgement:
+     // only the former proves the host did not start reading source buffers.
+     std::vector<uint32_t> reply;
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+index 5009644..9dc4ec8 100644
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -29,7 +29,7 @@ class DroidloomLayers {
+    public:
+     DroidloomLayers(base::unique_fd requests, base::unique_fd events, std::function<void()> repaint);
+     ~DroidloomLayers();
+-    void invalidate() { mScene.clear(); }
++    void invalidate();
+     bool present(compositionengine::Output& output, uint32_t width, uint32_t height);
+ 
+    private:

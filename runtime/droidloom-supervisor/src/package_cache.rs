@@ -20,9 +20,11 @@ pub(crate) fn invalidate_systemui_cache(root: &Path) -> io::Result<usize> {
             let kind = entry.file_type()?;
             if kind.is_dir() {
                 removed += visit(&entry.path())?;
-            } else if kind.is_file() && entry.file_name().to_str().is_some_and(|name| {
-                name.starts_with("SystemUI-") || name.starts_with("SystemUI.apk-")
-            }) {
+            } else if kind.is_file()
+                && entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("SystemUI-") || name.starts_with("SystemUI.apk-")
+                })
+            {
                 fs::remove_file(entry.path())?;
                 removed += 1;
             }
@@ -48,7 +50,11 @@ mod tests {
         let external = tempfile::tempdir().unwrap();
         fs::write(external.path().join("SystemUI-16-123"), "outside cache").unwrap();
         symlink(external.path(), cache.join("linked-directory")).unwrap();
-        symlink(external.path().join("SystemUI-16-123"), cache.join("SystemUI-linked")).unwrap();
+        symlink(
+            external.path().join("SystemUI-16-123"),
+            cache.join("SystemUI-linked"),
+        )
+        .unwrap();
         assert_eq!(invalidate_systemui_cache(root.path()).unwrap(), 2);
         assert!(cache.join("Settings-16-789").exists());
         assert!(cache.join("SystemUI-linked").exists());

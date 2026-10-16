@@ -303,11 +303,28 @@ impl SeqPacket {
     ///
     /// Rejects malformed paths and propagates socket/connect failures.
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, IpcError> {
-        let (address, length) = unix_address(path.as_ref().as_os_str())?;
+        Self::connect_flags(path.as_ref(), 0)
+    }
+
+    /// Connect without waiting for space in the server's accept queue.
+    ///
+    /// # Errors
+    /// Returns connection errors immediately, including a full accept queue.
+    pub fn connect_nonblocking(path: impl AsRef<Path>) -> Result<Self, IpcError> {
+        Self::connect_flags(path.as_ref(), libc::SOCK_NONBLOCK)
+    }
+
+    fn connect_flags(path: &Path, flags: i32) -> Result<Self, IpcError> {
+        let (address, length) = unix_address(path.as_os_str())?;
         // SAFETY: arguments are constants for a Unix sequenced-packet socket;
         // successful return transfers ownership of a fresh descriptor.
-        let raw =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | flags,
+                0,
+            )
+        };
         if raw < 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -407,40 +424,90 @@ impl SeqPacket {
         Ok(())
     }
 
+    /// Bound blocking sends and receives on a low-frequency control channel.
+    ///
+    /// # Errors
+    /// Rejects zero/overflowing durations and propagates `setsockopt` failures.
+    pub fn set_io_timeout(&self, timeout: std::time::Duration) -> Result<(), IpcError> {
+        if timeout.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
+        let value = libc::timeval {
+            tv_sec: timeout
+                .as_secs()
+                .try_into()
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+            tv_usec: timeout.subsec_micros().max(1).into(),
+        };
+        let size = mem::size_of_val(&value)
+            .try_into()
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: value is an initialized timeval and the socket is owned.
+            if unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    ptr::from_ref(&value).cast(),
+                    size,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sleep until a record or disconnect, without polling or consuming data.
+    ///
+    /// # Errors
+    /// Propagates `poll` failures, retrying interrupted waits.
+    pub fn wait_readable(&self) -> Result<(), IpcError> {
+        let mut event = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: event is one initialized, writable pollfd; -1 waits for an event.
+            if unsafe { libc::poll(ptr::from_mut(&mut event), 1, -1) } >= 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+
+    /// Observe connection loss without consuming an application record.
+    ///
+    /// # Errors
+    /// Propagates `poll` failures. This never waits.
+    pub fn peer_closed(&self) -> Result<bool, IpcError> {
+        let mut event = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: event is one initialized, writable pollfd.
+        if unsafe { libc::poll(ptr::from_mut(&mut event), 1, 0) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(event.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
+    }
+
     /// Read kernel-authenticated peer PID, UID, and GID.
     ///
     /// # Errors
     ///
     /// Propagates `SO_PEERCRED` failure or a malformed kernel response.
     pub fn peer_credentials(&self) -> Result<PeerCredentials, IpcError> {
-        let mut credentials = MaybeUninit::<libc::ucred>::uninit();
-        let mut length = libc::socklen_t::try_from(mem::size_of::<libc::ucred>())
-            .map_err(|_| IpcError::InvalidAncillary)?;
-        // SAFETY: the kernel writes at most the advertised `ucred` size into
-        // valid uninitialized storage, and the descriptor stays live.
-        let result = unsafe {
-            libc::getsockopt(
-                self.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                credentials.as_mut_ptr().cast(),
-                &raw mut length,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        if usize::try_from(length).ok() != Some(mem::size_of::<libc::ucred>()) {
-            return Err(IpcError::InvalidAncillary);
-        }
-        // SAFETY: successful `getsockopt` initialized the complete `ucred`.
-        let credentials = unsafe { credentials.assume_init() };
-        Ok(PeerCredentials {
-            pid: u32::try_from(credentials.pid).map_err(|_| IpcError::InvalidAncillary)?,
-            uid: credentials.uid,
-            gid: credentials.gid,
-        })
+        peer_credentials(self)
     }
+
 
     /// Send exactly one record with up to four attached descriptors.
     ///
@@ -614,6 +681,37 @@ impl AsFd for SeqPacket {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+}
+
+/// Read kernel-authenticated peer PID, UID, and GID from any connected Unix socket descriptor.
+pub fn peer_credentials(fd: impl AsFd) -> Result<PeerCredentials, IpcError> {
+    let mut credentials = MaybeUninit::<libc::ucred>::uninit();
+    let mut length = libc::socklen_t::try_from(mem::size_of::<libc::ucred>())
+        .map_err(|_| IpcError::InvalidAncillary)?;
+    // SAFETY: the kernel writes at most the advertised `ucred` size into
+    // valid uninitialized storage, and the descriptor stays live.
+    let result = unsafe {
+        libc::getsockopt(
+            fd.as_fd().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if usize::try_from(length).ok() != Some(mem::size_of::<libc::ucred>()) {
+        return Err(IpcError::InvalidAncillary);
+    }
+    // SAFETY: successful `getsockopt` initialized the complete `ucred`.
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(PeerCredentials {
+        pid: u32::try_from(credentials.pid).map_err(|_| IpcError::InvalidAncillary)?,
+        uid: credentials.uid,
+        gid: credentials.gid,
+    })
 }
 
 /// Untyped record returned by [`SeqPacket::receive_record`].
@@ -859,6 +957,35 @@ fn attach_decoded<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readable_wait_preserves_records_and_wakes_for_disconnect() {
+        let (left, right) = super::SeqPacket::pair().unwrap();
+        right.send_record(b"task command", &[]).unwrap();
+        left.wait_readable().unwrap();
+        assert_eq!(left.receive_record().unwrap().bytes, b"task command");
+        drop(right);
+        left.wait_readable().unwrap();
+        assert!(left.peer_closed().unwrap());
+    }
+
+    #[test]
+    fn control_timeout_and_disconnect_do_not_consume_records() {
+        let (left, right) = super::SeqPacket::pair().unwrap();
+        assert!(left.set_io_timeout(std::time::Duration::ZERO).is_err());
+        left.set_io_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        assert!(!left.peer_closed().unwrap());
+        assert!(
+            matches!(left.receive_record(), Err(super::IpcError::Io(error))
+            if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        right.send_record(b"hello", &[]).unwrap();
+        assert!(!left.peer_closed().unwrap());
+        assert_eq!(left.receive_record().unwrap().bytes, b"hello");
+        drop(right);
+        assert!(left.peer_closed().unwrap());
+    }
+
     use std::fs::File;
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;

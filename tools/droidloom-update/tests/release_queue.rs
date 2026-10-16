@@ -2,7 +2,7 @@
 use std::{fs, path::Path, process::Command};
 
 #[test]
-fn layer_pipeline_uses_one_commit_reply_and_preserves_legacy_staging() {
+fn layer_pipeline_supports_bounded_async_imports_commits_and_legacy_replies() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let temp = tempfile::tempdir().unwrap();
     // Materialize the actual final transport after both patches, checking that
@@ -10,6 +10,11 @@ fn layer_pipeline_uses_one_commit_reply_and_preserves_legacy_staging() {
     for patch in [
         "0007-droidloom-wayland-layers.patch",
         "0008-droidloom-release-fences.patch",
+        "0011-droidloom-async-layer-commits.patch",
+        "0012-droidloom-async-imports.patch",
+        "0013-droidloom-lazy-render-targets.patch",
+        "0014-droidloom-task-work-gate.patch",
+        "0015-droidloom-scene-batches.patch",
     ] {
         let output = Command::new("git")
             .current_dir(temp.path())
@@ -17,6 +22,7 @@ fn layer_pipeline_uses_one_commit_reply_and_preserves_legacy_staging() {
                 "apply",
                 "--include=services/surfaceflinger/DroidloomLayers.cpp",
                 "--include=services/surfaceflinger/DroidloomLayers.h",
+                "--include=services/surfaceflinger/DroidloomTaskWork.h",
             ])
             .arg(repo.join("android/surfaceflinger").join(patch))
             .output()
@@ -37,6 +43,12 @@ fn layer_pipeline_uses_one_commit_reply_and_preserves_legacy_staging() {
     fs::write(
         temp.path().join("DroidloomLayerTransport.inc"),
         &cpp[start..end],
+    )
+    .unwrap();
+    fs::copy(
+        temp.path()
+            .join("services/surfaceflinger/DroidloomTaskWork.h"),
+        temp.path().join("DroidloomTaskWork.h"),
     )
     .unwrap();
     let binary = temp.path().join("layer-staging-test");

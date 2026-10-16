@@ -51,7 +51,7 @@ impl FenceWakeup {
             }
             let error = io::Error::last_os_error();
             match error.kind() {
-                io::ErrorKind::Interrupted => {},
+                io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock => break,
                 _ => return Err(wakeup_error("drain fence availability eventfd", error)),
             }

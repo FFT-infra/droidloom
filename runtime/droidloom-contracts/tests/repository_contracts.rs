@@ -192,14 +192,13 @@ fn host_presentation_is_ordinary_wayland_without_plugin_artifacts() {
     assert!(!catalog.contains("/usr/bin/droidloomctl start"));
 
     let android_catalog = fs::read_to_string(root.join(
-        "android/framework/droidloom-input-bridge/src/com/android/droidloom/catalog/ApplicationCatalog.java",
+        "android/framework/droidloom-window-policy/java/com/android/server/wm/DroidloomApplicationCatalog.java",
     ))
     .expect("read Android application catalog adapter");
     assert!(android_catalog.contains("Intent.CATEGORY_LAUNCHER"));
     assert!(android_catalog.contains("queryIntentActivities"));
     assert!(android_catalog.contains("Bitmap.CompressFormat.PNG"));
 }
-
 
 #[test]
 fn shared_kernel_vintf_reports_the_real_kernel_policy_version() {
@@ -229,10 +228,10 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
     assert!(android_bp.contains("name: \"libdroidloom_minigbm\""));
     assert!(android_bp.contains("name: \"libdroidloom_composer_aidl\""));
     assert!(android_bp.contains("name: \"libdroidloom_task_control\""));
-    assert!(android_bp.contains("name: \"libdroidloom_task_launcher\""));
-    assert!(android_bp.contains("name: \"droidloom-task-launcher\""));
+    assert!(!android_bp.contains("name: \"libdroidloom_task_launcher\""));
+    assert!(!android_bp.contains("name: \"droidloom-task-launcher\""));
     assert!(android_bp.contains("name: \"droidloom-classpath-wrapper\""));
-    assert!(android_bp.contains("name: \"droidloom-input-bridge\""));
+    assert!(!android_bp.contains("name: \"droidloom-application-catalog\""));
     assert!(android_bp.contains("name: \"android.hardware.graphics.composer3-service.droidloom\""));
     assert!(android_bp.contains("crate_root: \"graphics/droidloom-composer/src/lib.rs\""));
     assert!(android_bp.contains("crate_root: \"graphics/droidloom-minigbm/src/lib.rs\""));
@@ -240,7 +239,9 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
     assert!(android_bp.contains("\"android.hardware.graphics.composer3-V5-rust\""));
     assert!(android_bp.contains("crate_root: \"graphics/droidloom-denial-protocol/src/lib.rs\""));
     assert!(android_bp.contains("crate_root: \"graphics/droidloom-denial-ipc/src/lib.rs\""));
-    assert_eq!(android_bp.matches("vendor: true").count(), 17);
+    // Five shared transport/codec crates also build platform variants for WMS
+    // and its native input receiver.
+    assert_eq!(android_bp.matches("vendor: true").count(), 12);
 
     let product = fs::read_to_string(
         repository_root().join("android/device/droidloom_arm64/droidloom_arm64.mk"),
@@ -268,7 +269,7 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
 fn native_targeted_input_keeps_the_boot_framework_abi_untouched() {
     let root = repository_root();
     let bridge = fs::read_to_string(root.join(
-        "android/framework/droidloom-input-bridge/src/com/android/droidloom/input/InputBridge.java",
+        "android/framework/droidloom-window-policy/java/com/android/server/policy/DroidloomHostChannels.java",
     ))
     .expect("read Droidloom input bridge");
     let surfaceflinger_patch = fs::read_to_string(
@@ -284,11 +285,29 @@ fn native_targeted_input_keeps_the_boot_framework_abi_untouched() {
     )
     .expect("read Android cell init patch");
 
-    assert!(bridge.contains("0x00444c01"));
+    let native_input = fs::read_to_string(
+        root.join("android/framework/droidloom-window-policy/jni/DroidloomInput.cpp"),
+    )
+    .expect("read native input adapter");
+    let native_patch =
+        fs::read_to_string(root.join("android/inputflinger/0004-droidloom-native-input.patch"))
+            .expect("read native input patch");
+    assert!(bridge.contains("0x00444c03"));
+    assert!(native_input.contains("0x00444c03"));
+    assert!(native_patch.contains("input->transact"));
+    // Prebuilt libandroid_servers allocates InputManager with its original
+    // sizeof. Native input must preserve that header's allocation/layout ABI.
+    assert!(!native_patch.contains("diff --git a/services/inputflinger/InputManager.h"));
+    assert!(
+        !root
+            .join("android/framework/droidloom-input-bridge")
+            .exists()
+    );
     assert!(surfaceflinger_patch.contains("0x00444c01"));
-    assert!(bridge.contains("0x00444c02"));
     assert!(inputflinger_patch.contains("0x00444c02"));
-    assert!(bridge.contains("SurfaceFlinger"));
+    assert!(!bridge.contains("MotionEvent"));
+    assert!(!bridge.contains("getTaskBounds"));
+    assert!(native_input.contains("injectInputEventToApplication"));
     assert!(bridge.contains("inputflinger"));
     assert!(init_patch.contains("setprop debug.wm.disable_deprecated_target_sdk_dialog true"));
     for forbidden in [
@@ -297,22 +316,51 @@ fn native_targeted_input_keeps_the_boot_framework_abi_untouched() {
         "core/java/android/hardware/input/InputManagerGlobal.java",
     ] {
         assert!(
-            !surfaceflinger_patch.contains(forbidden) && !inputflinger_patch.contains(forbidden),
+            !surfaceflinger_patch.contains(forbidden)
+                && !inputflinger_patch.contains(forbidden)
+                && !native_patch.contains(forbidden),
             "native task-targeted input must not change boot framework ABI through {forbidden}"
         );
     }
 }
 
 #[test]
-fn android_task_geometry_does_not_conflate_density_with_wayland_scale() {
+fn host_display_power_reaches_android_power_manager_through_versioned_protocols() {
     let root = repository_root();
+    let presenter = fs::read_to_string(root.join("graphics/droidloom-wayland/src/main.rs"))
+        .expect("read Wayland presenter");
+    let denial_protocol =
+        fs::read_to_string(root.join("graphics/droidloom-denial-protocol/src/lib.rs"))
+            .expect("read Denial protocol");
+    let input_protocol =
+        fs::read_to_string(root.join("graphics/droidloom-input-protocol/src/lib.rs"))
+            .expect("read input protocol");
     let bridge = fs::read_to_string(root.join(
-        "android/framework/droidloom-input-bridge/src/com/android/droidloom/input/InputBridge.java",
+        "android/framework/droidloom-window-policy/java/com/android/server/policy/DroidloomHostChannels.java",
     ))
     .expect("read Droidloom input bridge");
-    assert!(bridge.contains("mResizeTask.invoke(activityTaskManager, record.taskId, requestedBounds,"));
-    assert!(!bridge.contains("setDensityDpi"));
-    assert!(!bridge.contains("scaledDensity"));
+
+    assert!(presenter.contains("ZwlrOutputPowerManagerV1"));
+    assert!(presenter.contains("aggregate_display_power"));
+    assert!(denial_protocol.contains("DisplayPower"));
+    assert!(input_protocol.contains("encode_display_power"));
+    assert!(bridge.contains("manager.goToSleep"));
+    assert!(bridge.contains("manager.wakeUp"));
+    assert!(bridge.contains("policyHandler.post"));
+}
+
+#[test]
+fn android_task_geometry_does_not_conflate_density_with_wayland_scale() {
+    let root = repository_root();
+    let backend = fs::read_to_string(root.join(
+        "android/framework/droidloom-window-policy/java/com/android/server/wm/DroidloomTaskBackend.java",
+    ))
+    .expect("read Droidloom framework task backend");
+    assert!(
+        backend.contains("mService.resizeTask(task.mTaskId, bounds, 0 /* RESIZE_MODE_SYSTEM */)")
+    );
+    assert!(!backend.contains("setDensityDpi"));
+    assert!(!backend.contains("scaledDensity"));
 
     let surfaceflinger = fs::read_to_string(
         root.join("android/surfaceflinger/0001-droidloom-direct-denial-render-surface.patch"),
@@ -398,6 +446,10 @@ fn packaged_artifact_compatibility_regressions() {
         .current_dir(root)
         .output()
         .expect("python3 is required for package contract tests");
-    assert!(output.status.success(), "{}{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

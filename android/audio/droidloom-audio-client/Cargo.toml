@@ -1,0 +1,20 @@
+[package]
+name = "droidloom-audio-client"
+description = "Android HAL client for dedicated PipeWire sample buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+droidloom-audio-protocol = { path = "../../../runtime/droidloom-audio-protocol" }
+libc.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

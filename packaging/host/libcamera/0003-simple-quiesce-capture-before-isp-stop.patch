@@ -1,0 +1,40 @@
+From: xinyang <xinyangmn@gmail.com>
+Subject: [PATCH] libcamera: simple: quiesce capture before stopping the ISP
+
+The isolated IPA's synchronous stop dispatches events while waiting for its
+reply. SoftwareIsp has already stopped its worker at that point, but the
+video buffer-ready signal is still connected. A captured frame can therefore
+queue a Debayer invocation on the stopped worker. Teardown then cancels the
+request and releases its buffers, leaving the invocation to replay invalid
+pointers when the worker starts again.
+
+Disconnect capture delivery before stopping the ISP. Keep the existing
+blocking worker stop, worker wait and owner callback drain; release buffers
+only after those have completed. SimpleCameraData is not an Object, so the
+video signal calls it directly and has no separate queued delivery to drain.
+
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1710,6 +1710,13 @@
+ 							 &DelayedControls::applyControls);
+ 	}
+
++	/*
++	 * A synchronous IPA stop may dispatch capture events while the software
++	 * ISP worker is already stopped. Quiesce the producer before that call
++	 * so no buffer pointers can be queued for the worker's next start.
++	 */
++	video->bufferReady.disconnect(data, &SimpleCameraData::imageBufferReady);
++
+ 	if (data->useConversion_) {
+ 		if (data->converter_)
+ 			data->converter_->stop();
+@@ -1720,8 +1727,6 @@
+ 	video->streamOff();
+ 	video->releaseBuffers();
+
+-	video->bufferReady.disconnect(data, &SimpleCameraData::imageBufferReady);
+-
+ 	data->clearIncompleteRequests();
+ 	data->conversionBuffers_.clear();
+

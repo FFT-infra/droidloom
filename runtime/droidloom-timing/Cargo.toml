@@ -1,0 +1,22 @@
+[package]
+name = "droidloom-timing"
+description = "Opt-in bounded asynchronous frame timing shared by Android and Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+droidloom-cpu-placement = { path = "../droidloom-cpu-placement" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+libc.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

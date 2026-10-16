@@ -2,15 +2,17 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use clap::Parser;
 use droidloom_supervisor::control::{
-    DEFAULT_CONTROL_SOCKET, DEFAULT_SPEC_DIRECTORY, DEFAULT_SUPERVISOR, DaemonConfig, serve,
+    DEFAULT_CONTROL_SOCKET, DEFAULT_SPEC_DIRECTORY, DEFAULT_SUPERVISOR, DaemonConfig, Shutdown,
+    serve,
 };
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[derive(Debug, Parser)]
 #[command(name = "droidloomd", version, about)]
@@ -27,7 +29,18 @@ struct Cli {
 }
 
 extern "C" fn request_shutdown(_signal: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
+    // SAFETY: the initialized eventfd outlives installed handlers. write(2) is
+    // async-signal-safe; preserve the interrupted operation's errno.
+    unsafe {
+        let saved = *libc::__errno_location();
+        let value = 1_u64;
+        libc::write(
+            SHUTDOWN_FD.load(Ordering::Relaxed),
+            (&raw const value).cast(),
+            8,
+        );
+        *libc::__errno_location() = saved;
+    }
 }
 
 fn main() {
@@ -38,7 +51,10 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("{}", droidloom_supervisor::control::FRAMEWORK_CONTROL_ABI);
     droidloom_cpu_placement::initialize(droidloom_cpu_placement::Role::Background);
+    let shutdown = Shutdown::new()?;
+    SHUTDOWN_FD.store(shutdown.as_raw_fd(), Ordering::Relaxed);
     install_signal_handlers()?;
     let cli = Cli::parse();
     let config = DaemonConfig {
@@ -46,7 +62,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         supervisor: cli.supervisor,
         spec_directory: cli.spec_directory,
     };
-    serve(&config, &SHUTDOWN)?;
+    let result = serve(&config, &shutdown);
+    SHUTDOWN_FD.store(-1, Ordering::Relaxed);
+    result?;
     Ok(())
 }
 

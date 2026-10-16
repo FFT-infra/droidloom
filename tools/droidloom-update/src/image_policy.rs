@@ -1,4 +1,6 @@
-//! Derive the desktop system_ext image without legacy vendor compatibility APEXes.
+//! Derive the pinned images whose device-facing policy Droidloom changes: the
+//! desktop system_ext without legacy vendor compatibility APEXes, and the
+//! tablet product whose build characteristic declares its device class.
 use crate::util::*;
 use std::{
     collections::BTreeMap,
@@ -27,24 +29,40 @@ fn desktop_vendor(properties: &str) -> Result<()> {
             }
         })
         .collect();
-    if properties.get("ro.product.vendor.device") != Some(&"droidloom_x86_64")
-        || properties.get("ro.vendor.build.version.sdk") != Some(&"37")
-        || !matches!(
-            properties.get("ro.vendor.product.cpu.abilist"),
-            Some(&"x86_64" | &"x86_64,arm64-v8a")
-        )
+    // The vendor device selects its CPU list; cross products must not smuggle
+    // an x86_64 ABI declaration into an ARM64 cell or vice versa.
+    let abilist = match properties.get("ro.product.vendor.device") {
+        Some(&"droidloom_x86_64") => "x86_64",
+        Some(&"droidloom_arm64") | Some(&"droidloom_sheng") => "arm64-v8a",
+        _ => {
+            return fail(
+                "legacy VNDK removal requires a Droidloom vendor without a VNDK selection",
+            );
+        }
+    };
+    if properties.get("ro.vendor.build.version.sdk") != Some(&"37")
+        || !properties
+            .get("ro.vendor.product.cpu.abilist")
+            .is_some_and(|abilist_value| {
+                abilist_value.split(',').any(|entry| entry.trim() == abilist)
+            })
         || ["ro.vndk.version", "ro.product.vndk.version"]
             .iter()
             .any(|key| properties.get(key).is_some_and(|value| !value.is_empty()))
     {
         return fail(
-            "legacy VNDK removal requires the Android 17 Droidloom x86_64 vendor without a VNDK selection",
+            "legacy VNDK removal requires the Android 17 Droidloom vendor without a VNDK selection",
         );
     }
     Ok(())
 }
 
-pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Result<()> {
+pub fn stage(
+    source: &Path,
+    destination: &Path,
+    vendor_properties: &Path,
+    pencilengine_jar: Option<&Path>,
+) -> Result<()> {
     desktop_vendor(&fs::read_to_string(vendor_properties)?)?;
     fs::create_dir_all(destination.parent().ok_or("image has no parent")?)?;
     // A single fakeroot session preserves otherwise privileged ownership and
@@ -57,7 +75,8 @@ pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Res
     let executable = worker.path().join("droidloom-update");
     fs::copy("/proc/self/exe", &executable)?;
     crate::util::mode(&executable, 0o755)?;
-    run(Command::new("fakeroot")
+    let mut command = Command::new("fakeroot");
+    command
         .arg("--")
         .arg(&executable)
         .arg("prune-desktop-image")
@@ -66,7 +85,11 @@ pub fn stage(source: &Path, destination: &Path, vendor_properties: &Path) -> Res
         .arg("--destination")
         .arg(destination)
         .arg("--vendor-properties")
-        .arg(vendor_properties))
+        .arg(vendor_properties);
+    if let Some(jar) = pencilengine_jar {
+        command.arg("--pencilengine-jar").arg(jar);
+    }
+    run(&mut command)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -142,7 +165,12 @@ pub(crate) fn extract(image: &Path, destination: &Path) -> Result<()> {
         .arg(image))
 }
 
-pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Result<()> {
+pub fn prune(
+    image: &Path,
+    destination: &Path,
+    vendor_properties: &Path,
+    pencilengine_jar: Option<&Path>,
+) -> Result<()> {
     if std::env::var_os("FAKEROOTKEY").is_none() {
         return fail("image derivation must run inside fakeroot to preserve Android metadata");
     }
@@ -173,22 +201,262 @@ pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Resu
         std::time::UNIX_EPOCH
             + std::time::Duration::new(apex.modified.0.try_into()?, apex.modified.1.try_into()?),
     )?;
-    let rebuilt = work.path().join("system_ext.img");
+
+    if let Some(jar) = pencilengine_jar {
+        if jar.is_file() {
+            let fw_rel = Path::new("framework");
+            let fw_dir = tree.join(fw_rel);
+            let created_fw_dir = !expected.contains_key(fw_rel);
+            if created_fw_dir {
+                fs::create_dir_all(&fw_dir)?;
+                run(Command::new("chown").args(["-h", "0:0"]).arg(&fw_dir))?;
+                mode(&fw_dir, 0o755)?;
+                run(Command::new("setfattr")
+                    .args(["-h", "-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+                    .arg(&fw_dir))?;
+            }
+
+            let relative = Path::new("framework/xiaomi-pencilengine-pad.jar");
+            let target = tree.join(relative);
+            fs::copy(jar, &target)?;
+            run(Command::new("chown").args(["-h", "0:0"]).arg(&target))?;
+            mode(&target, 0o644)?;
+            run(Command::new("setfattr")
+                .args(["-h", "-n", "security.selinux", "-v", "u:object_r:system_file:s0"])
+                .arg(&target))?;
+            fs::File::open(&target)?.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::new(1230768000, 0),
+            )?;
+
+            if created_fw_dir {
+                fs::File::open(&fw_dir)?.set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::new(1230768000, 0),
+                )?;
+                let attributes = output(
+                    Command::new("getfattr")
+                        .args([
+                            "--absolute-names",
+                            "--dump",
+                            "--no-dereference",
+                            "--encoding=hex",
+                            "--match=-",
+                        ])
+                        .arg(&fw_dir),
+                )?
+                .lines()
+                .filter(|line| !line.starts_with("# file:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+                let meta = fs::symlink_metadata(&fw_dir)?;
+                expected.insert(
+                    fw_rel.to_path_buf(),
+                    Entry {
+                        uid: 0,
+                        gid: 0,
+                        mode: meta.mode(),
+                        modified: (1230768000, 0),
+                        content: String::new(),
+                        attributes,
+                    },
+                );
+            } else if let Some(framework) = expected.get(fw_rel) {
+                fs::File::open(&fw_dir)?.set_modified(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::new(
+                            framework.modified.0.try_into()?,
+                            framework.modified.1.try_into()?,
+                        ),
+                )?;
+            }
+
+            if let Some(root_entry) = expected.get(Path::new("")) {
+                fs::File::open(&tree)?.set_modified(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::new(
+                            root_entry.modified.0.try_into()?,
+                            root_entry.modified.1.try_into()?,
+                        ),
+                )?;
+            }
+
+            let attributes = output(
+                Command::new("getfattr")
+                    .args([
+                        "--absolute-names",
+                        "--dump",
+                        "--no-dereference",
+                        "--encoding=hex",
+                        "--match=-",
+                    ])
+                    .arg(&target),
+            )?
+            .lines()
+            .filter(|line| !line.starts_with("# file:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+            let meta = fs::symlink_metadata(&target)?;
+            expected.insert(
+                relative.to_path_buf(),
+                Entry {
+                    uid: 0,
+                    gid: 0,
+                    mode: meta.mode(),
+                    modified: (1230768000, 0),
+                    content: hash(&target)?,
+                    attributes,
+                },
+            );
+        }
+    }
+
+    let rebuilt = rebake_verified(work.path(), image, &tree, &expected)?;
+    eprintln!(
+        "Derived system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
+        fs::metadata(image)?.len(),
+        fs::metadata(&rebuilt)?.len()
+    );
+    fs::rename(rebuilt, destination)?;
+    Ok(())
+}
+
+/// Declare the tablet device class in the product image of the tablet product.
+///
+/// Platforms and applications read this characteristic to choose between phone
+/// and tablet presentation. The tablet product presents one large landscape
+/// display, so its image declares the class that display establishes, while the
+/// products that present a phone-sized display keep the class the pinned base
+/// image states. Only that one line changes; every other property, file and
+/// metadata entry keeps its pinned value.
+pub fn declare_tablet(image: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination.parent().ok_or("image has no parent")?)?;
+    // A single fakeroot session preserves otherwise privileged ownership and
+    // security xattrs across extraction, mkfs, and independent re-extraction.
+    let worker = tempfile::Builder::new()
+        .prefix("tablet-declaration-")
+        .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
+    let executable = worker.path().join("droidloom-update");
+    fs::copy("/proc/self/exe", &executable)?;
+    mode(&executable, 0o755)?;
+    run(Command::new("fakeroot")
+        .arg("--")
+        .arg(&executable)
+        .arg("declare-tablet-product-image")
+        .arg("--image")
+        .arg(image)
+        .arg("--destination")
+        .arg(destination))
+}
+
+pub fn declare_tablet_product_image(image: &Path, destination: &Path) -> Result<()> {
+    if std::env::var_os("FAKEROOTKEY").is_none() {
+        return fail("tablet declaration must run inside fakeroot to preserve Android metadata");
+    }
+    if destination.exists() {
+        return fail("declared product image destination already exists");
+    }
+    let work = tempfile::Builder::new()
+        .prefix("tablet-declaration-")
+        .tempdir_in(destination.parent().ok_or("image has no parent")?)?;
+    let tree = work.path().join("tree");
+    extract(image, &tree)?;
+    // A product image is an EROFS filesystem for /product, so its root is the
+    // partition root: the properties file sits directly under etc.
+    let properties = tree.join("etc/build.prop");
+    // The pinned base image declares the phone class once, without a prefix.
+    const PHONE: &str = "ro.build.characteristics=default";
+    const TABLET: &str = "ro.build.characteristics=tablet";
+    let contents = fs::read_to_string(&properties)?;
+    let declared = match contents.matches(PHONE).count() {
+        1 => contents.replace(PHONE, TABLET),
+        0 => {
+            return fail(format!(
+                "tablet product image declares no phone characteristic to replace: {}",
+                properties.display()
+            ));
+        }
+        count => {
+            return fail(format!(
+                "tablet product image declares the phone characteristic {count} times"
+            ));
+        }
+    };
+    // SurfaceFlinger takes an internal display's density from this property
+    // and falls back to its TV density when nothing defines it, which is what
+    // a panel without EDID gets. State it here: the product partition loads
+    // last, so this value wins over anything the pinned system image states,
+    // and a per-user `droidloomctl dpi` override still outranks it.
+    const DENSITY_PREFIX: &str = "ro.sf.lcd_density=";
+    const DENSITY: &str = "ro.sf.lcd_density=360";
+    let declared = match declared
+        .lines()
+        .find(|line| line.starts_with(DENSITY_PREFIX))
+    {
+        Some(existing) => declared.replace(existing, DENSITY),
+        None => format!("{declared}{DENSITY}\n"),
+    };
+    // Rewriting the file in place keeps its owner, mode and security label; the
+    // original modification time is restored so a derived image stays
+    // reproducible from its base.
+    let modified = fs::metadata(&properties)?.modified()?;
+    fs::write(&properties, declared)?;
+    fs::File::open(&properties)?.set_modified(modified)?;
+    let expected = inventory(&tree)?;
+    let rebuilt = rebake_verified(work.path(), image, &tree, &expected)?;
+    eprintln!(
+        "Declared the tablet device class; product: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
+        fs::metadata(image)?.len(),
+        fs::metadata(&rebuilt)?.len()
+    );
+    fs::rename(rebuilt, destination)?;
+    Ok(())
+}
+
+/// The EROFS identity a derived image has to keep. Android mounts these images
+/// by path, but every other reader of the image sees the filesystem UUID, so a
+/// derivation keeps the value its source states instead of inventing one.
+fn filesystem_uuid(image: &Path) -> Result<String> {
+    let report = output(Command::new("dump.erofs").arg("-s").arg(image))?;
+    match report
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Filesystem UUID:"))
+    {
+        Some(uuid) => Ok(uuid.trim().to_owned()),
+        None => fail(format!(
+            "no EROFS filesystem identity in {}; erofs-utils could not read it",
+            image.display()
+        )),
+    }
+}
+
+/// Rebuild an extracted tree as EROFS with the source image's identity, then
+/// prove that every retained entry survived the round trip byte for byte.
+fn rebake_verified(
+    work: &Path,
+    source: &Path,
+    tree: &Path,
+    expected: &BTreeMap<PathBuf, Entry>,
+) -> Result<PathBuf> {
+    let uuid = filesystem_uuid(source)?;
+    let rebuilt = work.join("rebuilt.img");
     run(Command::new("mkfs.erofs")
+        // makepkg exports SOURCE_DATE_EPOCH, which otherwise silently clamps
+        // newer mtimes despite --preserve-mtime. Preserve the staged metadata
+        // exactly; the filesystem creation timestamp is explicitly pinned below.
+        .env_remove("SOURCE_DATE_EPOCH")
         .args([
             "-zlz4hc,level=9",
             "--workers=2",
             "-T1230768000",
             "--mkfs-time",
             "--preserve-mtime",
-            "-U7b895cb0-54d5-4a4d-950d-50cda078053f",
         ])
+        .arg(format!("-U{uuid}"))
         .arg(&rebuilt)
-        .arg(&tree))?;
-    let checked = work.path().join("checked");
+        .arg(tree))?;
+    let checked = work.join("checked");
     extract(&rebuilt, &checked)?;
     let actual = inventory(&checked)?;
-    if actual != expected {
+    if &actual != expected {
         let changed: Vec<_> = expected
             .keys()
             .chain(actual.keys())
@@ -202,16 +470,13 @@ pub fn prune(image: &Path, destination: &Path, vendor_properties: &Path) -> Resu
             );
         }
         return fail(format!(
-            "derived system_ext changed retained file contents or metadata: {changed:?}"
+            "derived image changed retained file contents or metadata: {changed:?}"
         ));
     }
-    eprintln!(
-        "Removed four legacy VNDK APEXes; system_ext: {} -> {} bytes; retained contents, ownership, modes, timestamps and xattrs verified",
-        fs::metadata(image)?.len(),
-        fs::metadata(&rebuilt)?.len()
-    );
-    fs::rename(rebuilt, destination)?;
-    Ok(())
+    if filesystem_uuid(&rebuilt)? != uuid {
+        return fail("derived image did not keep its source filesystem identity");
+    }
+    Ok(rebuilt)
 }
 
 #[cfg(test)]
@@ -221,6 +486,14 @@ mod tests {
     #[test]
     fn rejects_legacy_vendor_and_other_products() {
         desktop_vendor(PROPERTIES).unwrap();
+        for device in ["droidloom_arm64", "droidloom_sheng"] {
+            let properties = PROPERTIES
+                .replace("droidloom_x86_64", device)
+                .replace("abilist=x86_64", "abilist=arm64-v8a");
+            desktop_vendor(&properties).unwrap();
+            // A foreign ABI declaration never belongs to this vendor device.
+            assert!(desktop_vendor(&format!("{properties}ro.vendor.product.cpu.abilist=x86_64\n")).is_err());
+        }
         for properties in [
             PROPERTIES.replace("sdk=37", "sdk=34"),
             PROPERTIES.replace("droidloom_x86_64", "phone"),
@@ -231,8 +504,100 @@ mod tests {
         }
     }
     #[test]
+    fn tablet_declaration_changes_only_the_device_class() {
+        if std::env::var_os("DROIDLOOM_TABLET_DECLARATION_TEST").is_none() {
+            if Command::new("fakeroot").arg("--version").output().is_err() {
+                eprintln!("fakeroot not installed; skipping test");
+                return;
+            }
+            run(Command::new("fakeroot")
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "image_policy::tests::tablet_declaration_changes_only_the_device_class",
+                    "--nocapture",
+                ])
+                .env("DROIDLOOM_TABLET_DECLARATION_TEST", "1"))
+            .unwrap();
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("input");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let properties = root.join("etc/build.prop");
+        fs::write(
+            &properties,
+            "ro.product.model=Cuttlefish arm64 phone\nro.build.characteristics=default\nro.sf.lcd_density=213\nro.vendor.build.characteristics=default\n",
+        )
+        .unwrap();
+        let original = work.path().join("original.img");
+        run(Command::new("mkfs.erofs")
+            .args(["-zlz4hc", "--workers=2"])
+            .arg(&original)
+            .arg(&root))
+        .unwrap();
+        let destination = work.path().join("product.img");
+        // This test already runs inside the fakeroot session `declare_tablet`
+        // would otherwise start, and a nested session is refused, so it drives
+        // the declaration itself. The wrapper around it only copies this
+        // executable into the work directory and starts that one session.
+        declare_tablet_product_image(&original, &destination).unwrap();
+        let check = work.path().join("verify");
+        extract(&destination, &check).unwrap();
+        // The declared class and density change; the product identity and
+        // every other characteristic keep the value the base image states.
+        let verified = fs::read_to_string(check.join("etc/build.prop")).unwrap();
+        assert!(verified.contains("ro.build.characteristics=tablet\n"));
+        assert!(verified.contains("ro.sf.lcd_density=360\n"));
+        assert!(
+            fs::metadata(&destination).unwrap().len() > 0,
+            "derived product image is empty"
+        );
+        // The derivation re-states the source filesystem identity rather than
+        // inventing one, so every reader of the image keeps seeing the same
+        // filesystem.
+        assert_eq!(
+            filesystem_uuid(&destination).unwrap(),
+            filesystem_uuid(&original).unwrap(),
+        );
+        // One derivation per base image: reusing the destination is refused.
+        assert!(declare_tablet_product_image(&original, &destination).is_err());
+        // A base image that states no density gains the line.
+        fs::write(&properties, "ro.build.characteristics=default\n").unwrap();
+        let undeclared = work.path().join("undeclared.img");
+        run(Command::new("mkfs.erofs")
+            .args(["-zlz4hc", "--workers=2"])
+            .arg(&undeclared)
+            .arg(&root))
+        .unwrap();
+        let declared = work.path().join("undeclared-out.img");
+        declare_tablet_product_image(&undeclared, &declared).unwrap();
+        let check = work.path().join("verify-undeclared");
+        extract(&declared, &check).unwrap();
+        let verified_undeclared = fs::read_to_string(check.join("etc/build.prop")).unwrap();
+        assert!(verified_undeclared.contains("ro.build.characteristics=tablet\n"));
+        assert!(verified_undeclared.contains("ro.sf.lcd_density=360\n"));
+
+        // An image without the phone class can not declare the tablet class.
+        fs::write(&properties, "ro.product.model=Cuttlefish arm64 phone\n").unwrap();
+        let absent = work.path().join("absent.img");
+        run(Command::new("mkfs.erofs")
+            .args(["-zlz4hc", "--workers=2"])
+            .arg(&absent)
+            .arg(&root))
+        .unwrap();
+        assert!(
+            declare_tablet_product_image(&absent, &work.path().join("absent-out.img")).is_err()
+        );
+    }
+    #[test]
     fn repack_preserves_android_metadata_and_adbd() {
         if std::env::var_os("DROIDLOOM_IMAGE_POLICY_TEST").is_none() {
+            if Command::new("fakeroot").arg("--version").output().is_err() {
+                eprintln!("fakeroot not installed; skipping test");
+                return;
+            }
             run(Command::new("fakeroot")
                 .arg("--")
                 .arg(std::env::current_exe().unwrap())
@@ -249,6 +614,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let root = work.path().join("input");
         fs::create_dir_all(root.join("apex")).unwrap();
+        fs::create_dir_all(root.join("framework")).unwrap();
         for file in LEGACY_VNDK
             .into_iter()
             .chain(["apex/com.android.adbd.apex"])
@@ -272,7 +638,7 @@ mod tests {
             .arg(&root))
         .unwrap();
         let destination = work.path().join("derived.img");
-        prune(&original, &destination, &properties).unwrap();
+        prune(&original, &destination, &properties, None).unwrap();
         let check = work.path().join("verify");
         extract(&destination, &check).unwrap();
         let retained = fs::metadata(check.join("apex/com.android.adbd.apex")).unwrap();
@@ -281,6 +647,18 @@ mod tests {
             (1000, 2000, 0o640)
         );
         assert!(LEGACY_VNDK.iter().all(|file| !check.join(file).exists()));
-        assert!(prune(&original, &destination, &properties).is_err());
+        assert!(prune(&original, &destination, &properties, None).is_err());
+
+        // Test with pencilengine_jar provided
+        let pencil_jar = work.path().join("pencil.jar");
+        fs::write(&pencil_jar, b"PK\x03\x04dummy-jar-content").unwrap();
+        let destination2 = work.path().join("derived2.img");
+        prune(&original, &destination2, &properties, Some(&pencil_jar)).unwrap();
+        let check2 = work.path().join("verify2");
+        extract(&destination2, &check2).unwrap();
+        assert_eq!(
+            fs::read(check2.join("framework/xiaomi-pencilengine-pad.jar")).unwrap(),
+            b"PK\x03\x04dummy-jar-content"
+        );
     }
 }

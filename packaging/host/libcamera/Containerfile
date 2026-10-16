@@ -1,0 +1,20 @@
+FROM registry.fedoraproject.org/fedora@sha256:5bd4e23ee7a4fd4c72996f9585f6cd1901a25a991ba4720311a1f55386d7463b
+
+COPY libcamera-0.7.1-1.fc44.src.rpm /input/
+RUN printf '%s  %s\n' \
+      2ab6c01e0191dec0599076a7451d0c3978ef4e045802d3424939d748bd756647 \
+      /input/libcamera-0.7.1-1.fc44.src.rpm | sha256sum --check - \
+    && dnf -y install rpm-build dnf5-plugins rust gcc-c++ patch \
+    && rpm -ivh --define '_topdir /opt/source' /input/libcamera-0.7.1-1.fc44.src.rpm \
+    && dnf -y builddep /opt/source/SPECS/libcamera.spec \
+    && dnf clean all
+
+# The original Fedora spec omits libdw's development dependency.
+RUN dnf -y install elfutils-devel && dnf clean all
+
+COPY 0002-simple-cancel-tracked-requests-on-stop.patch 0003-simple-quiesce-capture-before-isp-stop.patch /input/
+COPY stop-regression.rs stop-regression.cc.in worker-regression.rs worker-regression.cc.in build.rs /input/
+RUN rustc --edition=2024 /input/stop-regression.rs -o /usr/local/bin/libcamera-stop-regression \
+    && rustc --edition=2024 /input/build.rs -o /usr/local/bin/libcamera-rpm-build
+
+ENTRYPOINT ["/usr/local/bin/libcamera-rpm-build"]

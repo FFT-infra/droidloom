@@ -6,13 +6,17 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod adb;
 pub mod control;
+mod cpu_placement;
 pub mod development;
 mod development_network;
-mod cpu_placement;
+
+pub use development_network::CELL_ADB_ENDPOINT;
 pub mod gapps;
 pub mod linux_plan;
 mod package_cache;
+pub mod session_binding;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
@@ -115,6 +119,8 @@ pub enum GraphicsBackend {
     /// Native DRM rendering and allocation; retains existing cell behavior.
     #[default]
     Drm,
+    /// Native DRM rendering with portable linear system DMA-heap images.
+    DrmDmaHeap,
     /// Turnip KGSL rendering, Zink GLES and linear system DMA-heap images.
     KgslDmaHeap,
 }
@@ -124,9 +130,18 @@ impl GraphicsBackend {
     pub fn auxiliary_devices(self) -> &'static [&'static str] {
         match self {
             Self::Drm => &[],
+            Self::DrmDmaHeap => &["/dev/dma_heap/system"],
             Self::KgslDmaHeap => &["/dev/kgsl-3d0", "/dev/dma_heap/system"],
         }
     }
+}
+
+/// Optional host video decoder exposed to Android through a private device node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoDecoderBackend {
+    /// Qualcomm Iris V4L2 decoder, identified dynamically through sysfs and QUERYCAP.
+    Iris,
 }
 
 /// Immutable inputs required to construct one cell.
@@ -174,6 +189,9 @@ pub struct CellSpec {
     /// Host-validated graphics pairing. Omission uses native DRM.
     #[serde(default)]
     pub graphics_backend: GraphicsBackend,
+    /// Optional host hardware decoder exposed through a private Android node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_decoder: Option<VideoDecoderBackend>,
     /// Authenticated Denial endpoint exposed at the fixed Android path.
     pub denial_socket: PathBuf,
 }
@@ -690,6 +708,7 @@ mod tests {
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),
             graphics_backend: GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
     }
@@ -702,10 +721,19 @@ mod tests {
         let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(decoded.graphics_backend, GraphicsBackend::Drm);
         assert!(decoded.graphics_backend.auxiliary_devices().is_empty());
+        json["graphics_backend"] = serde_json::json!("drm_dma_heap");
+        let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.graphics_backend, GraphicsBackend::DrmDmaHeap);
+        assert_eq!(
+            decoded.graphics_backend.auxiliary_devices(),
+            &["/dev/dma_heap/system"]
+        );
         json["graphics_backend"] = serde_json::json!("kgsl_dma_heap");
         let decoded: CellSpec = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(decoded.graphics_backend.auxiliary_devices(),
-                   &["/dev/kgsl-3d0", "/dev/dma_heap/system"]);
+        assert_eq!(
+            decoded.graphics_backend.auxiliary_devices(),
+            &["/dev/kgsl-3d0", "/dev/dma_heap/system"]
+        );
         json["graphics_backend"] = serde_json::json!("/dev/dri/card0");
         assert!(serde_json::from_value::<CellSpec>(json).is_err());
     }

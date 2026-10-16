@@ -20,9 +20,11 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 7;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
+/// Wire version introducing task activation.
+pub const ACTIVATION_PROTOCOL_MINOR: u16 = 4;
 /// Fixed wire-header size.
 pub const HEADER_BYTES: usize = 32;
 /// Maximum complete sequenced packet, including its header.
@@ -62,6 +64,12 @@ pub mod capability {
     pub const DROIDLOOM_COMPOSITION: u64 = 1 << 7;
     /// The host accepts task activation requests under its own focus policy.
     pub const TASK_ACTIVATION: u64 = 1 << 8;
+    /// The host publishes whether any physical display is powered on.
+    pub const DISPLAY_POWER: u64 = 1 << 9;
+    /// Delegate a connected `InputFlinger` socket and framework task incarnations.
+    pub const DIRECT_INPUT: u64 = 1 << 10;
+    /// Allocate composition targets only after a configure-scoped request.
+    pub const LAZY_RENDER_TARGETS: u64 = 1 << 11;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -70,7 +78,8 @@ pub mod capability {
         | PRESENTATION_TIMING
         | INPUT
         | HOST_RENDER_TARGETS
-        | DROIDLOOM_COMPOSITION;
+        | DROIDLOOM_COMPOSITION
+        | DISPLAY_POWER;
 }
 
 /// Per-connection object naming one native Denial task window.
@@ -88,6 +97,8 @@ pub struct AndroidDisplayId(pub u64);
 /// Required meaning and ordering of an attached `SCM_RIGHTS` descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DescriptorKind {
+    /// Connected writer endpoint for the native `InputFlinger` input receiver.
+    InputChannel,
     /// One DMA-BUF plane, ordered by its dense plane index.
     DmabufPlane,
     /// Authenticated task-scoped layer request/release socket.
@@ -119,6 +130,29 @@ pub struct DecodedPacket<T> {
 /// Android-to-Denial protocol messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AndroidMessage {
+    /// Request fallback composition buffers for an existing task configuration.
+    RequestRenderTargets {
+        /// Existing task object; allocation is restricted to its current size.
+        object: TaskObjectId,
+        /// Configure generation needing composition targets.
+        configure_serial: u32,
+    },
+    /// Complete one host request with a connected native input socket.
+    BindInputChannel {
+        /// Host request generation; stale handoffs must be discarded.
+        generation: u64,
+        /// Input record wire ABI supported by the receiver.
+        wire: u16,
+    },
+    /// Publish a framework-authorized route for an already-bound task object.
+    BindInputRoute {
+        /// Existing native task object.
+        object: TaskObjectId,
+        /// Actual Android logical display, independent of the export display.
+        display: u32,
+        /// Framework incarnation of the bound Android task.
+        incarnation: u64,
+    },
     /// Start version and capability negotiation for one authenticated cell.
     ClientHello {
         /// Oldest major version the client understands.
@@ -240,6 +274,11 @@ pub mod content_state {
 /// Denial-to-Android protocol messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DenialMessage {
+    /// Ask for a new native input connection at startup or after disconnect.
+    RequestInputChannel {
+        /// Monotonic host request generation.
+        generation: u64,
+    },
     /// Select one version and publish authoritative connection limits.
     ServerHello {
         /// Selected protocol major.
@@ -254,6 +293,11 @@ pub enum DenialMessage {
         max_buffers_per_task: u32,
         /// Maximum damage rectangles per present.
         max_damage_rects: u32,
+    },
+    /// Publish whether the host currently has any powered physical display.
+    DisplayPower {
+        /// True while at least one host output is powered on.
+        powered: bool,
     },
     /// Replace the authoritative DMA-BUF import feedback generation.
     FormatFeedback {
@@ -1137,6 +1181,9 @@ const OP_PONG: u16 = 0x000b;
 const OP_BIND_TASK: u16 = 0x000c;
 const OP_BIND_LAYER_STREAM: u16 = 0x000d;
 const OP_REQUEST_ACTIVATION: u16 = 0x000e;
+const OP_BIND_INPUT_CHANNEL: u16 = 0x000f;
+const OP_BIND_INPUT_ROUTE: u16 = 0x0010;
+const OP_REQUEST_RENDER_TARGETS: u16 = 0x0011;
 
 const OP_SERVER_HELLO: u16 = 0x8001;
 const OP_FORMAT_FEEDBACK: u16 = 0x8002;
@@ -1151,6 +1198,8 @@ const OP_ERROR: u16 = 0x800a;
 const OP_PING: u16 = 0x800b;
 const OP_REGISTER_RENDER_TARGET: u16 = 0x800c;
 const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
+const OP_DISPLAY_POWER: u16 = 0x800e;
+const OP_REQUEST_INPUT_CHANNEL: u16 = 0x800f;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1164,6 +1213,35 @@ const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
 pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireError> {
     let mut payload = Writer::default();
     let (opcode, object, descriptors) = match message {
+        AndroidMessage::RequestRenderTargets {
+            object,
+            configure_serial,
+        } => {
+            nonzero("configure serial", u64::from(*configure_serial))?;
+            payload.u32(*configure_serial);
+            (
+                OP_REQUEST_RENDER_TARGETS,
+                valid_object(*object)?,
+                Vec::new(),
+            )
+        }
+        AndroidMessage::BindInputChannel { generation, wire } => {
+            nonzero("input generation", *generation)?;
+            nonzero("input wire ABI", u64::from(*wire))?;
+            payload.u64(*generation);
+            payload.u16(*wire);
+            (OP_BIND_INPUT_CHANNEL, 0, vec![DescriptorKind::InputChannel])
+        }
+        AndroidMessage::BindInputRoute {
+            object,
+            display,
+            incarnation,
+        } => {
+            validate_input_route(*display, *incarnation)?;
+            payload.u32(*display);
+            payload.u64(*incarnation);
+            (OP_BIND_INPUT_ROUTE, valid_object(*object)?, Vec::new())
+        }
         AndroidMessage::ClientHello {
             min_major,
             max_major,
@@ -1275,7 +1353,11 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             }
             (OP_PRESENT, valid_object(*object)?, Vec::new())
         }
-        AndroidMessage::BindLayerStream { object } => (OP_BIND_LAYER_STREAM, valid_object(*object)?, vec![DescriptorKind::LayerStream; 2]),
+        AndroidMessage::BindLayerStream { object } => (
+            OP_BIND_LAYER_STREAM,
+            valid_object(*object)?,
+            vec![DescriptorKind::LayerStream; 2],
+        ),
         AndroidMessage::SetContentState { object, flags } => {
             known_bits(
                 "content state",
@@ -1294,8 +1376,9 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             payload.u32(*millihz);
             (OP_SET_FRAME_RATE, valid_object(*object)?, Vec::new())
         }
-        AndroidMessage::RequestActivation { object } =>
-            (OP_REQUEST_ACTIVATION, valid_object(*object)?, Vec::new()),
+        AndroidMessage::RequestActivation { object } => {
+            (OP_REQUEST_ACTIVATION, valid_object(*object)?, Vec::new())
+        }
         AndroidMessage::Pong { cookie } => {
             payload.u64(*cookie);
             (OP_PONG, 0, Vec::new())
@@ -1325,6 +1408,18 @@ pub fn decode_android(
     let object = TaskObjectId(header.object);
     let mut payload = Reader::new(header.payload);
     let (message, descriptors) = match header.opcode {
+        OP_REQUEST_RENDER_TARGETS => {
+            valid_object(object)?;
+            let configure_serial = payload.u32()?;
+            nonzero("configure serial", u64::from(configure_serial))?;
+            (
+                AndroidMessage::RequestRenderTargets {
+                    object,
+                    configure_serial,
+                },
+                Vec::new(),
+            )
+        }
         OP_CLIENT_HELLO => {
             require_connection(header.object)?;
             let min_major = payload.u16()?;
@@ -1446,9 +1541,37 @@ pub fn decode_android(
                 Vec::new(),
             )
         }
+        OP_BIND_INPUT_CHANNEL => {
+            require_connection(header.object)?;
+            let generation = payload.u64()?;
+            nonzero("input generation", generation)?;
+            let wire = payload.u16()?;
+            nonzero("input wire ABI", u64::from(wire))?;
+            (
+                AndroidMessage::BindInputChannel { generation, wire },
+                vec![DescriptorKind::InputChannel],
+            )
+        }
+        OP_BIND_INPUT_ROUTE => {
+            valid_object(object)?;
+            let display = payload.u32()?;
+            let incarnation = payload.u64()?;
+            validate_input_route(display, incarnation)?;
+            (
+                AndroidMessage::BindInputRoute {
+                    object,
+                    display,
+                    incarnation,
+                },
+                Vec::new(),
+            )
+        }
         OP_BIND_LAYER_STREAM => {
             valid_object(object)?;
-            (AndroidMessage::BindLayerStream { object }, vec![DescriptorKind::LayerStream; 2])
+            (
+                AndroidMessage::BindLayerStream { object },
+                vec![DescriptorKind::LayerStream; 2],
+            )
         }
         OP_SET_CONTENT_STATE => {
             valid_object(object)?;
@@ -1508,6 +1631,11 @@ pub fn decode_android(
 pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError> {
     let mut payload = Writer::default();
     let (opcode, object) = match message {
+        DenialMessage::RequestInputChannel { generation } => {
+            nonzero("input generation", *generation)?;
+            payload.u64(*generation);
+            (OP_REQUEST_INPUT_CHANNEL, 0)
+        }
         DenialMessage::ServerHello {
             major,
             minor,
@@ -1531,6 +1659,10 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
             payload.u32(*max_buffers_per_task);
             payload.u32(*max_damage_rects);
             (OP_SERVER_HELLO, 0)
+        }
+        DenialMessage::DisplayPower { powered } => {
+            payload.u8(u8::from(*powered));
+            (OP_DISPLAY_POWER, 0)
         }
         DenialMessage::FormatFeedback {
             object,
@@ -1751,6 +1883,18 @@ pub fn decode_denial(
                 max_task_objects,
                 max_buffers_per_task,
                 max_damage_rects,
+            }
+        }
+        OP_REQUEST_INPUT_CHANNEL => {
+            require_connection(header.object)?;
+            let generation = payload.u64()?;
+            nonzero("input generation", generation)?;
+            DenialMessage::RequestInputChannel { generation }
+        }
+        OP_DISPLAY_POWER => {
+            require_connection(header.object)?;
+            DenialMessage::DisplayPower {
+                powered: decode_bool(payload.u8()?, "display power")?,
             }
         }
         OP_FORMAT_FEEDBACK => {
@@ -2053,8 +2197,14 @@ fn finish_packet(
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
     // Existing peers reject a header newer than their implementation before
-    // reading capabilities. Only the negotiated new opcode needs minor 4.
-    let minor = if opcode == OP_REQUEST_ACTIVATION { PROTOCOL_MINOR } else { BASE_PROTOCOL_MINOR };
+    // reading capabilities. Only each negotiated new opcode raises the header.
+    let minor = match opcode {
+        OP_REQUEST_ACTIVATION => ACTIVATION_PROTOCOL_MINOR,
+        OP_DISPLAY_POWER => 5,
+        OP_BIND_INPUT_CHANNEL | OP_BIND_INPUT_ROUTE | OP_REQUEST_INPUT_CHANNEL => 6,
+        OP_REQUEST_RENDER_TARGETS => 7,
+        _ => BASE_PROTOCOL_MINOR,
+    };
     bytes.extend_from_slice(&minor.to_le_bytes());
     bytes.extend_from_slice(&opcode.to_le_bytes());
     bytes.extend_from_slice(&fd_count.to_le_bytes());
@@ -2064,6 +2214,16 @@ fn finish_packet(
     bytes.extend_from_slice(&0_u32.to_le_bytes());
     bytes.extend_from_slice(payload);
     Ok(EncodedPacket { bytes, descriptors })
+}
+
+fn validate_input_route(display: u32, incarnation: u64) -> Result<(), WireError> {
+    if display > i32::MAX as u32 || incarnation == 0 || incarnation > i64::MAX as u64 {
+        return Err(WireError::InvalidEnum {
+            field: "native input route",
+            value: incarnation,
+        });
+    }
+    Ok(())
 }
 
 fn parse_header(packet: &[u8], received_descriptors: usize) -> Result<Header<'_>, WireError> {
@@ -2425,6 +2585,40 @@ mod tests {
 
     const OBJECT: TaskObjectId = TaskObjectId(7);
 
+    #[test]
+    fn demand_targets_are_descriptor_free_and_require_a_real_generation() {
+        let request = AndroidMessage::RequestRenderTargets {
+            object: OBJECT,
+            configure_serial: 9,
+        };
+        let encoded = encode_android(&request).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(encoded.bytes[6..8].try_into().unwrap()),
+            7
+        );
+        assert!(encoded.descriptors.is_empty());
+        assert_eq!(decode_android(&encoded.bytes, 0).unwrap().message, request);
+        assert!(decode_android(&encoded.bytes, 1).is_err());
+        for (object, configure_serial) in [(OBJECT, 0), (TaskObjectId(0), 9)] {
+            assert!(
+                encode_android(&AndroidMessage::RequestRenderTargets {
+                    object,
+                    configure_serial
+                })
+                .is_err()
+            );
+        }
+        let legacy = encode_android(&AndroidMessage::AckConfigure {
+            object: OBJECT,
+            serial: 9,
+        })
+        .unwrap();
+        assert_eq!(
+            u16::from_le_bytes(legacy.bytes[6..8].try_into().unwrap()),
+            BASE_PROTOCOL_MINOR
+        );
+    }
+
     fn buffer() -> BufferMetadata {
         BufferMetadata {
             id: BufferId(11),
@@ -2457,21 +2651,64 @@ mod tests {
     }
 
     #[test]
+    fn direct_input_records_require_correct_descriptors_routes_and_wire_version() {
+        let channel = AndroidMessage::BindInputChannel {
+            generation: 1,
+            wire: 7,
+        };
+        let encoded = encode_android(&channel).unwrap();
+        assert_eq!(&encoded.bytes[6..8], &6_u16.to_le_bytes());
+        assert!(decode_android(&encoded.bytes, 0).is_err());
+        round_trip_android(&channel);
+        round_trip_android(&AndroidMessage::BindInputRoute {
+            object: OBJECT,
+            display: 0,
+            incarnation: 7,
+        });
+        round_trip_denial(&DenialMessage::RequestInputChannel { generation: 2 });
+        assert!(
+            encode_android(&AndroidMessage::BindInputRoute {
+                object: OBJECT,
+                display: 0,
+                incarnation: 0
+            })
+            .is_err()
+        );
+        assert!(
+            encode_android(&AndroidMessage::BindInputRoute {
+                object: OBJECT,
+                display: u32::MAX,
+                incarnation: 7
+            })
+            .is_err()
+        );
+        assert!(encode_denial(&DenialMessage::RequestInputChannel { generation: 0 }).is_err());
+    }
+
+    #[test]
     fn activation_does_not_raise_the_wire_version_of_legacy_handshakes() {
         let hello = encode_android(&AndroidMessage::ClientHello {
-            min_major: 1, max_major: 1,
+            min_major: 1,
+            max_major: 1,
             capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION,
-        }).unwrap();
+        })
+        .unwrap();
         let create = encode_android(&AndroidMessage::CreateTask {
-            object: OBJECT, display: AndroidDisplayId(9), package: "org.example.app".into(),
-        }).unwrap();
+            object: OBJECT,
+            display: AndroidDisplayId(9),
+            package: "org.example.app".into(),
+        })
+        .unwrap();
         for legacy in [hello, create] {
             assert_eq!(&legacy.bytes[6..8], &3_u16.to_le_bytes());
         }
-        let activation = encode_android(&AndroidMessage::RequestActivation { object: OBJECT }).unwrap();
+        let activation =
+            encode_android(&AndroidMessage::RequestActivation { object: OBJECT }).unwrap();
         assert_eq!(&activation.bytes[6..8], &4_u16.to_le_bytes());
         assert!(activation.descriptors.is_empty());
         assert_eq!(activation.bytes.len(), HEADER_BYTES);
+        let display_power = encode_denial(&DenialMessage::DisplayPower { powered: true }).unwrap();
+        assert_eq!(&display_power.bytes[6..8], &5_u16.to_le_bytes());
     }
 
     #[test]
@@ -2602,6 +2839,7 @@ mod tests {
                 max_buffers_per_task: MAX_BUFFERS_PER_TASK,
                 max_damage_rects: u32::try_from(MAX_DAMAGE_RECTS).unwrap(),
             },
+            DenialMessage::DisplayPower { powered: false },
             DenialMessage::Configure {
                 object: OBJECT,
                 serial: 5,

@@ -6,8 +6,7 @@ import android.content.ClipDescription;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.database.Cursor;
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
+import com.android.droidloom.runtime.HostChannel;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
@@ -34,7 +33,7 @@ public final class ClipboardBridge implements AutoCloseable {
     private final String session=UUID.randomUUID().toString().replace("-", "");
     private final ClipboardManager.OnPrimaryClipChangedListener listener=this::changed;
     private final File directory;
-    private volatile LocalSocket socket;
+    private volatile HostChannel socket;
     private volatile boolean stopped;
     private boolean changed;
     private volatile long base;
@@ -50,7 +49,7 @@ public final class ClipboardBridge implements AutoCloseable {
         directory=new File(context.getCacheDir(), "droidloom-clipboard");
     }
     public void start(){
-        if(!new File("/dev/socket/droidloom/clipboard").exists())return;
+        if(!android.os.SystemProperties.getBoolean("ro.vendor.droidloom.surfaceflinger_tasks",false))return;
         directory.mkdirs();
         File[] old=directory.listFiles();if(old!=null)for(File f:old)if(f.isFile())f.delete();
         clipboard.addPrimaryClipChangedListener(listener);
@@ -69,7 +68,7 @@ public final class ClipboardBridge implements AutoCloseable {
         out.println("clipboardConnected="+(socket!=null)+" imports="+imports+" exports="+exports);
     }
     @Override public void close(){stopped=true;clipboard.removePrimaryClipChangedListener(listener);close(socket);synchronized(monitor){monitor.notifyAll();}}
-    private static void close(LocalSocket s){
+    private static void close(HostChannel s){
         if(s==null)return;
         try{s.shutdownInput();}catch(Exception ignored){}
         try{s.shutdownOutput();}catch(Exception ignored){}
@@ -78,9 +77,7 @@ public final class ClipboardBridge implements AutoCloseable {
     private void connect(){
         com.android.droidloom.runtime.CpuPlacement.background();
         while(!stopped){
-            try(LocalSocket client=new LocalSocket()){
-                client.connect(new LocalSocketAddress("droidloom-clipboard"));
-                if(client.getPeerCredentials().getUid()!=0)throw new IOException("Untrusted clipboard relay");
+            try(HostChannel client=HostChannel.open(HostChannel.CLIPBOARD)){
                 DataInputStream in=new DataInputStream(client.getInputStream());
                 DataOutputStream out=new DataOutputStream(client.getOutputStream());
                 message(out,new JSONObject().put("type","hello").put("abi",ABI));
@@ -94,7 +91,7 @@ public final class ClipboardBridge implements AutoCloseable {
             if(!stopped)try{Thread.sleep(1000);}catch(InterruptedException e){return;}
         }
     }
-    private void writeLoop(LocalSocket client,DataOutputStream out){
+    private void writeLoop(HostChannel client,DataOutputStream out){
         com.android.droidloom.runtime.CpuPlacement.background();
         try{
             while(!stopped){
@@ -193,7 +190,7 @@ public final class ClipboardBridge implements AutoCloseable {
             validate(desc);return result;
         }catch(Exception error){result.close();throw error;}
     }
-    private void readLoop(LocalSocket client,DataInputStream in)throws Exception{
+    private void readLoop(HostChannel client,DataInputStream in)throws Exception{
         Stored pending=null;long changedAtBegin=0;
         try{
             while(!stopped&&socket==client){
@@ -224,7 +221,7 @@ public final class ClipboardBridge implements AutoCloseable {
             }
         }finally{if(pending!=null)pending.close();}
     }
-    private void apply(LocalSocket client,Stored data,long expectedChanges){
+    private void apply(HostChannel client,Stored data,long expectedChanges){
         try{
             String id=data.description.getString("id");
             // A new local copy while bytes were arriving takes precedence over that transfer.

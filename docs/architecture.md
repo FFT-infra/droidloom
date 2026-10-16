@@ -11,6 +11,14 @@ task buffers, lifecycle and input over private Unix sockets. The presenter uses
 DMA-BUFs and explicit synchronization. Compositor geometry is sent back to Android;
 there is no combined Android desktop window or compositor plugin.
 
+Host focus, resize and close use the existing authenticated Composer task-control
+endpoint to reach the Rust backend inside system_server. ATMS/WMS validate the
+registered task incarnation and apply normal Android window/lifecycle operations
+directly. A bounded acknowledged queue coalesces obsolete updates; socket waits
+stay outside the WMS lock. InputFlinger owns the native input listener; the
+framework policy handles power changes. IME and SystemUI use authenticated
+descriptor delegation for direct host channels, without a standalone input bridge.
+
 Minimal Android SystemUI supplies system UI support and clipboard/notification
 adapters. The catalog exports Android activities as XDG desktop launchers.
 Launching uses an already-running cell. See [desktop integration](desktop-integration.md).
@@ -31,7 +39,7 @@ ARM64 workflows remain in `tools/`.
 - `runtime/droidloom-package-support`: first-user setup and package lifecycle.
 - `graphics/droidloom-wayland`: windows, input and desktop integration.
 - `graphics/`: Composer, private transport and synchronization libraries.
-- `android/framework/`: launcher, input bridge, IME and minimal system apps.
+- `android/framework/`: framework API adapters, native transport, IME and minimal system apps.
 - `android/device/`: product configuration, overlays and image contents.
 
 The development supervisor constructs private device nodes from the host's
@@ -40,12 +48,15 @@ than assuming consecutive whole-device minors. The selected DRM render node
 uses a private inode with Android-accessible permissions and the same device
 number; host node permissions remain unchanged, and no card/KMS node is exposed.
 
-The ARM64 product retains native MSM rendering and also builds Zink/Turnip
+The ARM64 product builds native Freedreno and Panfrost rendering, plus Zink/Turnip
 for split display/KGSL hosts. The cell's optional `graphics_backend` defaults
 to `drm`. Explicit `kgsl_dma_heap` selection exposes private character nodes
 for `/dev/kgsl-3d0` and `/dev/dma_heap/system`, verified against their kernel
 identities. It selects Zink GLES and minigbm's linear DMA-heap image allocator
 for Android children. It does not rename the display driver or grant KMS access.
+Explicit `drm_dma_heap` selection exposes only `/dev/dma_heap/system` alongside
+the selected render node and uses the same linear image allocator. Mesa retains
+native driver selection; this supports Panthor hosts without forcing Zink.
 
 The image backend preserves minigbm's native-handle ABI, AIDL allocator and
 stable-C mapper. RGB, HDR, YUV and blob layouts share DMA-BUFs directly with
@@ -114,6 +125,23 @@ The duplicate headless bootstrap draw is also disabled by default; its HWC
 scheduling remains active. `persist.vendor.droidloom.elide_bootstrap=false`
 restores that draw for comparison.
 
+The same invisible output can also complete without acquiring or submitting a
+discarded client target. One private fence-only request transfers the actual task
+completion sync-file to Composer before HWC validation, which can itself present
+the frame. This also covers frames without client composition. An already-complete
+frame signals a fresh point on a dedicated timeline, preserving per-frame
+completion timestamps while reusing the DRM objects. It advances the display
+surface, keeps the actual task completion fence on the normal client LayerFEs,
+and retains HWC validation, presentation, power-hint fences and layer release
+processing. Prediction and
+already-dequeued targets retain buffer-backed completion. Ordinary displays and
+capture outputs do not select this path. Set
+`persist.vendor.droidloom.bootstrap_bufferless=false` to restore the bootstrap's
+buffer round trips without enabling its duplicate GPU draw; this switch is live
+and allows comparison in the same process. Fence handoff failure selects the
+buffer-backed path. The private bridge is version 4; SurfaceFlinger and Composer
+must be updated together.
+
 `persist.vendor.droidloom.direct_layers=false` selects composition fallback for
 all tasks. Missing host alpha-modifier support also selects fallback. Existing
 host targets remain subject to the original configure and release rules.
@@ -148,6 +176,18 @@ holds a reusable target. At most 64 outstanding feedback requests per task
 retain frame identities and timing metadata, without retaining buffers or
 fences. When full, new frames omit the optional timing request until capacity
 returns. Late `Presented` events remain valid after `BufferReleased`.
+
+With negotiated protocol 1.7 demand allocation, geometry changes publish a new
+configure without allocating a composition pool. SurfaceFlinger prepares output
+geometry and tries direct layers before dequeuing any target. Only an actual
+composition dequeue requests the current generation's three host targets; one
+request per generation bounds retries. Bootstrap uses the same demand path when
+a caller dequeues a target. Older peers retain eager allocation.
+Stale requests and closing windows allocate nothing. Resizing retires older
+targets under their existing GPU release rules; a pool already needed for the
+current geometry remains available for later fallback. Pending source imports
+can still require fallback, so savings depend on the workload. This removes
+unnecessary allocations and target borrowing, not producer buffers or GPU fences.
 
 The presenter sleeps until a Wayland, Android transport, text-input, clipboard,
 or release-eventfd event arrives. It has no periodic idle poll. A 4 ms timeout
@@ -208,6 +248,14 @@ are retained only within the existing bounded in-flight target pool. Query
 errors produce unavailable-timestamp records, never zero-duration work.
 Tracing is disabled by default and does not log input contents or app pixels.
 
+The shared Rust timing library also records sampled stage durations in
+SurfaceFlinger and the direct-layer presenter. These use `CLOCK_MONOTONIC`
+elapsed time and `CLOCK_THREAD_CPUTIME_ID` CPU time. CPU time covers the measured
+thread, including its system calls; it excludes worker threads and GPU execution.
+Nested stages overlap, so their durations must not be added to the composite
+total. See [frame-stage measurement](BUILDING.md#frame-stage-timing-baselines)
+for capture, interpretation and comparison.
+
 Denial handles Droidloom windows through ordinary Wayland focus, input, tiling
 and resize paths. No Droidloom compositor plugin or alternate window role is
 required. Mobile integrations use the same surfaces and seat; the optional
@@ -215,7 +263,7 @@ required. Mobile integrations use the same surfaces and seat; the optional
 Android without changing ordinary text-input semantics.
 
 The user service starts Android after presenter readiness and stops the cell
-when the presenter stops. See [security requirements](threat-model-v1.md) for
+when the presenter stops. See [security requirements](threat-model-v2.md) for
 the shared-kernel trust boundary.
 
 Droidloom retains each direct task's CompositionEngine, capture output, and
@@ -245,10 +293,30 @@ The Composer refresh path also updates an enabled synthetic vsync timer and
 reannounces the existing Android display configuration, so SurfaceFlinger
 reloads its cached mode period. Disabled clocks remain disabled.
 
-Task discovery first uses Android's completed activity or resolved alias. If
-that activity has already handed off, only a visible successor in the requested
-package's owned task, Android user, and display is eligible. New tasks take
-precedence over preexisting ones; ambiguous candidates are rejected.
+ActivityTaskManager now owns task publication inside system_server. Its task
+callbacks enqueue a coalesced worker; the worker copies attached task identities
+under WMS's lock and uses the Rust registry/transport after releasing that lock.
+Host launches use a root-authenticated Rust RPC inside system_server, whose
+ActivityStarter completion callbacks identify the exact resulting task. Setup
+and density use existing framework APIs. The external observer, launcher
+executable, command children, discovery loops and task-dump parsing are removed.
+Host focus/resize/close commands use a separate subscription on
+the existing Composer task-control endpoint and run directly inside ATMS/WMS;
+the existing framework owns input setup, power and authenticated host-channel
+delegation. The standalone input bridge and byte-copy relays are removed.
+Package/user/locale broadcasts wake a native catalog subscription whose descriptor
+is delegated to the host catalog. It takes snapshots at connection and changes,
+with batched icon fetches and no healthy idle polling or app_process startup.
+SystemUI sends an initial notification snapshot followed by changed posts and
+versioned removals; unchanged entries do not re-encode their icons.
+The lifecycle daemon blocks on its control listener, a pidfd for the exact
+owned namespace child and a sticky eventfd written by SIGTERM/SIGINT. There is
+no periodic idle health timeout. Child exit still triggers teardown, and
+shutdown requested before entering the wait remains observable. Explicit
+startup/readiness deadlines are unchanged. Isolated binary checks observed
+zero idle wakeups over one second and clean shutdown for both signals; tests
+also cover child replacement and cancellation races.
+
 SurfaceFlinger retries unregistered tasks every 250 ms initially, then every
 five seconds after 24 attempts. Delayed composition callbacks allow an idle
 task to recover after late registration. The broker's explicit export allowlist
@@ -269,7 +337,7 @@ changes require user-owned device validation; they do not establish how much
 of first-image loading is app decoding, allocation or GPU upload work.
 
 Render and input receive loops reuse caller-owned packet storage. Direct-layer
-requests use a 128-byte buffer matching their wire limit; general task and
+requests use a 1260-byte buffer matching their bounded scene-chunk limit; general task and
 SurfaceFlinger connections retain maximum-sized storage across requests.
 The transport still rejects truncation and closes rejected descriptors.
 
@@ -302,16 +370,93 @@ The presenter retains its poll descriptor and layer-task vectors between wakeups
 Layer and text-input descriptor enumeration uses iterators rather than temporary
 vectors, retaining the existing poll readiness and idle-sleep behavior.
 
+Poll readiness now schedules work for the owning task and reason: layer requests,
+layer fence progress or composed-frame releases. Unrelated input and clipboard
+wakeups no longer probe every task's layer socket or DRM timelines. Configuration
+publication, window unmapping and deferred destruction are scheduled explicitly;
+configuration changes consumed during a cross-socket barrier are published in the
+same turn. Pending DMA-BUF imports pause request polling and explicitly resume
+queued commands when their Wayland callback completes.
+
+Poll still enumerates registered stream descriptors and outstanding reads; this
+change removes idle per-task processing rather than replacing poll with epoll.
+Only signalled eventfds are drained. Real timeline queries continue to govern
+buffer reuse. Kernels without the required eventfd support retain a four-millisecond
+fallback for affected tasks, using an absolute deadline so unrelated traffic cannot
+postpone it. Closing windows retain their outstanding release watches until safe
+destruction. Host tests cover real socket/eventfd readiness among 64 streams,
+disconnects, work coalescing, import resumption, cross-window configuration work,
+fallback deadlines and watch removal. CPU and latency gains remain unmeasured.
+
+Window configure and fractional-scale callbacks retain the latest requested
+geometry per task. After dispatching the queued Wayland events, the presenter
+applies each task's final size and scale once, before draining Android frames
+or publishing direct-layer configuration. SCTK still acknowledges every XDG
+configure. Unspecified axes inherit the latest queued size; scale events cannot
+overwrite it with the previous applied size. Input scaling and refresh-only
+updates use the applied scale until the new geometry is installed.
+
+Intermediate sizes allocate no fallback targets and send no Android geometry
+update. A batch that returns to the applied size and scale retains its pool;
+otherwise the presenter publishes the final geometry and retires the previous
+pool. With demand allocation, a new three-target GBM pool is created only when
+composition requests it; older peers allocate it immediately. Busy retired
+targets still wait for their real GPU releases. Close cancels queued geometry
+before allocation, and removal/disconnect clears its scheduled work. Window-size
+persistence follows the final XDG state in the batch. The hidden Android bootstrap
+canvas retains immediate output configuration. Host tests cover independent
+windows, unspecified axes, scale/configure ordering, scale-only changes, return
+to applied geometry and close cancellation. The user confirmed the local desktop
+resize build works; allocation savings and latency gains remain unmeasured.
+
+Direct-layer views cache both effective Wayland geometry and attached content:
+the buffer allocation/read-ticket pair or a solid color. An unchanged child
+issues no attachment, damage or commit requests when a sibling changes. The
+root still commits each accepted scene to apply synchronized child updates and
+stacking atomically. Reusing an allocation for a new read ticket, changing
+geometry or color, and switching between buffered and solid content still
+commit. Detach clears the content identity so returning from composed fallback
+reattaches unchanged solids as well as buffered layers. GPU reads and releases
+remain independently tracked; skipping a child commit never releases a read.
+
+SurfaceFlinger also gates each task before copying its layer snapshots or
+preparing its output. Retained ordered layer/buffer/frame identities and Android
+change flags detect task work. Geometry, visibility, effects, front-buffer and
+sideband updates remain active. Host configuration, drained imports, deferred
+or rejected commits and fallback recovery advance an asynchronous work revision
+before scheduling composition. Successful direct or fallback work accepts only
+the revision captured before preparation, preserving racing wakeups. Static
+fallback tasks skip dequeue/render/queue as well. Global lifecycle and release
+processing still runs. Optional `persist.vendor.droidloom.task_stats` counters
+report skipped tasks, copied snapshots and prepared tasks without an idle timer.
+
+Private-socket wire tests observe zero requests for two static children across
+100 updates to an animated sibling, while the changed child and root each
+commit 100 times. Regressions also cover new tickets on reused allocations,
+geometry changes, solid/buffer transitions, detach/reappearance and failed
+updates. This reduces Wayland protocol and state-processing work; no frame-time
+gain has been measured. Partial-damage transport is deferred for the current
+Denial target, and changed layers retain full-surface damage.
+
 The layer stream advertises optional `ASYNC_STAGE` capability bit 2. Updated
 SurfaceFlinger sends opcode 7 for each layer without waiting for individual
 acknowledgements, then waits for the existing complete-scene Commit result.
 For a changed scene with cached imports, staging alone reduces synchronous
-replies from N+2 to two (Config and Commit); allocation registration remains
-separately confirmed.
+replies from N+2 to two (Config and Commit); allocation registration is
+separately confirmed according to negotiated import capabilities.
 Peers lacking the capability keep opcode 4 and its per-layer replies. Scene
 overflow is sticky through Commit and releases all rejected staging resources;
 Abort and disconnect discard staged metadata without releasing existing reads.
 A lost Commit reply still leaves submitted source dependencies unresolved.
+
+Optional `SCENE_BATCH` bit 6 replaces the individual stage records with chunks
+of at most sixteen layers and four indexed producer fences. The last chunk
+shares a packet with CommitAsync, so a small cached scene needs one send and
+one receive dispatch. C++ encoding storage survives between frames. The host
+retains the existing bounded staging area, atomic acceptance, read-ticket
+ownership and fallback ordering barriers. Without bit 6, the legacy staging
+and commit path remains available. Tests cover chunk limits, descriptor identity,
+invalid indices and overflowing scenes; operation counts are not latency claims.
 
 Optional `CONFIG_EVENTS` capability bit 3 removes the remaining per-frame Config
 query after initial subscription. The host publishes revisioned configuration
@@ -322,19 +467,61 @@ changes without a new configure serial. The host publishes after draining all
 layer barriers, including configuration changes consumed from the Composer
 socket during that drain. The repaint callback is created once with the stream.
 Commit still checks the current host
-configuration. With both extensions and cached imports, a changed scene requires
-one synchronous reply (Commit); an unchanged scene sends no layer requests.
+configuration. With these two extensions and cached imports, a changed scene
+requires one synchronous reply (Commit); an unchanged scene sends no layer requests.
 Legacy hosts retain per-frame Config queries. These are protocol operation
 counts, not measured end-to-end latency improvements.
 
+Optional `ASYNC_COMMIT` capability bit 4 removes that last normal-frame wait.
+Opcode 9 carries a nonzero, increasing 64-bit scene ID followed by the existing
+Commit configuration and layer count. Acceptance or rejection arrives as event
+0x8006 with the same ID and a status; it never means GPU completion. The sender
+allows one unacknowledged scene per task. Further compositions coalesce until
+acceptance schedules another composition using the latest Android snapshot.
+Rejected scenes release only their newly tracked, never-attached reads and force
+a composed fallback; reused reads retain their original GPU dependencies.
+Invalid, duplicate or mismatched results fail the stream without releasing
+ambiguous reads. Transitions to composed targets wait for outstanding acceptance
+before sending on Composer's socket, preserving ordering across both sockets.
+Cached, eligible changed scenes now need no synchronous reply; legacy registration
+and mode-transition barriers remain synchronous. Peers without bit 4 retain Commit
+replies. End-to-end latency and coalescing under host contention remain unmeasured.
+
+Optional `ASYNC_IMPORT` capability bit 5 removes the per-allocation registration
+wait. Opcode 10 prefixes the existing allocation metadata with a strictly
+increasing, nonzero 64-bit attempt ID; event 0x8007 carries that attempt, allocation
+ID and signed status. Each task permits 16 pending imports and retains at most
+128 cached allocations, including failed attempts. The host continues reading
+requests during asynchronous imports and matches out-of-order Wayland callbacks
+to their original attempts. Legacy opcode 2 still pauses request processing until
+its import callback replies on the request socket.
+
+SurfaceFlinger stages no source reads until every allocation required by the
+current scene has imported successfully. Pending or failed imports select composed
+fallback so other tasks keep progressing. Draining an import batch schedules one
+new composition from the latest Android snapshot; no old frame is retained for
+later submission. Failed imports remain cached until ordinary eviction, avoiding
+repeated retries. Pending imports cannot be retired or reinterpreted; stale,
+duplicate, mismatched or malformed results fail the stream. Success proves only
+import usability, and never releases any producer buffer. GPU read tracking and
+the existing cross-socket composition-mode barrier remain independent. Older
+hosts retain synchronous registration. Startup and resize gains remain unmeasured.
+
 The Android sender's packet helper uses a stack header plus payload iovecs,
 avoiding its former packet vector allocation and payload copy. A host C++ test
-applies the actual 0007/0008 patch chain and exercises the resulting transport:
+applies the actual 0007/0008/0011/0012 patch chain and exercises the resulting transport:
 64 queued layers with descriptors before any reply, Commit rejection, the
 legacy acknowledgement path, and send failure. It also checks configuration
 subscription, a newer resize event racing the initial reply, visibility changes,
 duplicate/invalid revisions, callbacks outside the cache lock, and 1,000 cached
-configuration reads that send no requests. Run it with:
+configuration reads that send no requests. Async regressions cover submission
+before any result, bounded outstanding scenes, coalesced wakeups, strict result
+identity, rejection ownership, duplicate results and disconnected sends. Import
+regressions cover 16 registrations with descriptors before any reply, out-of-order
+results, strict attempt/allocation identity, scene gating, cache bounds, failed
+import retention, legacy acceptance/rejection and transport failure. Rust tests
+cover the wire contract, bounded callback tracking, legacy polling suspension and
+pending-resource cleanup. Run the C++ tests with:
 
 ```console
 cargo test --locked -j 1 -p droidloom-update --test release_queue
@@ -365,7 +552,8 @@ under `.work/moto-fastpath-deploy/`; this readiness check does not establish
 touch-to-display latency or visual acceptance.
 
 Key-event logs are off by default. `DROIDLOOM_INPUT_TRACE=1` enables them in each
-process where the environment is set: presenter, Composer, or Java input bridge.
+presenter process where the environment is set. Composer no longer forwards
+input records; the native receiver replaces the Java bridge's per-key path.
 The flag is read once per process, not from the environment on every event.
 
 Host regression tests cover reusable record boundaries, truncated-FD cleanup,
@@ -399,7 +587,7 @@ worker creation; there is no thread-name scanner or polling daemon.
 
 | Role | CPU domain | Owned work |
 | --- | --- | --- |
-| Graphics | Every capacity tier above the smallest | Presenter event loop and render/submission dependencies; Composer; SurfaceFlinger, RenderEngine and timing workers; input bridge main path |
+| Graphics | Every capacity tier above the smallest | Presenter event loop and render/submission dependencies; Composer; SurfaceFlinger, RenderEngine and timing workers; native input receiver |
 | Normal | Original inherited CPU domain | Lifecycle helpers before exec; ordinary Android foreground work |
 | Background | Smallest capacity tier | Lifecycle daemon; application catalog; clipboard/notification transfer workers; frame-log writers; explicitly minimum-priority Mesa queues |
 
@@ -442,7 +630,7 @@ or disables them receives an explicit backend diagnostic; the implementation
 does not take controllers away from host services. Such platforms need another
 Android backend. This is not a claim of compatibility with every Linux kernel.
 
-Composer and the input bridge request `MaxPerformance`. SurfaceFlinger's main,
+Composer requests `MaxPerformance`. SurfaceFlinger's main,
 RenderEngine and timing workers use the graphics group. Runtime generation
 merges the existing SurfaceFlinger service stanza, preserving other options and
 bootstrap imports. Owned Java notification and clipboard workers enter Android's
@@ -468,7 +656,8 @@ background priority remains useful, but startup role assignment alone is not a
 persistent little-only guarantee for AMS-managed app processes. This is an
 observed limit; no thread-name sweep or repeated affinity repair hides it. The
 hard graphics/background separation is verified for the host presenter and
-init-managed Composer, SurfaceFlinger and input bridge.
+init-managed Composer and SurfaceFlinger. Input now runs inside system_server;
+there is no standalone input bridge process to place.
 
 Focused native tests cover topology partitioning, invalid masks, worker and
 exec inheritance, profile translation, and service-stanza preservation. The
@@ -548,7 +737,7 @@ separate its housekeeping work.
 | Composer `dl-frame-log` | Little |
 | SurfaceFlinger, RenderEngine, scheduler/timing lanes and dependent Mesa rendering/submission workers | Big graphics domain; classify housekeeping separately |
 | Android app UI/RenderThread, input dispatcher and Droidloom input/text bridge | Use Android state/explicit roles with a functioning backend; do not restrict all of system_server or Zygote |
-| `droidloom-applications` launcher/icon catalog | Little; this is periodic desktop catalog reconciliation |
+| `droidloom-applications` launcher/icon catalog | Little; reconciliation runs on events and recovery |
 | `droidloomd` management work | Medium initially; little is possible only after restoring the original domain before cell/helper launch |
 | Other Android apps/services, mixed ART worker pools and unknown workers | Keep Android's state-aware policy; no blanket little classification from daemon/JIT/GC names |
 
@@ -556,10 +745,9 @@ The host clipboard code has four unnamed `std::thread::spawn` sites in
 `graphics/droidloom-wayland/src/clipboard/mod.rs` (native receive, Android
 receive, Android send and offer writing). Add explicit role/name registration
 there before treating the identically named live threads as proven clipboard
-workers. Notification and frame-log workers are already named. Java bridge
-workers are created by `TextInputBridge`, `ClipboardRelay`, `HostInputMethod`,
-the SystemUI bridges and the input bridge's scheduled executor; not all are
-part of the same process or have the same latency requirements.
+workers. Notification and frame-log workers are already named. Java workers
+remain in `HostInputMethod` and the SystemUI adapters. The standalone bridge's
+text and byte-copy workers are removed; framework delegation handles setup only.
 
 There is also a priority-inheritance concern distinct from placement:
 SurfaceFlinger's live `surfacefl:zcq0` cache-put worker had `SCHED_FIFO` priority
@@ -570,9 +758,9 @@ arbitrary Android threads; retain known graphics/real-time roles and explicitly
 handle any proven background inheritance.
 
 `start_development_cell` launches `ip` -> `unshare` -> supervisor -> Android init
-without resetting affinity. The `nsenter` task-launcher/catalog paths similarly
-inherit their caller's CPU mask. A future little-only lifecycle daemon must
-restore the original application domain before those launches, otherwise it
+without resetting affinity. Launch/catalog now use native RPC and retain
+system_server's existing worker placement. A future little-only lifecycle daemon must
+restore the original application domain before cell launch, otherwise it
 can inadvertently confine the entire Android workload to little. Zygote-spawned
 apps have their own Android process-state policy; process ancestry is not a
 sufficient role declaration.
@@ -619,3 +807,233 @@ kernel already exposes the relevant controllers; this finding does not justify
 a kernel upgrade. Verify effective masks, profile success, child inheritance,
 foreground/background transitions and background exceptions before treating the
 Android integration as complete.
+
+## Host service integration direction
+
+Proposal for review, 2026-09-12. This extends the SMS and audio proposals into a
+Linux-generic architecture. It is not an implemented capability claim.
+
+### Product contract and ownership
+
+Droidloom should make Android a client of Linux-owned services. Android apps
+retain Android APIs, permissions and familiar behavior; native Linux clients
+can access the same underlying devices and communications without Android
+running. The lifecycle supervisor continues to construct cells; it must not
+become the modem controller, message database, audio engine and notification
+server in one privileged process.
+
+| Responsibility | Authority |
+| --- | --- |
+| Physical modem, SIM operations, network registration, modem protocols | Host telephony backend; initially ModemManager |
+| Durable message identities, submission outcomes, delivery journal, client reconciliation | Host communications service |
+| Physical call state | Host telephony backend; communications service arbitrates client commands |
+| Physical audio devices and stream graph | PipeWire with host session-manager policy |
+| Android app permissions, SMS role, telephony/Telecom and audio APIs | Existing Android framework plus narrowly scoped adapters |
+| Android conversation/provider records | Android view reconciled with host message state |
+| User assignment, grants, privacy and presentation ownership | Host policy plus Android app permissions |
+| Cell construction, authenticated endpoint delegation and teardown | Existing Droidloom supervisor |
+
+The host message store is a new proposal. It extends the earlier SMS plan,
+which retained Android-owned conversation storage without a shared native
+history. Android still needs its TelephonyProvider and normal app-facing APIs;
+its records become a reconciled view of host message state. HAL integration
+alone cannot synchronize read/deleted/sent history with native apps.
+
+### Service boundaries
+
+Use Rust for new host services, transport codecs/state machines, and Android
+AIDL adapters where supported by the pinned product. Retain the existing
+Android framework. ModemManager and the underlying Linux libraries remain their
+existing implementations; this is not a rewrite of all dependencies in Rust.
+
+Proposed source boundaries (names are illustrative, not existing APIs):
+
+- `runtime/droidloom-communications`: modem discovery, subscriptions, SMS/call
+  domain operations, policy-aware durable delivery and native D-Bus API.
+- `runtime/droidloom-audio`: per-user PipeWire integration and negotiated stream
+  control; separate process and failure domain from telephony.
+- Shared protocol/types/state crates: capability negotiation, event cursors,
+  request correlation, session generations, bounded framing and replay rules.
+- Android radio and audio services: implement the appropriate stable AIDL
+  contracts on private Binder; speak the delegated host transport.
+- A narrowly scoped Android framework/provider integration: reconcile shared
+  message history and report read/delete changes. Keep APKs unmodified.
+
+Use existing Linux APIs southbound: ModemManager D-Bus, PipeWire,
+WirePlumber/session policy, desktop notifications and logind where available.
+The native communications API is a documented Droidloom interface initially,
+not an invented freedesktop standard. Native clients must explicitly adopt it
+or use an adapter; existing MM clients will not automatically share history.
+Do not expose the unrestricted host system/session bus inside Android.
+
+Telephony needs to survive Android and graphical-session exits. Provide an
+independently supervised communications component under a dedicated identity,
+with explicit persistent modem/SIM-to-user assignment. Scope mailboxes by user
+and subscription. A session switch must not transfer a SIM or expose message
+history to the newly active user. Session agents handle UI and user audio;
+headless receipt must not require the presenter. A mobile installation may keep
+an assigned user's audio session alive by policy; a desktop must not silently
+create a root PipeWire instance.
+
+Reuse protocol/authentication primitives from graphics, but give communications
+and audio their own endpoints. SMS must not depend on the render loop, and PCM
+must not pass through JSON, D-Bus method payloads or the message journal.
+Use bounded shared-memory audio buffers and negotiated formats with control
+messages on a separate channel. Measure the actual copy count and latency;
+zero-copy is not established by choosing shared memory alone.
+
+### Start with SMS as the first complete integration
+
+The acceptance scenario is: Android is stopped, an SMS arrives, Linux retains
+it and presents one notification; the user opens Android Messages and sees it,
+replies there, and native Linux clients observe the same submission outcome.
+Then repeat across restarts, duplicate delivery and SIM replacement.
+
+1. Discover the host backend and an explicitly assigned subscription. Enumerate
+   absent, locked, ready and unavailable states; do not assume slot 1, modem 0,
+   QRTR, a particular carrier or a phone-form-factor host.
+2. Subscribe and reconcile using stable host identifiers and event cursors.
+   MM object paths and Android row IDs are mappings, not primary identities.
+3. Persist accepted incoming parts/events before acknowledging ownership of
+   them. Distinguish modem/network ACK from Android-consumption ACK. If the
+   backend acknowledges a transfer-only SMS before durable storage, a broker
+   layered above it cannot close that loss window: that backend must expose a
+   durable handoff or be reported as lacking crash-safe receipt.
+4. Deliver real SMS PDUs into the Android radio path with correct subscription,
+   status and acknowledgement behavior. Android assembles and dispatches via
+   its normal telephony framework. Do not forge public SMS broadcasts or have
+   a host process edit Android's SQLite files.
+5. Add the framework/provider reconciliation boundary for history, sent
+   messages from native clients, read/unread and deletion. Specify stable ID
+   mapping, origin/revision markers, tombstones and conflict rules. Do not
+   trigger SMS re-delivery merely to restore an already-read history record.
+   Deduplicate replay by event identity, not only sender/text/timestamp: two
+   identical messages can be intentional.
+6. Outgoing requests receive durable operation IDs. Separate queued,
+   submitting, accepted, delivered, failed and outcome-unknown. Neither a
+   transport disconnect nor Android retry permits blind retransmission after
+   an ambiguous modem result. Carrier delivery reports are optional evidence,
+   not a universal guarantee.
+7. One component owns user-visible presentation for each message. Reconcile
+   host notifications with Android notifications by stable message identity;
+   the existing notification forwarding cannot deduplicate SMS by itself.
+   Read/delete changes propagate without generating new arrival notifications.
+   Inline reply requires explicit protocol/permission work; it is not supported
+   by the current notification bridge.
+
+A real technical gate remains: Android expects encoded SMS packets and per-part
+status, while stock MM's public SMS API exposes decoded/assembled messages.
+Define separate capabilities for basic native SMS, lossless Android SMS, and
+durable receipt. A versioned generic MM extension or an equivalent backend
+interface may supply the missing packet contract. Do not put QMI WMS calls in
+Droidloom core, or pass an encoded TPDU as MM `Data` (which means payload).
+Do not claim full Android radio compatibility through text reconstruction.
+
+### Extend the same ownership model to calls and audio
+
+Call control and call sound are distinct capabilities. MM can expose voice
+operations on supported modems; that does not prove a usable microphone,
+earpiece, Bluetooth route or carrier IMS service. A Linux-generic call backend
+must report both signaling availability and its audio-path requirements.
+Hardware-specific DSP/ALSA/UCM/routing support belongs below the portable service.
+A backend that cannot provide real call audio must not advertise complete calling.
+
+Maintain one authoritative call identity/state and arbitrate answer/hangup/hold
+commands across Android Telecom and native clients. Reconcile competing commands
+against current state. Android process death should not itself hang up an active
+call; its control UI can reconnect. Define host behavior if no UI/audio session
+is available. Emergency dialing needs a separately validated route and policy;
+never fabricate success or availability from generic voice support.
+
+The Android audio HAL should expose negotiated host outputs/capture to ordinary
+Android apps. PipeWire carries audio; WirePlumber or the selected session manager
+owns device selection and access policy. Linux routing changes, headset removal,
+Bluetooth profile changes, mute and microphone revocation must be reflected
+back into Android. Android audio focus and host communication-stream policy need
+an explicit mapping, so a call can interrupt/duck media without two independent
+managers fighting over global volume. Android master mute must not silently
+become system-wide mute.
+
+The initial bridge maps Android mix streams to PipeWire through a dedicated
+shared sample pool. Host loopback tests validate pool negotiation in both
+directions; see [implementation and tests](audio-integration-proposal.md#implemented-bridge-and-host-checks).
+Per-Android-app volume,
+routing and microphone attribution are a later explicit milestone: AudioFlinger
+may mix apps before the HAL, so creating PipeWire nodes at HAL level alone does
+not expose each app. Additional framework stream/identity plumbing may be needed.
+App labels supplied by a compromised cell are not trusted host identities.
+
+### What Linux-generic means
+
+The first supported host profile is Linux with ModemManager, PipeWire and the
+relevant session services. Other backends can implement the same contracts;
+do not implement speculative oFono/ALSA/remote-phone backends before needed.
+Generic does not mean every modem supports SMS/calls, or every distribution
+already exposes the required packet and media APIs.
+
+No Moto model names, Qualcomm nodes, fixed SIM numbers, driver commands, IMS
+workarounds or kernel release checks belong in Droidloom core. Those remain in
+host drivers, ModemManager/vendor adapters and distribution/device packages.
+Source should be buildable for ARM64 and x86_64 with separate dependencies for
+optional communications and audio. A desktop with no modem still runs Android
+and audio; adding/removing a modem produces capability events without restarting
+the Android cell. An initially non-telephony image may require a different
+product feature profile; never assume all Android feature declarations can be
+changed dynamically. Test the chosen cellular-capable image with no SIM/modem
+and with subsequent insertion.
+
+Capabilities distinguish unsupported, absent, locked, temporarily unavailable
+and ready; feature presence is not operational readiness. RCS is a separate
+service/account transport and does not work in the current setup. SMS success
+does not enable RCS, MMS or IMS.
+
+### Lifecycle, policy and validation
+
+Use event-driven reception. Brief, bounded sleep inhibitors may protect journal
+handoff or a route transition; an inhibitor does not wake already-suspended
+hardware. Real modem wake support is a backend/kernel capability to test.
+An active call may need an explicit host sleep policy; idle telephony must not
+hold a permanent wake lock or repeatedly poll to keep Android alive.
+
+Host permission bounds apply in addition to Android permissions. Grant a cell
+only its assigned subscription and operations; separate send, receive/history,
+call control, SIM administration and microphone grants. Never store/retry PINs
+implicitly. The current preview's root identities and incomplete isolation are
+not production patterns. New device-service authority requires updating the
+threat model as specified there before shipping an implemented boundary.
+
+Validate protocol state machines with fake backends, malformed packets, lost
+responses, queue limits and crash/replay tests on ordinary development hosts.
+Then test the real MM backend on the Moto and a second independent modem/host.
+Validate PipeWire playback/capture on an ordinary working Linux audio machine
+before attributing Moto hardware-driver gaps to the Android bridge. Include
+native/Android coexistence, session changes, Android stopped, no modem, locked
+SIM, USB removal, suspend, reconnect and actual battery measurements. Do not
+promise exactly-once network delivery; prove the local replay/idempotency rules.
+
+Milestones: (1) contracts and native headless SMS service; (2) Android radio and
+shared Messages history; (3) playback/capture and host audio policy; (4) cellular
+calls/Telecom and real call routing. Define the common interfaces first, but
+ship each milestone end-to-end rather than building an unused general platform.
+
+### Current evidence from the Moto
+
+The device demonstrates native MM receipt of a real SMS. Outgoing SMS, durable
+receipt across service restart and Android Messages integration are not yet
+validated. The first missing test messages were RCS; that was not an SMS fault.
+The device workspace records an independently proven private-libqmi List
+Messages encoding repair and unproven candidate initialization/routing changes;
+none belongs in generic Droidloom without a portable backend contract.
+
+Read-only inspection on 2026-09-12 found PipeWire and WirePlumber active, but
+`/proc/asound/cards` reported no sound cards and PipeWire exposed only
+`auto_null`, with no capture source. The new host-backed HAL has been tested
+against an isolated host graph. Real Moto audio therefore needs host hardware bring-up as
+well as the portable Android adapter. Calls and IMS remain unvalidated.
+
+References: [SMS proposal](sms-integration-proposal.md),
+[audio proposal](audio-integration-proposal.md),
+[desktop integration](desktop-integration.md), [threat model](threat-model-v2.md),
+[PipeWire session policy](https://docs.pipewire.org/page_session_manager.html),
+[PipeWire access control](https://docs.pipewire.org/page_access.html),
+[Android AIDL audio interfaces](https://source.android.com/docs/core/audio/aidl-hidl-comp?hl=en).

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-source_tree="${1:-$repo_root/.work/aosp-m2-source}"
+source_tree="${1:-$repo_root/.work/arch/build/aosp-source}"
 source_tree="$(readlink -f -- "$source_tree")"
 lock="$repo_root/android/manifest/m2-sparse-source-lock.json"
 manifest="$source_tree/.droidloom-source-manifest.json"
@@ -179,6 +179,10 @@ rsync -a --delete "$mesa_prepared/" "$source_tree/vendor/droidloom/mesa3d/"
     cd "$repo_root"
     rsync -aR \
         Android.bp \
+        ./runtime/droidloom-cpu-placement \
+        ./runtime/droidloom-timing \
+        ./runtime/droidloom-audio-protocol \
+        ./android/audio \
         ./graphics/droidloom-composer-aidl \
         ./graphics/droidloom-composer-service \
         ./graphics/droidloom-composer \
@@ -189,8 +193,7 @@ rsync -a --delete "$mesa_prepared/" "$source_tree/vendor/droidloom/mesa3d/"
         ./graphics/droidloom-syncobj \
         ./graphics/droidloom-task-control \
         ./graphics/droidloom-transport \
-        ./android/framework/droidloom-task-launcher \
-        ./android/framework/droidloom-input-bridge \
+        ./android/framework/host-channels \
         ./android/lmkd-compat \
         ./android/runtime/droidloom-classpath-wrapper \
         ./android/selinux-compat \

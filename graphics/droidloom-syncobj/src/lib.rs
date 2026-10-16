@@ -219,7 +219,10 @@ impl WaylandTimeline {
     /// # Errors
     /// Rejects reused/zero points and propagates DRM errors other than a
     /// nonblocking availability timeout. Call only until the first export.
-    pub fn try_export_release_fence(&mut self, point: u64) -> Result<Option<OwnedFd>, SyncobjError> {
+    pub fn try_export_release_fence(
+        &mut self,
+        point: u64,
+    ) -> Result<Option<OwnedFd>, SyncobjError> {
         match self.timeline.wait_available_and_export(point, NO_WAIT) {
             Ok(fd) => Ok(Some(fd)),
             Err(SyncobjError::Drm { source, .. }) if source.raw_os_error() == Some(libc::ETIME) => {
@@ -233,7 +236,11 @@ impl WaylandTimeline {
     ///
     /// # Errors
     /// Rejects zero and propagates unsupported-kernel or registration errors.
-    pub fn notify_when_available(&self, point: u64, event: BorrowedFd<'_>) -> Result<(), SyncobjError> {
+    pub fn notify_when_available(
+        &self,
+        point: u64,
+        event: BorrowedFd<'_>,
+    ) -> Result<(), SyncobjError> {
         require_newer(0, point)?;
         self.timeline
             .device
@@ -252,7 +259,8 @@ impl WaylandTimeline {
         event: BorrowedFd<'_>,
     ) -> Result<(), SyncobjError> {
         require_newer(0, point)?;
-        self.timeline.device
+        self.timeline
+            .device
             .syncobj_eventfd(self.timeline.handle(), point, event, false)
             .map_err(|source| drm_error("register Wayland release wakeup", source))
     }
@@ -442,7 +450,11 @@ impl Timeline {
         if self.transfer.is_none() {
             self.transfer = Some(BinarySyncobj::create(&self.device)?);
         }
-        Ok(self.transfer.as_ref().expect("scratch handle initialized").handle())
+        Ok(self
+            .transfer
+            .as_ref()
+            .expect("scratch handle initialized")
+            .handle())
     }
 
     fn export_opaque(&self) -> Result<OwnedFd, SyncobjError> {
@@ -483,7 +495,9 @@ impl Timeline {
         self.device
             .syncobj_timeline_transfer(self.handle(), temporary, point, 0)
             .map_err(|source| drm_error("transfer timeline point into sync_file", source))?;
-        let fd = self.device.syncobj_to_fd(temporary, true)
+        let fd = self
+            .device
+            .syncobj_to_fd(temporary, true)
             .map_err(|source| drm_error("export timeline point as sync_file", source))?;
         self.last_exported_point = point;
         Ok(fd)
@@ -538,7 +552,6 @@ impl BinarySyncobj {
         self.handle
             .expect("live binary syncobj always owns its handle")
     }
-
 }
 
 impl Drop for BinarySyncobj {
@@ -639,12 +652,18 @@ mod tests {
     #[test]
     #[ignore = "requires a DRM render node; set DROIDLOOM_TEST_DRM_NODE"]
     fn per_buffer_timeline_does_not_release_neighbors() {
-        use std::{fs::OpenOptions, os::fd::AsFd};
-        use drm::control::Device;
         use super::{SyncobjDevice, WaylandTimeline};
+        use drm::control::Device;
+        use std::{fs::OpenOptions, os::fd::AsFd};
 
         let node = std::env::var("DROIDLOOM_TEST_DRM_NODE").unwrap();
-        let open = || OpenOptions::new().read(true).write(true).open(&node).unwrap();
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&node)
+                .unwrap()
+        };
         let producer = SyncobjDevice::from_file(open());
         let consumer = SyncobjDevice::from_file(open());
         let complete = producer.create_syncobj(true).unwrap();
@@ -672,26 +691,41 @@ mod tests {
             let release = acquire + 1;
             first.import_acquire_fence(acquire, ready.as_fd()).unwrap();
             second.import_acquire_fence(acquire, ready.as_fd()).unwrap();
-            let handles = (first.timeline.transfer.as_ref().unwrap().handle(),
-                second.timeline.transfer.as_ref().unwrap().handle());
+            let handles = (
+                first.timeline.transfer.as_ref().unwrap().handle(),
+                second.timeline.transfer.as_ref().unwrap().handle(),
+            );
             if let Some(previous) = scratch_handles {
-                assert_eq!(handles, previous, "scratch handles must survive buffer reuse");
+                assert_eq!(
+                    handles, previous,
+                    "scratch handles must survive buffer reuse"
+                );
             }
             scratch_handles = Some(handles);
             assert!(first.signalled_point().unwrap() < release);
             assert!(first.try_export_release_fence(release).unwrap().is_none());
             // The later buffer is discarded/released first. The earlier
             // buffer must remain unavailable until its own release arrives.
-            consumer.syncobj_timeline_signal(&[second_handle], &[release]).unwrap();
+            consumer
+                .syncobj_timeline_signal(&[second_handle], &[release])
+                .unwrap();
             assert!(second.signalled_point().unwrap() >= release);
             assert!(second.try_export_release_fence(release).unwrap().is_some());
             assert!(first.try_export_release_fence(release).unwrap().is_none());
             assert!(first.signalled_point().unwrap() < release);
-            consumer.syncobj_timeline_signal(&[first_handle], &[release]).unwrap();
+            consumer
+                .syncobj_timeline_signal(&[first_handle], &[release])
+                .unwrap();
             assert!(first.signalled_point().unwrap() >= release);
             assert!(first.try_export_release_fence(release).unwrap().is_some());
-            assert_eq!(first.timeline.transfer.as_ref().unwrap().handle(), handles.0);
-            assert_eq!(second.timeline.transfer.as_ref().unwrap().handle(), handles.1);
+            assert_eq!(
+                first.timeline.transfer.as_ref().unwrap().handle(),
+                handles.0
+            );
+            assert_eq!(
+                second.timeline.transfer.as_ref().unwrap().handle(),
+                handles.1
+            );
         }
         consumer.destroy_syncobj(first_handle).unwrap();
         consumer.destroy_syncobj(second_handle).unwrap();
@@ -701,11 +735,21 @@ mod tests {
     #[test]
     #[ignore = "requires a DRM render node; set DROIDLOOM_TEST_DRM_NODE"]
     fn release_wakeup_tracks_only_its_completed_point() {
-        use std::{fs::{File, OpenOptions}, io::Read, os::fd::{AsFd, FromRawFd}};
-        use drm::control::Device;
         use super::{SyncobjDevice, WaylandTimeline};
+        use drm::control::Device;
+        use std::{
+            fs::{File, OpenOptions},
+            io::Read,
+            os::fd::{AsFd, FromRawFd},
+        };
         let node = std::env::var("DROIDLOOM_TEST_DRM_NODE").unwrap();
-        let device = SyncobjDevice::from_file(OpenOptions::new().read(true).write(true).open(node).unwrap());
+        let device = SyncobjDevice::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(node)
+                .unwrap(),
+        );
         let timeline = WaylandTimeline::create(&device).unwrap();
         // SAFETY: no pointer arguments; successful eventfd ownership moves to File once.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -713,14 +757,24 @@ mod tests {
         let mut event = unsafe { File::from_raw_fd(fd) };
         let mut value = [0_u8; 8];
         for point in 1..=128 {
-            timeline.notify_when_signalled(point, event.as_fd()).unwrap();
+            timeline
+                .notify_when_signalled(point, event.as_fd())
+                .unwrap();
             // The point does not exist yet: registration must be nonblocking,
             // and the event must remain unreadable until actual completion.
-            assert_eq!(event.read(&mut value).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-            device.syncobj_timeline_signal(&[timeline.timeline.handle()], &[point]).unwrap();
+            assert_eq!(
+                event.read(&mut value).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            device
+                .syncobj_timeline_signal(&[timeline.timeline.handle()], &[point])
+                .unwrap();
             event.read_exact(&mut value).unwrap();
             assert_eq!(u64::from_ne_bytes(value), 1);
-            assert_eq!(event.read(&mut value).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(
+                event.read(&mut value).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
         // Registering after completion must also wake immediately, avoiding
         // a race between the presenter's query and its next poll.

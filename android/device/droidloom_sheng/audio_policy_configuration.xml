@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Copyright (C) 2026 Droidloom
+  SPDX-License-Identifier: GPL-3.0-or-later
+  See LICENSE and LICENSES/GPL-3.0-or-later.txt for the license terms.
+-->
+<audioPolicyConfiguration version="7.0"
+    xmlns:xi="http://www.w3.org/2001/XInclude">
+    <globalConfiguration speaker_drc_enabled="false"/>
+    <modules>
+        <xi:include href="droidloom_primary_audio_policy_configuration.xml"/>
+    </modules>
+    <xi:include href="audio_policy_volumes.xml"/>
+    <xi:include href="default_volume_tables.xml"/>
+    <xi:include href="surround_sound_configuration_5_0.xml"/>
+</audioPolicyConfiguration>

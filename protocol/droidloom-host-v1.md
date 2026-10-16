@@ -56,7 +56,7 @@ are impossible at the protocol layer; truncation (`MSG_TRUNC` or
 | ---: | --- | --- | --- |
 | 0 | `[u8; 4]` | magic | ASCII `DLOM` |
 | 4 | `u16` | major | `1` |
-| 6 | `u16` | minor | `3` for existing records; `4` for negotiated activation |
+| 6 | `u16` | minor | `3` for existing records; `4` activation, `5` power, `6` direct input, `7` target demand |
 | 8 | `u16` | opcode | direction-specific value |
 | 10 | `u16` | descriptor count | must equal ancillary descriptors |
 | 12 | `u32` | flags | zero in version 1 |
@@ -91,6 +91,9 @@ is malformed. Descriptors are never inferred from payload integers.
 | `0x000c` | `BindTask` | task | none |
 | `0x000d` | `BindLayerStream` | task | request socket, completion socket |
 | `0x000e` | `RequestActivation` | bound task | none |
+| `0x000f` | `BindInputChannel` | connection | connected input socket |
+| `0x0010` | `BindInputRoute` | bound task | none |
+| `0x0011` | `RequestRenderTargets` | task | none |
 
 `CreateTask` carries a non-zero dedicated logical display ID and a package
 identity of at most 255 bytes. `BindTask` subsequently supplies the real Android
@@ -108,8 +111,23 @@ and waits for a new window's first buffer commit before applying its token.
 Stale tokens and tokens for closed windows are discarded. Old peers remain
 compatible and receive no new opcode. Initial negotiation and all existing
 records retain minor-3 headers, so a minor-3 decoder can reach the handshake.
-ServerHello selects minor 4 only when both peers support task activation;
-otherwise it selects minor 3.
+At that revision, ServerHello selected minor 4 only with mutual activation
+support. Later power and direct-input extensions raise the negotiated minor.
+
+Protocol minor 7 adds optional bit 11 (`LAZY_RENDER_TARGETS`). Only when both
+peers advertise it may the host publish a configure without a fallback pool.
+`RequestRenderTargets` carries one nonzero `u32` configure serial and no FDs;
+the task object fixes allocation ownership and the host's current dimensions.
+Composer sends it only from an actual composition dequeue, at most once per
+generation after a successful send. Existing busy buffers wait for real release
+and do not trigger another allocation. Stale requests and requests for closing
+windows allocate nothing. Targets arrive through the existing registration
+messages; geometry acknowledgement and GPU ownership rules remain unchanged.
+The presenter selects minor 7 with this capability and minor 6 for current
+direct-input peers without it. Existing records retain their original headers.
+SurfaceFlinger prepares geometry and tries direct layers before dequeue, so
+direct presentation needs no composition target. Its bootstrap dequeue can
+request targets too when the normally elided hidden draw is needed.
 
 `BindTimelines` transfers exactly two DRM syncobj opaque descriptors. The first
 exports the acquire timeline; the second exports the release timeline. Both
@@ -122,13 +140,18 @@ channel. A stream is bound once, cannot address other tasks, and has no authorit
 to create windows. The `DLL1` stream codec in
 `graphics/droidloom-surface-bridge/src/layers.rs` is authoritative: each record has
 a 16-byte little-endian header (magic, opcode, payload size, descriptor count),
-with a 128-byte record bound and at most four image-plane descriptors.
+with a 1260-byte record bound and at most four descriptors. Legacy records
+remain at most 128 bytes.
 
 The stream requests are Config (1), Register (2), Unregister (3), Stage (4),
-Commit (5), Abort (6), optional StageAsync (7), and SubscribeConfig (8). Config returns capabilities,
+Commit (5), Abort (6), optional StageAsync (7), SubscribeConfig (8),
+CommitAsync (9), RegisterAsync (10), StageBatch (11), and CommitBatch (12).
+Config returns capabilities,
 configure serial and physical dimensions. Register has one FD per image plane;
 Stage and StageAsync have at most
-one original producer sync-file. Remaining requests have no descriptors.
+one original producer sync-file. RegisterAsync has Register's image planes;
+batch records have up to four indexed producer sync-files. Remaining requests
+have no descriptors.
 Commit validates the entire layer list and current configure before publishing
 it. Ack (`0x8001`) reports acceptance or a negative error; Config (`0x8002`)
 returns four words; Released (`0x8003`) names one 64-bit completed read ticket.
@@ -169,6 +192,19 @@ SubscribeConfig retains the same cross-socket barrier as Config. Cached values
 replace frame-by-frame Config queries; Commit still validates current host
 geometry and serial, rejecting stale submissions. Peers without bit 3 continue
 querying Config. No configuration events are sent to unsubscribed peers.
+
+Config capability bit 6 (`SCENE_BATCH`) permits StageBatch and CommitBatch,
+used together with asynchronous staging, configuration and commit acceptance.
+StageBatch contains a u32 chunk count followed by 1–16 entries. Each entry is
+the existing 72-byte Stage payload followed by a u32 descriptor index, or
+`0xffffffff` for no fence. Indices are packet-local, unique and exhaustive;
+solid layers cannot carry fences. CommitBatch starts with a u64 scene ID and
+u32 configure serial, width, height and total scene count, followed by the same
+chunk encoding. It appends the last chunk and uses the existing CommitAsync
+validation and event `0x8006`. Earlier chunks remain invisible until acceptance.
+The complete scene remains bounded to 64 layers and one unacknowledged commit;
+chunk overflow invalidates the whole scene. Final batches preserve the same
+cross-socket barrier as Commit. Older peers use StageAsync and CommitAsync.
 
 `RegisterBuffer` carries an allocation ID, dimensions, explicit DRM FourCC and
 modifier, and one through four dense plane records containing index, offset,

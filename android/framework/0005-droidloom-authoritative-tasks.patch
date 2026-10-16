@@ -1,0 +1,56 @@
+--- a/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
++++ b/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+@@ -894,6 +894,16 @@
+         mBackNavigationController = new BackNavigationController();
+     }
+ 
++    volatile DroidloomTaskBackend mDroidloomTasks;
++
++    @Override
++    public void onShellCommand(java.io.FileDescriptor in, java.io.FileDescriptor out,
++            java.io.FileDescriptor err, String[] args, android.os.ShellCallback callback,
++            android.os.ResultReceiver receiver) {
++        new DroidloomTaskShellCommand(mDroidloomTasks).exec(
++                this, in, out, err, args, callback, receiver);
++    }
++
+     public void onSystemReady() {
+         synchronized (mGlobalLock) {
+             final PackageManager pm = mContext.getPackageManager();
+@@ -909,6 +919,7 @@
+                     GrammaticalInflectionManagerInternal.class);
+             mPackageUpdateManager.onSystemReady();
+         }
++        if (DroidloomTaskBackend.ENABLED) mDroidloomTasks = new DroidloomTaskBackend(this);
+     }
+ 
+     public void onInitPowerManagement() {
+--- a/services/core/java/com/android/server/wm/TaskChangeNotificationController.java
++++ b/services/core/java/com/android/server/wm/TaskChangeNotificationController.java
+@@ -311,6 +311,8 @@
+     }
+ 
+     private void forAllLocalListeners(TaskStackConsumer callback, Message message) {
++        DroidloomTaskBackend backend = mTaskSupervisor.mService.mDroidloomTasks;
++        if (backend != null) backend.schedule();
+         synchronized (mLocalTaskStackListeners) {
+             for (int i = mLocalTaskStackListeners.size() - 1; i >= 0; i--) {
+                 try {
+--- a/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java
++++ b/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java
+@@ -665,6 +665,7 @@
+             final WaitResult w = info.mResult;
+             w.timeout = timeout;
+             w.who = r.mActivityComponent;
++            if (mService.mDroidloomTasks != null) mService.mDroidloomTasks.launchCompleted(w, r);
+             w.totalTime = totalTime;
+             w.launchState = launchState;
+             mWaitingActivityLaunched.remove(i);
+@@ -697,6 +698,7 @@
+                 // Unlike START_TASK_TO_FRONT, When an intent is delivered to top, there
+                 // will be no followup launch signals. Assign the result and launched component.
+                 w.who = r.mActivityComponent;
++                if (mService.mDroidloomTasks != null) mService.mDroidloomTasks.launchCompleted(w, r);
+                 mWaitingActivityLaunched.remove(i);
+                 changed = true;
+             }

@@ -26,6 +26,33 @@ use thiserror::Error;
 /// One fully validated operation for Denial's native task/window machinery.
 #[derive(Debug)]
 pub enum EndpointAction {
+    /// Allocate fallback composition targets for the current task generation.
+    RequestRenderTargets {
+        /// Existing task object.
+        object: TaskObjectId,
+        /// Requested configure generation; stale requests can be discarded.
+        configure_serial: u32,
+    },
+    /// Adopt one explicitly requested connected native input writer.
+    BindInputChannel {
+        /// Host request generation.
+        generation: u64,
+        /// Native input wire ABI.
+        wire: u16,
+        /// Owned connected sequenced-packet socket.
+        socket: OwnedFd,
+    },
+    /// Cache the native route for an authenticated, bound task.
+    BindInputRoute {
+        /// Host task object.
+        object: TaskObjectId,
+        /// Bound Android task identity.
+        task: AndroidTaskId,
+        /// Actual Android logical display.
+        display: u32,
+        /// Framework task incarnation.
+        incarnation: u64,
+    },
     /// Connection-level version and capability negotiation completed.
     ClientReady,
     /// Create exactly one native Denial task/window.
@@ -298,10 +325,18 @@ pub struct DenialEndpoint {
     device: SyncobjDevice,
     ready: bool,
     activation_requests: bool,
+    direct_input: bool,
+    lazy_render_targets: bool,
     tasks: BTreeMap<TaskObjectId, TaskEndpoint>,
 }
 
 impl DenialEndpoint {
+    /// Whether version and capability negotiation has completed.
+    #[must_use]
+    pub const fn ready(&self) -> bool {
+        self.ready
+    }
+
     /// Construct an endpoint after the listener authenticates the peer with
     /// `SO_PEERCRED`. The first accepted record must still be `ClientHello`.
     pub fn new(socket: ProtocolSocket, device: SyncobjDevice) -> Self {
@@ -311,16 +346,74 @@ impl DenialEndpoint {
             device,
             ready: false,
             activation_requests: false,
+            direct_input: false,
+            lazy_render_targets: false,
             tasks: BTreeMap::new(),
         }
     }
 
     /// Opt in only when the host implements activation under its focus policy.
+    ///
+    /// # Panics
+    /// Panics if capability negotiation has already completed.
     #[must_use]
     pub fn with_activation_requests(mut self) -> Self {
-        assert!(!self.ready, "activation must be configured before handshake");
+        assert!(
+            !self.ready,
+            "activation must be configured before handshake"
+        );
         self.activation_requests = true;
         self
+    }
+
+    /// Enable direct native input handoff before capability negotiation.
+    ///
+    /// # Panics
+    /// Panics if capability negotiation has already completed.
+    #[must_use]
+    pub fn with_direct_input(mut self) -> Self {
+        assert!(
+            !self.ready,
+            "direct input must be configured before handshake"
+        );
+        self.direct_input = true;
+        self
+    }
+
+    /// Enable demand allocation before capability negotiation.
+    ///
+    /// # Panics
+    /// Panics if the handshake has completed.
+    #[must_use]
+    pub fn with_lazy_render_targets(mut self) -> Self {
+        assert!(!self.ready, "target policy must precede handshake");
+        self.lazy_render_targets = true;
+        self
+    }
+
+    /// Whether both peers support demand allocation of composition buffers.
+    #[must_use]
+    pub fn lazy_render_targets(&self) -> bool {
+        self.ready && self.lazy_render_targets
+    }
+
+    /// Whether direct native input was negotiated.
+    #[must_use]
+    pub fn direct_input(&self) -> bool {
+        self.ready && self.direct_input
+    }
+
+    /// Request a connected native input socket without forwarding input records.
+    ///
+    /// # Errors
+    /// Rejects unsupported peers and propagates send failures.
+    pub fn request_input_channel(&self, generation: u64) -> Result<(), EndpointError> {
+        if !self.direct_input() {
+            return Err(EndpointError::IncompatibleClient);
+        }
+        self.socket
+            .send_denial(&DenialMessage::RequestInputChannel { generation })?;
+        Ok(())
     }
 
     /// Borrow the socket for calloop registration and peer diagnostics.
@@ -342,6 +435,41 @@ impl DenialEndpoint {
             return Err(EndpointError::HandshakeRequired);
         }
         match received.message {
+            AndroidMessage::RequestRenderTargets {
+                object,
+                configure_serial,
+            } => {
+                if !self.lazy_render_targets {
+                    return Err(EndpointError::IncompatibleClient);
+                }
+                self.task(object)?;
+                Ok(EndpointAction::RequestRenderTargets {
+                    object,
+                    configure_serial,
+                })
+            }
+            AndroidMessage::BindInputChannel { generation, wire } => {
+                self.bind_input_channel(generation, wire, received.descriptors)
+            }
+            AndroidMessage::BindInputRoute {
+                object,
+                display,
+                incarnation,
+            } => {
+                if !self.direct_input {
+                    return Err(EndpointError::IncompatibleClient);
+                }
+                let task = self
+                    .task(object)?
+                    .task
+                    .ok_or(EndpointError::UnknownObject(object))?;
+                Ok(EndpointAction::BindInputRoute {
+                    object,
+                    task,
+                    display,
+                    incarnation,
+                })
+            }
             AndroidMessage::ClientHello {
                 min_major,
                 max_major,
@@ -387,7 +515,10 @@ impl DenialEndpoint {
             ),
             AndroidMessage::BindLayerStream { object } => {
                 self.task(object)?;
-                Ok(EndpointAction::BindLayerStream { object, sockets: received.descriptors.into_iter().map(|d| d.fd).collect() })
+                Ok(EndpointAction::BindLayerStream {
+                    object,
+                    sockets: received.descriptors.into_iter().map(|d| d.fd).collect(),
+                })
             }
             AndroidMessage::SetContentState { object, flags } => {
                 self.task(object)?;
@@ -398,7 +529,9 @@ impl DenialEndpoint {
                 Ok(EndpointAction::SetFrameRate { object, millihz })
             }
             AndroidMessage::RequestActivation { object } => {
-                if !self.activation_requests { return Err(EndpointError::IncompatibleClient); }
+                if !self.activation_requests {
+                    return Err(EndpointError::IncompatibleClient);
+                }
                 if self.task(object)?.task.is_none() {
                     return Err(EndpointError::UnknownObject(object));
                 }
@@ -406,6 +539,27 @@ impl DenialEndpoint {
             }
             AndroidMessage::Pong { cookie } => Ok(EndpointAction::Pong { cookie }),
         }
+    }
+
+    fn bind_input_channel(
+        &self,
+        generation: u64,
+        wire: u16,
+        descriptors: Vec<AttachedDescriptor>,
+    ) -> Result<EndpointAction, EndpointError> {
+        if !self.direct_input {
+            return Err(EndpointError::IncompatibleClient);
+        }
+        let socket = descriptors
+            .into_iter()
+            .next()
+            .ok_or(EndpointError::IncompatibleClient)?
+            .fd;
+        Ok(EndpointAction::BindInputChannel {
+            generation,
+            wire,
+            socket,
+        })
     }
 
     /// Publish authoritative DMA-BUF feedback for one native task.
@@ -538,6 +692,17 @@ impl DenialEndpoint {
             visibility,
             focused,
         })?;
+        Ok(())
+    }
+
+    /// Publish the aggregate power state of the host's physical outputs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates codec or socket failure.
+    pub fn send_display_power(&self, powered: bool) -> Result<(), EndpointError> {
+        self.socket
+            .send_denial(&DenialMessage::DisplayPower { powered })?;
         Ok(())
     }
 
@@ -761,11 +926,31 @@ impl DenialEndpoint {
             return Err(EndpointError::IncompatibleClient);
         }
         self.activation_requests &= capabilities & capability::TASK_ACTIVATION != 0;
+        self.direct_input &= capabilities & capability::DIRECT_INPUT != 0;
+        self.lazy_render_targets &= capabilities & capability::LAZY_RENDER_TARGETS != 0;
         self.socket.send_denial(&DenialMessage::ServerHello {
             major: PROTOCOL_MAJOR,
-            minor: if self.activation_requests { PROTOCOL_MINOR } else { droidloom_denial_protocol::BASE_PROTOCOL_MINOR },
+            minor: if self.lazy_render_targets {
+                PROTOCOL_MINOR
+            } else {
+                6
+            },
             capabilities: capability::REQUIRED_V1
-                | if self.activation_requests { capability::TASK_ACTIVATION } else { 0 },
+                | if self.activation_requests {
+                    capability::TASK_ACTIVATION
+                } else {
+                    0
+                }
+                | if self.direct_input {
+                    capability::DIRECT_INPUT
+                } else {
+                    0
+                }
+                | if self.lazy_render_targets {
+                    capability::LAZY_RENDER_TARGETS
+                } else {
+                    0
+                },
             max_task_objects: MAX_TASK_OBJECTS,
             max_buffers_per_task: MAX_BUFFERS_PER_TASK,
             max_damage_rects: u32::try_from(MAX_DAMAGE_RECTS).unwrap_or(u32::MAX),
@@ -943,8 +1128,19 @@ impl DenialEndpoint {
         };
         task.pending.insert(frame, accepted.clone());
         if let Some(begin) = trace_begin {
-            droidloom_syncobj::frame_trace::event("host_receive", object.0, frame.0, buffer.0,
-                &[("receive_ns", begin), ("fence_exported_ns", droidloom_syncobj::frame_trace::now_ns())]);
+            droidloom_syncobj::frame_trace::event(
+                "host_receive",
+                object.0,
+                frame.0,
+                buffer.0,
+                &[
+                    ("receive_ns", begin),
+                    (
+                        "fence_exported_ns",
+                        droidloom_syncobj::frame_trace::now_ns(),
+                    ),
+                ],
+            );
         }
         Ok(EndpointAction::Present {
             frame: accepted,
@@ -994,11 +1190,13 @@ fn take_descriptor(
 mod tests {
     use std::fs::File;
     use std::io;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt as _;
 
     use droidloom_denial_ipc::{ProtocolSocket, SeqPacket};
     use droidloom_denial_protocol::{
-        AndroidDisplayId, AndroidMessage, AndroidTaskId, DenialMessage, TaskObjectId, capability,
+        AndroidDisplayId, AndroidMessage, AndroidTaskId, DenialMessage, PROTOCOL_MINOR,
+        TaskObjectId, capability,
     };
     use droidloom_syncobj::SyncobjDevice;
 
@@ -1017,6 +1215,164 @@ mod tests {
                 SyncobjDevice::from_file(placeholder),
             ),
         )
+    }
+
+    #[test]
+    fn direct_input_requires_negotiation_and_an_already_bound_task() {
+        let (android, endpoint) = pair();
+        let mut denial = endpoint.with_direct_input();
+        android
+            .send_android(
+                &AndroidMessage::ClientHello {
+                    min_major: 1,
+                    max_major: 1,
+                    capabilities: capability::REQUIRED_V1 | capability::DIRECT_INPUT,
+                },
+                &[],
+            )
+            .unwrap();
+        denial.receive_action().unwrap();
+        assert!(denial.direct_input());
+        android.receive_denial().unwrap();
+        let object = TaskObjectId(7);
+        let route = AndroidMessage::BindInputRoute {
+            object,
+            display: 0,
+            incarnation: 99,
+        };
+        android.send_android(&route, &[]).unwrap();
+        assert!(matches!(
+            denial.receive_action(),
+            Err(EndpointError::UnknownObject(_))
+        ));
+        android
+            .send_android(
+                &AndroidMessage::CreateTask {
+                    object,
+                    display: AndroidDisplayId(9),
+                    package: "org.example.app".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        denial.receive_action().unwrap();
+        android.send_android(&route, &[]).unwrap();
+        assert!(matches!(
+            denial.receive_action(),
+            Err(EndpointError::UnknownObject(_))
+        ));
+        android
+            .send_android(
+                &AndroidMessage::BindTask {
+                    object,
+                    task: AndroidTaskId(42),
+                },
+                &[],
+            )
+            .unwrap();
+        denial.receive_action().unwrap();
+        android.send_android(&route, &[]).unwrap();
+        assert!(matches!(
+            denial.receive_action().unwrap(),
+            EndpointAction::BindInputRoute {
+                task: AndroidTaskId(42),
+                display: 0,
+                incarnation: 99,
+                ..
+            }
+        ));
+        denial.request_input_channel(1).unwrap();
+        assert_eq!(
+            android.receive_denial().unwrap().message,
+            DenialMessage::RequestInputChannel { generation: 1 }
+        );
+        let (writer, receiver) = SeqPacket::pair().unwrap();
+        android
+            .send_android(
+                &AndroidMessage::BindInputChannel {
+                    generation: 1,
+                    wire: 7,
+                },
+                &[writer.as_fd()],
+            )
+            .unwrap();
+        drop(writer);
+        let EndpointAction::BindInputChannel { socket, .. } = denial.receive_action().unwrap()
+        else {
+            panic!("expected handoff");
+        };
+        drop(socket);
+        assert!(receiver.receive_record().is_err());
+    }
+
+    #[test]
+    fn target_demand_requires_mutual_support_and_an_existing_task() {
+        for (host, client) in [(false, true), (true, false), (true, true)] {
+            let (android, mut endpoint) = pair();
+            if host {
+                endpoint = endpoint.with_lazy_render_targets();
+            }
+            android
+                .send_android(
+                    &AndroidMessage::ClientHello {
+                        min_major: 1,
+                        max_major: 1,
+                        capabilities: capability::REQUIRED_V1
+                            | if client {
+                                capability::LAZY_RENDER_TARGETS
+                            } else {
+                                0
+                            },
+                    },
+                    &[],
+                )
+                .unwrap();
+            endpoint.receive_action().unwrap();
+            let DenialMessage::ServerHello {
+                minor,
+                capabilities,
+                ..
+            } = android.receive_denial().unwrap().message
+            else {
+                panic!("hello")
+            };
+            let supported = host && client;
+            assert_eq!(endpoint.lazy_render_targets(), supported);
+            assert_eq!(
+                capabilities & capability::LAZY_RENDER_TARGETS != 0,
+                supported
+            );
+            assert_eq!(minor, if supported { PROTOCOL_MINOR } else { 6 });
+            let object = TaskObjectId(7);
+            let request = AndroidMessage::RequestRenderTargets {
+                object,
+                configure_serial: 3,
+            };
+            android.send_android(&request, &[]).unwrap();
+            assert!(endpoint.receive_action().is_err()); // No allocation for an unknown task.
+            android
+                .send_android(
+                    &AndroidMessage::CreateTask {
+                        object,
+                        display: AndroidDisplayId(9),
+                        package: "org.example.app".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            endpoint.receive_action().unwrap();
+            android.send_android(&request, &[]).unwrap();
+            assert_eq!(
+                matches!(
+                    endpoint.receive_action(),
+                    Ok(EndpointAction::RequestRenderTargets {
+                        object: TaskObjectId(7),
+                        configure_serial: 3
+                    })
+                ),
+                supported
+            );
+        }
     }
 
     #[test]
@@ -1148,29 +1504,85 @@ mod tests {
     fn activation_requires_mutual_support_and_a_bound_live_task() {
         for (host_support, client_support) in [(false, true), (true, false), (true, true)] {
             let (android, endpoint) = pair();
-            let mut denial = if host_support { endpoint.with_activation_requests() } else { endpoint };
-            android.send_android(&AndroidMessage::ClientHello { min_major: 1, max_major: 1,
-                capabilities: capability::REQUIRED_V1 | if client_support { capability::TASK_ACTIVATION } else { 0 } }, &[]).unwrap();
+            let mut denial = if host_support {
+                endpoint.with_activation_requests()
+            } else {
+                endpoint
+            };
+            android
+                .send_android(
+                    &AndroidMessage::ClientHello {
+                        min_major: 1,
+                        max_major: 1,
+                        capabilities: capability::REQUIRED_V1
+                            | if client_support {
+                                capability::TASK_ACTIVATION
+                            } else {
+                                0
+                            },
+                    },
+                    &[],
+                )
+                .unwrap();
             denial.receive_action().unwrap();
-            let DenialMessage::ServerHello { capabilities, minor, .. } = android.receive_denial().unwrap().message else { panic!("missing hello") };
+            let DenialMessage::ServerHello {
+                capabilities,
+                minor,
+                ..
+            } = android.receive_denial().unwrap().message
+            else {
+                panic!("missing hello")
+            };
             let supported = host_support && client_support;
             assert_eq!(capabilities & capability::TASK_ACTIVATION != 0, supported);
-            assert_eq!(minor, if supported { 4 } else { 3 });
+            assert_eq!(minor, 6); // No demand-allocation capability in this handshake.
             let object = TaskObjectId(1);
-            android.send_android(&AndroidMessage::RequestActivation { object }, &[]).unwrap();
+            android
+                .send_android(&AndroidMessage::RequestActivation { object }, &[])
+                .unwrap();
             assert!(denial.receive_action().is_err()); // Unknown task, even with the capability.
-            android.send_android(&AndroidMessage::CreateTask { object, display: AndroidDisplayId(1), package: "org.example.app".into() }, &[]).unwrap();
+            android
+                .send_android(
+                    &AndroidMessage::CreateTask {
+                        object,
+                        display: AndroidDisplayId(1),
+                        package: "org.example.app".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
             denial.receive_action().unwrap();
-            android.send_android(&AndroidMessage::RequestActivation { object }, &[]).unwrap();
+            android
+                .send_android(&AndroidMessage::RequestActivation { object }, &[])
+                .unwrap();
             assert!(denial.receive_action().is_err()); // A reserved display is not a bound task.
-            android.send_android(&AndroidMessage::BindTask { object, task: AndroidTaskId(26) }, &[]).unwrap();
+            android
+                .send_android(
+                    &AndroidMessage::BindTask {
+                        object,
+                        task: AndroidTaskId(26),
+                    },
+                    &[],
+                )
+                .unwrap();
             denial.receive_action().unwrap();
-            for _ in 0..2 { // Reopening requests activation of the same object, never a second window.
-                android.send_android(&AndroidMessage::RequestActivation { object }, &[]).unwrap();
+            for _ in 0..2 {
+                // Reopening requests activation of the same object, never a second window.
+                android
+                    .send_android(&AndroidMessage::RequestActivation { object }, &[])
+                    .unwrap();
                 if supported {
-                    assert!(matches!(denial.receive_action().unwrap(), EndpointAction::RequestActivation { object: TaskObjectId(1) }));
+                    assert!(matches!(
+                        denial.receive_action().unwrap(),
+                        EndpointAction::RequestActivation {
+                            object: TaskObjectId(1)
+                        }
+                    ));
                 } else {
-                    assert!(matches!(denial.receive_action(), Err(EndpointError::IncompatibleClient)));
+                    assert!(matches!(
+                        denial.receive_action(),
+                        Err(EndpointError::IncompatibleClient)
+                    ));
                 }
             }
         }

@@ -175,10 +175,10 @@ fn dbus_and_android_socket_lifecycle() {
         let bridge = serve(&listener, &state, conn, unsafe { libc::getuid() });
         let checks = async {
             let socket = Async::<UnixStream>::connect(&path).await.unwrap();
-            frame(&socket, serde_json::json!({"type":"hello","abi":1})).await;
+            frame(&socket, serde_json::json!({"type":"hello","abi":2})).await;
             assert_eq!(
                 reply(&socket).await,
-                serde_json::json!({"type":"hello","abi":1})
+                serde_json::json!({"type":"hello","abi":2})
             );
             snapshot(&socket, &[note("v1")]).await;
             match timeout(rx.recv()).await.unwrap() {
@@ -191,9 +191,17 @@ fn dbus_and_android_socket_lifecycle() {
                 }
                 other => panic!("{other:?}"),
             }
-            snapshot(&socket, &[note("v1")]).await;
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":note("v1")}),
+            )
+            .await;
             quiet(&rx).await;
-            snapshot(&socket, &[note("v2")]).await;
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":note("v2")}),
+            )
+            .await;
             assert!(matches!(
                 timeout(rx.recv()).await.unwrap(),
                 Observed::Posted(100, 100, ..)
@@ -268,14 +276,18 @@ fn dbus_and_android_socket_lifecycle() {
             // Reconnecting Android sends a snapshot without duplicating an unchanged item.
             drop(socket);
             let socket = Async::<UnixStream>::connect(&path).await.unwrap();
-            frame(&socket, serde_json::json!({"type":"hello","abi":1})).await;
+            frame(&socket, serde_json::json!({"type":"hello","abi":2})).await;
             assert_eq!(
                 reply(&socket).await,
-                serde_json::json!({"type":"hello","abi":1})
+                serde_json::json!({"type":"hello","abi":2})
             );
             snapshot(&socket, &[note("v4")]).await;
             quiet(&rx).await;
-            snapshot(&socket, &[]).await;
+            frame(
+                &socket,
+                serde_json::json!({"type":"remove","key":note("v4").key,"version":"v4"}),
+            )
+            .await;
             assert!(matches!(
                 timeout(rx.recv()).await.unwrap(),
                 Observed::Closed(102)
@@ -376,6 +388,8 @@ fn rejects_unbounded_or_invalid_frames() {
         buffer: vec![],
         hello: false,
         snapshot: None,
+        known: BTreeMap::new(),
+        synced: false,
     };
     assert!(
         peer.ingest(&((MAX_FRAME + 1) as u32).to_be_bytes())
@@ -388,4 +402,97 @@ fn rejects_unbounded_or_invalid_frames() {
     n.icon.clear();
     n.actions[0].key = "arbitrary-intent".into();
     assert!(!n.valid());
+}
+
+#[test]
+fn deltas_require_sync_and_stale_removal_cannot_delete_newer_versions() {
+    fn encoded(value: serde_json::Value) -> Vec<u8> {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend(bytes);
+        frame
+    }
+    let (socket, _other) = UnixStream::pair().unwrap();
+    let mut peer = Peer {
+        socket: Async::new(socket).unwrap(),
+        buffer: vec![],
+        hello: false,
+        snapshot: None,
+        known: BTreeMap::new(),
+        synced: false,
+    };
+    peer.ingest(&encoded(serde_json::json!({"type":"hello","abi":2})))
+        .unwrap();
+    assert!(
+        peer.ingest(&encoded(
+            serde_json::json!({"type":"post","notification":note("v1")})
+        ))
+        .is_err()
+    );
+    peer.ingest(&encoded(serde_json::json!({"type":"begin"})))
+        .unwrap();
+    peer.ingest(&encoded(
+        serde_json::json!({"type":"post","notification":note("v1")}),
+    ))
+    .unwrap();
+    assert!(matches!(
+        peer.ingest(&encoded(serde_json::json!({"type":"end"})))
+            .unwrap()
+            .as_slice(),
+        [Update::Snapshot(_)]
+    ));
+    let key = note("v1").key;
+    let updates = peer
+        .ingest(&encoded(
+            serde_json::json!({"type":"post","notification":note("v2")}),
+        ))
+        .unwrap();
+    assert!(matches!(updates.as_slice(), [Update::Post(n)] if n.version == "v2"));
+    assert!(
+        peer.ingest(&encoded(
+            serde_json::json!({"type":"remove","key":key,"version":"v1"})
+        ))
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(peer.known.get(&key).unwrap(), "v2");
+    let update = encoded(serde_json::json!({"type":"remove","key":key,"version":"v2"}));
+    for byte in &update[..update.len() - 1] {
+        assert!(peer.ingest(&[*byte]).unwrap().is_empty());
+    }
+    assert!(matches!(
+        peer.ingest(&update[update.len() - 1..]).unwrap().as_slice(),
+        [Update::Remove { .. }]
+    ));
+    assert!(peer.known.is_empty());
+    for index in 0..MAX_ACTIVE {
+        let mut n = note("v1");
+        n.key = format!("note-{index}");
+        n.icon.clear();
+        peer.ingest(&encoded(
+            serde_json::json!({"type":"post","notification":n}),
+        ))
+        .unwrap();
+    }
+    assert_eq!(peer.known.len(), MAX_ACTIVE);
+    // SystemUI retires the evicted entry first when replacing a full set.
+    peer.ingest(&encoded(
+        serde_json::json!({"type":"remove","key":"note-0","version":"v1"}),
+    ))
+    .unwrap();
+    let mut replacement = note("v1");
+    replacement.key = "replacement".into();
+    replacement.icon.clear();
+    peer.ingest(&encoded(
+        serde_json::json!({"type":"post","notification":replacement}),
+    ))
+    .unwrap();
+    assert_eq!(peer.known.len(), MAX_ACTIVE);
+    replacement.key = "overflow".into();
+    assert!(
+        peer.ingest(&encoded(
+            serde_json::json!({"type":"post","notification":replacement})
+        ))
+        .is_err()
+    );
 }

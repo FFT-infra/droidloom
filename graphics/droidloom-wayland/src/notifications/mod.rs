@@ -38,7 +38,8 @@ impl Bridge {
             Err(e) => return Err(e),
         }
         let listener = Async::new(UnixListener::bind(&path)?)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        // Private host parent and system-only guest mount protect this path.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
         let (stop, stopped) = UnixStream::pair()?;
         let stopped = Async::new(stopped)?;
         let state_path = path.with_extension("state");
@@ -78,7 +79,7 @@ impl Bridge {
                     }
                 });
             })?;
-        eprintln!("DROIDLOOM_NOTIFICATIONS_ABI=1;");
+        eprintln!("DROIDLOOM_NOTIFICATIONS_ABI=2;");
         Ok(Self { stop, path })
     }
 }
@@ -145,6 +146,7 @@ enum Frame {
     Hello { abi: u32 },
     Begin,
     Post { notification: Note },
+    Remove { key: String, version: String },
     End,
 }
 struct Peer {
@@ -152,9 +154,16 @@ struct Peer {
     buffer: Vec<u8>,
     hello: bool,
     snapshot: Option<BTreeMap<String, Note>>,
+    known: BTreeMap<String, String>,
+    synced: bool,
+}
+enum Update {
+    Snapshot(BTreeMap<String, Note>),
+    Post(Note),
+    Remove { key: String, version: String },
 }
 impl Peer {
-    fn ingest(&mut self, bytes: &[u8]) -> Result<Vec<BTreeMap<String, Note>>> {
+    fn ingest(&mut self, bytes: &[u8]) -> Result<Vec<Update>> {
         self.buffer.extend_from_slice(bytes);
         let mut complete = vec![];
         loop {
@@ -171,18 +180,51 @@ impl Peer {
             let frame: Frame = serde_json::from_slice(&self.buffer[4..length + 4])?;
             self.buffer.drain(..length + 4);
             match frame {
-                Frame::Hello { abi: 1 } if !self.hello => self.hello = true,
+                Frame::Hello { abi: 2 } if !self.hello => self.hello = true,
                 Frame::Begin if self.hello && self.snapshot.is_none() => {
                     self.snapshot = Some(BTreeMap::new())
                 }
                 Frame::Post { notification: n } if self.hello && n.valid() => {
-                    let snapshot = self.snapshot.as_mut().ok_or("post outside snapshot")?;
-                    if snapshot.len() >= MAX_ACTIVE || snapshot.insert(n.key.clone(), n).is_some() {
-                        return Err("invalid notification snapshot".into());
+                    if let Some(snapshot) = self.snapshot.as_mut() {
+                        if snapshot.len() >= MAX_ACTIVE
+                            || snapshot.insert(n.key.clone(), n).is_some()
+                        {
+                            return Err("invalid notification snapshot".into());
+                        }
+                    } else {
+                        if !self.synced
+                            || (!self.known.contains_key(&n.key) && self.known.len() >= MAX_ACTIVE)
+                        {
+                            return Err(
+                                "notification delta before snapshot or over capacity".into()
+                            );
+                        }
+                        self.known.insert(n.key.clone(), n.version.clone());
+                        complete.push(Update::Post(n));
                     }
                 }
                 Frame::End if self.hello => {
-                    complete.push(self.snapshot.take().ok_or("end outside snapshot")?)
+                    let snapshot = self.snapshot.take().ok_or("end outside snapshot")?;
+                    self.known = snapshot
+                        .iter()
+                        .map(|(key, note)| (key.clone(), note.version.clone()))
+                        .collect();
+                    self.synced = true;
+                    complete.push(Update::Snapshot(snapshot));
+                }
+                Frame::Remove { key, version }
+                    if self.hello
+                        && self.synced
+                        && self.snapshot.is_none()
+                        && !key.is_empty()
+                        && key.len() <= 2048
+                        && !version.is_empty()
+                        && version.len() <= 96 =>
+                {
+                    if self.known.get(&key) == Some(&version) {
+                        self.known.remove(&key);
+                        complete.push(Update::Remove { key, version });
+                    }
                 }
                 _ => return Err("invalid notification sequence".into()),
             }
@@ -325,16 +367,20 @@ async fn reconcile(
         }
     }
     for (key, note) in snapshot {
-        let record = state.records.entry(key).or_default();
-        if record.version != note.version {
-            record.hidden = false;
-        }
-        let changed = record.version != note.version;
-        record.version = note.version.clone();
-        record.note = Some(note.clone());
-        if !state.owner.is_empty() && !record.hidden && (changed || record.id.is_none()) {
-            record.id = Some(desktop.notify(&note, record.id.unwrap_or(0)).await?);
-        }
+        upsert(state, key, note, desktop).await?;
+    }
+    Ok(())
+}
+async fn upsert(state: &mut State, key: String, note: Note, desktop: &Desktop<'_>) -> Result<()> {
+    let record = state.records.entry(key).or_default();
+    if record.version != note.version {
+        record.hidden = false;
+    }
+    let changed = record.version != note.version;
+    record.version = note.version.clone();
+    record.note = Some(note.clone());
+    if !state.owner.is_empty() && !record.hidden && (changed || record.id.is_none()) {
+        record.id = Some(desktop.notify(&note, record.id.unwrap_or(0)).await?);
     }
     Ok(())
 }
@@ -362,7 +408,7 @@ async fn run(listener: &Async<UnixListener>, state_path: &PathBuf) -> Result<()>
         .method_timeout(Duration::from_secs(3))
         .build()
         .await?;
-    serve(listener, state_path, conn, 0).await
+    serve(listener, state_path, conn, 1000).await
 }
 async fn serve(
     listener: &Async<UnixListener>,
@@ -424,7 +470,7 @@ async fn serve(
         .await;
         match event {
             Event::Accept(Ok((socket, _))) => {
-                if !root_peer(socket.get_ref(), peer_uid)? {
+                if !authenticated_peer(socket.get_ref(), peer_uid)? {
                     continue;
                 }
                 peer = Some(Peer {
@@ -432,6 +478,8 @@ async fn serve(
                     buffer: vec![],
                     hello: false,
                     snapshot: None,
+                    known: BTreeMap::new(),
+                    synced: false,
                 });
                 eprintln!("Droidloom notifications: Android connected");
             }
@@ -444,7 +492,7 @@ async fn serve(
                             if peer
                                 .as_ref()
                                 .unwrap()
-                                .send(serde_json::json!({"type":"hello","abi":1}))
+                                .send(serde_json::json!({"type":"hello","abi":2}))
                                 .await
                                 .is_err()
                             {
@@ -452,8 +500,31 @@ async fn serve(
                                 continue;
                             }
                         }
-                        for snapshot in snapshots {
-                            reconcile(&mut state, snapshot, &desktop).await?;
+                        let changed = !snapshots.is_empty();
+                        for update in snapshots {
+                            match update {
+                                Update::Snapshot(snapshot) => {
+                                    reconcile(&mut state, snapshot, &desktop).await?
+                                }
+                                Update::Post(note) => {
+                                    upsert(&mut state, note.key.clone(), note, &desktop).await?
+                                }
+                                Update::Remove { key, version } => {
+                                    if state
+                                        .records
+                                        .get(&key)
+                                        .is_some_and(|record| record.version == version)
+                                    {
+                                        if let Some(record) = state.records.remove(&key) {
+                                            if let Some(id) = record.id {
+                                                desktop.close(id).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if changed {
                             state.save(state_path)?;
                         }
                     }
@@ -532,7 +603,7 @@ async fn serve(
         }
     }
 }
-fn root_peer(s: &UnixStream, expected_uid: u32) -> io::Result<bool> {
+fn authenticated_peer(s: &UnixStream, expected_uid: u32) -> io::Result<bool> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: !0,

@@ -1,0 +1,65 @@
+From: xinyang <xinyangmn@gmail.com>
+Subject: [PATCH] libcamera: simple: cancel all tracked requests when stopping
+
+A converted buffer can be returned before its IPA metadata. Once submitted
+for conversion, its request is no longer in conversionQueue_. Clearing
+frameInfo_ without cancelling these requests leaves queuedRequests_ nonempty
+and aborts PipelineHandler::stop().
+
+After stopping the ISP and video device, cancel the complete set of tracked
+requests, including those waiting only for metadata. Detach the records before
+emitting completion callbacks so reentrant or late metadata cannot use them.
+Keep the framework's empty-queue assertions intact.
+
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -205,7 +205,7 @@
+ public:
+ 	void create(Request *request, bool metadataRequested);
+ 	void destroy(uint32_t frame);
+-	void clear();
++	void clear(PipelineHandler *pipe);
+
+ 	SimpleFrameInfo *find(uint32_t frame);
+
+@@ -225,9 +225,15 @@
+ 	frameInfo_.erase(frame);
+ }
+
+-void SimpleFrames::clear()
++void SimpleFrames::clear(PipelineHandler *pipe)
+ {
+-	frameInfo_.clear();
++	/* Remove records before cancellation can deliver completion callbacks. */
++	std::map<uint32_t, SimpleFrameInfo> pending;
++	pending.swap(frameInfo_);
++
++	for (auto &[frame, info] : pending) {
++		pipe->cancelRequest(info.request);
++	}
+ }
+
+ SimpleFrameInfo *SimpleFrames::find(uint32_t frame)
+@@ -977,10 +983,11 @@
+
+ void SimpleCameraData::clearIncompleteRequests()
+ {
+-	while (!conversionQueue_.empty()) {
+-		pipe()->cancelRequest(conversionQueue_.front().request);
++	while (!conversionQueue_.empty())
+ 		conversionQueue_.pop();
+-	}
++
++	/* Include requests already converted but still waiting for metadata. */
++	frameInfo_.clear(pipe());
+ }
+
+ void SimpleCameraData::tryCompleteRequest(Request *request)
+@@ -1715,7 +1722,6 @@
+
+ 	video->bufferReady.disconnect(data, &SimpleCameraData::imageBufferReady);
+
+-	data->frameInfo_.clear();
+ 	data->clearIncompleteRequests();
+ 	data->conversionBuffers_.clear();
+

@@ -11,7 +11,7 @@ use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::adb::AdbConnection;
 use crate::development_network::DevelopmentNetwork;
 use crate::{CellSpec, SpecError};
 
@@ -57,10 +58,62 @@ compile_error!("Droidloom supports only aarch64 and x86_64 hosts");
 const DRM_DEVICE_MAJOR: u64 = 226;
 const DRM_RENDER_MINOR_BASE: u64 = 128;
 const MAX_RENDER_NODE_UEVENT_BYTES: usize = 64 * 1024;
+const V4L2_CAP_VIDEO_M2M_MPLANE: u32 = 0x0000_4000;
+const V4L2_CAP_DEVICE_CAPS: u32 = 0x8000_0000;
+const V4L2_QUERYCAP_IOCTL: libc::c_ulong = 0x8068_5600;
+const ANDROID_IRIS_VIDEO_NODE: &str = "video0";
+const ANDROID_CAMERA_GID: u32 = 1006;
+const ANDROID_INPUT_GID: u32 = 1004;
+const ANDROID_SYSTEM_UID: u32 = 1000;
+const ANDROID_SYSTEM_GID: u32 = 1000;
 const PRIVATE_SYSCTL_DIRECTORY: &str = "android-private-sysctls";
 const PRIVATE_NET_CORE_DIRECTORY: &str = "net-core";
 const PRIVATE_BPF_SYSCTLS: [(&str, &str); 2] =
     [("bpf_jit_enable", "1\n"), ("bpf_jit_kallsyms", "1\n")];
+const POWER_SUPPLY_TYPES: [&str; 13] = [
+    "Battery",
+    "UPS",
+    "Mains",
+    "USB",
+    "USB_DCP",
+    "USB_HVDCP",
+    "USB_CDP",
+    "USB_ACA",
+    "USB_C",
+    "USB_PD",
+    "USB_PD_DRP",
+    "Wireless",
+    "Dock",
+];
+const POWER_SUPPLY_ATTRIBUTES: [&str; 27] = [
+    "type",
+    "online",
+    "is_dock",
+    "status",
+    "health",
+    "present",
+    "capacity",
+    "capacity_level",
+    "voltage_now",
+    "voltage_max",
+    "voltage_max_design",
+    "voltage_min_design",
+    "current_now",
+    "current_avg",
+    "current_max",
+    "charge_counter",
+    "charge_full",
+    "charge_full_design",
+    "cycle_count",
+    "time_to_full_now",
+    "temp",
+    "technology",
+    "state_of_health",
+    "health_index",
+    "health_status",
+    "charging_state",
+    "charging_policy",
+];
 
 /// Failure to validate or start the deliberately minimal first-boot cell.
 #[derive(Debug, Error)]
@@ -110,7 +163,8 @@ pub fn validate_development_inputs(spec: &CellSpec) -> Result<(), DevelopmentErr
         let image = crate::gapps::partition_image(spec, name);
         detect_read_only_filesystem(&image)?;
     }
-    crate::gapps::validate(spec).map_err(|error| DevelopmentError::InvalidInput(error.to_string()))?;
+    crate::gapps::validate(spec)
+        .map_err(|error| DevelopmentError::InvalidInput(error.to_string()))?;
     if starts_with_magic(&spec.vendor_image, 0, &ANDROID_SPARSE_MAGIC)? {
         return Err(DevelopmentError::InvalidInput(format!(
             "{} is Android-sparse; convert it with simg2img before boot",
@@ -273,6 +327,7 @@ pub struct DevelopmentCell {
     spec: CellSpec,
     child: Child,
     network: Option<DevelopmentNetwork>,
+    adb: Option<AdbConnection>,
     cleaned: bool,
 }
 
@@ -359,6 +414,9 @@ impl DevelopmentCell {
             return Ok(());
         }
         let mut first_error = None;
+        // Remove the transport before its route disappears. The user's ADB
+        // server and connections to other devices remain independent.
+        self.adb.take();
         if let Some(mut network) = self.network.take()
             && let Err(error) = network.teardown()
         {
@@ -387,6 +445,14 @@ impl Drop for DevelopmentCell {
 
 /// Start a development cell and return its exact lifecycle handle.
 ///
+fn unshare_supports_forward_signals() -> bool {
+    std::process::Command::new("unshare")
+        .arg("--help")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("--forward-signals"))
+        .unwrap_or(false)
+}
+
 /// `entry_executable` must expose the supervisor's private
 /// `development-enter --spec ...` command. Separating it from the caller lets
 /// `droidloomd` own the cell while keeping namespace entry in the small
@@ -409,27 +475,38 @@ pub fn start_development_cell(
             return Err(error);
         }
     };
+    let adb_client = match AdbConnection::prepare(spec) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            eprintln!("droidloom-supervisor: automatic ADB unavailable: {error}");
+            None
+        }
+    };
     let parent_pid = unsafe { libc::getpid() };
     let mut command = droidloom_cpu_placement::command("ip");
-    command
-        .args(["netns", "exec", network.namespace(), "unshare"])
-        .args([
-            OsStr::new("--mount"),
-            OsStr::new("--pid"),
-            // Host-side setup helpers also need /proc to describe this PID
-            // namespace (not only the procfs later exposed inside Android).
-            OsStr::new("--mount-proc"),
-            OsStr::new("--ipc"),
-            OsStr::new("--uts"),
-            OsStr::new("--fork"),
-            OsStr::new("--kill-child=TERM"),
-            OsStr::new("--forward-signals"),
-            OsStr::new("--propagation=private"),
-            entry_executable.as_os_str(),
-            OsStr::new("development-enter"),
-            OsStr::new("--spec"),
-            spec_path.as_os_str(),
-        ]);
+    command.args(["netns", "exec", network.namespace(), "unshare"]);
+    let mut unshare_args = vec![
+        OsStr::new("--mount"),
+        OsStr::new("--pid"),
+        // Host-side setup helpers also need /proc to describe this PID
+        // namespace (not only the procfs later exposed inside Android).
+        OsStr::new("--mount-proc"),
+        OsStr::new("--ipc"),
+        OsStr::new("--uts"),
+        OsStr::new("--fork"),
+        OsStr::new("--kill-child=TERM"),
+    ];
+    if unshare_supports_forward_signals() {
+        unshare_args.push(OsStr::new("--forward-signals"));
+    }
+    unshare_args.extend([
+        OsStr::new("--propagation=private"),
+        entry_executable.as_os_str(),
+        OsStr::new("development-enter"),
+        OsStr::new("--spec"),
+        spec_path.as_os_str(),
+    ]);
+    command.args(unshare_args);
     // If the lifecycle owner disappears even under SIGKILL or a crash,
     // terminate `unshare`; its own --kill-child contract then terminates
     // Android PID 1. Only deterministic network/path residue remains for the
@@ -450,12 +527,22 @@ pub fn start_development_cell(
     }
     let child_result = command.spawn();
     match child_result {
-        Ok(child) => Ok(DevelopmentCell {
-            spec: spec.clone(),
-            child,
-            network: Some(network),
-            cleaned: false,
-        }),
+        Ok(child) => {
+            let adb = adb_client.and_then(|client| match AdbConnection::start(client) {
+                Ok(connection) => Some(connection),
+                Err(error) => {
+                    eprintln!("droidloom-supervisor: automatic ADB registration failed: {error}");
+                    None
+                }
+            });
+            Ok(DevelopmentCell {
+                spec: spec.clone(),
+                child,
+                network: Some(network),
+                adb,
+                cleaned: false,
+            })
+        }
         Err(source) => {
             let network_result = network.teardown();
             let runtime_result = cleanup_runtime_directory(spec);
@@ -624,6 +711,8 @@ fn stop_idmap_namespace(child: &mut Child) -> Result<(), DevelopmentError> {
 }
 
 fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
+    crate::adb::cleanup(&spec.runtime_dir)
+        .map_err(|source| io_error("remove private ADB configuration", source))?;
     for (path, context) in [
         (
             spec.runtime_dir.join("android-cmdline"),
@@ -642,9 +731,12 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
     }
     let cpu_policy = spec.runtime_dir.join("cpu-policy");
     if cpu_policy.exists() {
-        for entry in fs::read_dir(&cpu_policy).map_err(|e| io_error("read CPU policy directory", e))? {
+        for entry in
+            fs::read_dir(&cpu_policy).map_err(|e| io_error("read CPU policy directory", e))?
+        {
             let entry = entry.map_err(|e| io_error("read CPU policy entry", e))?;
-            fs::remove_file(entry.path()).map_err(|e| io_error("remove generated CPU policy", e))?;
+            fs::remove_file(entry.path())
+                .map_err(|e| io_error("remove generated CPU policy", e))?;
         }
         fs::remove_dir(cpu_policy).map_err(|e| io_error("remove CPU policy directory", e))?;
     }
@@ -816,10 +908,11 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     create_private_dev(spec, &root)?;
     mount_first_stage_runtime_filesystems(&root)?;
     bind_boot_parameters(spec, &root)?;
-    let cpu_policy = crate::cpu_placement::prepare(&root, spec.id().as_str())
+    let cpu_backends = crate::cpu_placement::prepare(&root, spec.id().as_str())
         .map_err(|source| io_error("prepare private Android CPU placement hierarchy", source))?;
-    bind_development_cgroups(spec, &root, cpu_policy.is_some())?;
-    if let Some(policy) = cpu_policy { bind_cpu_policy(spec, &root, &policy)?; }
+    bind_development_cgroups(spec, &root, cpu_backends.cpuset)?;
+    bind_cpu_policy(spec, &root, &cpu_backends)?;
+    bind_adb_configuration(spec, &root)?;
 
     // The reusable base is a system-as-root image, but Droidloom has already
     // supplied the mounts that Android first-stage init normally constructs.
@@ -832,13 +925,14 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     // pairing applies to all Android children, including mapper clients.
     init.env_remove("MESA_LOADER_DRIVER_OVERRIDE")
         .env_remove("vendor.minigbm.allocator");
+    if spec.graphics_backend != crate::GraphicsBackend::Drm {
+        init.env("vendor.minigbm.allocator", "dma_heap_images");
+    }
     if spec.graphics_backend == crate::GraphicsBackend::KgslDmaHeap {
-        init.env("MESA_LOADER_DRIVER_OVERRIDE", "zink")
-            .env("vendor.minigbm.allocator", "dma_heap_images");
+        init.env("MESA_LOADER_DRIVER_OVERRIDE", "zink");
     }
     let error = std::os::unix::process::CommandExt::exec(
-        init
-            .arg("second_stage")
+        init.arg("second_stage")
             // Android's mount-namespace decision runs before ro.boot.*
             // properties are guaranteed to exist. Give the package-owned
             // init adaptation an unambiguous early-boot marker instead.
@@ -849,6 +943,8 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
             .env("ANDROID_STORAGE", "/storage")
             .env("ASEC_MOUNTPOINT", "/mnt/asec")
             .env("LOOP_MOUNTPOINT", "/mnt/obb")
+            .env("MESA_SHADER_CACHE_DIR", "/data/vendor/mesa_shader_cache")
+            .env("MESA_SHADER_CACHE_MAX_SIZE", "2G")
             .env("LD_PRELOAD", ANDROID_SELINUX_COMPAT_PRELOAD),
     );
     Err(io_error("exec Android init", error))
@@ -1240,6 +1336,8 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     fs::create_dir_all(sys.join("fs/fuse/connections"))
         .map_err(|source| io_error("create Android fusectl mount point", source))?;
     project_loop_sysfs(&sys)?;
+    project_power_supply_sysfs(&sys)?;
+    publish_cpu_topology_sysfs(&sys)?;
     let render_metadata = read_render_node_sysfs_metadata(&spec.render_node)?;
     publish_render_node_sysfs_metadata(&sys, &render_metadata)?;
     run_os(
@@ -1250,6 +1348,74 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             sys.into_os_string(),
         ],
     )
+}
+
+fn publish_cpu_topology_sysfs(sys: &Path) -> Result<(), DevelopmentError> {
+    // get_nprocs(), get_nprocs_conf() and therefore Java's
+    // Runtime.availableProcessors() read this subtree. With a synthetic sysfs
+    // that does not contain it, bionic falls back to its hardcoded single CPU
+    // while the cell really schedules on every allowed core. Applications which
+    // size a pool, a renderer or a code path from the core count then misjudge
+    // the cell, so publish the CPU set this cell actually inherits rather than
+    // the host's full topology.
+    let cpus = droidloom_cpu_placement::CpuSet::current()
+        .map_err(|source| io_error("read the cell's allowed CPU set", source))?;
+    let cpu = sys.join("devices/system/cpu");
+    fs::create_dir_all(&cpu).map_err(|source| io_error("create synthetic CPU topology", source))?;
+    for name in ["possible", "present", "online"] {
+        let node = cpu.join(name);
+        fs::write(&node, format!("{}\n", cpus.list()))
+            .map_err(|source| io_error("publish synthetic CPU topology", source))?;
+        set_mode(&node, 0o444)?;
+    }
+    Ok(())
+}
+
+fn discover_power_supply_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, DevelopmentError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("read host power-supply sysfs", error)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error("read host power-supply entry", error))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let source = entry.path();
+        let Ok(kind) = fs::read_to_string(source.join("type")) else {
+            continue;
+        };
+        if !POWER_SUPPLY_TYPES.contains(&kind.trim()) {
+            continue;
+        }
+        for attribute in POWER_SUPPLY_ATTRIBUTES {
+            let source_file = source.join(attribute);
+            if fs::metadata(&source_file).is_ok_and(|metadata| metadata.is_file()) {
+                files.push((source_file, PathBuf::from(&name).join(attribute)));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(files)
+}
+
+fn project_power_supply_sysfs(sys: &Path) -> Result<(), DevelopmentError> {
+    let target_root = sys.join("class/power_supply");
+    fs::create_dir_all(&target_root)
+        .map_err(|error| io_error("create synthetic power-supply sysfs", error))?;
+    for (source, relative) in discover_power_supply_files(Path::new("/sys/class/power_supply"))? {
+        let target = target_root.join(relative);
+        let directory = target
+            .parent()
+            .expect("power-supply attribute has a parent");
+        fs::create_dir_all(directory)
+            .map_err(|error| io_error("create projected power-supply directory", error))?;
+        create_mount_target(&target)?;
+        bind_mount(&source, &target, true)?;
+    }
+    Ok(())
 }
 
 fn project_private_bpf_sysctls(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
@@ -1563,6 +1729,33 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
         make_device_node(&dev.join(name), "c", major, minor, mode)?;
     }
 
+    // Kernel hotplug uevents reach every listener, including the cell's
+    // ueventd, so a device attached to the host would otherwise be published
+    // here as /dev/input/event* even though this private /dev never creates
+    // it, and Android would read that device directly alongside this
+    // runtime's routed input.
+    //
+    // The pen relay's button and gesture devices are the exception: it creates
+    // them for an Android reader and nothing else on the host reads them, so
+    // the cell takes exactly those two and Android's InputReader turns them
+    // into the key events note-taking applications bind their eraser and
+    // gesture actions to. The pen tip stays on the routed path, so no stroke
+    // is delivered twice. The directory is read-only afterwards, which keeps
+    // every other host device out.
+    let input = dev.join("input");
+    fs::create_dir_all(&input)
+        .map_err(|source| io_error("create private input directory", source))?;
+    create_pen_input_nodes(&input, 0, &discover_pen_input_devices()?)?;
+    bind_mount(&input, &input, false)?;
+    run_os(
+        "mount",
+        [
+            OsString::from("-o"),
+            OsString::from("remount,bind,ro,nosuid"),
+            input.into_os_string(),
+        ],
+    )?;
+
     // The pinned CI base contains ext4-payload APEX packages. apexd obtains
     // unused loop minors through loop-control; provide only loop devices, not
     // the host block-device tree that ueventd would otherwise recreate.
@@ -1665,8 +1858,25 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             .map_err(|source| io_error("create render-node minor compatibility alias", source))?;
     }
 
+    let iris_devices_ready = if spec.video_decoder == Some(crate::VideoDecoderBackend::Iris) {
+        match create_iris_device_nodes(&dev) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "droidloom-supervisor: warning: Iris video decoding is unavailable ({error}); continuing without Iris devices"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     for path in spec.graphics_backend.auxiliary_devices() {
         let path = Path::new(path);
+        if iris_devices_ready && path == Path::new("/dev/dma_heap/system") {
+            continue;
+        }
         let (major, minor) = auxiliary_graphics_device_numbers(path)?;
         let target = root.join(path.strip_prefix("/").expect("fixed absolute device path"));
         fs::create_dir_all(target.parent().expect("device parent"))
@@ -1677,20 +1887,33 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     let denial_target = root.join(ANDROID_DENIAL_SOCKET);
     create_mount_target(&denial_target)?;
     bind_mount(&spec.denial_socket, &denial_target, false)?;
-    // Optional companion socket, owned by the same presenter. Older hosts
-    // without text-input support keep their ordinary hardware-key path.
+    // Framework-only host channels. The host listener is reachable only below
+    // its owner's 0700 directory. This guest mount directory restricts access
+    // to root/system even when the host owner is not Android's UID 1000.
+    let framework_host = root.join("dev/socket/droidloom-framework-host");
+    fs::create_dir_all(&framework_host)
+        .map_err(|source| io_error("create framework host channel directory", source))?;
+    set_owner(&framework_host, 1000, 1000)?;
+    set_mode(&framework_host, 0o700)?;
     let text_socket = spec.denial_socket.with_file_name("text-input.sock");
     if text_socket.exists() {
         if !fs::metadata(&text_socket)
             .map_err(|source| io_error("stat text-input socket", source))?
-            .file_type().is_socket() {
-            return Err(DevelopmentError::InvalidInput("text-input endpoint is not a socket".into()));
+            .file_type()
+            .is_socket()
+        {
+            return Err(DevelopmentError::InvalidInput(
+                "text-input endpoint is not a socket".into(),
+            ));
         }
-        let target = root.join("dev/socket/droidloom/text-input");
+        let target = framework_host.join("text-input");
         create_mount_target(&target)?;
         bind_mount(&text_socket, &target, false)?;
     }
-    for name in ["clipboard", "notifications"] {
+    // Audio and camera are separate user brokers. Their systemd-owned sockets
+    // survive broker restarts, preserving the inode bind-mounted into the
+    // Android cell at the endpoint each guest client dials.
+    for name in ["clipboard", "notifications", "audio", "camera"] {
         let socket = spec.denial_socket.with_file_name(format!("{name}.sock"));
         if socket.exists() {
             if !fs::symlink_metadata(&socket)
@@ -1702,7 +1925,15 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
                     "{name} endpoint is not a socket"
                 )));
             }
-            let target = root.join(format!("dev/socket/droidloom/{name}"));
+            // The presenter consumes the framework-only clipboard and
+            // notification channels below its private host directory, while
+            // the Android audio and camera clients dial their own fixed guest
+            // endpoints.
+            let target = match name {
+                "audio" => root.join("dev/socket/droidloom/audio"),
+                "camera" => root.join("dev/socket/droidloom/camera"),
+                _ => framework_host.join(name),
+            };
             create_mount_target(&target)?;
             bind_mount(&socket, &target, false)?;
         }
@@ -1710,25 +1941,382 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     Ok(())
 }
 
-fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
+fn verified_char_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|source| io_error("stat auxiliary graphics device", source))?;
+        .map_err(|source| io_error("stat auxiliary device", source))?;
     if !metadata.file_type().is_char_device() {
         return Err(DevelopmentError::InvalidInput(format!(
-            "{} must be a character device, not a symlink", path.display()
+            "{} must be a character device, not a symlink",
+            path.display()
         )));
     }
     let (major, minor) = linux_device_numbers(metadata.rdev());
     let uevent = fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/uevent"))
-        .map_err(|source| io_error("read auxiliary graphics device identity", source))?;
-    let expected = format!("DEVNAME={}", path.strip_prefix("/dev").expect("fixed device path").display());
+        .map_err(|source| io_error("read auxiliary device identity", source))?;
+    let expected = format!(
+        "DEVNAME={}",
+        path.strip_prefix("/dev")
+            .expect("fixed device path")
+            .display()
+    );
     if !uevent.lines().any(|line| line == expected) {
         return Err(DevelopmentError::InvalidInput(format!(
-            "{} does not match its kernel device identity", path.display()
+            "{} does not match its kernel device identity",
+            path.display()
         )));
     }
-    Ok((u32::try_from(major).expect("Linux device major"),
-        u32::try_from(minor).expect("Linux device minor")))
+    Ok((
+        u32::try_from(major).expect("Linux device major"),
+        u32::try_from(minor).expect("Linux device minor"),
+    ))
+}
+
+fn auxiliary_graphics_device_numbers(path: &Path) -> Result<(u32, u32), DevelopmentError> {
+    verified_char_device_numbers(path)
+}
+
+/// One host input device the pen relay created for an Android reader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PenInputDevice {
+    pub(crate) phys: String,
+    pub(crate) event_name: String,
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+}
+
+/// The pen relay's Android-facing input devices, matched by their physical
+/// device path. The relay keeps the pen's own device tree to itself and
+/// publishes these for the platform that reads them.
+pub(crate) fn discover_pen_input_devices() -> Result<Vec<PenInputDevice>, DevelopmentError> {
+    const PEN_PHYS: [&str; 2] = ["waydroid-pen-buttons", "waydroid-gesture-android"];
+    let Ok(entries) = fs::read_dir("/sys/class/input") else {
+        return Ok(Vec::new());
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name
+            .strip_prefix("event")
+            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let phys = match fs::read_to_string(entry.path().join("device/phys")) {
+            Ok(phys) => phys.trim().to_owned(),
+            Err(_) => continue,
+        };
+        if PEN_PHYS.contains(&phys.as_str()) {
+            if let Ok((major, minor)) =
+                verified_char_device_numbers(&Path::new("/dev/input").join(&name))
+            {
+                map.insert(
+                    phys.clone(),
+                    PenInputDevice {
+                        phys,
+                        event_name: name,
+                        major,
+                        minor,
+                    },
+                );
+            }
+        }
+    }
+    let mut devices = Vec::new();
+    for phys in PEN_PHYS {
+        if let Some(device) = map.remove(phys) {
+            devices.push(device);
+        }
+    }
+    Ok(devices)
+}
+
+/// Refresh the Android-facing pen devices using new filenames so EventHub's
+/// inotify watcher opens the new kernel device generation.
+pub(crate) fn refresh_pen_input_nodes(
+    namespace_pid: u32,
+    generation: u64,
+    devices: &[PenInputDevice],
+) -> Result<(), DevelopmentError> {
+    let input = PathBuf::from(format!("/proc/{namespace_pid}/root/dev/input"));
+    let view = writable_pen_input_mount(namespace_pid, input)
+        .map_err(|source| io_error("clone private pen input mount", source))?;
+    // mknod/chown run as children: name the parent's descriptor so CLOEXEC
+    // cannot invalidate the detached mount path in those helpers.
+    let input = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        view.as_raw_fd()
+    ));
+    create_pen_input_nodes(&input, generation, devices)
+}
+
+#[repr(C)]
+struct InputMountAttributes {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+fn writable_pen_input_mount(namespace_pid: u32, input: PathBuf) -> io::Result<OwnedFd> {
+    // A detached clone shares the directory's inotify events, while Android's
+    // original bind mount stays read-only. Remounting Android's own path would
+    // let ueventd import unrelated host devices during the writable interval.
+    // open_tree requires the source's namespace. Only this worker enters it;
+    // unsharing CLONE_FS leaves the daemon's filesystem and namespace intact.
+    thread::Builder::new()
+        .name("pen-input-mount".into())
+        .spawn(move || {
+            let namespace = File::open(format!("/proc/{namespace_pid}/ns/mnt"))?;
+            let input = File::open(input)?;
+            // SAFETY: these calls operate on this worker's filesystem context
+            // and a live mount-namespace descriptor, retaining no pointers.
+            if unsafe { libc::unshare(libc::CLONE_FS) } != 0
+                || unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNS) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            const OPEN_TREE_CLONE: libc::c_uint = 1;
+            let flags = OPEN_TREE_CLONE
+                | libc::O_CLOEXEC as libc::c_uint
+                | libc::AT_EMPTY_PATH as libc::c_uint;
+            // SAFETY: input is a live directory descriptor; the empty path
+            // selects it and open_tree returns a fresh detached mount FD.
+            let raw = unsafe {
+                libc::syscall(libc::SYS_open_tree, input.as_raw_fd(), c"".as_ptr(), flags)
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful open_tree transferred this fresh descriptor.
+            let view = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
+            const MOUNT_ATTR_RDONLY: u64 = 1;
+            const MOUNT_ATTR_NOSUID: u64 = 2;
+            let attributes = InputMountAttributes {
+                attr_set: MOUNT_ATTR_NOSUID,
+                attr_clr: MOUNT_ATTR_RDONLY,
+                propagation: libc::MS_PRIVATE,
+                userns_fd: 0,
+            };
+            // SAFETY: attributes matches Linux mount_attr's four u64 fields;
+            // the descriptor names only the detached clone, never Android's
+            // original mount. Closing the descriptor disposes of the clone.
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_mount_setattr,
+                    view.as_raw_fd(),
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                    &attributes,
+                    std::mem::size_of_val(&attributes),
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(view)
+        })?
+        .join()
+        .map_err(|_| io::Error::other("pen input mount worker panicked"))?
+}
+
+fn create_pen_input_nodes(
+    input: &Path,
+    generation: u64,
+    devices: &[PenInputDevice],
+) -> Result<(), DevelopmentError> {
+    let mut active_nodes = Vec::new();
+    for device in devices {
+        let Some(name) = pen_input_node_name(&device.phys, generation) else {
+            continue;
+        };
+        let node = input.join(&name);
+        make_device_node(&node, "c", device.major, device.minor, "666")?;
+        set_owner(&node, 0, ANDROID_INPUT_GID)?;
+        active_nodes.push(name);
+    }
+
+    for entry in
+        fs::read_dir(input).map_err(|source| io_error("list private input devices", source))?
+    {
+        let entry = entry.map_err(|source| io_error("read private input entry", source))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if matches!(name, "event0" | "event1")
+            || ((name.starts_with("droidloom-pen-buttons-")
+                || name.starts_with("droidloom-pen-gestures-"))
+                && !active_nodes.iter().any(|active| active == name))
+        {
+            fs::remove_file(entry.path())
+                .map_err(|source| io_error("remove retired private pen device", source))?;
+        }
+    }
+    Ok(())
+}
+
+fn pen_input_node_name(phys: &str, generation: u64) -> Option<String> {
+    let base = match phys {
+        "waydroid-pen-buttons" => "droidloom-pen-buttons",
+        "waydroid-gesture-android" => "droidloom-pen-gestures",
+        _ => return None,
+    };
+    Some(format!("{base}-{generation}"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IrisVideoDecoder {
+    major: u32,
+    minor: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct V4l2Capability {
+    driver: [u8; 16],
+    card: [u8; 32],
+    bus_info: [u8; 32],
+    version: u32,
+    capabilities: u32,
+    device_caps: u32,
+    reserved: [u32; 3],
+}
+
+fn is_iris_decoder_capability(capability: &V4l2Capability, effective_caps: u32) -> bool {
+    c_string_field(&capability.driver) == "iris_driver"
+        && c_string_field(&capability.card) == "Iris Decoder"
+        && effective_caps & V4L2_CAP_VIDEO_M2M_MPLANE != 0
+}
+
+fn c_string_field(bytes: &[u8]) -> &str {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+fn discover_iris_video_decoder() -> Result<IrisVideoDecoder, DevelopmentError> {
+    let class_root = Path::new("/sys/class/video4linux");
+    let entries = fs::read_dir(class_root)
+        .map_err(|source| io_error("enumerate host V4L2 devices", source))?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error("read host V4L2 entry", source))?;
+        let Some(node_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !node_name
+            .strip_prefix("video")
+            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let device_link = entry.path().join("device/driver");
+        let driver = match fs::canonicalize(&device_link) {
+            Ok(driver) => driver,
+            Err(_) => continue,
+        };
+        if driver.file_name().and_then(OsStr::to_str) != Some("qcom-iris") {
+            continue;
+        }
+
+        let host_path = Path::new("/dev").join(&node_name);
+        let metadata = fs::symlink_metadata(&host_path)
+            .map_err(|source| io_error("stat candidate Iris decoder", source))?;
+        if !metadata.file_type().is_char_device() {
+            return Err(DevelopmentError::InvalidInput(format!(
+                "{} is not a character device",
+                host_path.display()
+            )));
+        }
+        let (major, minor) = linux_device_numbers(metadata.rdev());
+        let uevent = fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/uevent"))
+            .map_err(|source| io_error("read candidate Iris decoder identity", source))?;
+        if !uevent
+            .lines()
+            .any(|line| line == format!("DEVNAME={node_name}"))
+        {
+            return Err(DevelopmentError::InvalidInput(format!(
+                "{} does not match its kernel device identity",
+                host_path.display()
+            )));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&host_path)
+            .map_err(|source| io_error("open candidate Iris decoder for QUERYCAP", source))?;
+        let mut capability = V4l2Capability::default();
+        // SAFETY: V4L2 defines VIDIOC_QUERYCAP as _IOR('V', 0, struct
+        // v4l2_capability); repr(C) matches the kernel UAPI layout.
+        let result = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                V4L2_QUERYCAP_IOCTL,
+                std::ptr::addr_of_mut!(capability),
+            )
+        };
+        if result != 0 {
+            return Err(io_error(
+                "query candidate Iris decoder capabilities",
+                io::Error::last_os_error(),
+            ));
+        }
+        let caps = if capability.capabilities & V4L2_CAP_DEVICE_CAPS != 0 {
+            capability.device_caps
+        } else {
+            capability.capabilities
+        };
+        if !is_iris_decoder_capability(&capability, caps) {
+            continue;
+        }
+        matches.push(IrisVideoDecoder {
+            major: u32::try_from(major).expect("Linux device major fits u32"),
+            minor: u32::try_from(minor).expect("Linux device minor fits u32"),
+        });
+    }
+    match matches.as_slice() {
+        [decoder] => Ok(decoder.clone()),
+        [] => Err(DevelopmentError::InvalidInput(
+            "Iris decoder requested but no qcom-iris V4L2 node with iris_driver, Iris Decoder, and M2M multi-planar capability was found".into(),
+        )),
+        _ => Err(DevelopmentError::InvalidInput(
+            "multiple Iris V4L2 M2M multi-planar nodes matched; refusing ambiguous exposure".into(),
+        )),
+    }
+}
+
+fn create_iris_device_nodes(dev: &Path) -> Result<(), DevelopmentError> {
+    let decoder = discover_iris_video_decoder()?;
+    let (heap_major, heap_minor) = auxiliary_graphics_device_numbers(Path::new("/dev/dma_heap/system"))?;
+    let decoder_node = dev.join(ANDROID_IRIS_VIDEO_NODE);
+    let heap_node = dev.join("dma_heap/system");
+    fs::create_dir_all(heap_node.parent().expect("fixed DMA heap path"))
+        .map_err(|source| io_error("create private DMA heap directory", source))?;
+
+    let result = (|| {
+        make_device_node(&decoder_node, "c", decoder.major, decoder.minor, "660")?;
+        // The Codec2 service runs as user media with the camera supplementary
+        // group; the private node is inaccessible to other Android groups.
+        set_owner(&decoder_node, 0, ANDROID_CAMERA_GID)?;
+
+        // Android's standard ueventd rule exposes the system DMA heap as
+        // 0444 system:system. Keep that exact node private to this cell.
+        make_device_node(&heap_node, "c", heap_major, heap_minor, "444")?;
+        set_owner(&heap_node, ANDROID_SYSTEM_UID, ANDROID_SYSTEM_GID)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&decoder_node);
+        let _ = fs::remove_file(&heap_node);
+    }
+    result
 }
 
 fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
@@ -1737,6 +2325,7 @@ fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentE
         &cmdline,
         concat!(
             "androidboot.hardware=droidloom ",
+            "androidboot.serialno=droidloom ",
             "androidboot.selinux=permissive ",
             "androidboot.debuggable=1 ",
             "androidboot.veritymode=enforcing ",
@@ -1747,64 +2336,146 @@ fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentE
     bind_mount(&cmdline, &root.join("proc/cmdline"), true)
 }
 
-fn bind_development_cgroups(spec: &CellSpec, root: &Path, cpuset: bool) -> Result<(), DevelopmentError> {
+fn bind_development_cgroups(
+    spec: &CellSpec,
+    root: &Path,
+    cpuset: bool,
+) -> Result<(), DevelopmentError> {
     // The target host is unified cgroup v2. Keep Android's legacy controller
     // descriptors optional so their unavailable v1 mounts cannot prevent the
     // private v2 hierarchy (and its /system subtree) from being created.
     let source = spec.runtime_dir.join("android-cgroups.json");
-    let mut config: serde_json::Value = serde_json::from_str(DEVELOPMENT_CGROUPS)
-        .expect("embedded cgroup configuration is valid");
+    let mut config: serde_json::Value =
+        serde_json::from_str(DEVELOPMENT_CGROUPS).expect("embedded cgroup configuration is valid");
     if cpuset {
         // CPU placement uses cpuset. Do not advertise an unusable legacy CPU
         // controller: get_sched_policy() must read the real cpuset hierarchy.
-        config["Cgroups"].as_array_mut().expect("controller list")
+        config["Cgroups"]
+            .as_array_mut()
+            .expect("controller list")
             .retain(|controller| controller["Controller"] != "cpu");
     }
-    fs::write(&source, serde_json::to_vec_pretty(&config).expect("JSON value serializes"))
-        .map_err(|source| io_error("write Android development cgroup configuration", source))?;
+    fs::write(
+        &source,
+        serde_json::to_vec_pretty(&config).expect("JSON value serializes"),
+    )
+    .map_err(|source| io_error("write Android development cgroup configuration", source))?;
     bind_mount(&source, &root.join(ANDROID_CGROUPS_TARGET), true)
 }
 
-fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), DevelopmentError> {
+fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
+    let directory = spec.runtime_dir.join(crate::adb::DIRECTORY);
+    let keys = directory.join(crate::adb::KEYS_FILE);
+    if !keys.exists() {
+        return Ok(());
+    }
+    set_mode(&keys, 0o644)?;
+    let target = root.join("adb_keys");
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            // This link was copied into the synthetic root. Replace it there,
+            // rather than following an image's absolute link on the host.
+            fs::remove_file(&target)
+                .map_err(|source| io_error("replace Android ADB key link", source))?;
+            create_mount_target(&target)?;
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(DevelopmentError::InvalidInput(
+                "Android ADB key target is not a regular file".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_mount_target(&target)?,
+        Err(source) => return Err(io_error("stat Android ADB key target", source)),
+    }
+    bind_mount(&keys, &target, true)?;
+
+    // Product properties are read last by Android's boot property loader.
+    // Override the pinned development image's authentication default while
+    // retaining every unrelated property and immutable partition byte.
+    let target = ["product/etc/build.prop", "product/build.prop"]
+        .into_iter()
+        .map(|path| root.join(path))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            DevelopmentError::InvalidInput("Android product build properties are missing".into())
+        })?;
+    let properties = fs::read_to_string(&target)
+        .map_err(|source| io_error("read Android product properties", source))?;
+    let source = directory.join("build.prop");
+    fs::write(&source, crate::adb::authenticated_properties(&properties))
+        .map_err(|source| io_error("write authenticated ADB properties", source))?;
+    set_mode(&source, 0o644)?;
+    bind_mount(&source, &target, true)?;
+
+    // Append after the classpath and CPU adaptations already mounted here.
+    let target = root.join("system/etc/init/hw/init.rc");
+    let mut init = fs::read_to_string(&target)
+        .map_err(|source| io_error("read Android init for ADB", source))?;
+    init.push_str(crate::adb::INIT_POLICY);
+    let source = directory.join("init.rc");
+    fs::write(&source, init).map_err(|source| io_error("write Android ADB init policy", source))?;
+    set_mode(&source, 0o644)?;
+    bind_mount(&source, &target, true)
+}
+
+fn bind_cpu_policy(
+    spec: &CellSpec,
+    root: &Path,
+    backends: &crate::cpu_placement::Backends,
+) -> Result<(), DevelopmentError> {
     let directory = spec.runtime_dir.join("cpu-policy");
     fs::create_dir(&directory).map_err(|e| io_error("create CPU policy directory", e))?;
-    // Preserve the already projected init file, including the classpath and
-    // shared-kernel adaptations. The appended on-init action follows AOSP's
-    // cpuset defaults and completes before services are started.
-    let target = root.join("system/etc/init/hw/init.rc");
-    let mut init = fs::read_to_string(&target).map_err(|e| io_error("read Android init policy", e))?;
-    init.push_str(policy);
-    let source = directory.join("init.rc");
-    fs::write(&source, init).map_err(|e| io_error("write Android CPU init policy", e))?;
-    bind_mount(&source, &target, true)?;
+    if let Some(policy) = &backends.policy {
+        let target = root.join("system/etc/init/hw/init.rc");
+        let mut init =
+            fs::read_to_string(&target).map_err(|e| io_error("read Android init policy", e))?;
+        init.push_str(policy);
+        let source = directory.join("init.rc");
+        fs::write(&source, init).map_err(|e| io_error("write Android CPU init policy", e))?;
+        bind_mount(&source, &target, true)?;
 
-    let target = root.join("system/etc/init/surfaceflinger.rc");
-    let original = fs::read_to_string(&target).map_err(|e| io_error("read SurfaceFlinger service", e))?;
-    let service = crate::cpu_placement::graphics_service(&original)
-        .map_err(|e| io_error("set SurfaceFlinger graphics role", e))?;
-    let source = directory.join("surfaceflinger.rc");
-    fs::write(&source, service).map_err(|e| io_error("write SurfaceFlinger CPU policy", e))?;
-    bind_mount(&source, &target, true)?;
+        let target = root.join("system/etc/init/surfaceflinger.rc");
+        let original =
+            fs::read_to_string(&target).map_err(|e| io_error("read SurfaceFlinger service", e))?;
+        let service = crate::cpu_placement::graphics_service(&original)
+            .map_err(|e| io_error("set SurfaceFlinger graphics role", e))?;
+        let source = directory.join("surfaceflinger.rc");
+        fs::write(&source, service).map_err(|e| io_error("write SurfaceFlinger CPU policy", e))?;
+        bind_mount(&source, &target, true)?;
+    }
 
     let mut targets = vec![root.join("system/etc/task_profiles.json")];
-    for relative in ["vendor/etc/task_profiles.json", "system_ext/etc/task_profiles.json"] {
+    for relative in [
+        "vendor/etc/task_profiles.json",
+        "system_ext/etc/task_profiles.json",
+    ] {
         let target = root.join(relative);
-        if target.exists() { targets.push(target); }
+        if target.exists() {
+            targets.push(target);
+        }
     }
     // API-specific profiles load between system and vendor; translate them
     // too, so an older image cannot silently replace a working CPU backend.
     let api_directory = root.join("system/etc/task_profiles");
     if api_directory.is_dir() {
-        for entry in fs::read_dir(api_directory).map_err(|e| io_error("read API task profiles", e))? {
+        for entry in
+            fs::read_dir(api_directory).map_err(|e| io_error("read API task profiles", e))?
+        {
             let entry = entry.map_err(|e| io_error("read API task profile entry", e))?;
-            if entry.file_name().to_str().is_some_and(|s| s.starts_with("task_profiles_") && s.ends_with(".json")) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with("task_profiles_") && s.ends_with(".json"))
+            {
                 targets.push(entry.path());
             }
         }
     }
     for (index, target) in targets.iter().enumerate() {
-        let original = fs::read_to_string(target).map_err(|e| io_error("read Android task profiles", e))?;
-        let translated = crate::cpu_placement::task_profiles(&original)
+        let original =
+            fs::read_to_string(target).map_err(|e| io_error("read Android task profiles", e))?;
+        let translated = crate::cpu_placement::task_profiles(&original, backends)
             .map_err(|e| io_error("translate Android CPU task profiles", e))?;
         let source = directory.join(format!("profiles-{index}.json"));
         fs::write(&source, translated).map_err(|e| io_error("write Android task profiles", e))?;
@@ -1989,6 +2660,77 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn pen_input_node_names_change_with_kernel_device_generation() {
+        let first = pen_input_node_name("waydroid-pen-buttons", 4).unwrap();
+        let next = pen_input_node_name("waydroid-pen-buttons", 5).unwrap();
+        assert_eq!(first, "droidloom-pen-buttons-4");
+        assert_ne!(first, next);
+        assert_eq!(
+            pen_input_node_name("waydroid-gesture-android", 5).as_deref(),
+            Some("droidloom-pen-gestures-5")
+        );
+        assert!(pen_input_node_name("unrelated-device", 5).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root under unshare --mount --propagation private"]
+    fn pen_refresh_view_preserves_android_read_only_input_mount() {
+        assert_eq!(effective_uid().unwrap(), 0);
+        let namespace = fs::read_link("/proc/self/ns/mnt").unwrap();
+        assert_ne!(namespace, fs::read_link("/proc/1/ns/mnt").unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        fs::create_dir(&input).unwrap();
+        bind_mount(&input, &input, false).unwrap();
+        run_os(
+            "mount",
+            [
+                OsString::from("-o"),
+                OsString::from("remount,bind,ro,nosuid"),
+                input.as_os_str().to_owned(),
+            ],
+        )
+        .unwrap();
+
+        let view = writable_pen_input_mount(std::process::id(), input.clone()).unwrap();
+        assert_eq!(fs::read_link("/proc/self/ns/mnt").unwrap(), namespace);
+        let view_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            view.as_raw_fd()
+        ));
+        let device = PenInputDevice {
+            phys: "waydroid-pen-buttons".into(),
+            event_name: "event12".into(),
+            major: 13,
+            minor: 76,
+        };
+        create_pen_input_nodes(&view_path, 1, &[device]).unwrap();
+        assert!(
+            fs::symlink_metadata(input.join("droidloom-pen-buttons-1"))
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+        assert_eq!(
+            fs::write(input.join("unrelated-host-device"), b"must fail")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        create_pen_input_nodes(&view_path, 2, &[]).unwrap();
+        assert!(!input.join("droidloom-pen-buttons-1").exists());
+        drop(view);
+        assert_eq!(
+            fs::write(input.join("still-read-only"), b"must fail")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        run_os("umount", [input.as_os_str().to_owned()]).unwrap();
+    }
+
+    #[test]
     fn loop_device_minors_follow_host_partition_geometry() {
         assert_eq!(loop_device_minor(0, 7).unwrap(), 0);
         assert_eq!(loop_device_minor(6, 0).unwrap(), 6);
@@ -2157,6 +2899,41 @@ mod tests {
     }
 
     #[test]
+    fn power_supply_projection_selects_only_health_state() {
+        let root = tempfile::tempdir().unwrap();
+        let battery = root.path().join("battery");
+        let usb = root.path().join("usb");
+        let ignored = root.path().join("charge_pump");
+        for directory in [&battery, &usb, &ignored] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::write(battery.join("type"), "Battery\n").unwrap();
+        fs::write(battery.join("status"), "Discharging\n").unwrap();
+        fs::write(battery.join("capacity"), "42\n").unwrap();
+        fs::write(battery.join("serial_number"), "private\n").unwrap();
+        fs::write(usb.join("type"), "USB\n").unwrap();
+        fs::write(usb.join("online"), "0\n").unwrap();
+        fs::write(ignored.join("type"), "Unknown\n").unwrap();
+        fs::write(ignored.join("online"), "1\n").unwrap();
+
+        let selected = discover_power_supply_files(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|(_, relative)| relative)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            [
+                PathBuf::from("battery/capacity"),
+                PathBuf::from("battery/status"),
+                PathBuf::from("battery/type"),
+                PathBuf::from("usb/online"),
+                PathBuf::from("usb/type"),
+            ]
+        );
+    }
+
+    #[test]
     fn pci_render_node_projection_includes_bounded_libdrm_identity() {
         let root = tempfile::tempdir().unwrap();
         let metadata = RenderNodeSysfsMetadata {
@@ -2193,6 +2970,20 @@ mod tests {
                     & 0o777,
                 0o444
             );
+        }
+    }
+
+    #[test]
+    fn synthetic_sysfs_reports_the_cell_cpu_set() {
+        let sys = tempfile::tempdir().unwrap();
+        publish_cpu_topology_sysfs(sys.path()).unwrap();
+        let cpus = droidloom_cpu_placement::CpuSet::current().unwrap().list();
+        for name in ["possible", "present", "online"] {
+            let node = sys.path().join("devices/system/cpu").join(name);
+            // Linux's own format: digits, commas and ranges. Consumers count
+            // entries, so the list must name exactly the inherited CPUs.
+            assert_eq!(fs::read_to_string(&node).unwrap(), format!("{cpus}\n"));
+            assert_eq!(fs::metadata(&node).unwrap().mode() & 0o777, 0o444);
         }
     }
 }

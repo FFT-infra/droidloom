@@ -12,7 +12,7 @@ use thiserror::Error;
 /// Four-byte little-endian record marker.
 pub const MAGIC: [u8; 4] = *b"DLSF";
 /// Exact protocol version.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 /// Fixed record header length.
 pub const HEADER_BYTES: usize = 16;
 /// Maximum image planes supported by both the host and Android paths.
@@ -34,6 +34,7 @@ mod opcode {
     pub const PRESENT_WITH_DAMAGE: u16 = 11;
     pub const OPEN_LAYERS: u16 = 12;
     pub const LAYER_STREAM: u16 = 13;
+    pub const COMPLETE_HEADLESS: u16 = 14;
 }
 
 /// One DMA-BUF plane layout. Plane descriptors are attached in dense order.
@@ -62,6 +63,12 @@ pub struct DamageRect {
 /// `SurfaceFlinger` request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
+    /// Complete a bufferless bootstrap frame with zero (already complete)
+    /// or one attached GPU-ready sync-file. Valid only on task zero.
+    CompleteHeadless {
+        /// Composer bootstrap display identity.
+        display: u64,
+    },
     /// Negotiate the exact private protocol and select one presentation
     /// channel. Task zero selects the temporary whole-display bootstrap;
     /// positive values select a real Android task.
@@ -179,6 +186,11 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
         return Err(WireError::Descriptors);
     }
     match opcode {
+        opcode::COMPLETE_HEADLESS if payload.len() == 8 && descriptor_count <= 1 => {
+            Ok(Request::CompleteHeadless {
+                display: read_u64(payload, 0)?,
+            })
+        }
         opcode::CLIENT_HELLO if payload.len() == 8 && descriptor_count == 0 => Ok(Request::Hello {
             task: read_u64(payload, 0)?,
         }),
@@ -193,7 +205,9 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
         }),
         opcode::PRESENT_WITH_CONTENT if payload.len() == 24 && descriptor_count <= 1 => {
             let flags = read_u32(payload, 16)?;
-            if flags & !1 != 0 || read_u32(payload, 20)? != 0 { return Err(WireError::Field); }
+            if flags & !1 != 0 || read_u32(payload, 20)? != 0 {
+                return Err(WireError::Field);
+            }
             Ok(Request::Present {
                 display: read_u64(payload, 0)?,
                 buffer: nonzero(read_u64(payload, 8)?)?,
@@ -209,7 +223,8 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
                 width: read_u32(payload, 32)?,
                 height: read_u32(payload, 36)?,
             };
-            if flags & !1 != 0 || read_u32(payload, 20)? != 0
+            if flags & !1 != 0
+                || read_u32(payload, 20)? != 0
                 || (damage.width == 0) != (damage.height == 0)
                 || damage.x.checked_add(damage.width).is_none()
                 || damage.y.checked_add(damage.height).is_none()
@@ -223,7 +238,11 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
                 damage: Some(damage),
             })
         }
-        opcode::OPEN_LAYERS if payload.len() == 8 && descriptor_count == 0 => Ok(Request::OpenLayers { display: read_u64(payload, 0)? }),
+        opcode::OPEN_LAYERS if payload.len() == 8 && descriptor_count == 0 => {
+            Ok(Request::OpenLayers {
+                display: read_u64(payload, 0)?,
+            })
+        }
         opcode::CANCEL if payload.len() == 16 && descriptor_count == 0 => Ok(Request::Cancel {
             display: read_u64(payload, 0)?,
             buffer: nonzero(read_u64(payload, 8)?)?,
@@ -236,6 +255,7 @@ pub fn decode_request(bytes: &[u8], descriptor_count: usize) -> Result<Request, 
         | opcode::PRESENT
         | opcode::PRESENT_WITH_CONTENT
         | opcode::PRESENT_WITH_DAMAGE
+        | opcode::COMPLETE_HEADLESS
         | opcode::CANCEL
         | opcode::RETIRE => Err(WireError::Length),
         _ => Err(WireError::Opcode),
@@ -400,6 +420,30 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn headless_completion_carries_only_display_and_optional_real_fence() {
+        for display in [0_u64, 7] {
+            for count in [0, 1] {
+                let bytes = request(opcode::COMPLETE_HEADLESS, &display.to_le_bytes(), count);
+                assert_eq!(
+                    decode_request(&bytes, count),
+                    Ok(Request::CompleteHeadless { display })
+                );
+                assert_eq!(
+                    decode_request(&bytes, 1 - count),
+                    Err(WireError::Descriptors)
+                );
+            }
+        }
+        let mut bytes = request(opcode::COMPLETE_HEADLESS, &7_u64.to_le_bytes(), 1);
+        bytes[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(decode_request(&bytes, 1), Err(WireError::Header));
+        for (payload, count) in [(vec![0; 8], 2), (vec![0; 16], 0), (vec![], 1)] {
+            let bytes = request(opcode::COMPLETE_HEADLESS, &payload, count);
+            assert!(decode_request(&bytes, count).is_err());
+        }
+    }
+
     fn request(opcode: u16, payload: &[u8], descriptors: usize) -> Vec<u8> {
         encode(opcode, payload, descriptors).unwrap()
     }
@@ -436,16 +480,35 @@ mod tests {
             push_u32(&mut payload, flags);
             push_u32(&mut payload, 0);
             for descriptors in [0, 1] {
-                assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, descriptors), descriptors),
-                    Ok(Request::Present { display: 7, buffer: 9, opaque, damage: None }));
+                assert_eq!(
+                    decode_request(
+                        &request(opcode::PRESENT_WITH_CONTENT, &payload, descriptors),
+                        descriptors
+                    ),
+                    Ok(Request::Present {
+                        display: 7,
+                        buffer: 9,
+                        opaque,
+                        damage: None
+                    })
+                );
             }
             payload[20] = 1;
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0), Err(WireError::Field));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0),
+                Err(WireError::Field)
+            );
             payload[20] = 0;
             payload[16] = 2;
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0), Err(WireError::Field));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0),
+                Err(WireError::Field)
+            );
             payload.truncate(16);
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0), Err(WireError::Length));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_CONTENT, &payload, 0), 0),
+                Err(WireError::Length)
+            );
         }
     }
 
@@ -460,27 +523,48 @@ mod tests {
             }
             for descriptors in [0, 1] {
                 assert_eq!(
-                    decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, descriptors), descriptors),
+                    decode_request(
+                        &request(opcode::PRESENT_WITH_DAMAGE, &payload, descriptors),
+                        descriptors
+                    ),
                     Ok(Request::Present {
-                        display: 7, buffer: 9, opaque: true,
-                        damage: Some(DamageRect { x: 10, y: 20, width, height }),
+                        display: 7,
+                        buffer: 9,
+                        opaque: true,
+                        damage: Some(DamageRect {
+                            x: 10,
+                            y: 20,
+                            width,
+                            height
+                        }),
                     })
                 );
             }
             for offset in [16, 20] {
                 let mut bad = payload.clone();
                 bad[offset] = 2;
-                assert_eq!(decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &bad, 0), 0), Err(WireError::Field));
+                assert_eq!(
+                    decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &bad, 0), 0),
+                    Err(WireError::Field)
+                );
             }
             payload.pop();
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0), Err(WireError::Length));
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0),
+                Err(WireError::Length)
+            );
         }
         for values in [[0, 0, 0, 1], [u32::MAX, 0, 1, 1], [0, u32::MAX, 1, 1]] {
             let mut payload = Vec::new();
             push_u64(&mut payload, 7);
             push_u64(&mut payload, 9);
-            for value in [0, 0].into_iter().chain(values) { push_u32(&mut payload, value); }
-            assert_eq!(decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0), Err(WireError::Field));
+            for value in [0, 0].into_iter().chain(values) {
+                push_u32(&mut payload, value);
+            }
+            assert_eq!(
+                decode_request(&request(opcode::PRESENT_WITH_DAMAGE, &payload, 0), 0),
+                Err(WireError::Field)
+            );
         }
     }
 

@@ -12,12 +12,11 @@ droidloom-cpu-placement = { path = "../droidloom-cpu-placement" }
 clap.workspace = true
 droidloom-contracts = { path = "../droidloom-contracts" }
 droidloom-window-policy = { path = "../droidloom-window-policy" }
+droidloom-task-control = { path = "../../graphics/droidloom-task-control" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [lints.rust]

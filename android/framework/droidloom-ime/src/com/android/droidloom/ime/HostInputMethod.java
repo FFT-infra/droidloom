@@ -1,8 +1,7 @@
 package com.android.droidloom.ime;
 
 import android.inputmethodservice.InputMethodService;
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
+import com.android.droidloom.runtime.HostChannel;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
@@ -19,7 +18,7 @@ import java.util.concurrent.Executors;
 public final class HostInputMethod extends InputMethodService {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService writes = Executors.newSingleThreadExecutor();
-    private volatile LocalSocket socket;
+    private volatile HostChannel socket;
     private volatile boolean stopped;
     private Thread reader;
     private long session;
@@ -76,9 +75,11 @@ public final class HostInputMethod extends InputMethodService {
     private void publish(boolean active) {
         try {
             EditorInfo editor = getCurrentInputEditorInfo();
-            state = new JSONObject().put("session", session).put("active", active)
+            int task = editor == null || editor.extras == null ? 0
+                    : editor.extras.getInt("com.android.droidloom.ime.task", 0);
+            state = new JSONObject().put("session", session).put("active", active && task > 0)
                     .put("show_request", showRequest)
-                    .put("package", editor == null ? "" : editor.packageName)
+                    .put("task", active ? task : 0)
                     .put("input_type", editor == null ? 0 : editor.inputType);
             sendState();
         } catch (Exception error) {
@@ -89,7 +90,7 @@ public final class HostInputMethod extends InputMethodService {
     private void sendState() {
         if (state == null || stopped) return;
         final byte[] bytes = (state.toString() + "\n").getBytes(StandardCharsets.UTF_8);
-        final LocalSocket target = socket;
+        final HostChannel target = socket;
         if (target == null) return;
         writes.execute(() -> {
             try { target.getOutputStream().write(bytes); }
@@ -99,8 +100,7 @@ public final class HostInputMethod extends InputMethodService {
 
     private void connect() {
         while (!stopped) {
-            try (LocalSocket client = new LocalSocket()) {
-                client.connect(new LocalSocketAddress("droidloom-ime"));
+            try (HostChannel client = HostChannel.open(HostChannel.TEXT_INPUT)) {
                 socket = client;
                 main.post(this::sendState);
                 InputStream input = client.getInputStream();
@@ -172,7 +172,7 @@ public final class HostInputMethod extends InputMethodService {
         } finally { connection.endBatchEdit(); }
     }
 
-    private static void close(LocalSocket client) {
+    private static void close(HostChannel client) {
         if (client != null) try { client.close(); } catch (Exception ignored) { }
     }
 

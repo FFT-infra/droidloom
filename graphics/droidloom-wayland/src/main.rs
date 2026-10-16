@@ -2,16 +2,40 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-mod clipboard;
 mod activation;
-mod layers;
+mod chrome;
+mod clipboard;
 mod fence_wakeup;
-mod notifications;
+mod gesture;
+mod gesture_feedback;
+mod immersion;
+mod imports;
+mod input;
 mod insets;
+mod interaction;
+mod layers;
+mod notifications;
 mod presentation_audit;
+mod readiness;
+mod resize;
+mod session;
+mod tablet_input;
 mod text_input;
 
-use std::collections::{BTreeMap, VecDeque};
+macro_rules! tablet_trace {
+    ($($arg:tt)*) => {
+        if input_trace_enabled() { eprintln!($($arg)*); }
+    };
+}
+
+fn input_trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| {
+        env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -43,12 +67,16 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{
     PresentTime, PresentationTimeHandler, PresentationTimeState,
 };
+use smithay_client_toolkit::reexports::csd_frame::WindowManagerCapabilities;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    AxisScroll, CursorIcon, PointerData, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec,
+    ThemedPointer,
+};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -56,12 +84,15 @@ use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
     Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
+use tablet_input::tilt_degrees;
 use thiserror::Error;
 use wayland_client::globals::{BindError, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, backend::WaylandError};
+use wayland_client::{
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, backend::WaylandError,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -77,14 +108,27 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{
     self, WpPresentationFeedback,
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    self as tablet, zwp_tablet_manager_v2::ZwpTabletManagerV2,
+    zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+    zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+    zwp_tablet_pad_v2::ZwpTabletPadV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    zwp_tablet_tool_v2::ZwpTabletToolV2, zwp_tablet_v2::ZwpTabletV2,
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
 };
 
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
 const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const LEFT_BUTTON: u32 = 0x110;
+const PAD_BUTTON_BASE: u32 = 0x106;
+const PAD_BUTTON_COUNT: u32 = 4;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
 
@@ -127,6 +171,8 @@ enum PresenterError {
     },
     #[error("Droidloom configuration is invalid: {0}")]
     Configuration(&'static str),
+    #[error("window decoration failure: {0}")]
+    WindowDecoration(String),
 }
 
 struct RenderTarget {
@@ -152,11 +198,16 @@ struct BufferSync {
 
 impl BufferSync {
     fn arm_release_wakeup(&mut self, point: u64) -> Result<(), PresenterError> {
-        let Some(event) = self.release_wakeup.as_ref() else { return Ok(()); };
+        let Some(event) = self.release_wakeup.as_ref() else {
+            return Ok(());
+        };
         match self.timeline.notify_when_signalled(point, event.as_fd()) {
             Ok(()) => Ok(()),
             Err(droidloom_syncobj::SyncobjError::Drm { source, .. })
-                if matches!(source.raw_os_error(), Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::EINVAL)) =>
+                if matches!(
+                    source.raw_os_error(),
+                    Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::EINVAL)
+                ) =>
             {
                 // Older timeline-capable kernels still use the bounded poll
                 // fallback. Never replace an unsupported wakeup with a release.
@@ -191,16 +242,22 @@ struct FrameFeedback {
 }
 
 struct TaskWindow {
+    chrome: Option<chrome::Chrome>,
+    gesture_feedback: Option<gesture_feedback::Feedback>,
+    controls_until: Option<Instant>,
+    fullscreen: bool,
     layers: Option<layers::Stream>,
     package: String,
     android_task: Option<u64>,
+    input_route: Option<input::Route>,
     window: Option<Window>,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
     logical_size: Option<(u32, u32)>,
     buffer_size: (u32, u32),
-    preferred_scale_120: u32,
+    applied_scale_120: u32,
+    resize: resize::Pending,
     configure_serial: u32,
     refresh_millihz: u32,
     entered_outputs: Vec<wl_output::WlOutput>,
@@ -217,6 +274,12 @@ struct TaskWindow {
 }
 
 impl TaskWindow {
+    fn needs_refresh_update(&self, refresh: u32) -> bool {
+        // Android has already retired this object. Keep only host buffer
+        // cleanup alive; output-leave callbacks must not configure it again.
+        !self.closing && self.configure_serial != 0 && self.refresh_millihz != refresh
+    }
+
     fn headless(&self) -> bool {
         self.package == BOOTSTRAP_PACKAGE
     }
@@ -227,6 +290,28 @@ impl TaskWindow {
 
     fn surface(&self) -> Option<&wl_surface::WlSurface> {
         self.window.as_ref().map(Window::wl_surface)
+    }
+
+    fn contains_surface(&self, surface: &wl_surface::WlSurface) -> bool {
+        if self.surface().is_some_and(|candidate| candidate == surface) {
+            return true;
+        }
+        if let Some(stream) = self.layers.as_ref() {
+            if stream.contains_surface(surface) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn surface_offset(&self, surface: &wl_surface::WlSurface) -> Option<(f64, f64)> {
+        if self.surface().is_some_and(|candidate| candidate == surface) {
+            return Some((0.0, 0.0));
+        }
+        if let Some(stream) = self.layers.as_ref() {
+            return stream.surface_offset(surface);
+        }
+        None
     }
 }
 
@@ -252,6 +337,74 @@ impl Contact {
     }
 }
 
+struct TabletToolState {
+    tool_id: u32,
+    surface: Option<wl_surface::WlSurface>,
+    x: f64,
+    y: f64,
+    pressure: u16,
+    is_down: bool,
+    pending_down: bool,
+    pending_up: bool,
+    pending_proximity_out: bool,
+    dirty_motion: bool,
+    native_entered: bool,
+    eraser: bool,
+    supported: bool,
+    tilt: (i8, i8),
+    buttons: u8,
+    dirty_buttons: bool,
+}
+
+impl TabletToolState {
+    fn new(tool_id: u32) -> Self {
+        Self {
+            tool_id,
+            surface: None,
+            x: 0.0,
+            y: 0.0,
+            pressure: 0,
+            is_down: false,
+            pending_down: false,
+            pending_up: false,
+            pending_proximity_out: false,
+            dirty_motion: false,
+            native_entered: false,
+            eraser: false,
+            supported: true,
+            tilt: (0, 0),
+            buttons: 0,
+            dirty_buttons: false,
+        }
+    }
+}
+
+enum TabletPadChild {
+    Group(ZwpTabletPadGroupV2),
+    Ring(ZwpTabletPadRingV2),
+    Strip(ZwpTabletPadStripV2),
+    Dial(ZwpTabletPadDialV2),
+}
+
+impl TabletPadChild {
+    fn destroy(self) {
+        match self {
+            Self::Group(proxy) => proxy.destroy(),
+            Self::Ring(proxy) => proxy.destroy(),
+            Self::Strip(proxy) => proxy.destroy(),
+            Self::Dial(proxy) => proxy.destroy(),
+        }
+    }
+}
+
+struct TabletPadState {
+    tablet_seat_id: u32,
+    proxy: ZwpTabletPadV2,
+    children: Vec<TabletPadChild>,
+    focus: Option<TaskObjectId>,
+    pressed: BTreeSet<u32>,
+}
+
 struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
@@ -260,8 +413,19 @@ struct App {
     text_input: text_input::TextInput,
     registry_state: RegistryState,
     output_state: OutputState,
+    output_power_manager: ZwlrOutputPowerManagerV1,
+    output_power: Vec<OutputPowerState>,
+    host_display_powered: Option<bool>,
+    published_display_power: Option<bool>,
     presentation_time: PresentationTimeState,
     seat_state: SeatState,
+    tablet_manager: Option<ZwpTabletManagerV2>,
+    tablet_seats: Vec<(wl_seat::WlSeat, ZwpTabletSeatV2)>,
+    tablet_tools: Vec<TabletToolState>,
+    tablet_tool_proxies: BTreeMap<u32, ZwpTabletToolV2>,
+    tablet_proxies: BTreeMap<u32, (u32, ZwpTabletV2)>,
+    tablet_pads: BTreeMap<u32, TabletPadState>,
+    tablet_pad_groups: BTreeMap<u32, u32>,
     dmabuf_state: DmabufState,
     feedback: Option<DmabufFeedback>,
     compositor: CompositorState,
@@ -276,16 +440,37 @@ struct App {
     window_policy: WindowPolicyStore,
     endpoint: Option<DenialEndpoint>,
     tasks: BTreeMap<TaskObjectId, TaskWindow>,
+    task_work: readiness::Tasks,
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
+    keyboard_seat: Option<wl_seat::WlSeat>,
+    pointer_constraints: smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState,
+    shortcuts_inhibit_manager: Option<wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
+    immersion: Option<immersion::Capture>,
+    modifiers: Modifiers,
+    pointer: Option<ThemedPointer<PointerData>>,
     touch: Option<wl_touch::WlTouch>,
     focused: Option<TaskObjectId>,
+    pressed_keys: input::Keys,
+    mouse_focus: Option<TaskObjectId>,
+    mouse_buttons: u32,
+    mouse_position: (f64, f64),
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
+    swipe_back: Option<gesture::SwipeBackCandidate>,
+    top_pull: Option<gesture::TopPullCandidate>,
+    chrome_press: Option<(TaskObjectId, chrome::Action)>,
+    chrome_touches: BTreeMap<i32, (TaskObjectId, chrome::Action)>,
     next_buffer_id: u64,
     next_input_serial: u64,
+    direct_input: input::DirectInput,
     socket_path: PathBuf,
     fatal: Option<String>,
+}
+
+struct OutputPowerState {
+    output: wl_output::WlOutput,
+    control: ZwlrOutputPowerV1,
+    powered: Option<bool>,
 }
 
 impl Drop for App {
@@ -295,58 +480,115 @@ impl Drop for App {
 }
 
 impl App {
+    fn recompute_display_power(&mut self) -> Result<(), PresenterError> {
+        let powered =
+            aggregate_display_power(self.output_power.iter().map(|output| output.powered));
+        self.host_display_powered = powered;
+        self.publish_display_power()
+    }
+
+    fn publish_display_power(&mut self) -> Result<(), PresenterError> {
+        let Some(powered) = self.host_display_powered else {
+            return Ok(());
+        };
+        if self.published_display_power == Some(powered) {
+            return Ok(());
+        }
+        let Some(endpoint) = self.endpoint.as_ref().filter(|endpoint| endpoint.ready()) else {
+            return Ok(());
+        };
+        if endpoint.direct_input() {
+            if let Err(error) = self.direct_input.set_power(powered) {
+                eprintln!("Droidloom input power: {error}");
+            }
+        } else {
+            endpoint.send_display_power(powered)?;
+        }
+        self.published_display_power = Some(powered);
+        Ok(())
+    }
+
     fn task_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<TaskObjectId> {
-        self.tasks.iter().find_map(|(object, task)| {
-            task.surface()
-                .is_some_and(|candidate| candidate == surface)
-                .then_some(*object)
-        })
+        self.tasks
+            .iter()
+            .find_map(|(object, task)| task.contains_surface(surface).then_some(*object))
     }
 
     fn task_refresh_millihz(&self, object: TaskObjectId) -> u32 {
-        let Some(task) = self.tasks.get(&object) else { return 60_000; };
+        let Some(task) = self.tasks.get(&object) else {
+            return 60_000;
+        };
         if task.package == BOOTSTRAP_PACKAGE {
             // Android's shared scheduler must accommodate active task outputs,
             // but an unrelated faster monitor must not drive its cadence.
-            return self.tasks.iter().filter(|(_, task)| task.package != BOOTSTRAP_PACKAGE
-                    && !task.closing && !task.entered_outputs.is_empty())
+            return self
+                .tasks
+                .iter()
+                .filter(|(_, task)| {
+                    task.package != BOOTSTRAP_PACKAGE
+                        && !task.closing
+                        && !task.entered_outputs.is_empty()
+                })
                 .map(|(object, _)| self.task_refresh_millihz(*object))
-                .max().unwrap_or(60_000);
+                .max()
+                .unwrap_or(60_000);
         }
         select_surface_refresh(
             &task.entered_outputs,
             task.presentation_output.as_ref(),
-            |output| self.output_state.info(output).and_then(|info| {
-                info.modes.iter()
-                    .find(|mode| mode.current && mode.refresh_rate > 0)
-                    .and_then(|mode| u32::try_from(mode.refresh_rate).ok())
-            }),
+            |output| {
+                self.output_state.info(output).and_then(|info| {
+                    info.modes
+                        .iter()
+                        .find(|mode| mode.current && mode.refresh_rate > 0)
+                        .and_then(|mode| u32::try_from(mode.refresh_rate).ok())
+                })
+            },
         )
     }
 
     fn update_task_refresh(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
         let refresh = self.task_refresh_millihz(object);
-        let task = self.tasks.get_mut(&object).ok_or(PresenterError::UnknownTask(object))?;
-        if task.configure_serial == 0 || task.refresh_millihz == refresh { return Ok(()); }
+        let task = self
+            .tasks
+            .get_mut(&object)
+            .ok_or(PresenterError::UnknownTask(object))?;
+        if !task.needs_refresh_update(refresh) {
+            return Ok(());
+        }
         // A cadence change preserves the configure's allocation generation.
         // Existing targets and in-flight frames still satisfy its dimensions.
-        self.endpoint.as_mut()
+        self.endpoint
+            .as_mut()
             .ok_or(PresenterError::Configuration("endpoint disappeared"))?
-            .send_configure(object, task.configure_serial, task.buffer_size.0,
-                task.buffer_size.1, task.preferred_scale_120,
-                FRACTIONAL_SCALE_DENOMINATOR, Transform::Normal, refresh)?;
+            .send_configure(
+                object,
+                task.configure_serial,
+                task.buffer_size.0,
+                task.buffer_size.1,
+                task.applied_scale_120,
+                FRACTIONAL_SCALE_DENOMINATOR,
+                Transform::Normal,
+                refresh,
+            )?;
         task.refresh_millihz = refresh;
         if task.package != BOOTSTRAP_PACKAGE {
-            let bootstrap = self.tasks.iter()
+            let bootstrap = self
+                .tasks
+                .iter()
                 .find_map(|(object, task)| (task.package == BOOTSTRAP_PACKAGE).then_some(*object));
-            if let Some(bootstrap) = bootstrap { self.update_task_refresh(bootstrap)?; }
+            if let Some(bootstrap) = bootstrap {
+                self.update_task_refresh(bootstrap)?;
+            }
         }
         Ok(())
     }
 
     fn update_output_refreshes(&mut self) -> Result<(), PresenterError> {
         let objects = self.tasks.keys().copied().collect::<Vec<_>>();
-        for object in objects { self.update_task_refresh(object)?; }
+        for object in objects {
+            self.update_task_refresh(object)?;
+        }
         Ok(())
     }
 
@@ -401,7 +643,15 @@ impl App {
         let Some((width, height)) = self.host_canvas_size() else {
             return Ok(());
         };
-        self.configure_task(qh, object, width, height)
+        self.configure_task(
+            qh,
+            object,
+            resize::Configure {
+                size: LogicalSize { width, height },
+                scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                remember: false,
+            },
+        )
     }
 
     fn selected_format(&self) -> Result<(DrmFourcc, Vec<Modifier>), PresenterError> {
@@ -420,8 +670,7 @@ impl App {
                 // DMA-BUFs keep the shared render targets importable across
                 // that boundary, including laptops with multiple GPUs.
                 .filter(|entry| {
-                    entry.format == fourcc as u32
-                        && entry.modifier == u64::from(Modifier::Linear)
+                    entry.format == fourcc as u32 && entry.modifier == u64::from(Modifier::Linear)
                 })
                 .map(|entry| Modifier::from(entry.modifier))
                 .collect::<Vec<_>>();
@@ -455,63 +704,67 @@ impl App {
         if !headless && let Err(error) = self.window_policy.reload_policy() {
             eprintln!("Droidloom kept the last valid window policy: {error}");
         }
-        let (window, viewport, fractional_scale, sync_surface) =
-            if headless {
-                (None, None, None, None)
-            } else {
-                let surface = self.compositor.create_surface(qh);
-                let window = self
-                    .xdg_shell
-                    .create_window(surface, WindowDecorations::None, qh);
-                window.set_title(package.to_owned());
-                window.set_app_id(package.to_owned());
-                window.set_min_size(Some((1, 1)));
-                if let Some(manager) = &self.insets_manager {
-                    manager.set_self_managed(window.wl_surface());
-                }
-                // fractional-scale-v1 keeps the wl_surface at scale 1 and uses a
-                // viewport to map the higher-resolution buffer into XDG logical
-                // coordinates.
-                window.wl_surface().set_buffer_scale(1);
-                let viewport = self.viewporter.get_viewport(window.wl_surface(), qh, ());
-                let fractional_scale = self.fractional_scale_manager.get_fractional_scale(
-                    window.wl_surface(),
-                    qh,
-                    object,
-                );
-                let sync_surface = self.sync_manager.get_surface(window.wl_surface(), qh, ());
-                window.commit();
-                (
-                    Some(window),
-                    Some(viewport),
-                    Some(fractional_scale),
-                    Some(sync_surface),
-                )
-            };
+        let (window, viewport, fractional_scale, sync_surface) = if headless {
+            (None, None, None, None)
+        } else {
+            let surface = self.compositor.create_surface(qh);
+            let window = self
+                .xdg_shell
+                .create_window(surface, WindowDecorations::None, qh);
+            window.set_title(package.to_owned());
+            window.set_app_id(package.to_owned());
+            window.set_min_size(Some((1, 1)));
+            if let Some(manager) = &self.insets_manager {
+                manager.set_self_managed(window.wl_surface());
+            }
+            // fractional-scale-v1 keeps the wl_surface at scale 1 and uses a
+            // viewport to map the higher-resolution buffer into XDG logical
+            // coordinates.
+            window.wl_surface().set_buffer_scale(1);
+            let viewport = self.viewporter.get_viewport(window.wl_surface(), qh, ());
+            let fractional_scale =
+                self.fractional_scale_manager
+                    .get_fractional_scale(window.wl_surface(), qh, object);
+            let sync_surface = self.sync_manager.get_surface(window.wl_surface(), qh, ());
+            window.commit();
+            (
+                Some(window),
+                Some(viewport),
+                Some(fractional_scale),
+                Some(sync_surface),
+            )
+        };
         self.tasks.insert(
             object,
             TaskWindow {
+                chrome: None,
+                gesture_feedback: None,
+                controls_until: None,
+                fullscreen: false,
                 layers: None,
                 package: package.to_owned(),
                 android_task: None,
+                input_route: None,
                 window,
                 viewport,
                 fractional_scale,
                 sync_surface,
                 logical_size: None,
                 buffer_size: (0, 0),
-                preferred_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                applied_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                resize: resize::Pending::new(FRACTIONAL_SCALE_DENOMINATOR),
                 configure_serial: 0,
                 refresh_millihz: 60_000,
-            entered_outputs: Vec::new(),
-            presentation_output: None,
+                entered_outputs: Vec::new(),
+                presentation_output: None,
                 targets: BTreeMap::new(),
                 pending: VecDeque::new(),
                 presentation_feedback: Vec::new(),
                 content_opaque: false,
                 applied_opaque: None,
-                presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref() == Some(std::ffi::OsStr::new("1")))
-                    .then(presentation_audit::Audit::default),
+                presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref()
+                    == Some(std::ffi::OsStr::new("1")))
+                .then(presentation_audit::Audit::default),
                 focused: false,
                 unmap_requested: false,
                 closing: false,
@@ -532,7 +785,44 @@ impl App {
                 .ok_or(PresenterError::Configuration(
                     "Wayland output has no current pixel mode",
                 ))?;
-            self.configure_task(qh, object, width, height)?;
+            self.configure_task(
+                qh,
+                object,
+                resize::Configure {
+                    size: LogicalSize { width, height },
+                    scale_120: FRACTIONAL_SCALE_DENOMINATOR,
+                    remember: false,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_pending_resizes(&mut self, qh: &QueueHandle<Self>) -> Result<(), PresenterError> {
+        // Wayland callbacks only replace pending geometry. Apply the final
+        // size/scale before draining Android frames or publishing layer config.
+        while let Some(object) = self.task_work.pop(readiness::RESIZE) {
+            let Some(task) = self.tasks.get_mut(&object) else {
+                continue;
+            };
+            let Some(configure) = task.resize.take() else {
+                continue;
+            };
+            if !task.accepts_present() {
+                continue;
+            }
+            self.configure_task(qh, object, configure)?;
+            if configure.remember {
+                let package = &self
+                    .tasks
+                    .get(&object)
+                    .expect("configured task exists")
+                    .package;
+                if let Err(error) = self.window_policy.remember(package, configure.size) {
+                    // Persistence failure is non-fatal to an otherwise valid frame.
+                    eprintln!("Droidloom could not remember {package} window size: {error}");
+                }
+            }
         }
         Ok(())
     }
@@ -541,33 +831,24 @@ impl App {
         &mut self,
         qh: &QueueHandle<Self>,
         object: TaskObjectId,
-        width: u32,
-        height: u32,
+        configure: resize::Configure,
     ) -> Result<(), PresenterError> {
-        let width = width.max(1);
-        let height = height.max(1);
-        let (scale_120, buffer_width, buffer_height) = {
-            let task = self
-                .tasks
-                .get(&object)
-                .ok_or(PresenterError::UnknownTask(object))?;
-            let scale_120 = task.preferred_scale_120;
-            (
-                scale_120,
-                scale_dimension(width, scale_120)?,
-                scale_dimension(height, scale_120)?,
-            )
-        };
-        let needs_pool = {
+        let width = configure.size.width;
+        let height = configure.size.height;
+        let scale_120 = configure.scale_120;
+        let buffer_width = scale_dimension(width, scale_120)?;
+        let buffer_height = scale_dimension(height, scale_120)?;
+        self.configure_controls(qh, object, width, scale_120);
+        let needs_configure = {
             let task = self
                 .tasks
                 .get(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.configure_serial == 0
-                || task.logical_size != Some((width, height))
+                || configure.changes_geometry(task.logical_size, task.applied_scale_120)
                 || task.buffer_size != (buffer_width, buffer_height)
         };
-        if !needs_pool {
+        if !needs_configure {
             return Ok(());
         }
 
@@ -577,29 +858,6 @@ impl App {
             .get(&object)
             .and_then(|task| task.configure_serial.checked_add(1))
             .ok_or(PresenterError::Configuration("configure serial exhausted"))?;
-        let mut targets: Vec<RenderTarget> = Vec::with_capacity(TARGET_POOL_LENGTH);
-        for _ in 0..TARGET_POOL_LENGTH {
-            let id = self.allocate_buffer_id()?;
-            let target = self.allocate_target(qh, id, buffer_width, buffer_height)?;
-            let planes = target.planes.iter().map(AsFd::as_fd).collect::<Vec<_>>();
-            let result = self
-                .endpoint
-                .as_mut()
-                .ok_or(PresenterError::Configuration("endpoint disappeared"))?
-                .register_render_target(object, serial, &target.metadata, &planes);
-            if let Err(error) = result {
-                for registered in &targets {
-                    let _ = self
-                        .endpoint
-                        .as_mut()
-                        .expect("endpoint existed during target registration")
-                        .unregister_render_target(object, registered.metadata.id);
-                }
-                return Err(error.into());
-            }
-            targets.push(target);
-        }
-
         let refresh = self.task_refresh_millihz(object);
         {
             let task = self
@@ -607,15 +865,11 @@ impl App {
                 .get_mut(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
             task.logical_size = Some((width, height));
+            task.applied_scale_120 = scale_120;
             task.applied_opaque = None;
             task.buffer_size = (buffer_width, buffer_height);
             task.configure_serial = serial;
             task.refresh_millihz = refresh;
-            task.targets.extend(
-                targets
-                    .into_iter()
-                    .map(|target| (target.metadata.id, target)),
-            );
             if let Some(viewport) = task.viewport.as_ref() {
                 let destination_width = i32::try_from(width)
                     .map_err(|_| PresenterError::Configuration("logical width exceeds Wayland"))?;
@@ -637,7 +891,80 @@ impl App {
                 Transform::Normal,
                 refresh,
             )?;
+        self.task_work.mark(object, readiness::CONFIG);
+        // Only a peer that negotiated demand allocation may configure an
+        // empty pool. Bootstrap can request its targets through the same
+        // dequeue path if its normally elided composition is ever needed.
+        if !self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::lazy_render_targets)
+        {
+            self.ensure_render_targets(qh, object, serial)?;
+        }
         self.update_output_refreshes()
+    }
+
+    fn ensure_render_targets(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        object: TaskObjectId,
+        serial: u32,
+    ) -> Result<(), PresenterError> {
+        let task = self
+            .tasks
+            .get(&object)
+            .ok_or(PresenterError::UnknownTask(object))?;
+        // Requests race resizes and close on the other socket. Never allocate
+        // obsolete dimensions or resurrect a closing task's target pool.
+        if (!task.headless() && !task.accepts_present())
+            || task.closing
+            || task.unmap_requested
+            || task.configure_serial != serial
+            || task
+                .targets
+                .values()
+                .any(|target| target.host_owned && !target.retired)
+        {
+            return Ok(());
+        }
+        let (width, height) = task.buffer_size;
+        let mut targets: Vec<RenderTarget> = Vec::with_capacity(TARGET_POOL_LENGTH);
+        for _ in 0..TARGET_POOL_LENGTH {
+            let id = self.allocate_buffer_id()?;
+            let target = self.allocate_target(qh, id, width, height)?;
+            targets.push(target);
+        }
+        // Finish allocation before publishing any descriptors. A failed GBM
+        // allocation must not leave Android holding an incomplete pool.
+        for (index, target) in targets.iter().enumerate() {
+            let planes = target.planes.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+            let result = self
+                .endpoint
+                .as_mut()
+                .ok_or(PresenterError::Configuration("endpoint disappeared"))?
+                .register_render_target(object, serial, &target.metadata, &planes);
+            if let Err(error) = result {
+                for registered in &targets[..index] {
+                    let _ = self
+                        .endpoint
+                        .as_mut()
+                        .unwrap()
+                        .unregister_render_target(object, registered.metadata.id);
+                }
+                return Err(error.into());
+            }
+        }
+        self.tasks.get_mut(&object).unwrap().targets.extend(
+            targets
+                .into_iter()
+                .map(|target| (target.metadata.id, target)),
+        );
+        eprintln!(
+            "Droidloom composition targets: object={} configure={serial} size={width}x{height} buffers={TARGET_POOL_LENGTH}",
+            object.0
+        );
+        Ok(())
     }
 
     fn allocate_buffer_id(&mut self) -> Result<BufferId, PresenterError> {
@@ -824,7 +1151,11 @@ impl App {
     ) -> Result<(), PresenterError> {
         let object = frame.object;
         let mut frame_trace = presentation_audit::FrameTrace::new(
-            object.0, frame.frame.0, frame.buffer.0, acquire_fence.as_fd());
+            object.0,
+            frame.frame.0,
+            frame.buffer.0,
+            acquire_fence.as_fd(),
+        );
         if !self
             .tasks
             .get(&object)
@@ -859,8 +1190,11 @@ impl App {
             let buffer = self.create_wayland_buffer(qh, &target.metadata, &target.planes)?;
             let timeline = WaylandTimeline::create(&self.syncobj)?;
             let descriptor = timeline.export_descriptor()?;
-            let proxy = self.sync_manager.import_timeline(descriptor.as_fd(), qh, ());
-            let target = self.tasks
+            let proxy = self
+                .sync_manager
+                .import_timeline(descriptor.as_fd(), qh, ());
+            let target = self
+                .tasks
                 .get_mut(&object)
                 .and_then(|task| task.targets.get_mut(&frame.buffer))
                 .expect("target was just checked");
@@ -868,7 +1202,9 @@ impl App {
             // SAFETY: eventfd has no pointer arguments; a nonnegative return
             // value is a new descriptor uniquely owned below.
             let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            if event < 0 { return Err(io::Error::last_os_error().into()); }
+            if event < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
             target.sync = Some(BufferSync {
                 timeline,
                 proxy,
@@ -887,24 +1223,40 @@ impl App {
             .expect("accepts_present guaranteed a mapped window");
         if task.applied_opaque != Some(task.content_opaque) {
             if task.content_opaque {
-                let (width, height) = task.logical_size
-                    .ok_or(PresenterError::Configuration("opaque target has no logical size"))?;
+                let (width, height) = task.logical_size.ok_or(PresenterError::Configuration(
+                    "opaque target has no logical size",
+                ))?;
                 let region = Region::new(&self.compositor)?;
-                region.add(0, 0, i32::try_from(width).map_err(|_| PresenterError::Configuration("opaque width exceeds Wayland"))?,
-                    i32::try_from(height).map_err(|_| PresenterError::Configuration("opaque height exceeds Wayland"))?);
+                region.add(
+                    0,
+                    0,
+                    i32::try_from(width).map_err(|_| {
+                        PresenterError::Configuration("opaque width exceeds Wayland")
+                    })?,
+                    i32::try_from(height).map_err(|_| {
+                        PresenterError::Configuration("opaque height exceeds Wayland")
+                    })?,
+                );
                 surface.set_opaque_region(Some(region.wl_region()));
             } else {
                 surface.set_opaque_region(None);
             }
             task.applied_opaque = Some(task.content_opaque);
             if droidloom_syncobj::frame_trace::enabled() {
-                eprintln!("Droidloom content state: object={} frame={} opaque={} source=android monotonic_ns={}",
-                    object.0, frame.frame.0, task.content_opaque, droidloom_syncobj::frame_trace::now_ns());
+                eprintln!(
+                    "Droidloom content state: object={} frame={} opaque={} source=android monotonic_ns={}",
+                    object.0,
+                    frame.frame.0,
+                    task.content_opaque,
+                    droidloom_syncobj::frame_trace::now_ns()
+                );
             }
         }
         let layers_hidden = task.layers.as_mut().is_some_and(|layers| layers.hide());
         if layers_hidden {
-            if let Some(viewport) = task.viewport.as_ref() { viewport.set_source(-1.0,-1.0,-1.0,-1.0); }
+            if let Some(viewport) = task.viewport.as_ref() {
+                viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+            }
         }
         let target = task
             .targets
@@ -918,14 +1270,16 @@ impl App {
                 "presented buffer is unavailable",
             ));
         }
-        let sync = target.sync.as_mut()
+        let sync = target
+            .sync
+            .as_mut()
             .ok_or(PresenterError::Configuration("buffer timeline is absent"))?;
-        let acquire_point =
-            sync.next_point
-                .checked_add(1)
-                .ok_or(PresenterError::Configuration(
-                    "Wayland sync point exhausted",
-                ))?;
+        let acquire_point = sync
+            .next_point
+            .checked_add(1)
+            .ok_or(PresenterError::Configuration(
+                "Wayland sync point exhausted",
+            ))?;
         let release_point = acquire_point
             .checked_add(1)
             .ok_or(PresenterError::Configuration(
@@ -935,7 +1289,9 @@ impl App {
         sync.timeline
             .import_acquire_fence(acquire_point, acquire_fence.as_fd())?;
         sync.arm_release_wakeup(release_point)?;
-        if task.sync_surface.is_none() { task.sync_surface=Some(self.sync_manager.get_surface(&surface,qh,())); }
+        if task.sync_surface.is_none() {
+            task.sync_surface = Some(self.sync_manager.get_surface(&surface, qh, ()));
+        }
         let sync_surface = task
             .sync_surface
             .as_ref()
@@ -949,9 +1305,12 @@ impl App {
         // Timing feedback is optional and can arrive long after the compositor
         // releases a buffer (especially for obscured windows). Bound outstanding
         // callbacks independently of render-target ownership.
-        let feedback = if self.endpoint.as_mut()
+        let feedback = if self
+            .endpoint
+            .as_mut()
             .ok_or(PresenterError::Configuration("endpoint disappeared"))?
-            .track_presentation(object, frame.frame)? {
+            .track_presentation(object, frame.frame)?
+        {
             Some(self.presentation_time.feedback(&surface, qh)?)
         } else {
             None
@@ -970,8 +1329,14 @@ impl App {
                 i32::try_from(damage.height).unwrap_or(i32::MAX),
             );
         }
-        let submitted_nanos = if task.presentation_audit.is_some() { monotonic_timestamp_nanos()? } else { 0 };
-        if let Some(trace) = frame_trace.as_mut() { trace.commit(); }
+        let submitted_nanos = if task.presentation_audit.is_some() {
+            monotonic_timestamp_nanos()?
+        } else {
+            0
+        };
+        if let Some(trace) = frame_trace.as_mut() {
+            trace.commit();
+        }
         surface.commit();
         self.activation.mapped(object, &surface);
         target.busy = true;
@@ -990,22 +1355,34 @@ impl App {
                 submitted_nanos,
             });
         }
+        self.task_work.frames.insert(object);
+        self.task_work.mark(object, readiness::FRAMES);
         Ok(())
     }
 
     fn release_ready_frames(&mut self) -> Result<(), PresenterError> {
         let mut ready = Vec::new();
-        for (object, task) in &mut self.tasks {
+        while let Some(object) = self.task_work.pop(readiness::FRAMES) {
+            let Some(task) = self.tasks.get_mut(&object) else {
+                continue;
+            };
             // Diagnostic observation only: retain the existing release policy.
             // Inspect sampled frames independently so FIFO head blocking is visible.
             for pending in &mut task.pending {
                 if let Some(trace) = pending.trace.as_mut() {
                     if !trace.release_observed {
-                        if let Some(sync) = task.targets.get(&pending.buffer).and_then(|t| t.sync.as_ref()) {
+                        if let Some(sync) = task
+                            .targets
+                            .get(&pending.buffer)
+                            .and_then(|t| t.sync.as_ref())
+                        {
                             if let Ok(point) = sync.timeline.signalled_point() {
                                 if point >= pending.release_point {
-                                    trace.release_ready(task.presentation_feedback.iter()
-                                        .any(|feedback| feedback.frame == pending.frame));
+                                    trace.release_ready(
+                                        task.presentation_feedback
+                                            .iter()
+                                            .any(|feedback| feedback.frame == pending.frame),
+                                    );
                                 }
                             }
                         }
@@ -1013,9 +1390,13 @@ impl App {
                 }
             }
             while let Some(pending) = task.pending.front() {
-                let sync = task.targets.get(&pending.buffer)
+                let sync = task
+                    .targets
+                    .get(&pending.buffer)
                     .and_then(|target| target.sync.as_ref())
-                    .ok_or(PresenterError::Configuration("pending buffer timeline is absent"))?;
+                    .ok_or(PresenterError::Configuration(
+                        "pending buffer timeline is absent",
+                    ))?;
                 // Only the compositor's real release fence controls reuse.
                 // Presentation feedback retains its own bounded frame identity.
                 if pending.release_point > sync.timeline.signalled_point()? {
@@ -1025,7 +1406,20 @@ impl App {
                 if let Some(audit) = task.presentation_audit.as_mut() {
                     audit.released(pending.submitted_nanos, monotonic_timestamp_nanos()?);
                 }
-                ready.push((*object, pending));
+                ready.push((object, pending));
+            }
+            if task.pending.is_empty() {
+                self.task_work.frames.remove(&object);
+            }
+            let fallback = task.pending.iter().any(|pending| {
+                task.targets
+                    .get(&pending.buffer)
+                    .and_then(|target| target.sync.as_ref())
+                    .is_some_and(|sync| sync.release_wakeup.is_none())
+            });
+            self.task_work.frame_fallback(object, fallback);
+            if task.closing {
+                self.task_work.mark(object, readiness::CLEANUP);
             }
         }
         for (object, pending) in ready {
@@ -1033,7 +1427,9 @@ impl App {
                 .as_mut()
                 .ok_or(PresenterError::Configuration("endpoint disappeared"))?
                 .finish_release(object, pending.frame)?;
-            if let Some(mut trace) = pending.trace { trace.returned(); }
+            if let Some(mut trace) = pending.trace {
+                trace.returned();
+            }
             let (retired, closing) = {
                 let task = self
                     .tasks
@@ -1065,20 +1461,21 @@ impl App {
                 }
             }
         }
-        let finished = self
-            .tasks
-            .iter()
-            .filter_map(|(object, task)| {
-                (task.closing && task.pending.is_empty() && task.layers.as_ref().is_none_or(|s|!s.busy())).then_some(*object)
-            })
-            .collect::<Vec<_>>();
-        for object in finished {
-            self.remove_task(object);
+        while let Some(object) = self.task_work.pop(readiness::CLEANUP) {
+            if self.tasks.get(&object).is_some_and(|task| {
+                task.closing
+                    && task.pending.is_empty()
+                    && task.layers.as_ref().is_none_or(|s| !s.busy())
+            }) {
+                self.remove_task(object);
+            }
         }
         Ok(())
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.release_task_inputs(object);
+        self.task_work.remove(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             if let Some(fractional_scale) = task.fractional_scale.take() {
@@ -1104,17 +1501,33 @@ impl App {
             .filter(|contact| contact.object != object);
         self.touch_contacts
             .retain(|_, contact| contact.object != object);
+        if let Some(task) = self.tasks.get(&object) {
+            for tool in &mut self.tablet_tools {
+                if tool
+                    .surface
+                    .as_ref()
+                    .is_some_and(|s| task.contains_surface(s))
+                {
+                    tool.is_down = false;
+                    tool.surface = None;
+                }
+            }
+        }
         if self.endpoint.is_some() {
-            if let Err(error) = self.update_output_refreshes() { self.fail(&error); }
+            if let Err(error) = self.update_output_refreshes() {
+                self.fail(&error);
+            }
         }
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.release_task_inputs(object);
         self.activation.remove(object);
         let task = self
             .tasks
             .get_mut(&object)
             .ok_or(PresenterError::UnknownTask(object))?;
+        task.resize.cancel();
         let Some(surface) = task.surface().cloned() else {
             return Ok(());
         };
@@ -1130,7 +1543,9 @@ impl App {
                 endpoint.forget_presentation(object, feedback.frame);
             }
         }
-        if let Some(stream)=task.layers.as_mut() { stream.hide(); }
+        if let Some(stream) = task.layers.as_mut() {
+            stream.hide();
+        }
         if let Some(fractional_scale) = task.fractional_scale.take() {
             fractional_scale.destroy();
         }
@@ -1151,6 +1566,8 @@ impl App {
         }
         task.window.take();
         task.unmap_requested = false;
+        self.task_work
+            .mark(object, readiness::CONFIG | readiness::CLEANUP);
 
         if self.focused == Some(object) {
             self.focused = None;
@@ -1168,17 +1585,16 @@ impl App {
     }
 
     fn unmap_requested_tasks(&mut self) -> Result<(), PresenterError> {
-        let requested = self
-            .tasks
-            .iter()
-            .filter_map(|(object, task)| task.unmap_requested.then_some(*object))
-            .collect::<Vec<_>>();
-        for object in requested {
+        while let Some(object) = self.task_work.pop(readiness::UNMAP) {
+            if !self.tasks.contains_key(&object) {
+                continue;
+            }
             self.unmap_task_window(object)?;
-            let finished = self
-                .tasks
-                .get(&object)
-                .is_some_and(|task| task.closing && task.pending.is_empty() && task.layers.as_ref().is_none_or(|s|!s.busy()));
+            let finished = self.tasks.get(&object).is_some_and(|task| {
+                task.closing
+                    && task.pending.is_empty()
+                    && task.layers.as_ref().is_none_or(|s| !s.busy())
+            });
             if finished {
                 self.remove_task(object);
             }
@@ -1187,12 +1603,17 @@ impl App {
     }
 
     fn destroy_task(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.release_task_inputs(object);
         let task = self
             .tasks
             .get_mut(&object)
             .ok_or(PresenterError::UnknownTask(object))?;
         task.closing = true;
         task.unmap_requested = true;
+        self.task_work.mark(
+            object,
+            readiness::UNMAP | readiness::CONFIG | readiness::CLEANUP,
+        );
         Ok(())
     }
 
@@ -1202,21 +1623,87 @@ impl App {
         action: EndpointAction,
     ) -> Result<(), PresenterError> {
         match action {
+            EndpointAction::RequestRenderTargets {
+                object,
+                configure_serial,
+            } => {
+                self.ensure_render_targets(qh, object, configure_serial)?;
+            }
+            EndpointAction::BindInputChannel {
+                generation,
+                wire,
+                socket,
+            } => {
+                if self
+                    .direct_input
+                    .attach(generation, wire, socket)
+                    .map_err(PresenterError::Wayland)?
+                {
+                    self.clear_input_tracking();
+                    eprintln!("Droidloom direct input: connected to InputFlinger, wire ABI {wire}");
+                    if wire == droidloom_input_protocol::LEGACY_PROTOCOL_MAJOR {
+                        eprintln!(
+                            "Droidloom mouse: Android receiver has legacy ABI 7; native mouse requires matching ABI 8 Android and Composer"
+                        );
+                    }
+                }
+            }
+            EndpointAction::BindInputRoute {
+                object,
+                task,
+                display,
+                incarnation,
+            } => {
+                let next = input::Route {
+                    task: task.0,
+                    display,
+                    incarnation,
+                };
+                if self
+                    .tasks
+                    .get(&object)
+                    .and_then(|window| window.input_route)
+                    .is_some_and(|old| old != next)
+                {
+                    self.release_task_inputs(object);
+                }
+                if let Some(window) = self.tasks.get_mut(&object) {
+                    window.input_route = Some(next);
+                }
+            }
             EndpointAction::RequestActivation { object } => {
                 if self.focused != Some(object)
-                    && let Some(task) = self.tasks.get(&object).filter(|task| task.accepts_present()) {
+                    && let Some(task) = self
+                        .tasks
+                        .get(&object)
+                        .filter(|task| task.accepts_present())
+                {
                     self.activation.request(qh, object, &task.package);
                 }
             }
-            EndpointAction::BindLayerStream { object, sockets } => self.bind_layers(object, sockets)?,
-            EndpointAction::ClientReady
-            | EndpointAction::TimelinesBound { .. }
+            EndpointAction::BindLayerStream { object, sockets } => {
+                self.bind_layers(object, sockets)?
+            }
+            EndpointAction::ClientReady => {
+                if self
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(DenialEndpoint::lazy_render_targets)
+                {
+                    eprintln!("Droidloom graphics: fallback targets allocated on demand");
+                }
+                self.pump_direct_input()?;
+                self.publish_display_power()?;
+            }
+            EndpointAction::TimelinesBound { .. }
             | EndpointAction::ConfigureAcknowledged { .. }
             | EndpointAction::SupersededPresentDiscarded { .. }
             | EndpointAction::Pong { .. }
             | EndpointAction::SetFrameRate { .. } => {}
             EndpointAction::SetContentState { object, flags } => {
-                self.tasks.get_mut(&object).ok_or(PresenterError::UnknownTask(object))?
+                self.tasks
+                    .get_mut(&object)
+                    .ok_or(PresenterError::UnknownTask(object))?
                     .content_opaque = flags & droidloom_denial_protocol::content_state::OPAQUE != 0;
             }
             EndpointAction::BindTask { object, task } => {
@@ -1263,7 +1750,10 @@ impl App {
             Ok(endpoint) => {
                 let endpoint = if self.activation.supported() {
                     endpoint.with_activation_requests()
-                } else { endpoint };
+                } else {
+                    endpoint
+                };
+                let endpoint = endpoint.with_direct_input().with_lazy_render_targets();
                 endpoint.socket().socket().set_nonblocking(true)?;
                 self.endpoint = Some(endpoint);
             }
@@ -1296,23 +1786,43 @@ impl App {
         self.activation.clear();
         self.text_input.disconnect();
         self.endpoint = None;
+        self.direct_input.disconnect();
+        self.clear_input_tracking();
+        self.published_display_power = None;
         for object in self.tasks.keys().copied().collect::<Vec<_>>() {
             self.remove_task(object);
         }
         self.focused = None;
         self.pointer_contact = None;
         self.touch_contacts.clear();
+        for tool in &mut self.tablet_tools {
+            tool.is_down = false;
+            tool.native_entered = false;
+            tool.buttons = 0;
+            tool.dirty_buttons = false;
+            tool.surface = None;
+        }
     }
 
     fn send_input(
         &mut self,
         object: TaskObjectId,
         event: InputEvent,
-    ) -> Result<(), PresenterError> {
+    ) -> Result<bool, PresenterError> {
         static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if self.clipboard.blocked() && self.clipboard_inputs.len() < 512 {
+        let direct = self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input);
+        // Native key/touch/mouse/pen records share one connection-owned FIFO.
+        self.direct_input.set_blocked(self.clipboard.blocked());
+        if !direct && self.clipboard.blocked() {
+            if self.clipboard_inputs.len() >= 512 {
+                self.disconnect_endpoint();
+                return Ok(false);
+            }
             self.clipboard_inputs.push_back((object, event));
-            return Ok(());
+            return Ok(true);
         }
         self.next_input_serial = self
             .next_input_serial
@@ -1321,22 +1831,363 @@ impl App {
         let timestamp = monotonic_timestamp_nanos()?;
         if *KEY_TRACE.get_or_init(|| {
             env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        })
-            && let InputEvent::Key {
-                action,
-                keycode,
-                repeat,
-            } = &event
+        }) && let InputEvent::Key {
+            action,
+            keycode,
+            repeat,
+        } = &event
         {
             eprintln!(
                 "Droidloom key trace: stage=wayland serial={} object={} action={action:?} scan_code={keycode} repeat={repeat}",
                 self.next_input_serial, object.0
             );
         }
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input)
+        {
+            let window = self
+                .tasks
+                .get(&object)
+                .ok_or(PresenterError::UnknownTask(object))?;
+            if window.closing {
+                return Ok(false);
+            }
+            let Some(route) = window.input_route else {
+                // The task binding and native route arrive in ordered records,
+                // but Wayland may dispatch input between their receipt.
+                return Ok(false);
+            };
+            if let Err(error) = self.direct_input.send(
+                route,
+                (window.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR),
+                self.next_input_serial,
+                timestamp,
+                event,
+            ) {
+                // The native receiver cancels held input on EOF. Recover this
+                // connection without taking down unrelated app windows.
+                eprintln!("Droidloom direct input: {error}");
+                self.direct_input.disconnect();
+                self.clear_input_tracking();
+                return Ok(false);
+            }
+            return Ok(true);
+        }
         self.endpoint
             .as_ref()
             .ok_or(PresenterError::Configuration("endpoint is absent"))?
             .send_input(object, self.next_input_serial, timestamp, event)?;
+        Ok(true)
+    }
+
+    /// Cancel every tracked touch for a task and keep the local contacts until
+    /// Android has accepted the cancellation. A native touch's original route
+    /// remains usable even if the Wayland task route is being rebound.
+    fn cancel_task_touch_contacts(&mut self, object: TaskObjectId) -> Result<bool, String> {
+        let contacts = self
+            .touch_contacts
+            .values()
+            .filter(|contact| contact.object == object)
+            .copied()
+            .collect::<Vec<_>>();
+        if contacts.is_empty() {
+            return Ok(true);
+        }
+
+        let direct = self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input);
+        if direct {
+            let timestamp = monotonic_timestamp_nanos().map_err(|error| error.to_string())?;
+            for contact in contacts {
+                if let Err(error) =
+                    self.direct_input
+                        .cancel_task_pointer(object.0, contact.pointer_id, timestamp)
+                {
+                    self.direct_input.disconnect();
+                    self.clear_input_tracking();
+                    return Err(error);
+                }
+            }
+            self.touch_contacts
+                .retain(|_, contact| contact.object != object);
+            return Ok(true);
+        }
+
+        let contact = contacts[0];
+        match self.send_input(object, contact.event(TouchAction::Cancel)) {
+            Ok(true) => {
+                self.touch_contacts
+                    .retain(|_, contact| contact.object != object);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn clear_input_tracking(&mut self) {
+        self.clipboard_inputs.clear();
+        self.abandon_gestures();
+        self.clear_control_presses();
+        self.end_capture();
+        self.pressed_keys.clear();
+        if let Some(contact) = self.pointer_contact.take() {
+            let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+        }
+        let contacts = std::mem::take(&mut self.touch_contacts);
+        for (_, contact) in contacts {
+            let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+        }
+        self.mouse_focus = None;
+        self.mouse_buttons = 0;
+        for tool in &mut self.tablet_tools {
+            tool.is_down = false;
+            tool.native_entered = false;
+            tool.buttons = 0;
+            tool.dirty_buttons = false;
+            tool.pending_down = false;
+            tool.pending_up = false;
+            tool.pending_proximity_out = false;
+            tool.dirty_motion = false;
+        }
+    }
+
+    fn release_task_inputs(&mut self, object: TaskObjectId) {
+        let pad_ids = self
+            .tablet_pads
+            .iter()
+            .filter_map(|(id, pad)| (pad.focus == Some(object)).then_some(*id))
+            .collect::<Vec<_>>();
+        for pad_id in pad_ids {
+            self.release_pad_buttons(pad_id);
+        }
+        self.clipboard_inputs.retain(|(owner, _)| *owner != object);
+        self.abandon_gestures();
+        self.clear_control_presses();
+        if self
+            .immersion
+            .as_ref()
+            .is_some_and(|capture| capture.object == object)
+        {
+            self.end_capture();
+        }
+        // Discard deferred presses before queuing releases to this old route.
+        if let Some(route) = self.tasks.get(&object).and_then(|task| task.input_route) {
+            if let Ok(now) = monotonic_timestamp_nanos() {
+                if let Err(error) = self.direct_input.cancel_route(route, now) {
+                    eprintln!("Droidloom input route cancellation: {error}");
+                    self.direct_input.disconnect();
+                    self.clear_input_tracking();
+                }
+            }
+        }
+        for keycode in self.pressed_keys.take_task(object) {
+            let _ = self.send_input(
+                object,
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode,
+                    repeat: 0,
+                },
+            );
+        }
+        if self.mouse_focus == Some(object) {
+            let _ = self.send_mouse(
+                object,
+                input::MouseAction::Cancel,
+                self.mouse_position,
+                0,
+                (0, 0),
+            );
+            self.mouse_focus = None;
+            self.mouse_buttons = 0;
+        }
+        self.pointer_contact = self
+            .pointer_contact
+            .filter(|contact| contact.object != object);
+        self.touch_contacts
+            .retain(|_, contact| contact.object != object);
+        if let Some(task) = self.tasks.get(&object) {
+            for tool in &mut self.tablet_tools {
+                if tool
+                    .surface
+                    .as_ref()
+                    .is_some_and(|s| task.contains_surface(s))
+                {
+                    tool.is_down = false;
+                    tool.native_entered = false;
+                    tool.buttons = 0;
+                    tool.dirty_buttons = false;
+                    tool.surface = None;
+                    tool.pending_down = false;
+                    tool.pending_up = false;
+                    tool.pending_proximity_out = false;
+                    tool.dirty_motion = false;
+                }
+            }
+        }
+    }
+
+    fn surface_position(
+        &self,
+        object: TaskObjectId,
+        surface: &wl_surface::WlSurface,
+        position: (f64, f64),
+    ) -> (f64, f64) {
+        let offset = self
+            .tasks
+            .get(&object)
+            .and_then(|task| task.surface_offset(surface))
+            .unwrap_or((0.0, 0.0));
+        (position.0 + offset.0, position.1 + offset.1)
+    }
+
+    fn send_mouse(
+        &mut self,
+        object: TaskObjectId,
+        action: input::MouseAction,
+        position: (f64, f64),
+        button: u32,
+        scroll: (i16, i16),
+    ) -> Result<(), PresenterError> {
+        if !self.direct_input.supports_mouse() {
+            return Ok(());
+        }
+        let Some(window) = self.tasks.get(&object).filter(|window| !window.closing) else {
+            return Ok(());
+        };
+        let Some(route) = window.input_route else {
+            return Ok(());
+        };
+        let scale = (window.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR);
+        let fixed = self.fixed_position(object, position);
+        self.direct_input.set_blocked(self.clipboard.blocked());
+        if let Err(error) = self.direct_input.send_mouse(
+            route,
+            scale,
+            monotonic_timestamp_nanos()?,
+            action,
+            button,
+            fixed,
+            scroll,
+        ) {
+            eprintln!("Droidloom native mouse: {error}");
+            self.direct_input.disconnect();
+            self.clear_input_tracking();
+        }
+        Ok(())
+    }
+
+    fn route_mouse(&mut self, event: &PointerEvent) {
+        use input::MouseAction;
+        let object = self.task_for_surface(&event.surface);
+        let Some(target) = self.mouse_focus.or(object) else {
+            return;
+        };
+        let position = self.surface_position(target, &event.surface, event.position);
+        self.mouse_position = position;
+        let result = match event.kind {
+            PointerEventKind::Enter { .. } => {
+                if let Some(previous) = self
+                    .mouse_focus
+                    .filter(|previous| Some(*previous) != object)
+                {
+                    let _ = self.send_mouse(
+                        previous,
+                        MouseAction::Leave,
+                        self.mouse_position,
+                        0,
+                        (0, 0),
+                    );
+                    self.mouse_buttons = 0;
+                }
+                self.mouse_focus = object;
+                if let Some(object) = object {
+                    self.send_mouse(
+                        object,
+                        MouseAction::Enter,
+                        self.surface_position(object, &event.surface, event.position),
+                        0,
+                        (0, 0),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            PointerEventKind::Leave { .. } => {
+                if object.is_some_and(|object| object != target) {
+                    return;
+                }
+                self.mouse_focus = None;
+                self.mouse_buttons = 0;
+                self.send_mouse(target, MouseAction::Leave, position, 0, (0, 0))
+            }
+            PointerEventKind::Motion { .. } => {
+                self.mouse_focus = Some(target);
+                self.send_mouse(target, MouseAction::Motion, position, 0, (0, 0))
+            }
+            PointerEventKind::Press { button, .. } => {
+                let Some(mask) = droidloom_input_protocol::mouse_button(button) else {
+                    return;
+                };
+                if self.mouse_buttons & mask != 0 {
+                    let _ = self.send_mouse(target, MouseAction::Cancel, position, 0, (0, 0));
+                    self.mouse_buttons = 0;
+                }
+                self.mouse_focus = Some(target);
+                self.mouse_buttons |= mask;
+                self.text_input.note_touch();
+                self.send_mouse(target, MouseAction::Press, position, button, (0, 0))
+            }
+            PointerEventKind::Release { button, .. } => {
+                let Some(mask) = droidloom_input_protocol::mouse_button(button) else {
+                    return;
+                };
+                if self.mouse_buttons & mask == 0 {
+                    return;
+                }
+                self.mouse_buttons &= !mask;
+                self.send_mouse(target, MouseAction::Release, position, button, (0, 0))
+            }
+            PointerEventKind::Axis {
+                ref horizontal,
+                ref vertical,
+                ..
+            } => {
+                let scroll = (
+                    mouse_scroll(horizontal),
+                    mouse_scroll(vertical).saturating_neg(),
+                );
+                if scroll == (0, 0) {
+                    return;
+                }
+                self.send_mouse(target, MouseAction::Scroll, position, 0, scroll)
+            }
+        };
+        if let Err(error) = result {
+            self.fail(&error);
+        }
+    }
+
+    fn pump_direct_input(&mut self) -> Result<(), PresenterError> {
+        self.direct_input.set_blocked(self.clipboard.blocked());
+        if let Err(error) = self.direct_input.flush() {
+            eprintln!("Droidloom input: {error}");
+            self.clear_input_tracking();
+        }
+        if let Some(endpoint) = self
+            .endpoint
+            .as_ref()
+            .filter(|endpoint| endpoint.direct_input())
+        {
+            if let Some(generation) = self.direct_input.next_request() {
+                endpoint.request_input_channel(generation)?;
+            }
+        }
         Ok(())
     }
 
@@ -1362,11 +2213,32 @@ impl App {
         if self.focused == object {
             return Ok(());
         }
+        if self
+            .immersion
+            .as_ref()
+            .is_some_and(|capture| Some(capture.object) != object)
+        {
+            self.end_capture();
+        }
+        if let Some(previous) = self.focused {
+            for keycode in self.pressed_keys.take_task(previous) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode,
+                        repeat: 0,
+                    },
+                );
+            }
+        }
         if let Some(previous) = self.focused
             && let Some(task) = self.tasks.get_mut(&previous)
         {
             task.focused = false;
-            if let Some(endpoint) = self.endpoint.as_ref() {
+            if !task.closing
+                && let Some(endpoint) = self.endpoint.as_ref()
+            {
                 endpoint.send_visibility(previous, Visibility::Visible, false)?;
             }
         }
@@ -1375,8 +2247,10 @@ impl App {
         if let Some(object) = object
             && let Some(task) = self.tasks.get_mut(&object)
         {
-            task.focused = true;
-            if let Some(endpoint) = self.endpoint.as_ref() {
+            task.focused = !task.closing;
+            if !task.closing
+                && let Some(endpoint) = self.endpoint.as_ref()
+            {
                 endpoint.send_visibility(object, Visibility::Visible, true)?;
             }
         }
@@ -1412,7 +2286,12 @@ impl CompositorHandler for App {
         surface: &wl_surface::WlSurface,
         _new_factor: i32,
     ) {
-        surface.set_buffer_scale(1);
+        apply_content_buffer_scale(
+            surface,
+            self.tasks
+                .values()
+                .any(|task| task.contains_surface(surface)),
+        );
     }
 
     fn transform_changed(
@@ -1434,24 +2313,42 @@ impl CompositorHandler for App {
     }
 
     fn surface_enter(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        surface: &wl_surface::WlSurface, output: &wl_output::WlOutput,
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        output: &wl_output::WlOutput,
     ) {
-        let Some(object) = self.task_for_surface(surface) else { return; };
+        let Some(object) = self.task_for_surface(surface) else {
+            return;
+        };
         let task = self.tasks.get_mut(&object).expect("surface has a task");
-        if !task.entered_outputs.contains(output) { task.entered_outputs.push(output.clone()); }
-        if let Err(error) = self.update_task_refresh(object) { self.fail(&error); }
+        if !task.entered_outputs.contains(output) {
+            task.entered_outputs.push(output.clone());
+        }
+        if let Err(error) = self.update_task_refresh(object) {
+            self.fail(&error);
+        }
     }
 
     fn surface_leave(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        surface: &wl_surface::WlSurface, output: &wl_output::WlOutput,
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        output: &wl_output::WlOutput,
     ) {
-        let Some(object) = self.task_for_surface(surface) else { return; };
+        let Some(object) = self.task_for_surface(surface) else {
+            return;
+        };
         let task = self.tasks.get_mut(&object).expect("surface has a task");
         task.entered_outputs.retain(|entered| entered != output);
-        if task.presentation_output.as_ref() == Some(output) { task.presentation_output = None; }
-        if let Err(error) = self.update_task_refresh(object) { self.fail(&error); }
+        if task.presentation_output.as_ref() == Some(output) {
+            task.presentation_output = None;
+        }
+        if let Err(error) = self.update_task_refresh(object) {
+            self.fail(&error);
+        }
     }
 }
 
@@ -1462,7 +2359,7 @@ impl Dispatch<WpFractionalScaleV1, TaskObjectId> for App {
         event: wp_fractional_scale_v1::Event,
         object: &TaskObjectId,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
     ) {
         let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
             return;
@@ -1474,18 +2371,8 @@ impl Dispatch<WpFractionalScaleV1, TaskObjectId> for App {
         let Some(task) = state.tasks.get_mut(object) else {
             return;
         };
-        if task.preferred_scale_120 == scale {
-            return;
-        }
-        task.preferred_scale_120 = scale;
-        let Some((width, height)) = task.logical_size else {
-            // Scale is part of resolving the first buffer extent. Do not
-            // allocate an observable provisional target before XDG configures
-            // the logical window.
-            return;
-        };
-        if let Err(error) = state.configure_task(qh, *object, width, height) {
-            state.fail(&error);
+        if task.accepts_present() && task.resize.preferred_scale(scale, task.logical_size) {
+            state.task_work.mark(*object, readiness::RESIZE);
         }
     }
 }
@@ -1505,6 +2392,8 @@ impl WindowHandler for App {
                 Ok(()) => {
                     if let Some(task) = self.tasks.get_mut(&object) {
                         task.unmap_requested = true;
+                        self.task_work
+                            .mark(object, readiness::UNMAP | readiness::CONFIG);
                     }
                 }
                 Err(error) => self.fail(&error),
@@ -1515,7 +2404,7 @@ impl WindowHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         window: &Window,
         configure: WindowConfigure,
         _serial: u32,
@@ -1529,10 +2418,12 @@ impl WindowHandler for App {
         let Some(object) = object else {
             return;
         };
-        let (package, previous, headless) = self.tasks.get(&object).map_or_else(
-            || (String::new(), None, false),
-            |task| (task.package.clone(), task.logical_size, task.headless()),
-        );
+        let task = self.tasks.get(&object).expect("surface has a task");
+        if !task.accepts_present() {
+            return;
+        }
+        let package = task.package.clone();
+        let previous = task.resize.logical_size(task.logical_size);
         let requested_width = configure.new_size.0.map(NonZeroU32::get);
         let requested_height = configure.new_size.1.map(NonZeroU32::get);
         let size = previous.map_or_else(
@@ -1548,23 +2439,25 @@ impl WindowHandler for App {
                     self.host_logical_canvas_size(),
                 )
             },
-            |(width, height)| LogicalSize {
-                width: requested_width.unwrap_or(width),
-                height: requested_height.unwrap_or(height),
+            |previous| LogicalSize {
+                width: requested_width.unwrap_or(previous.width),
+                height: requested_height.unwrap_or(previous.height),
             },
         );
-        if let Err(error) = self.configure_task(qh, object, size.width, size.height) {
-            self.fail(&error);
-        } else if !headless
-            && previous.is_some()
+        let remember = previous.is_some()
             && !configure.is_resizing()
             && !configure.is_maximized()
-            && !configure.is_fullscreen()
-            && let Err(error) = self.window_policy.remember(&package, size)
-        {
-            // Persistence failure is non-fatal to an otherwise valid frame.
-            eprintln!("Droidloom could not remember {package} window size: {error}");
-        }
+            && !configure.is_fullscreen();
+        self.tasks
+            .get_mut(&object)
+            .expect("surface has a task")
+            .fullscreen = configure.is_fullscreen();
+        self.tasks
+            .get_mut(&object)
+            .expect("surface has a task")
+            .resize
+            .configure(size, remember);
+        self.task_work.mark(object, readiness::RESIZE);
     }
 }
 
@@ -1599,8 +2492,7 @@ impl DmabufHandler for App {
         _qh: &QueueHandle<Self>,
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
     ) {
-        if self.layer_imported(params, None) { return; }
-        self.fail(&"compositor rejected a DMA-BUF import");
+        self.layer_imported(params, None);
     }
 
     fn released(
@@ -1621,9 +2513,20 @@ impl OutputHandler for App {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
-        if let Err(error) = self.reconfigure_bootstrap(qh).and_then(|()| self.update_output_refreshes()) {
+        let control = self
+            .output_power_manager
+            .get_output_power(&output, qh, output.clone());
+        self.output_power.push(OutputPowerState {
+            output,
+            control,
+            powered: None,
+        });
+        if let Err(error) = self
+            .reconfigure_bootstrap(qh)
+            .and_then(|()| self.update_output_refreshes())
+        {
             self.fail(&error);
         }
     }
@@ -1634,7 +2537,10 @@ impl OutputHandler for App {
         qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        if let Err(error) = self.reconfigure_bootstrap(qh).and_then(|()| self.update_output_refreshes()) {
+        if let Err(error) = self
+            .reconfigure_bootstrap(qh)
+            .and_then(|()| self.update_output_refreshes())
+        {
             self.fail(&error);
         }
     }
@@ -1645,12 +2551,68 @@ impl OutputHandler for App {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
+        self.output_power.retain(|state| {
+            if state.output == output {
+                state.control.destroy();
+                false
+            } else {
+                true
+            }
+        });
+        if let Err(error) = self.recompute_display_power() {
+            self.fail(&error);
+        }
         for task in self.tasks.values_mut() {
             task.entered_outputs.retain(|entered| entered != &output);
-            if task.presentation_output.as_ref() == Some(&output) { task.presentation_output = None; }
+            if task.presentation_output.as_ref() == Some(&output) {
+                task.presentation_output = None;
+            }
         }
-        if let Err(error) = self.reconfigure_bootstrap(qh).and_then(|()| self.update_output_refreshes()) {
+        if let Err(error) = self
+            .reconfigure_bootstrap(qh)
+            .and_then(|()| self.update_output_refreshes())
+        {
             self.fail(&error);
+        }
+    }
+}
+
+impl Dispatch<ZwlrOutputPowerV1, wl_output::WlOutput> for App {
+    fn event(
+        state: &mut Self,
+        control: &ZwlrOutputPowerV1,
+        event: zwlr_output_power_v1::Event,
+        _output: &wl_output::WlOutput,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_output_power_v1::Event::Mode {
+                mode: WEnum::Value(mode),
+            } => {
+                let powered = match mode {
+                    zwlr_output_power_v1::Mode::On => true,
+                    zwlr_output_power_v1::Mode::Off => false,
+                    _ => return,
+                };
+                if let Some(output) = state
+                    .output_power
+                    .iter_mut()
+                    .find(|output| output.control == *control)
+                {
+                    output.powered = Some(powered);
+                }
+                if let Err(error) = state.recompute_display_power() {
+                    state.fail(&error);
+                }
+            }
+            zwlr_output_power_v1::Event::Mode {
+                mode: WEnum::Unknown(_),
+            }
+            | zwlr_output_power_v1::Event::Failed => {
+                state.fail(&"compositor output-power state became unavailable");
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -1676,9 +2638,15 @@ impl PresentationTimeHandler for App {
             return;
         };
         let task = self.tasks.get_mut(&object).expect("surface has a task");
+        if task.closing {
+            return;
+        }
         // Presentation feedback identifies the timing output for overlapping
         // surfaces. Ignore late feedback from an output already left.
-        if let Some(output) = outputs.into_iter().find(|output| task.entered_outputs.contains(output)) {
+        if let Some(output) = outputs
+            .into_iter()
+            .find(|output| task.entered_outputs.contains(output))
+        {
             if task.presentation_output.as_ref() != Some(&output) {
                 task.presentation_output = Some(output);
                 if let Err(error) = self.update_task_refresh(object) {
@@ -1712,13 +2680,26 @@ impl PresentationTimeHandler for App {
             let timestamp_nanos = presentation_timestamp_nanos(time.tv_sec, time.tv_nsec)?;
             let task = self.tasks.get_mut(&object).expect("task was just checked");
             if droidloom_syncobj::frame_trace::sampled(frame.0) {
-                droidloom_syncobj::frame_trace::event("presented", object.0, frame.0,
-                    completed.buffer.0, &[("display_ns", timestamp_nanos),
-                        ("refresh_ns", u64::from(refresh)), ("display_sequence", sequence)]);
+                droidloom_syncobj::frame_trace::event(
+                    "presented",
+                    object.0,
+                    frame.0,
+                    completed.buffer.0,
+                    &[
+                        ("display_ns", timestamp_nanos),
+                        ("refresh_ns", u64::from(refresh)),
+                        ("display_sequence", sequence),
+                    ],
+                );
             }
             if let Some(audit) = task.presentation_audit.as_mut() {
-                audit.presented(object.0, completed.submitted_nanos, timestamp_nanos,
-                    monotonic_timestamp_nanos()?, task.pending.len());
+                audit.presented(
+                    object.0,
+                    completed.submitted_nanos,
+                    timestamp_nanos,
+                    monotonic_timestamp_nanos()?,
+                    task.pending.len(),
+                );
             }
             let refresh_period_nanos = presentation_refresh_period(refresh, advertised_refresh)?;
             let protocol_flags = if matches!(
@@ -1768,8 +2749,13 @@ impl PresentationTimeHandler for App {
             let completed = task.presentation_feedback.swap_remove(index);
             let frame = completed.frame;
             if droidloom_syncobj::frame_trace::sampled(frame.0) {
-                droidloom_syncobj::frame_trace::event("discarded", object.0, frame.0,
-                    completed.buffer.0, &[]);
+                droidloom_syncobj::frame_trace::event(
+                    "discarded",
+                    object.0,
+                    frame.0,
+                    completed.buffer.0,
+                    &[],
+                );
             }
             if let Some(endpoint) = self.endpoint.as_mut() {
                 endpoint.forget_presentation(object, frame);
@@ -1783,7 +2769,9 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.bind_tablet_seat(seat, qh);
+    }
 
     fn new_capability(
         &mut self,
@@ -1803,11 +2791,20 @@ impl SeatHandler for App {
             Capability::Keyboard if self.keyboard.is_none() => self
                 .seat_state
                 .get_keyboard(qh, &seat, None)
-                .map(|keyboard| self.keyboard = Some(keyboard))
+                .map(|keyboard| {
+                    self.keyboard = Some(keyboard);
+                    self.keyboard_seat = Some(seat.clone());
+                })
                 .map_err(|error| error.to_string()),
             Capability::Pointer if self.pointer.is_none() => self
                 .seat_state
-                .get_pointer(qh, &seat)
+                .get_pointer_with_theme(
+                    qh,
+                    &seat,
+                    &self.layer_globals.shm,
+                    self.compositor.create_surface(qh),
+                    ThemeSpec::default(),
+                )
                 .map(|pointer| self.pointer = Some(pointer))
                 .map_err(|error| error.to_string()),
             Capability::Touch if self.touch.is_none() => self
@@ -1831,14 +2828,39 @@ impl SeatHandler for App {
     ) {
         match capability {
             Capability::Keyboard => {
+                if let Err(error) = self.set_focus(None) {
+                    self.fail(&error);
+                }
                 self.keyboard = None;
+                self.keyboard_seat = None;
                 self.text_input.remove_resource();
             }
             Capability::Pointer => {
+                self.end_capture();
+                if let Some(object) = self.mouse_focus {
+                    let _ = self.send_mouse(
+                        object,
+                        input::MouseAction::Cancel,
+                        self.mouse_position,
+                        0,
+                        (0, 0),
+                    );
+                }
+                if let Some(contact) = self.pointer_contact.take() {
+                    let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+                }
+                self.mouse_focus = None;
+                self.mouse_buttons = 0;
                 self.pointer = None;
                 self.pointer_contact = None;
             }
             Capability::Touch => {
+                self.abandon_gestures();
+                self.clear_control_presses();
+                let contacts = std::mem::take(&mut self.touch_contacts);
+                for (_, contact) in contacts {
+                    let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
+                }
                 self.touch = None;
                 self.touch_contacts.clear();
             }
@@ -1846,13 +2868,695 @@ impl SeatHandler for App {
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.direct_input.disconnect();
+        self.clear_input_tracking();
+        self.unbind_tablet_seat(&seat);
         self.text_input.remove_resource();
         self.keyboard = None;
+        self.keyboard_seat = None;
         self.pointer = None;
         self.touch = None;
         self.pointer_contact = None;
         self.touch_contacts.clear();
+    }
+}
+
+impl App {
+    fn bind_tablet_seat(&mut self, seat: wl_seat::WlSeat, qh: &QueueHandle<Self>) {
+        if self.tablet_manager.is_none()
+            || self
+                .tablet_seats
+                .iter()
+                .any(|(existing, _)| *existing == seat)
+        {
+            return;
+        }
+        tablet_trace!("Droidloom tablet: binding tablet seat for {:?}", seat.id());
+        let tablet_seat = self
+            .tablet_manager
+            .as_ref()
+            .unwrap()
+            .get_tablet_seat(&seat, qh, ());
+        self.tablet_seats.push((seat, tablet_seat));
+    }
+
+    fn unbind_tablet_seat(&mut self, seat: &wl_seat::WlSeat) {
+        if let Some(pos) = self.tablet_seats.iter().position(|(s, _)| s == seat) {
+            let (_, proxy) = self.tablet_seats.remove(pos);
+            let seat_id = proxy.id().protocol_id();
+            let pad_ids = self
+                .tablet_pads
+                .iter()
+                .filter_map(|(id, pad)| (pad.tablet_seat_id == seat_id).then_some(*id))
+                .collect::<Vec<_>>();
+            for pad_id in pad_ids {
+                self.release_pad_buttons(pad_id);
+                self.destroy_tablet_pad(pad_id);
+            }
+            proxy.destroy();
+        }
+    }
+
+    fn pad_button(&mut self, pad_id: u32, button: u32, pressed: bool) {
+        if button >= PAD_BUTTON_COUNT {
+            return;
+        }
+        let Some(pad) = self.tablet_pads.get_mut(&pad_id) else {
+            return;
+        };
+        let target = pad.focus.or(self.focused);
+        let Some(object) = target else { return };
+        let changed = if pressed {
+            pad.pressed.insert(button)
+        } else {
+            pad.pressed.remove(&button)
+        };
+        if !changed {
+            return;
+        }
+        if pressed {
+            pad.focus = Some(object);
+        }
+        tablet_trace!(
+            "Droidloom tablet trace: stage=pad-button pad={pad_id} button={button} pressed={pressed} task={}",
+            object.0
+        );
+        if let Err(error) = self.send_input(
+            object,
+            InputEvent::Key {
+                action: if pressed {
+                    KeyAction::Down
+                } else {
+                    KeyAction::Up
+                },
+                keycode: PAD_BUTTON_BASE + button,
+                repeat: 0,
+            },
+        ) {
+            self.fail(&error);
+        }
+    }
+
+    fn release_pad_buttons(&mut self, pad_id: u32) {
+        let Some(pad) = self.tablet_pads.get(&pad_id) else {
+            return;
+        };
+        for button in pad.pressed.iter().copied().collect::<Vec<_>>() {
+            self.pad_button(pad_id, button, false);
+        }
+        if let Some(pad) = self.tablet_pads.get_mut(&pad_id) {
+            pad.focus = None;
+        }
+    }
+
+    fn destroy_tablet_pad(&mut self, pad_id: u32) {
+        if let Some(pad) = self.tablet_pads.remove(&pad_id) {
+            for child in pad.children.into_iter().rev() {
+                child.destroy();
+            }
+            pad.proxy.destroy();
+        }
+        self.tablet_pad_groups.retain(|_, owner| *owner != pad_id);
+    }
+
+    fn tablet_tool_mut(&mut self, tool_id: u32) -> &mut TabletToolState {
+        if let Some(index) = self.tablet_tools.iter().position(|t| t.tool_id == tool_id) {
+            &mut self.tablet_tools[index]
+        } else {
+            self.tablet_tools.push(TabletToolState::new(tool_id));
+            self.tablet_tools.last_mut().unwrap()
+        }
+    }
+
+    fn cancel_tablet_tool(&mut self, tool_id: u32) {
+        if self.direct_input.supports_mouse() {
+            let _ = self.send_native_pen(tool_id, 5);
+        }
+        let (surface, is_down) = {
+            let Some(tool) = self.tablet_tools.iter_mut().find(|t| t.tool_id == tool_id) else {
+                return;
+            };
+            let surface = tool.surface.take();
+            let is_down = std::mem::replace(&mut tool.is_down, false);
+            (surface, is_down)
+        };
+        if is_down
+            && !self.direct_input.supports_mouse()
+            && let Some(surface) = surface
+            && let Some(object) = self.task_for_surface(&surface)
+        {
+            tablet_trace!("Droidloom tablet: cancel_tablet_tool {tool_id} on {object:?}");
+            let pointer_id = 0x8000_0000 | tool_id;
+            let _ = self.send_input(
+                object,
+                InputEvent::Touch {
+                    action: TouchAction::Cancel,
+                    pointer_id,
+                    x_fixed: 0,
+                    y_fixed: 0,
+                    pressure: 0,
+                },
+            );
+        }
+    }
+
+    fn flush_tablet_tool(&mut self, tool_id: u32) {
+        if !self.tablet_tool_mut(tool_id).supported {
+            return;
+        }
+        if self.direct_input.supports_mouse() {
+            self.flush_native_pen(tool_id);
+            return;
+        }
+        let tool = self.tablet_tool_mut(tool_id);
+        let pending_down = std::mem::take(&mut tool.pending_down);
+        let pending_up = std::mem::take(&mut tool.pending_up);
+        let pending_out = std::mem::take(&mut tool.pending_proximity_out);
+        let dirty_motion = std::mem::take(&mut tool.dirty_motion);
+        let x = tool.x;
+        let y = tool.y;
+        let pressure = tool.pressure;
+        let surface = tool.surface.clone();
+
+        let pointer_id = 0x8000_0000 | tool_id;
+
+        if pending_down {
+            if self.tablet_tool_mut(tool_id).is_down {
+                if let Some(surface) = &surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    let offset = self
+                        .tasks
+                        .get(&object)
+                        .and_then(|t| t.surface_offset(surface))
+                        .unwrap_or((0.0, 0.0));
+                    let (x_fixed, y_fixed) =
+                        self.fixed_position(object, (x + offset.0, y + offset.1));
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Up,
+                            pointer_id,
+                            x_fixed,
+                            y_fixed,
+                            pressure: 0,
+                        },
+                    );
+                }
+                self.tablet_tool_mut(tool_id).is_down = false;
+            }
+            if let Some(surface) = &surface
+                && let Some(object) = self.task_for_surface(surface)
+            {
+                self.text_input.note_touch();
+                if self.focused != Some(object) {
+                    let _ = self.set_focus(Some(object));
+                }
+                let offset = self
+                    .tasks
+                    .get(&object)
+                    .and_then(|t| t.surface_offset(surface))
+                    .unwrap_or((0.0, 0.0));
+                let (x_fixed, y_fixed) = self.fixed_position(object, (x + offset.0, y + offset.1));
+                let press = if pressure > 0 { pressure } else { u16::MAX };
+                tablet_trace!(
+                    "Droidloom tablet: send Down to {object:?} (x={x_fixed}, y={y_fixed}, pressure={press})"
+                );
+                match self.send_input(
+                    object,
+                    InputEvent::Touch {
+                        action: TouchAction::Down,
+                        pointer_id,
+                        x_fixed,
+                        y_fixed,
+                        pressure: press,
+                    },
+                ) {
+                    Ok(true) => self.tablet_tool_mut(tool_id).is_down = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("Droidloom tablet: send Down failed: {error}");
+                        self.fail(&error);
+                    }
+                }
+            } else {
+                tablet_trace!(
+                    "Droidloom tablet: pending_down but surface {:?} matched no task!",
+                    surface.as_ref().map(|s| s.id())
+                );
+            }
+        }
+
+        if dirty_motion && self.tablet_tool_mut(tool_id).is_down && !pending_up {
+            if let Some(surface) = &surface
+                && let Some(object) = self.task_for_surface(surface)
+            {
+                let offset = self
+                    .tasks
+                    .get(&object)
+                    .and_then(|t| t.surface_offset(surface))
+                    .unwrap_or((0.0, 0.0));
+                let (x_fixed, y_fixed) = self.fixed_position(object, (x + offset.0, y + offset.1));
+                let _ = self.send_input(
+                    object,
+                    InputEvent::Touch {
+                        action: TouchAction::Motion,
+                        pointer_id,
+                        x_fixed,
+                        y_fixed,
+                        pressure,
+                    },
+                );
+            }
+        }
+
+        if pending_up {
+            let was_down = self.tablet_tool_mut(tool_id).is_down;
+            if was_down {
+                if let Some(surface) = &surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    let offset = self
+                        .tasks
+                        .get(&object)
+                        .and_then(|t| t.surface_offset(surface))
+                        .unwrap_or((0.0, 0.0));
+                    let (x_fixed, y_fixed) =
+                        self.fixed_position(object, (x + offset.0, y + offset.1));
+                    tablet_trace!(
+                        "Droidloom tablet: send Up to {object:?} (x={x_fixed}, y={y_fixed})"
+                    );
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Up,
+                            pointer_id,
+                            x_fixed,
+                            y_fixed,
+                            pressure: 0,
+                        },
+                    );
+                }
+                self.tablet_tool_mut(tool_id).is_down = false;
+            }
+        }
+
+        if pending_out {
+            let was_down = self.tablet_tool_mut(tool_id).is_down;
+            if was_down {
+                if let Some(surface) = &surface
+                    && let Some(object) = self.task_for_surface(surface)
+                {
+                    tablet_trace!("Droidloom tablet: send Cancel to {object:?}");
+                    let _ = self.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Cancel,
+                            pointer_id,
+                            x_fixed: 0,
+                            y_fixed: 0,
+                            pressure: 0,
+                        },
+                    );
+                }
+                self.tablet_tool_mut(tool_id).is_down = false;
+            }
+            self.tablet_tool_mut(tool_id).surface = None;
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletManagerV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletManagerV2,
+        _event: tablet::zwp_tablet_manager_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletSeatV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletSeatV2,
+        event: tablet::zwp_tablet_seat_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let seat_id = proxy.id().protocol_id();
+        match &event {
+            tablet::zwp_tablet_seat_v2::Event::TabletAdded { id } => {
+                tablet_trace!("Droidloom tablet: TabletAdded id={:?}", id.id());
+                state
+                    .tablet_proxies
+                    .insert(id.id().protocol_id(), (seat_id, id.clone()));
+            }
+            tablet::zwp_tablet_seat_v2::Event::ToolAdded { id } => {
+                tablet_trace!("Droidloom tablet: ToolAdded id={:?}", id.id());
+                let tool_id = id.id().protocol_id();
+                state.tablet_tool_proxies.insert(tool_id, id.clone());
+            }
+            tablet::zwp_tablet_seat_v2::Event::PadAdded { id } => {
+                let pad_id = id.id().protocol_id();
+                tablet_trace!("Droidloom tablet: PadAdded id={pad_id}");
+                state.tablet_pads.insert(
+                    pad_id,
+                    TabletPadState {
+                        tablet_seat_id: seat_id,
+                        proxy: id.clone(),
+                        children: Vec::new(),
+                        focus: None,
+                        pressed: BTreeSet::new(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletSeatV2,
+        [
+            0 => (ZwpTabletV2, ()),
+            1 => (ZwpTabletToolV2, ()),
+            2 => (ZwpTabletPadV2, ())
+        ]
+    );
+}
+
+impl Dispatch<ZwpTabletToolV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletToolV2,
+        event: tablet::zwp_tablet_tool_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let tool_id = proxy.id().protocol_id();
+        match event {
+            tablet::zwp_tablet_tool_v2::Event::Type { tool_type } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.eraser = matches!(
+                    tool_type,
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::Type::Eraser)
+                );
+                tool.supported = matches!(
+                    tool_type,
+                    WEnum::Value(
+                        tablet::zwp_tablet_tool_v2::Type::Pen
+                            | tablet::zwp_tablet_tool_v2::Type::Eraser
+                            | tablet::zwp_tablet_tool_v2::Type::Brush
+                            | tablet::zwp_tablet_tool_v2::Type::Pencil
+                            | tablet::zwp_tablet_tool_v2::Type::Airbrush
+                    )
+                );
+            }
+            tablet::zwp_tablet_tool_v2::Event::Tilt { tilt_x, tilt_y } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.tilt = (tilt_degrees(tilt_x), tilt_degrees(tilt_y));
+                tool.dirty_motion = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+                state.abandon_gestures();
+                if state.direct_input.supports_mouse() {
+                    state.cancel_tablet_tool(tool_id);
+                }
+                if let Some(object) = state.task_for_surface(&surface)
+                    && let Err(error) = state.cancel_task_touch_contacts(object)
+                {
+                    eprintln!("Droidloom pen proximity touch cancellation: {error}");
+                    state.fail(&error);
+                }
+                let prev_surface = state.tablet_tool_mut(tool_id).surface.take();
+                let was_down = state.tablet_tool_mut(tool_id).is_down;
+                if was_down
+                    && let Some(prev) = prev_surface
+                    && let Some(object) = state.task_for_surface(&prev)
+                {
+                    let pointer_id = 0x8000_0000 | tool_id;
+                    let _ = state.send_input(
+                        object,
+                        InputEvent::Touch {
+                            action: TouchAction::Cancel,
+                            pointer_id,
+                            x_fixed: 0,
+                            y_fixed: 0,
+                            pressure: 0,
+                        },
+                    );
+                }
+                tablet_trace!(
+                    "Droidloom tablet: ProximityIn tool_id={tool_id}, surface={:?}, task={:?}",
+                    surface.id(),
+                    state.task_for_surface(&surface)
+                );
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.is_down = false;
+                tool.surface = Some(surface);
+                tool.pressure = 0;
+                tool.native_entered = false;
+                tool.buttons = 0;
+                tool.tilt = (0, 0);
+                tool.pending_down = false;
+                tool.pending_up = false;
+                tool.pending_proximity_out = false;
+            }
+            tablet::zwp_tablet_tool_v2::Event::ProximityOut => {
+                tablet_trace!("Droidloom tablet: ProximityOut tool_id={tool_id}");
+                state.tablet_tool_mut(tool_id).pending_proximity_out = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Down { .. } => {
+                tablet_trace!("Droidloom tablet: Down tool_id={tool_id}");
+                state.tablet_tool_mut(tool_id).pending_down = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Up => {
+                tablet_trace!("Droidloom tablet: Up tool_id={tool_id}");
+                state.tablet_tool_mut(tool_id).pending_up = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.x = x;
+                tool.y = y;
+                tool.dirty_motion = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                let tool = state.tablet_tool_mut(tool_id);
+                tool.pressure =
+                    u16::try_from(pressure.min(u32::from(u16::MAX))).unwrap_or(u16::MAX);
+                tool.dirty_motion = true;
+            }
+            tablet::zwp_tablet_tool_v2::Event::Button {
+                button,
+                state: button_state,
+                ..
+            } => {
+                if state.direct_input.supports_mouse() && matches!(button, 0x14b | 0x14c) {
+                    let bit = if button == 0x14b { 1 } else { 2 };
+                    let tool = state.tablet_tool_mut(tool_id);
+                    match button_state {
+                        WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                            tool.buttons |= bit
+                        }
+                        WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Released) => {
+                            tool.buttons &= !bit
+                        }
+                        _ => return,
+                    }
+                    tool.dirty_buttons = true;
+                    return;
+                }
+                let action = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                        KeyAction::Down
+                    }
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Released) => {
+                        KeyAction::Up
+                    }
+                    _ => return,
+                };
+                let surface = state
+                    .tablet_tools
+                    .iter()
+                    .find(|t| t.tool_id == tool_id)
+                    .and_then(|t| t.surface.clone());
+                if let Some(surface) = surface
+                    && let Some(object) = state.task_for_surface(&surface)
+                {
+                    tablet_trace!(
+                        "Droidloom tablet: Button tool_id={tool_id}, button={button}, action={action:?}"
+                    );
+                    let _ = state.send_input(
+                        object,
+                        InputEvent::Key {
+                            action,
+                            keycode: button,
+                            repeat: 0,
+                        },
+                    );
+                }
+            }
+            tablet::zwp_tablet_tool_v2::Event::Frame { .. } => {
+                state.flush_tablet_tool(tool_id);
+            }
+            tablet::zwp_tablet_tool_v2::Event::Removed => {
+                tablet_trace!("Droidloom tablet: Removed tool_id={tool_id}");
+                state.cancel_tablet_tool(tool_id);
+                state.tablet_tools.retain(|tool| tool.tool_id != tool_id);
+                state.tablet_tool_proxies.remove(&tool_id);
+                proxy.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletV2,
+        _event: tablet::zwp_tablet_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletPadV2,
+        event: tablet::zwp_tablet_pad_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let pad_id = proxy.id().protocol_id();
+        match event {
+            tablet::zwp_tablet_pad_v2::Event::Group { pad_group } => {
+                let group_id = pad_group.id().protocol_id();
+                state.tablet_pad_groups.insert(group_id, pad_id);
+                if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                    pad.children.push(TabletPadChild::Group(pad_group));
+                }
+            }
+            tablet::zwp_tablet_pad_v2::Event::Enter { surface, .. } => {
+                let object = state.task_for_surface(&surface);
+                if let Some(pad) = state.tablet_pads.get_mut(&pad_id) {
+                    pad.focus = object;
+                }
+            }
+            tablet::zwp_tablet_pad_v2::Event::Leave { .. } => {
+                state.release_pad_buttons(pad_id);
+            }
+            tablet::zwp_tablet_pad_v2::Event::Button {
+                button,
+                state: button_state,
+                ..
+            } => {
+                let pressed = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_pad_v2::ButtonState::Pressed) => true,
+                    WEnum::Value(tablet::zwp_tablet_pad_v2::ButtonState::Released) => false,
+                    _ => return,
+                };
+                state.pad_button(pad_id, button, pressed);
+            }
+            tablet::zwp_tablet_pad_v2::Event::Removed => {
+                state.release_pad_buttons(pad_id);
+                state.destroy_tablet_pad(pad_id);
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletPadV2,
+        [
+            0 => (ZwpTabletPadGroupV2, ())
+        ]
+    );
+}
+
+impl Dispatch<ZwpTabletPadGroupV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpTabletPadGroupV2,
+        event: tablet::zwp_tablet_pad_group_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let group_id = proxy.id().protocol_id();
+        let Some(pad_id) = state.tablet_pad_groups.get(&group_id).copied() else {
+            return;
+        };
+        let child = match event {
+            tablet::zwp_tablet_pad_group_v2::Event::Ring { ring } => {
+                Some(TabletPadChild::Ring(ring))
+            }
+            tablet::zwp_tablet_pad_group_v2::Event::Strip { strip } => {
+                Some(TabletPadChild::Strip(strip))
+            }
+            tablet::zwp_tablet_pad_group_v2::Event::Dial { dial } => {
+                Some(TabletPadChild::Dial(dial))
+            }
+            _ => None,
+        };
+        if let Some(child) = child
+            && let Some(pad) = state.tablet_pads.get_mut(&pad_id)
+        {
+            pad.children.push(child);
+        }
+    }
+
+    wayland_client::event_created_child!(
+        App,
+        ZwpTabletPadGroupV2,
+        [1 => (ZwpTabletPadRingV2, ()), 2 => (ZwpTabletPadStripV2, ()), 6 => (ZwpTabletPadDialV2, ())]
+    );
+}
+
+impl Dispatch<ZwpTabletPadRingV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadRingV2,
+        _event: tablet::zwp_tablet_pad_ring_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadStripV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadStripV2,
+        _event: tablet::zwp_tablet_pad_strip_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTabletPadDialV2, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletPadDialV2,
+        _event: tablet::zwp_tablet_pad_dial_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -1864,7 +3568,7 @@ impl KeyboardHandler for App {
         _keyboard: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
         serial: u32,
-        _raw: &[u32],
+        raw: &[u32],
         _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
     ) {
         self.clipboard.focus(true);
@@ -1872,6 +3576,34 @@ impl KeyboardHandler for App {
         let object = self.task_for_surface(surface);
         if let Err(error) = self.set_focus(object) {
             self.fail(&error);
+        }
+        if let Some(object) = object {
+            // Wayland enter lists physically held keys but does not replay
+            // their presses. Restore only modifiers, never type a held letter.
+            for keycode in raw
+                .iter()
+                .copied()
+                .filter(|key| matches!(key, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126))
+            {
+                if self.pressed_keys.owner(keycode) == Some(object) {
+                    continue;
+                }
+                self.pressed_keys.press(keycode, object);
+                match self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Down,
+                        keycode,
+                        repeat: 0,
+                    },
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.pressed_keys.release(keycode);
+                    }
+                    Err(error) => self.fail(&error),
+                }
+            }
         }
     }
 
@@ -1894,27 +3626,70 @@ impl KeyboardHandler for App {
     fn press_key(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         serial: u32,
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
-        if let Some(data) = _keyboard.data::<smithay_client_toolkit::seat::keyboard::KeyboardData<App>>()
-            && let Some(surface) = self.focused.and_then(|id| self.tasks.get(&id)).and_then(TaskWindow::surface) {
+        if event.raw_code == 87
+            && self.immersion.is_none()
+            && let Some(object) = self.focused
+        {
+            self.control_action(object, chrome::Action::Fullscreen);
+            self.pressed_keys.consume(event.raw_code, object);
+            return;
+        }
+        if immersion::shortcut(event.raw_code, self.modifiers)
+            && let Some(object) = self.focused
+        {
+            self.toggle_capture(qh);
+            if let Some(previous) = self.pressed_keys.consume(event.raw_code, object) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                );
+            }
+            return;
+        }
+        if let Some(data) =
+            _keyboard.data::<smithay_client_toolkit::seat::keyboard::KeyboardData<App>>()
+            && let Some(surface) = self
+                .focused
+                .and_then(|id| self.tasks.get(&id))
+                .and_then(TaskWindow::surface)
+        {
             self.activation.input(serial, data.seat(), surface);
         }
-        if let Some(object) = self.focused
-            && let Err(error) = self.send_input(
+        if let Some(object) = self.focused {
+            if let Some(previous) = self.pressed_keys.press(event.raw_code, object) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                );
+            }
+            match self.send_input(
                 object,
                 InputEvent::Key {
                     action: KeyAction::Down,
                     keycode: event.raw_code,
                     repeat: 0,
                 },
-            )
-        {
-            self.fail(&error);
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.pressed_keys.release(event.raw_code);
+                }
+                Err(error) => self.fail(&error),
+            }
         }
     }
 
@@ -1927,7 +3702,11 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
+        if self.pressed_keys.is_consumed(event.raw_code) {
+            return;
+        }
         if let Some(object) = self.focused
+            && self.pressed_keys.owner(event.raw_code) == Some(object)
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
@@ -1950,7 +3729,7 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
-        if let Some(object) = self.focused
+        if let Some(object) = self.pressed_keys.release(event.raw_code)
             && let Err(error) = self.send_input(
                 object,
                 InputEvent::Key {
@@ -1970,10 +3749,33 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _modifiers: Modifiers,
+        modifiers: Modifiers,
         _raw_modifiers: RawModifiers,
         _layout: u32,
     ) {
+        self.modifiers = modifiers;
+        // Input methods can filter raw modifier transitions while publishing
+        // its effective seat mask. Native Android input needs actual modifier
+        // transitions; preserve a known side and infer left only if absent.
+        // After focus enters, this also clears Ctrl from a stale enter key
+        // array when an input method filtered its release outside that task.
+        if let Some(object) = self.focused {
+            for (keycode, action) in self
+                .pressed_keys
+                .modifiers(object, modifiers.shift, modifiers.ctrl)
+            {
+                match self.send_input(
+                    object,
+                    InputEvent::Key { action, keycode, repeat: 0 },
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.pressed_keys.release(keycode);
+                    }
+                    Err(error) => self.fail(&error),
+                }
+            }
+        }
     }
 
     fn update_repeat_info(
@@ -1995,24 +3797,58 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if self.immersion.is_none()
+                && matches!(
+                    event.kind,
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
+                )
+                && let Some(object) = self.task_for_surface(&event.surface)
+            {
+                let position = self.surface_position(object, &event.surface, event.position);
+                if (0.0..=8.0).contains(&position.1) {
+                    self.reveal_controls(object);
+                }
+            }
+            if self.control_pointer(event) {
+                continue;
+            }
+            if matches!(event.kind, PointerEventKind::Enter { .. }) {
+                if let Some(pointer) = self.pointer.as_ref() {
+                    if let Err(error) = pointer.set_cursor(_conn, CursorIcon::Default) {
+                        eprintln!("Droidloom cursor: {error}");
+                    }
+                }
+            }
             if let PointerEventKind::Press { serial, .. } = event.kind
-                && let Some(data) = _pointer.data::<smithay_client_toolkit::seat::pointer::PointerData>() {
+                && let Some(data) =
+                    _pointer.data::<smithay_client_toolkit::seat::pointer::PointerData>()
+            {
                 self.activation.input(serial, data.seat(), &event.surface);
             }
-            if let PointerEventKind::Press { serial, .. } | PointerEventKind::Release { serial, .. } = event.kind { self.clipboard.serial(serial); }
+            if let PointerEventKind::Press { serial, .. }
+            | PointerEventKind::Release { serial, .. } = event.kind
+            {
+                self.clipboard.serial(serial);
+            }
             let object = self.task_for_surface(&event.surface);
+            if self.direct_input.supports_mouse() {
+                self.route_mouse(event);
+                continue;
+            }
             match event.kind {
                 PointerEventKind::Press { button, .. }
                     if button == LEFT_BUTTON && self.pointer_contact.is_none() =>
                 {
                     let Some(object) = object else { continue };
-                    let (x_fixed, y_fixed) = self.fixed_position(object, event.position);
+                    self.text_input.note_touch();
+                    let position = self.surface_position(object, &event.surface, event.position);
+                    let (x_fixed, y_fixed) = self.fixed_position(object, position);
                     let contact = Contact {
                         object,
                         pointer_id: u32::MAX,
                         position_fixed: (x_fixed, y_fixed),
                     };
-                    if let Err(error) = self.send_input(
+                    match self.send_input(
                         object,
                         InputEvent::Touch {
                             action: TouchAction::Down,
@@ -2022,16 +3858,18 @@ impl PointerHandler for App {
                             pressure: u16::MAX,
                         },
                     ) {
-                        self.fail(&error);
-                    } else {
-                        self.pointer_contact = Some(contact);
+                        Ok(true) => self.pointer_contact = Some(contact),
+                        Ok(false) => {}
+                        Err(error) => self.fail(&error),
                     }
                 }
                 PointerEventKind::Motion { .. } => {
                     let Some(contact) = self.pointer_contact else {
                         continue;
                     };
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, event.position);
+                    let position =
+                        self.surface_position(contact.object, &event.surface, event.position);
+                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, position);
                     if let Err(error) = self.send_input(
                         contact.object,
                         InputEvent::Touch {
@@ -2049,7 +3887,9 @@ impl PointerHandler for App {
                     let Some(contact) = self.pointer_contact.take() else {
                         continue;
                     };
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, event.position);
+                    let position =
+                        self.surface_position(contact.object, &event.surface, event.position);
+                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, position);
                     if let Err(error) = self.send_input(
                         contact.object,
                         InputEvent::Touch {
@@ -2061,6 +3901,11 @@ impl PointerHandler for App {
                         },
                     ) {
                         self.fail(&error);
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    if let Some(contact) = self.pointer_contact.take() {
+                        let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
                     }
                 }
                 _ => {}
@@ -2081,6 +3926,22 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        tablet_trace!(
+            "Droidloom touch trace: stage=down id={id} surface={:?} task={:?} position={position:?}",
+            surface.id(),
+            self.task_for_surface(&surface)
+        );
+        if let Some(hit) = self.control_at(&surface, position) {
+            self.chrome_touches.insert(id, hit);
+            if let Some(chrome) = self
+                .tasks
+                .get_mut(&hit.0)
+                .and_then(|task| task.chrome.as_mut())
+            {
+                chrome.press(hit.1);
+            }
+            return;
+        }
         let Some(object) = self.task_for_surface(&surface) else {
             return;
         };
@@ -2091,16 +3952,20 @@ impl TouchHandler for App {
         if let Some(data) = _touch.data::<smithay_client_toolkit::seat::touch::TouchData>() {
             self.activation.input(_serial, data.seat(), &surface);
         }
+        let position = self.surface_position(object, &surface, position);
+        self.begin_gesture(_qh, object, pointer_id, position, _time);
         let (x_fixed, y_fixed) = self.fixed_position(object, position);
         let contact = Contact {
             object,
             pointer_id,
             position_fixed: (x_fixed, y_fixed),
         };
-        if let Err(error) = self.send_input(object, contact.event(TouchAction::Down)) {
-            self.fail(&error);
-        } else {
-            self.touch_contacts.insert(id, contact);
+        match self.send_input(object, contact.event(TouchAction::Down)) {
+            Ok(true) => {
+                self.touch_contacts.insert(id, contact);
+            }
+            Ok(false) => {}
+            Err(error) => self.fail(&error),
         }
     }
 
@@ -2113,6 +3978,14 @@ impl TouchHandler for App {
         _time: u32,
         id: i32,
     ) {
+        if let Some((object, action)) = self.chrome_touches.remove(&id) {
+            self.clear_control_presses();
+            if self.tasks.get(&object).is_some_and(|task| task.controls_until.is_some()) {
+                self.control_action(object, action);
+            }
+            return;
+        }
+        self.finish_gesture(id);
         let Some(contact) = self.touch_contacts.remove(&id) else {
             return;
         };
@@ -2132,14 +4005,26 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if self.chrome_touches.contains_key(&id) {
+            if !chrome::button_contains(position.0, position.1) {
+                self.chrome_touches.remove(&id);
+                self.clear_control_presses();
+            }
+            return;
+        }
+        if self.motion_gesture(id, position, _time) {
+            return;
+        }
         let Some(mut contact) = self.touch_contacts.get(&id).copied() else {
             return;
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
-        if let Err(error) = self.send_input(contact.object, contact.event(TouchAction::Motion)) {
-            self.fail(&error);
-        } else {
-            self.touch_contacts.insert(id, contact);
+        match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+            Ok(true) => {
+                self.touch_contacts.insert(id, contact);
+            }
+            Ok(false) => {}
+            Err(error) => self.fail(&error),
         }
     }
 
@@ -2165,20 +4050,27 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
-        let contacts = std::mem::take(&mut self.touch_contacts);
-        for (_, contact) in contacts {
-            if let Err(error) = self.send_input(
-                contact.object,
-                InputEvent::Touch {
-                    action: TouchAction::Cancel,
-                    pointer_id: contact.pointer_id,
-                    x_fixed: 0,
-                    y_fixed: 0,
-                    pressure: 0,
-                },
-            ) {
-                self.fail(&error);
-                break;
+        tablet_trace!(
+            "Droidloom touch trace: stage=cancel contacts={}",
+            self.touch_contacts.len()
+        );
+        self.abandon_gestures();
+        self.clear_control_presses();
+        let objects = self
+            .touch_contacts
+            .values()
+            .map(|contact| contact.object)
+            .collect::<std::collections::BTreeSet<_>>();
+        for object in objects {
+            match self.cancel_task_touch_contacts(object) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tablet_trace!(
+                        "Droidloom touch trace: cancel deferred for task={} until its route is ready",
+                        object.0
+                    );
+                }
+                Err(error) => self.fail(&error),
             }
         }
     }
@@ -2210,12 +4102,34 @@ wayland_client::delegate_noop!(App: ignore WpLinuxDrmSyncobjTimelineV1);
 wayland_client::delegate_noop!(App: ignore WpFractionalScaleManagerV1);
 wayland_client::delegate_noop!(App: ignore WpViewporter);
 wayland_client::delegate_noop!(App: ignore WpViewport);
+wayland_client::delegate_noop!(App: ignore ZwlrOutputPowerManagerV1);
+
+fn mouse_scroll(axis: &AxisScroll) -> i16 {
+    let detents = if axis.value120 != 0 {
+        f64::from(axis.value120) / 120.0
+    } else if axis.discrete != 0 {
+        f64::from(axis.discrete)
+    } else {
+        axis.absolute / 10.0
+    };
+    // Preserve high-resolution fractions, including on v5 seats. The caller
+    // reverses only vertical scrolling: Android's positive VSCROLL points up.
+    (detents * 256.0)
+        .round()
+        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
 
 fn main() {
+    eprintln!("DROIDLOOM_DIRECT_INPUT_ABI=1;");
+    eprintln!("DROIDLOOM_HOST_CHANNELS_ABI=1;");
     // SAFETY: the process is still single-threaded. Mesa consumes this optional
     // worker policy after its own full-affinity reset, before executing jobs.
-    if let Some(groups) = droidloom_cpu_placement::initialize(droidloom_cpu_placement::Role::Graphics) {
-        unsafe { env::set_var("MESA_BACKGROUND_CPUS", groups.background.list()); }
+    if let Some(groups) =
+        droidloom_cpu_placement::initialize(droidloom_cpu_placement::Role::Graphics)
+    {
+        unsafe {
+            env::set_var("MESA_BACKGROUND_CPUS", groups.background.list());
+        }
     }
     if let Err(error) = run() {
         eprintln!("droidloom-wayland: {error}");
@@ -2224,10 +4138,10 @@ fn main() {
 }
 
 fn run() -> Result<(), PresenterError> {
-    let runtime_root = PathBuf::from(
-        env::var("XDG_RUNTIME_DIR")
-            .map_err(|_| PresenterError::Configuration("XDG_RUNTIME_DIR is missing"))?,
-    );
+    // Own the session before inspecting or replacing any IPC endpoint. Keep
+    // the lease through run_presenter_loop so another presenter cannot race it.
+    let lease = session::SessionLease::acquire_from_environment()?;
+    let runtime_root = lease.runtime_dir().to_owned();
     let socket_path = env::var_os("DROIDLOOM_HOST_SOCKET").map_or_else(
         || runtime_root.join("droidloom/native-bridge.sock"),
         PathBuf::from,
@@ -2239,7 +4153,8 @@ fn run() -> Result<(), PresenterError> {
     prepare_socket_path(&socket_path, &runtime_root, identity.uid())?;
     // The async reactor may be created synchronously by Bridge::start.
     droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Background);
-    let notifications = notifications::Bridge::start(socket_path.with_file_name("notifications.sock"));
+    let notifications =
+        notifications::Bridge::start(socket_path.with_file_name("notifications.sock"));
     droidloom_cpu_placement::current(droidloom_cpu_placement::Role::Graphics);
     let _notifications = notifications?;
 
@@ -2275,6 +4190,7 @@ fn run() -> Result<(), PresenterError> {
     .with_session_mode(session_mode);
 
     let conn = Connection::connect_to_env()?;
+    lease.verify_connection(conn.as_fd())?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
     let compositor = CompositorState::bind(&globals, &qh)?;
@@ -2287,10 +4203,29 @@ fn run() -> Result<(), PresenterError> {
         return Err(PresenterError::DmabufV4Required);
     }
     let sync_manager: WpLinuxDrmSyncobjManagerV1 = globals.bind(&qh, 1..=1, ())?;
+    let output_power_manager: ZwlrOutputPowerManagerV1 = globals.bind(&qh, 1..=1, ())?;
+    let tablet_manager: Option<ZwpTabletManagerV2> = globals.bind(&qh, 1..=1, ()).ok();
+    let seat_state = SeatState::new(&globals, &qh);
+    let mut tablet_seats = Vec::new();
+    if let Some(manager) = &tablet_manager {
+        for seat in seat_state.seats() {
+            if !tablet_seats.iter().any(|(existing, _)| *existing == seat) {
+                tablet_seats.push((seat.clone(), manager.get_tablet_seat(&seat, &qh, ())));
+            }
+        }
+    }
     let mut app = App {
         activation: activation::Activation::new(&globals, &qh),
-        layer_globals: layers::Globals { subcompositor: globals.bind(&qh, 1..=1, ())?, shm: globals.bind(&qh, 1..=1, ())?, alpha: globals.bind(&qh, 1..=1, ()).ok() },
-        clipboard: clipboard::Clipboard::new(socket_path.with_file_name("clipboard.sock"), &globals, &qh)?,
+        layer_globals: layers::Globals {
+            subcompositor: globals.bind(&qh, 1..=1, ())?,
+            shm: globals.bind(&qh, 1..=1, ())?,
+            alpha: globals.bind(&qh, 1..=1, ()).ok(),
+        },
+        clipboard: clipboard::Clipboard::new(
+            socket_path.with_file_name("clipboard.sock"),
+            &globals,
+            &qh,
+        )?,
         clipboard_inputs: VecDeque::new(),
         text_input: text_input::TextInput::new(
             socket_path.with_file_name("text-input.sock"),
@@ -2298,8 +4233,19 @@ fn run() -> Result<(), PresenterError> {
         )?,
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        output_power_manager,
+        output_power: Vec::new(),
+        host_display_powered: None,
+        published_display_power: None,
         presentation_time,
-        seat_state: SeatState::new(&globals, &qh),
+        seat_state,
+        tablet_manager,
+        tablet_seats,
+        tablet_tools: Vec::new(),
+        tablet_tool_proxies: BTreeMap::new(),
+        tablet_proxies: BTreeMap::new(),
+        tablet_pads: BTreeMap::new(),
+        tablet_pad_groups: BTreeMap::new(),
         dmabuf_state,
         feedback: None,
         compositor,
@@ -2314,14 +4260,32 @@ fn run() -> Result<(), PresenterError> {
         window_policy,
         endpoint: None,
         tasks: BTreeMap::new(),
+        task_work: readiness::Tasks::default(),
         keyboard: None,
+        keyboard_seat: None,
+        pointer_constraints:
+            smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState::bind(
+                &globals, &qh,
+            ),
+        shortcuts_inhibit_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        immersion: None,
+        modifiers: Modifiers::default(),
         pointer: None,
         touch: None,
         focused: None,
+        pressed_keys: input::Keys::default(),
+        mouse_focus: None,
+        mouse_buttons: 0,
+        mouse_position: (0.0, 0.0),
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
+        swipe_back: None,
+        top_pull: None,
+        chrome_press: None,
+        chrome_touches: BTreeMap::new(),
         next_buffer_id: 0,
         next_input_serial: 0,
+        direct_input: input::DirectInput::default(),
         socket_path,
         fatal: None,
     };
@@ -2342,26 +4306,42 @@ fn run_presenter_loop(
 ) -> Result<(), PresenterError> {
     let qh = event_queue.handle();
     let mut poll_descriptors = Vec::new();
+    let mut poll_owners = Vec::new();
     let mut layer_tasks = Vec::new();
     loop {
         event_queue.dispatch_pending(&mut app)?;
+        app.expire_controls();
+        app.task_work.notify_fallback(Instant::now());
         app.unmap_requested_tasks()?;
         if let Some(error) = app.fatal.take() {
             return Err(PresenterError::Wayland(error));
         }
+        app.apply_pending_resizes(&qh)?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
+        app.pump_direct_input()?;
         app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();
         app.clipboard.pump(&qh);
+        app.pump_direct_input()?;
         if !app.clipboard.blocked() {
             while let Some((object, input)) = app.clipboard_inputs.pop_front() {
-                if app.tasks.contains_key(&object) { app.send_input(object, input)?; }
+                if app.tasks.contains_key(&object) {
+                    if let Err(error) = app.send_input(object, input) {
+                        eprintln!("Droidloom queued input: {error}");
+                    }
+                }
             }
         }
         app.unmap_requested_tasks()?;
         app.release_ready_frames()?;
-        poll_sources(conn, &mut event_queue, &mut app, &mut poll_descriptors)?;
+        poll_sources(
+            conn,
+            &mut event_queue,
+            &mut app,
+            &mut poll_descriptors,
+            &mut poll_owners,
+        )?;
     }
 }
 
@@ -2385,22 +4365,34 @@ fn poll_sources(
     event_queue: &mut EventQueue<App>,
     app: &mut App,
     descriptors: &mut Vec<libc::pollfd>,
+    owners: &mut Vec<readiness::Source>,
 ) -> Result<(), PresenterError> {
     let write_blocked = match event_queue.flush() {
         Ok(()) => {
-            for pending in app.tasks.values_mut().flat_map(|task| task.pending.iter_mut()) {
-                if let Some(trace) = pending.trace.as_mut() { trace.flushed(); }
+            for object in &app.task_work.frames {
+                if let Some(task) = app.tasks.get_mut(object) {
+                    for pending in &mut task.pending {
+                        if let Some(trace) = pending.trace.as_mut() {
+                            trace.flushed();
+                        }
+                    }
+                }
             }
             false
         }
         Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => true,
         Err(error) => return Err(PresenterError::Wayland(error.to_string())),
     };
+    let now = Instant::now();
+    let fallback_deadline = app.task_work.deadline(now, RELEASE_POLL_FALLBACK);
     // Pending Wayland events must be dispatched before sleeping. The previous
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
-    let Some(read_guard) = event_queue.prepare_read() else { return Ok(()); };
+    let Some(read_guard) = event_queue.prepare_read() else {
+        return Ok(());
+    };
     descriptors.clear();
+    owners.clear();
     descriptors.extend([
         libc::pollfd {
             fd: conn.as_fd().as_raw_fd(),
@@ -2427,29 +4419,68 @@ fn poll_sources(
             revents: 0,
         });
     }
-    for stream in app.tasks.values().filter_map(|t|t.layers.as_ref()) {
-        for (fd,events) in stream.fds() { descriptors.push(libc::pollfd { fd, events, revents:0 }); }
+    if let Some((fd, events)) = app.direct_input.fd() {
+        descriptors.push(libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        });
     }
-    let wakeups_start = descriptors.len();
-    let mut release_fallback = app.tasks.values().filter_map(|t|t.layers.as_ref()).any(|s|s.poll_fallback());
-    for target in app.tasks.values().flat_map(|task| task.targets.values()) {
-        if target.busy {
-            if let Some(event) = target.sync.as_ref().and_then(|sync| sync.release_wakeup.as_ref()) {
+    owners.resize(descriptors.len(), readiness::Source::Other);
+    for object in &app.task_work.streams {
+        let Some(stream) = app.tasks.get(object).and_then(|t| t.layers.as_ref()) else {
+            continue;
+        };
+        for (fd, work) in stream.fds() {
+            descriptors.push(libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            owners.push(readiness::Source::Task {
+                object: *object,
+                work,
+                eventfd: work == readiness::RELEASES,
+            });
+        }
+    }
+    for object in &app.task_work.frames {
+        let Some(task) = app.tasks.get(object) else {
+            continue;
+        };
+        for pending in &task.pending {
+            let Some(target) = task.targets.get(&pending.buffer) else {
+                continue;
+            };
+            if let Some(event) = target
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.release_wakeup.as_ref())
+            {
                 descriptors.push(libc::pollfd {
                     fd: event.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 });
-            } else {
-                // Only kernels without timeline eventfd support need periodic
-                // checks, and only while an actual release is outstanding.
-                release_fallback = true;
+                owners.push(readiness::Source::Task {
+                    object: *object,
+                    work: readiness::FRAMES,
+                    eventfd: true,
+                });
             }
         }
     }
-    let clipboard_deadline = (!app.clipboard_inputs.is_empty())
-        .then(|| app.clipboard.unblock_deadline()).flatten();
-    let timeout = poll_timeout_millis(release_fallback, clipboard_deadline, Instant::now());
+    let clipboard_deadline = app.clipboard.unblock_deadline().filter(|_| app.clipboard.blocked());
+    let deadline = clipboard_deadline
+        .into_iter()
+        .chain(fallback_deadline)
+        .chain(app.tasks.values().filter_map(|task| task.controls_until))
+        .min();
+    let timeout = if app.task_work.pending() {
+        0 // Flush Wayland first, then service work queued during this turn.
+    } else {
+        poll_timeout_millis(deadline, now)
+    };
     // SAFETY: `descriptors` is live writable storage for exactly its length;
     // poll retains no pointer after returning.
     let result = unsafe {
@@ -2466,17 +4497,29 @@ fn poll_sources(
         }
     }
     app.clipboard.notify_ready(descriptors);
-    for event in &descriptors[wakeups_start..] {
-        if event.revents & libc::POLLIN != 0 {
+    app.direct_input.notify_ready(descriptors);
+    if app.direct_input.fd().is_none() {
+        app.clear_input_tracking();
+    }
+    app.task_work.notify_fallback(Instant::now());
+    for (event, owner) in descriptors.iter().zip(owners.iter().copied()) {
+        if owner.notify(&mut app.task_work, event.revents) {
             let mut count = 0_u64;
             // SAFETY: all entries in this slice borrow live nonblocking
             // eventfds; count is writable storage for the required eight bytes.
             let result = unsafe {
-                libc::read(event.fd, std::ptr::from_mut(&mut count).cast(), size_of::<u64>())
+                libc::read(
+                    event.fd,
+                    std::ptr::from_mut(&mut count).cast(),
+                    size_of::<u64>(),
+                )
             };
             if result < 0 {
                 let error = io::Error::last_os_error();
-                if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
                     return Err(error.into());
                 }
             }
@@ -2496,13 +4539,8 @@ fn poll_sources(
     Ok(())
 }
 
-fn poll_timeout_millis(release_fallback: bool, deadline: Option<Instant>, now: Instant) -> i32 {
+fn poll_timeout_millis(deadline: Option<Instant>, now: Instant) -> i32 {
     let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
-    let timeout = if release_fallback {
-        Some(timeout.map_or(RELEASE_POLL_FALLBACK, |timeout| timeout.min(RELEASE_POLL_FALLBACK)))
-    } else {
-        timeout
-    };
     // Round up so sub-millisecond deadlines cannot turn into a busy loop.
     timeout.map_or(-1, |duration| {
         i32::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
@@ -2576,6 +4614,14 @@ fn fixed_16_16(value: f64) -> i32 {
         i32::MAX
     } else {
         scaled as i32
+    }
+}
+
+fn apply_content_buffer_scale(surface: &wl_surface::WlSurface, viewport_content: bool) {
+    // Controls, feedback, decorations and themed pointers own their buffer
+    // pixel scale. Only our viewport-mapped Android content stays at scale 1.
+    if viewport_content {
+        surface.set_buffer_scale(1);
     }
 }
 
@@ -2716,12 +4762,28 @@ fn listener_would_block(error: &EndpointListenerError) -> bool {
 // Use the presentation clock's output when known. Until feedback arrives,
 // the most recently entered output is deterministic; unmapped tasks use 60 Hz.
 fn select_surface_refresh<T: PartialEq>(
-    entered: &[T], presented: Option<&T>, mut refresh: impl FnMut(&T) -> Option<u32>,
+    entered: &[T],
+    presented: Option<&T>,
+    mut refresh: impl FnMut(&T) -> Option<u32>,
 ) -> u32 {
-    presented.filter(|output| entered.contains(output))
+    presented
+        .filter(|output| entered.contains(output))
         .and_then(&mut refresh)
         .or_else(|| entered.iter().rev().find_map(refresh))
         .unwrap_or(60_000)
+}
+
+fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut saw_output = false;
+    let mut any_powered = false;
+    for state in states {
+        saw_output = true;
+        match state {
+            Some(powered) => any_powered |= powered,
+            None => return None,
+        }
+    }
+    saw_output.then_some(any_powered)
 }
 
 #[cfg(test)]
@@ -2729,34 +4791,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tablet_pad_button_scan_codes_match_android_pen_button_layouts() {
+        assert_eq!(PAD_BUTTON_BASE, 0x106);
+        assert_eq!(PAD_BUTTON_COUNT, 4);
+        assert_eq!(PAD_BUTTON_BASE + PAD_BUTTON_COUNT - 1, 0x109);
+    }
+
+    #[test]
+    fn closing_window_does_not_reconfigure_a_retired_android_object() {
+        let mut task = TaskWindow {
+            chrome: None,
+            gesture_feedback: None,
+            controls_until: None,
+            fullscreen: false,
+            layers: None,
+            package: "test".into(),
+            android_task: None,
+            input_route: None,
+            window: None,
+            viewport: None,
+            fractional_scale: None,
+            sync_surface: None,
+            logical_size: None,
+            buffer_size: (1280, 720),
+            applied_scale_120: 120,
+            resize: resize::Pending::new(120),
+            configure_serial: 1,
+            refresh_millihz: 120_000,
+            entered_outputs: Vec::new(),
+            presentation_output: None,
+            targets: BTreeMap::new(),
+            pending: VecDeque::new(),
+            presentation_feedback: Vec::new(),
+            presentation_audit: None,
+            content_opaque: false,
+            applied_opaque: None,
+            focused: false,
+            unmap_requested: false,
+            closing: false,
+        };
+        assert!(task.needs_refresh_update(60_000));
+        assert!(!task.needs_refresh_update(120_000));
+        // DestroyTask removes the endpoint immediately when no legacy frame
+        // is pending. Direct layer releases can still retain this host record.
+        task.closing = true;
+        assert!(!task.needs_refresh_update(60_000));
+    }
+
+    #[test]
+    fn remote_mouse_scroll_matches_the_previous_sheng_port() {
+        let axis = |value120, discrete, absolute| AxisScroll {
+            value120,
+            discrete,
+            absolute,
+            ..AxisScroll::default()
+        };
+        assert_eq!(mouse_scroll(&axis(360, 3, 500.0)), 3 * 256);
+        assert_eq!(mouse_scroll(&axis(0, -2, 500.0)), -2 * 256);
+        assert_eq!(mouse_scroll(&axis(0, 0, -25.0)), -640);
+        assert_eq!(mouse_scroll(&AxisScroll::default()), 0);
+    }
+
+    #[test]
+    fn display_power_waits_for_all_outputs_and_tracks_any_powered_output() {
+        assert_eq!(aggregate_display_power([]), None);
+        assert_eq!(aggregate_display_power([Some(false), None]), None);
+        assert_eq!(
+            aggregate_display_power([Some(false), Some(false)]),
+            Some(false)
+        );
+        assert_eq!(
+            aggregate_display_power([Some(false), Some(true)]),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn refresh_tracks_surface_membership_presentation_moves_and_mode_changes() {
-        let mode = |output: &u8| match output { 1 => Some(240_000), 2 => Some(143_973), _ => None };
+        let mode = |output: &u8| match output {
+            1 => Some(240_000),
+            2 => Some(143_973),
+            _ => None,
+        };
         assert_eq!(select_surface_refresh(&[2], None, mode), 143_973);
         assert_eq!(select_surface_refresh(&[1, 2], Some(&1), mode), 240_000);
         assert_eq!(select_surface_refresh(&[1, 2], Some(&2), mode), 143_973);
         assert_eq!(select_surface_refresh(&[2], Some(&1), mode), 143_973);
         assert_eq!(select_surface_refresh(&[1, 2], None, mode), 143_973);
-        assert_eq!(select_surface_refresh(&[2], Some(&2), |_| Some(120_000)), 120_000);
+        assert_eq!(
+            select_surface_refresh(&[2], Some(&2), |_| Some(120_000)),
+            120_000
+        );
         assert_eq!(select_surface_refresh(&[2], Some(&2), |_| None), 60_000);
         assert_eq!(select_surface_refresh(&[], Some(&1), mode), 60_000);
     }
 
     #[test]
-    fn idle_wait_has_no_periodic_timer_but_release_fallback_remains_bounded() {
+    fn idle_wait_has_no_periodic_timer() {
         let now = Instant::now();
-        assert_eq!(poll_timeout_millis(false, None, now), -1);
-        assert_eq!(poll_timeout_millis(true, None, now), 4);
+        assert_eq!(poll_timeout_millis(None, now), -1);
         let deadline = Some(now + Duration::from_secs(10));
-        assert_eq!(poll_timeout_millis(false, deadline, now), 10_000);
-        assert_eq!(poll_timeout_millis(true, deadline, now), 4);
+        assert_eq!(poll_timeout_millis(deadline, now), 10_000);
     }
 
     #[test]
     fn clipboard_deadline_wakes_even_without_socket_traffic() {
         let now = Instant::now();
-        assert_eq!(poll_timeout_millis(false, Some(now), now), 0);
-        assert_eq!(poll_timeout_millis(true, Some(now + Duration::from_micros(50)), now), 1);
-        assert_eq!(poll_timeout_millis(false, Some(now - Duration::from_millis(1)), now), 0);
+        assert_eq!(poll_timeout_millis(Some(now), now), 0);
+        assert_eq!(
+            poll_timeout_millis(Some(now + Duration::from_micros(50)), now),
+            1
+        );
+        assert_eq!(
+            poll_timeout_millis(Some(now - Duration::from_millis(1)), now),
+            0
+        );
     }
 
     #[test]

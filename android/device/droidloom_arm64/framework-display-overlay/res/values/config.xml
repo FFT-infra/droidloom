@@ -7,4 +7,8 @@
       Composer-created display capable of hosting tasks.
     -->
     <bool name="config_localDisplaysMirrorContent">false</bool>
+    <!-- Linux owns whole-host suspend. Android still defers its own background
+         work when the host display is off; the cell has no motion sensor. -->
+    <bool name="config_enableAutoPowerModes">true</bool>
+    <bool name="config_autoPowerModeUseMotionSensor">false</bool>
 </resources>

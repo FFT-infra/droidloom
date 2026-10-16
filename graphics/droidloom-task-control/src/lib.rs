@@ -2,19 +2,23 @@
 //!
 //! This is a privileged lifecycle channel, separate from the high-frequency
 //! DMA-BUF presentation protocol. Direct tasks are registered only after the
-//! launcher or privileged task observer resolves their `ActivityTaskManager` identity, making the
+//! in-process `ActivityTaskManager` backend resolves their identity, making the
 //! registry the allowlist for windows `SurfaceFlinger` may export to the host.
 
 #![forbid(unsafe_code)]
 
 use thiserror::Error;
 
+mod commands;
+pub mod framework;
+pub use commands::{CommandQueue, PendingCommand, TaskAction, TaskCommand};
+
 /// Protocol marker at the start of each sequenced-packet record.
 pub const MAGIC: [u8; 4] = *b"DLTC";
 /// Supported protocol major.
 pub const PROTOCOL_MAJOR: u16 = 3;
 /// Supported protocol minor.
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 2;
 /// Fixed bytes before the opcode-specific payload.
 pub const HEADER_BYTES: usize = 24;
 /// Maximum complete task-control record.
@@ -29,15 +33,46 @@ const OP_RESERVE: u16 = 0x0002;
 const OP_BIND: u16 = 0x0003;
 const OP_REMOVE: u16 = 0x0004;
 const OP_REGISTER_DIRECT: u16 = 0x0005;
+const OP_PUBLISH_DIRECT: u16 = 0x0006;
+const OP_SUBSCRIBE: u16 = 0x0007;
+const OP_ACKNOWLEDGE: u16 = 0x0008;
+const OP_PUBLISH_FRAMEWORK: u16 = 0x0009;
 const OP_SERVER_HELLO: u16 = 0x8001;
 const OP_RESERVED: u16 = 0x8002;
 const OP_BOUND: u16 = 0x8003;
 const OP_REMOVED: u16 = 0x8004;
+const OP_SUBSCRIBED: u16 = 0x8005;
+const OP_TASK_COMMAND: u16 = 0x8006;
 const OP_ERROR: u16 = 0x80ff;
 
 /// Privileged controller request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlRequest {
+    /// Authoritative publication including framework incarnation (protocol 3.2).
+    PublishFramework {
+        /// Nonzero client correlation identity.
+        request_id: u64,
+        /// Framework-verified task base package.
+        package: String,
+        /// Attached task selected by ATMS.
+        task: u64,
+        /// Android logical display.
+        android_display: u32,
+        /// Framework incarnation, unique across system-server restarts this boot.
+        incarnation: u64,
+        /// True for a foreground transition or explicit host launch.
+        activate: bool,
+    },
+    /// Become the framework's host-window command receiver (protocol 3.2).
+    Subscribe {
+        /// Nonzero client correlation identity.
+        request_id: u64,
+    },
+    /// Consume one command after applying it or rejecting a stale identity.
+    Acknowledge {
+        /// Command serial returned in `TaskCommand`.
+        request_id: u64,
+    },
     /// Negotiate the connection before lifecycle requests.
     Hello {
         /// Oldest supported major.
@@ -75,6 +110,19 @@ pub enum ControlRequest {
         /// Android display receiving input for this task.
         android_display: u32,
     },
+    /// Framework publication with explicit activation intent (protocol 3.1).
+    PublishDirect {
+        /// Nonzero client correlation identity.
+        request_id: u64,
+        /// Framework-verified task base package.
+        package: String,
+        /// Attached task selected by `ActivityTaskManager`.
+        task: u64,
+        /// Android display receiving input.
+        android_display: u32,
+        /// True for a foreground transition or explicit host launch.
+        activate: bool,
+    },
     /// Tear down a reserved or bound task window.
     Remove {
         /// Nonzero client correlation identity.
@@ -87,6 +135,18 @@ pub enum ControlRequest {
 /// Task-control service response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlResponse {
+    /// The authenticated connection now carries framework commands only.
+    Subscribed {
+        /// Matching subscription request.
+        request_id: u64,
+    },
+    /// One host-window operation, retained until acknowledged (protocol 3.2).
+    TaskCommand {
+        /// Nonzero serial to acknowledge after framework processing.
+        request_id: u64,
+        /// Object-scoped operation; numeric task IDs alone are insufficient.
+        command: TaskCommand,
+    },
     /// Selected protocol version.
     ServerHello {
         /// Selected major.
@@ -201,9 +261,39 @@ pub enum CodecError {
 /// # Errors
 ///
 /// Rejects invalid version ranges, identities, packages, and record overflow.
+#[allow(clippy::too_many_lines)] // Keep the wire opcode table together for review.
 pub fn encode_request(request: &ControlRequest) -> Result<Vec<u8>, CodecError> {
     let mut payload = Writer::default();
     let (opcode, request_id) = match request {
+        ControlRequest::PublishFramework {
+            request_id,
+            package,
+            task,
+            android_display,
+            incarnation,
+            activate,
+        } => {
+            nonzero("request identity", *request_id)?;
+            nonzero("task identity", *task)?;
+            nonzero("task incarnation", *incarnation)?;
+            if i64::try_from(*incarnation).is_err() || !valid_package(package) {
+                return Err(CodecError::InvalidValue("framework task identity"));
+            }
+            payload.string(package, MAX_PACKAGE_BYTES)?;
+            payload.u64(*task);
+            payload.u32(*android_display);
+            payload.u64(*incarnation);
+            payload.u32(u32::from(*activate));
+            (OP_PUBLISH_FRAMEWORK, *request_id)
+        }
+        ControlRequest::Subscribe { request_id } => {
+            nonzero("request identity", *request_id)?;
+            (OP_SUBSCRIBE, *request_id)
+        }
+        ControlRequest::Acknowledge { request_id } => {
+            nonzero("request identity", *request_id)?;
+            (OP_ACKNOWLEDGE, *request_id)
+        }
         ControlRequest::Hello {
             min_major,
             max_major,
@@ -262,6 +352,24 @@ pub fn encode_request(request: &ControlRequest) -> Result<Vec<u8>, CodecError> {
             payload.u64(*object);
             (OP_REMOVE, *request_id)
         }
+        ControlRequest::PublishDirect {
+            request_id,
+            package,
+            task,
+            android_display,
+            activate,
+        } => {
+            nonzero("request identity", *request_id)?;
+            nonzero("task identity", *task)?;
+            if !valid_package(package) {
+                return Err(CodecError::InvalidValue("package"));
+            }
+            payload.string(package, MAX_PACKAGE_BYTES)?;
+            payload.u64(*task);
+            payload.u32(*android_display);
+            payload.u32(u32::from(*activate));
+            (OP_PUBLISH_DIRECT, *request_id)
+        }
     };
     encode(opcode, request_id, &payload.bytes)
 }
@@ -271,10 +379,17 @@ pub fn encode_request(request: &ControlRequest) -> Result<Vec<u8>, CodecError> {
 /// # Errors
 ///
 /// Rejects malformed, oversized, incompatible, or wrong-direction records.
+#[allow(clippy::too_many_lines)] // Keep the matching decode table beside its validation.
 pub fn decode_request(record: &[u8]) -> Result<ControlRequest, CodecError> {
     let header = decode_header(record)?;
     let mut payload = Reader::new(header.payload);
     let request = match header.opcode {
+        OP_SUBSCRIBE => ControlRequest::Subscribe {
+            request_id: required_request(header.request_id)?,
+        },
+        OP_ACKNOWLEDGE => ControlRequest::Acknowledge {
+            request_id: required_request(header.request_id)?,
+        },
         OP_HELLO => {
             if header.request_id != 0 {
                 return Err(CodecError::InvalidHeader);
@@ -323,6 +438,47 @@ pub fn decode_request(record: &[u8]) -> Result<ControlRequest, CodecError> {
             request_id: required_request(header.request_id)?,
             object: required("object identity", payload.u64()?)?,
         },
+        OP_PUBLISH_DIRECT | OP_PUBLISH_FRAMEWORK => {
+            let request_id = required_request(header.request_id)?;
+            let package = payload.string(MAX_PACKAGE_BYTES)?;
+            if !valid_package(&package) {
+                return Err(CodecError::InvalidValue("package"));
+            }
+            let task = required("task identity", payload.u64()?)?;
+            let android_display = payload.u32()?;
+            let incarnation = if header.opcode == OP_PUBLISH_FRAMEWORK {
+                let incarnation = required("task incarnation", payload.u64()?)?;
+                if i64::try_from(incarnation).is_err() {
+                    return Err(CodecError::InvalidValue("task incarnation"));
+                }
+                Some(incarnation)
+            } else {
+                None
+            };
+            let activate = match payload.u32()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CodecError::InvalidValue("activation flags")),
+            };
+            if let Some(incarnation) = incarnation {
+                ControlRequest::PublishFramework {
+                    request_id,
+                    package,
+                    task,
+                    android_display,
+                    incarnation,
+                    activate,
+                }
+            } else {
+                ControlRequest::PublishDirect {
+                    request_id,
+                    package,
+                    task,
+                    android_display,
+                    activate,
+                }
+            }
+        }
         opcode => return Err(CodecError::UnknownOpcode(opcode)),
     };
     payload.finish()?;
@@ -337,6 +493,33 @@ pub fn decode_request(record: &[u8]) -> Result<ControlRequest, CodecError> {
 pub fn encode_response(response: &ControlResponse) -> Result<Vec<u8>, CodecError> {
     let mut payload = Writer::default();
     let (opcode, request_id) = match response {
+        ControlResponse::Subscribed { request_id } => {
+            nonzero("request identity", *request_id)?;
+            (OP_SUBSCRIBED, *request_id)
+        }
+        ControlResponse::TaskCommand {
+            request_id,
+            command,
+        } => {
+            nonzero("request identity", *request_id)?;
+            if *request_id > i64::MAX as u64 {
+                return Err(CodecError::InvalidValue("task command serial"));
+            }
+            command.validate()?;
+            payload.u64(command.object);
+            payload.u64(command.task);
+            payload.u64(command.incarnation);
+            payload.u32(command.android_display);
+            let (kind, width, height) = match command.action {
+                TaskAction::Focus => (1, 0, 0),
+                TaskAction::Resize { width, height } => (2, width, height),
+                TaskAction::Close => (3, 0, 0),
+            };
+            payload.u32(kind);
+            payload.u32(width);
+            payload.u32(height);
+            (OP_TASK_COMMAND, *request_id)
+        }
         ControlResponse::ServerHello { major, minor } => {
             if *major == 0 {
                 return Err(CodecError::InvalidValue("selected version"));
@@ -399,6 +582,40 @@ pub fn decode_response(record: &[u8]) -> Result<ControlResponse, CodecError> {
     let header = decode_header(record)?;
     let mut payload = Reader::new(header.payload);
     let response = match header.opcode {
+        OP_SUBSCRIBED => ControlResponse::Subscribed {
+            request_id: required_request(header.request_id)?,
+        },
+        OP_TASK_COMMAND => {
+            let request_id = required_request(header.request_id)?;
+            if request_id > i64::MAX as u64 {
+                return Err(CodecError::InvalidValue("task command serial"));
+            }
+            let object = payload.u64()?;
+            let task = payload.u64()?;
+            let incarnation = payload.u64()?;
+            let android_display = payload.u32()?;
+            let kind = payload.u32()?;
+            let width = payload.u32()?;
+            let height = payload.u32()?;
+            let action = match (kind, width, height) {
+                (1, 0, 0) => TaskAction::Focus,
+                (2, width, height) => TaskAction::Resize { width, height },
+                (3, 0, 0) => TaskAction::Close,
+                _ => return Err(CodecError::InvalidValue("task command action")),
+            };
+            let command = TaskCommand {
+                object,
+                task,
+                incarnation,
+                android_display,
+                action,
+            };
+            command.validate()?;
+            ControlResponse::TaskCommand {
+                request_id,
+                command,
+            }
+        }
         OP_SERVER_HELLO => {
             if header.request_id != 0 {
                 return Err(CodecError::InvalidHeader);
@@ -637,11 +854,146 @@ fn valid_package(package: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_subscription_and_acknowledgement_round_trip() {
+        for request in [
+            super::ControlRequest::Subscribe { request_id: 1 },
+            super::ControlRequest::Acknowledge { request_id: 2 },
+        ] {
+            let bytes = super::encode_request(&request).unwrap();
+            assert_eq!(super::decode_request(&bytes).unwrap(), request);
+            assert!(super::decode_response(&bytes).is_err());
+        }
+        let subscribed = super::ControlResponse::Subscribed { request_id: 1 };
+        assert_eq!(
+            super::decode_response(&super::encode_response(&subscribed).unwrap()).unwrap(),
+            subscribed
+        );
+    }
+
+    #[test]
+    fn host_commands_validate_scope_dimensions_actions_and_signed_serials() {
+        use super::*;
+        for action in [
+            TaskAction::Focus,
+            TaskAction::Resize {
+                width: 800,
+                height: 600,
+            },
+            TaskAction::Close,
+        ] {
+            let response = ControlResponse::TaskCommand {
+                request_id: 9,
+                command: TaskCommand {
+                    object: 7,
+                    task: 42,
+                    incarnation: 1,
+                    android_display: 0,
+                    action,
+                },
+            };
+            let mut bytes = encode_response(&response).unwrap();
+            assert_eq!(decode_response(&bytes).unwrap(), response);
+            bytes[HEADER_BYTES + 28..HEADER_BYTES + 32].copy_from_slice(&4_u32.to_le_bytes());
+            assert!(decode_response(&bytes).is_err());
+        }
+        for command in [
+            TaskCommand {
+                object: 7,
+                task: 42,
+                incarnation: 1,
+                android_display: 1,
+                action: TaskAction::Focus,
+            },
+            TaskCommand {
+                object: 0,
+                task: 42,
+                incarnation: 1,
+                android_display: 0,
+                action: TaskAction::Close,
+            },
+            TaskCommand {
+                object: 7,
+                task: 0,
+                incarnation: 1,
+                android_display: 0,
+                action: TaskAction::Close,
+            },
+            TaskCommand {
+                object: 7,
+                task: 42,
+                incarnation: 1,
+                android_display: 0,
+                action: TaskAction::Resize {
+                    width: 0,
+                    height: 600,
+                },
+            },
+            TaskCommand {
+                object: 7,
+                task: 42,
+                incarnation: 1,
+                android_display: 0,
+                action: TaskAction::Resize {
+                    width: 16385,
+                    height: 600,
+                },
+            },
+        ] {
+            assert!(
+                encode_response(&ControlResponse::TaskCommand {
+                    request_id: 9,
+                    command
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            encode_response(&ControlResponse::TaskCommand {
+                request_id: u64::MAX,
+                command: TaskCommand {
+                    object: 7,
+                    task: 42,
+                    incarnation: 1,
+                    android_display: 0,
+                    action: TaskAction::Close
+                }
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lifecycle_publication_carries_activation_intent_and_rejects_unknown_flags() {
+        for activate in [false, true] {
+            let request = super::ControlRequest::PublishDirect {
+                request_id: 7,
+                package: "org.example.app".into(),
+                task: 42,
+                android_display: 0,
+                activate,
+            };
+            let mut bytes = super::encode_request(&request).unwrap();
+            assert_eq!(super::decode_request(&bytes).unwrap(), request);
+            let last = bytes.len() - 4;
+            bytes[last..].copy_from_slice(&2_u32.to_le_bytes());
+            assert!(super::decode_request(&bytes).is_err());
+        }
+    }
+
     use super::*;
 
     #[test]
     fn two_phase_launch_records_round_trip() {
         for request in [
+            ControlRequest::PublishFramework {
+                request_id: 9,
+                package: "org.example.app".into(),
+                task: 42,
+                android_display: 0,
+                incarnation: 100_000,
+                activate: false,
+            },
             ControlRequest::Hello {
                 min_major: 1,
                 max_major: 1,

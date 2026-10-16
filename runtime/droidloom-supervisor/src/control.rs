@@ -8,19 +8,22 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use droidloom_task_control::framework as framework_wire;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::CellSpec;
-use crate::development::{DevelopmentCell, recover_development_cell, start_development_cell};
+use crate::development::{
+    DevelopmentCell, PenInputDevice, discover_pen_input_devices, recover_development_cell,
+    refresh_pen_input_nodes, start_development_cell,
+};
 
 #[path = "diagnostics.rs"]
 mod diagnostics;
@@ -28,8 +31,18 @@ mod diagnostics;
 #[path = "apk.rs"]
 mod apk;
 
+#[path = "framework_control.rs"]
+mod framework_control;
+pub use framework_control::subscribe_applications;
+use framework_control::{framework_request, launch_in_cell, set_dpi_in_cell};
+
 #[path = "control_progress.rs"]
 mod progress;
+
+#[path = "lifecycle_wait.rs"]
+mod lifecycle_wait;
+pub use lifecycle_wait::Shutdown;
+use lifecycle_wait::WaitSources;
 
 use progress::{LOG_HINT, Reporter};
 
@@ -43,25 +56,34 @@ pub const DEFAULT_SPEC_DIRECTORY: &str = "/etc/droidloom";
 pub const DEFAULT_SUPERVISOR: &str = "/usr/bin/droidloom-supervisor";
 
 const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
-const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SPEC_BYTES: u64 = 1024 * 1024;
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const ANDROID_READY_TIMEOUT: Duration = Duration::from_secs(120);
-const ANDROID_SERVICE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MIN_DISPLAY_DPI: u32 = 72;
 const MIN_ICON_SIZE: u32 = 16;
 const MAX_ICON_SIZE: u32 = 512;
 const MAX_APPLICATIONS: usize = 1024;
 const ANDROID_PER_USER_UID_RANGE: u32 = 100_000;
-const APPLICATION_CATALOG_CLASS: &str = "com.android.droidloom.catalog.ApplicationCatalog";
-const APPLICATION_CATALOG_ENV: &str = "CLASSPATH=/vendor/framework/droidloom-input-bridge.jar";
+/// Paired direct framework launch/catalog transport.
+pub const FRAMEWORK_CONTROL_ABI: &str = framework_wire::BUILD_ABI;
 
 /// One control request. The externally tagged encoding is stable and easy to
 /// inspect in traces without a bespoke binary parser.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlRequest {
+    /// Delegate a direct, read-only framework catalog event subscription.
+    WatchApplications,
+    /// Render a bounded batch of launcher PNGs without starting ART processes.
+    ApplicationIcons {
+        /// Exact launcher components (at most 32).
+        components: Vec<String>,
+        /// Android user (currently zero).
+        user: u32,
+        /// Square PNG extent.
+        size: u32,
+    },
     /// Install a standalone APK supplied as a file descriptor on this connection.
     Install {
         /// Android user identifier.
@@ -178,6 +200,9 @@ pub struct ControlResponse {
     /// Base64-encoded PNG for one exact launcher component, when requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_icon: Option<String>,
+    /// Component-to-base64 PNG batch, when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_icons: Option<std::collections::BTreeMap<String, String>>,
     /// Android log snapshot or crash report, when requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<String>,
@@ -217,6 +242,20 @@ struct ActiveCell {
     spec_path: PathBuf,
     spec: CellSpec,
     cell: DevelopmentCell,
+    ready_init: std::cell::Cell<Option<u32>>,
+    pen_devices: Vec<PenInputDevice>,
+    pen_generation: u64,
+    pen_refresh_pending: bool,
+}
+impl ActiveCell {
+    fn ready_init(&self, progress: &Reporter) -> Result<u32, ControlError> {
+        if let Some(pid) = self.ready_init.get() {
+            return Ok(pid);
+        }
+        let pid = wait_for_android_init(&self.spec, progress)?;
+        self.ready_init.set(Some(pid));
+        Ok(pid)
+    }
 }
 
 struct Daemon {
@@ -224,32 +263,179 @@ struct Daemon {
     active: Option<ActiveCell>,
     last_exit: Option<String>,
     progress: Reporter,
+    pen_input_watcher: Option<PenInputWatcher>,
+}
+
+struct PenInputWatcher {
+    fd: OwnedFd,
+}
+
+impl PenInputWatcher {
+    fn new() -> io::Result<Self> {
+        // SAFETY: inotify_init1 takes flags only and returns a fresh descriptor.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful inotify_init1 transferred its descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let path = std::ffi::CString::new("/dev/input").expect("static path has no NUL");
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                fd.as_raw_fd(),
+                path.as_ptr(),
+                libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+            )
+        };
+        if watch < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    fn drain(&self) -> io::Result<Vec<(u32, String)>> {
+        let mut events = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            // SAFETY: read writes at most buffer.len() bytes into a valid buffer.
+            let count = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                match error.kind() {
+                    io::ErrorKind::WouldBlock => break,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return Err(error),
+                }
+            }
+            if count == 0 {
+                break;
+            }
+            events.extend(parse_pen_input_events(
+                &buffer[..usize::try_from(count).expect("nonnegative read length")],
+            ));
+        }
+        Ok(events)
+    }
+}
+
+fn parse_pen_input_events(bytes: &[u8]) -> Vec<(u32, String)> {
+    let mut parsed = Vec::new();
+    let mut offset = 0;
+    while offset + 16 <= bytes.len() {
+        let mask = u32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let name_length = usize::try_from(u32::from_ne_bytes(
+            bytes[offset + 12..offset + 16].try_into().unwrap(),
+        ))
+        .expect("inotify name length fits usize");
+        let name_start = offset + 16;
+        let Some(name_end) = name_start.checked_add(name_length) else {
+            break;
+        };
+        if name_end > bytes.len() {
+            break;
+        }
+        let name = bytes[name_start..name_end]
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        if mask & libc::IN_Q_OVERFLOW != 0 {
+            parsed.push((mask, String::new()));
+        } else if let Ok(name) = std::str::from_utf8(name)
+            && is_host_event_name(name)
+        {
+            parsed.push((mask, name.to_owned()));
+        }
+        offset = name_end;
+    }
+    parsed
+}
+
+fn is_host_event_name(name: &str) -> bool {
+    name.strip_prefix("event")
+        .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 impl Daemon {
     fn new(config: DaemonConfig) -> Self {
+        let pen_input_watcher = PenInputWatcher::new()
+            .map_err(|error| {
+                eprintln!("droidloomd: pen device hotplug watch unavailable: {error}");
+                error
+            })
+            .ok();
         Self {
             config,
             active: None,
             last_exit: None,
             progress: Reporter::default(),
+            pen_input_watcher,
         }
     }
 
     fn poll(&mut self) -> Result<(), ControlError> {
+        if let Some(active) = self.active.as_mut() {
+            match active.cell.try_wait().map_err(development_error) {
+                Ok(Some(status)) => {
+                    self.last_exit = Some(format!("Android cell exited with {status}"));
+                    self.active = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.last_exit = Some(format!("Android cell teardown failed: {error}"));
+                    self.active = None;
+                    return Err(error);
+                }
+            }
+        }
+
+        let events = self
+            .pen_input_watcher
+            .as_ref()
+            .map(PenInputWatcher::drain)
+            .transpose()
+            .map_err(|source| io_error("read host pen device events", source))?
+            .unwrap_or_default();
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
-        match active.cell.try_wait().map_err(development_error) {
-            Ok(Some(status)) => {
-                self.last_exit = Some(format!("Android cell exited with {status}"));
-                self.active = None;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.last_exit = Some(format!("Android cell teardown failed: {error}"));
-                self.active = None;
-                return Err(error);
+        let devices = discover_pen_input_devices().map_err(development_error)?;
+        let previous_names = active
+            .pen_devices
+            .iter()
+            .map(|device| device.event_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let current_names = devices
+            .iter()
+            .map(|device| device.event_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let hotplugged_pen = events.iter().any(|(mask, name)| {
+            mask & libc::IN_Q_OVERFLOW != 0
+                || previous_names.contains(name.as_str())
+                || current_names.contains(name.as_str())
+        });
+        if hotplugged_pen || devices != active.pen_devices {
+            active.pen_refresh_pending = true;
+        }
+        if active.pen_refresh_pending {
+            let generation = active
+                .pen_generation
+                .checked_add(1)
+                .ok_or_else(|| ControlError::Invalid("pen device generation exhausted".into()))?;
+            active.pen_generation = generation;
+            match refresh_pen_input_nodes(active.cell.host_pid(), generation, &devices) {
+                Ok(()) => {
+                    active.pen_devices = devices;
+                    active.pen_refresh_pending = false;
+                }
+                Err(error) => {
+                    eprintln!("droidloomd: could not refresh Android pen devices: {error}");
+                }
             }
         }
         Ok(())
@@ -265,6 +451,14 @@ impl Daemon {
             return self.failure(error.to_string());
         }
         let result = match request {
+            ControlRequest::WatchApplications => Err(ControlError::Invalid(
+                "subscription requires descriptor transport".into(),
+            )),
+            ControlRequest::ApplicationIcons {
+                components,
+                user,
+                size,
+            } => self.application_icons(peer_uid, &components, user, size),
             ControlRequest::Install { user } => self.install(peer_uid, user, file),
             ControlRequest::Start { spec } => self.start(peer_uid, &spec),
             ControlRequest::Stop => self.stop(peer_uid),
@@ -272,7 +466,9 @@ impl Daemon {
             ControlRequest::Status => self.status(peer_uid),
             ControlRequest::WaitReady => {
                 self.require_active_cell(peer_uid, None).and_then(|active| {
-                    wait_for_android_init(&active.spec, &self.progress)?;
+                    // Explicit readiness requests recheck a possible system_server restart.
+                    active.ready_init.set(None);
+                    active.ready_init(&self.progress)?;
                     Ok(self.success("Droidloom is running; Android is ready"))
                 })
             }
@@ -324,10 +520,15 @@ impl Daemon {
         let cell = start_development_cell(spec_path, &spec, &self.config.supervisor)
             .map_err(development_error)?;
         let pid = cell.host_pid();
+        let pen_devices = discover_pen_input_devices().map_err(development_error)?;
         self.active = Some(ActiveCell {
             spec_path: spec_path.to_owned(),
             spec: spec.clone(),
             cell,
+            ready_init: std::cell::Cell::new(None),
+            pen_devices,
+            pen_generation: 0,
+            pen_refresh_pending: false,
         });
         self.last_exit = None;
         Ok(ControlResponse {
@@ -338,6 +539,7 @@ impl Daemon {
             launch: None,
             applications: None,
             application_icon: None,
+            application_icons: None,
             diagnostics: None,
         })
     }
@@ -410,7 +612,7 @@ impl Daemon {
         validate_android_user(user)?;
         let active = self.require_active_cell(peer_uid, Some(spec_path))?;
         let started = Instant::now();
-        let init_pid = wait_for_android_init(&active.spec, &self.progress)?;
+        let init_pid = active.ready_init(&self.progress)?;
         let ready_us = started.elapsed().as_micros();
         self.progress
             .report("Android is ready. Launching the application (up to 120 seconds)...");
@@ -427,6 +629,7 @@ impl Daemon {
             launch: Some(output),
             applications: None,
             application_icon: None,
+            application_icons: None,
             diagnostics: None,
         })
     }
@@ -434,14 +637,13 @@ impl Daemon {
     fn list_applications(&self, peer_uid: u32, user: u32) -> Result<ControlResponse, ControlError> {
         validate_android_user(user)?;
         let active = self.require_active_cell(peer_uid, None)?;
-        wait_for_android_init(&active.spec, &self.progress)?;
         self.progress
             .report("Android is ready. Reading the application list (up to 115 seconds)...");
-        let framework_pid = android_system_server_pid(&active.spec)?;
-        let output = run_application_catalog_in_cell(
-            framework_pid,
-            &["list".to_owned(), "--user".to_owned(), user.to_string()],
-            "application listing",
+        let init = active.ready_init(&self.progress)?;
+        let output = framework_request(
+            init,
+            framework_wire::CATALOG,
+            &serde_json::json!({"user":user}),
         )?;
         let applications: Vec<AndroidApplication> =
             serde_json::from_str(&output).map_err(|error| {
@@ -458,6 +660,7 @@ impl Daemon {
             launch: None,
             applications: Some(applications),
             application_icon: None,
+            application_icons: None,
             diagnostics: None,
         })
     }
@@ -477,7 +680,7 @@ impl Daemon {
             )
         })?;
         apk::validate(&file)?;
-        let pid = wait_for_android_init(&active.spec, &self.progress)?;
+        let pid = active.ready_init(&self.progress)?;
         self.progress
             .report("Android is ready. Installing the APK (up to 115 seconds)...");
         apk::install(pid, user, file)?;
@@ -501,23 +704,19 @@ impl Daemon {
             )));
         }
         let active = self.require_active_cell(peer_uid, None)?;
-        wait_for_android_init(&active.spec, &self.progress)?;
         self.progress
             .report("Android is ready. Loading the application icon (up to 115 seconds)...");
-        let framework_pid = android_system_server_pid(&active.spec)?;
-        let icon = run_application_catalog_in_cell(
-            framework_pid,
-            &[
-                "icon".to_owned(),
-                "--user".to_owned(),
-                user.to_string(),
-                "--component".to_owned(),
-                component.to_owned(),
-                "--size".to_owned(),
-                size.to_string(),
-            ],
-            "application icon rendering",
+        let init = active.ready_init(&self.progress)?;
+        let output = framework_request(
+            init,
+            framework_wire::ICONS,
+            &serde_json::json!({"user":user,"components":[component],"size":size}),
         )?;
+        let icons: std::collections::BTreeMap<String, String> = serde_json::from_str(&output)?;
+        let icon = icons
+            .get(component)
+            .ok_or_else(|| ControlError::Invalid("launcher icon unavailable".into()))?
+            .clone();
         if icon.is_empty() || icon.len() as u64 > MAX_RESPONSE_BYTES / 2 {
             return Err(ControlError::Invalid(
                 "Android application icon output has an invalid size".into(),
@@ -531,8 +730,58 @@ impl Daemon {
             launch: None,
             applications: None,
             application_icon: Some(icon),
+            application_icons: None,
             diagnostics: None,
         })
+    }
+
+    fn application_icons(
+        &self,
+        peer_uid: u32,
+        components: &[String],
+        user: u32,
+        size: u32,
+    ) -> Result<ControlResponse, ControlError> {
+        if user != 0
+            || components.is_empty()
+            || components.len() > 32
+            || !(MIN_ICON_SIZE..=MAX_ICON_SIZE).contains(&size)
+        {
+            return Err(ControlError::Invalid(
+                "invalid icon batch scope or size".into(),
+            ));
+        }
+        for component in components {
+            validate_component(component)?;
+        }
+        let active = self.require_active_cell(peer_uid, None)?;
+        let init = active.ready_init(&self.progress)?;
+        let result = framework_request(
+            init,
+            framework_wire::ICONS,
+            &serde_json::json!({"user":user,"components":components,"size":size}),
+        )?;
+        let icons: std::collections::BTreeMap<String, String> = serde_json::from_str(&result)?;
+        if icons.iter().any(|(name, png)| {
+            !components.contains(name) || png.is_empty() || png.len() > 2 * 1024 * 1024
+        }) {
+            return Err(ControlError::Invalid(
+                "framework returned invalid icon batch".into(),
+            ));
+        }
+        let mut response = self.success("rendered Android launcher icon batch");
+        response.application_icons = Some(icons);
+        Ok(response)
+    }
+
+    fn watch_applications(&self, peer_uid: u32) -> Result<UnixStream, ControlError> {
+        let active = self.require_active_cell(peer_uid, None)?;
+        let init = match active.ready_init.get() {
+            Some(pid) => pid,
+            None => android_init_pid(&active.spec)?
+                .ok_or_else(|| ControlError::Invalid("Android init unavailable".into()))?,
+        };
+        framework_control::connect(init, "catalog-events")
     }
 
     fn set_dpi(
@@ -547,7 +796,7 @@ impl Daemon {
             .active
             .as_ref()
             .expect("density configuration ensured an active cell");
-        let init_pid = wait_for_android_init(&active.spec, &self.progress)?;
+        let init_pid = active.ready_init(&self.progress)?;
         self.progress
             .report("Android is ready. Applying display density (up to 120 seconds)...");
         set_dpi_in_cell(init_pid, dpi)?;
@@ -559,6 +808,7 @@ impl Daemon {
             launch: None,
             applications: None,
             application_icon: None,
+            application_icons: None,
             diagnostics: None,
         })
     }
@@ -647,6 +897,7 @@ impl Daemon {
             launch: None,
             applications: None,
             application_icon: None,
+            application_icons: None,
             diagnostics: None,
         }
     }
@@ -665,13 +916,13 @@ impl Daemon {
     }
 }
 
-/// Run the lifecycle daemon until `shutdown` is set by a signal handler.
+/// Run the lifecycle daemon until `shutdown` is requested by a signal handler.
 ///
 /// # Errors
 ///
 /// Returns socket setup, protocol I/O, cell lifecycle, or final cleanup
 /// failures.
-pub fn serve(config: &DaemonConfig, shutdown: &AtomicBool) -> Result<(), ControlError> {
+pub fn serve(config: &DaemonConfig, shutdown: &Shutdown) -> Result<(), ControlError> {
     let listener = bind_listener(&config.socket)?;
     listener
         .set_nonblocking(true)
@@ -687,59 +938,66 @@ pub fn serve(config: &DaemonConfig, shutdown: &AtomicBool) -> Result<(), Control
 fn run_loop(
     listener: &UnixListener,
     daemon: &mut Daemon,
-    shutdown: &AtomicBool,
+    shutdown: &Shutdown,
 ) -> Result<(), ControlError> {
+    let mut sources = WaitSources::default();
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        daemon.poll()?;
+        sources
+            .child(daemon.active.as_ref().map(|active| active.cell.host_pid()))
+            .map_err(|source| io_error("watch lifecycle child", source))?;
+        if !sources
+            .wait_with_fd(
+                listener,
+                shutdown,
+                daemon
+                    .pen_input_watcher
+                    .as_ref()
+                    .map(|watcher| watcher.fd.as_raw_fd()),
+            )
+            .map_err(|source| io_error("wait for lifecycle readiness", source))?
+        {
             return Ok(());
         }
         daemon.poll()?;
         match listener.accept() {
             Ok((mut stream, _)) => {
+                let mut delegated = None;
                 let response = match receive_request(&mut stream) {
                     Ok((peer_uid, request, file, streaming)) => {
                         daemon.progress = Reporter::new(&stream, streaming)?;
-                        daemon.handle(peer_uid, request, file)
+                        if matches!(request, ControlRequest::WatchApplications) {
+                            match daemon.watch_applications(peer_uid) {
+                                Ok(events) => {
+                                    delegated =
+                                        Some(fs::File::from(std::os::fd::OwnedFd::from(events)));
+                                    daemon.success("subscribed to framework catalog events")
+                                }
+                                Err(error) => daemon.failure(error.to_string()),
+                            }
+                        } else {
+                            daemon.handle(peer_uid, request, file)
+                        }
                     }
                     Err(error) => daemon.failure(error.to_string()),
                 };
                 // Closing a diagnostic client must not tear down Android.
-                if let Err(error) = send_response(&mut stream, &response) {
+                let delivered = if let Some(file) = delegated {
+                    apk::send_file(&stream, 1, &file)
+                } else {
+                    send_response(&mut stream, &response)
+                };
+                if let Err(error) = delivered {
                     eprintln!("could not deliver lifecycle response: {error}");
                 }
                 daemon.progress = Reporter::default();
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                wait_for_client(listener)?;
+                continue;
             }
             Err(source) => return Err(io_error("accept lifecycle client", source)),
         }
     }
-}
-
-fn wait_for_client(listener: &UnixListener) -> Result<(), ControlError> {
-    let mut descriptor = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // Keep the existing shutdown/child-health check interval, but wake
-    // immediately on a connection instead of delaying launches by 0–50 ms.
-    let timeout = i32::try_from(ACCEPT_POLL.as_millis()).expect("bounded accept interval");
-    // SAFETY: descriptor is initialized and valid for one pollfd; listener
-    // remains borrowed and owns its descriptor throughout this synchronous call.
-    let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(io_error("wait for lifecycle client", error));
-        }
-    } else if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-        return Err(ControlError::Invalid(
-            "lifecycle listener became unavailable".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Send one request and wait for its bounded response.
@@ -1116,7 +1374,7 @@ fn android_boot_snapshot(spec: &CellSpec) -> Result<(Option<u32>, Option<String>
         return Ok((None, Some("waiting for Android init".into())));
     };
     let launcher = PathBuf::from(format!(
-        "/proc/{pid}/root/vendor/bin/droidloom-task-launcher"
+        "/proc/{pid}/root/dev/socket/droidloom-framework/control"
     ));
     let task_control = PathBuf::from(format!(
         "/proc/{pid}/root/dev/socket/droidloom-task-control"
@@ -1128,7 +1386,7 @@ fn android_boot_snapshot(spec: &CellSpec) -> Result<(Option<u32>, Option<String>
         Some(pid),
         properties.map_or_else(
             || Some("waiting for Android's property service to respond".into()),
-            |properties| android_boot_phase(&properties, launcher.is_file(), control_ready),
+            |properties| android_boot_phase(&properties, launcher.exists(), control_ready),
         ),
     ))
 }
@@ -1176,13 +1434,13 @@ fn android_boot_phase(properties: &[u8], launcher: bool, task_control: bool) -> 
             service("init.svc.zygote"),
             service("init.svc.bootanim")
         ))
-    } else if property("init.svc.droidloom-input-bridge") != Some("running") {
+    } else if property("sys.droidloom.framework_ready") != Some("1") {
         Some(format!(
-            "Android boot completed; waiting for Droidloom input service ({})",
-            service("init.svc.droidloom-input-bridge")
+            "Android boot completed; waiting for Droidloom framework input/channels ({})",
+            property("sys.droidloom.framework_ready").unwrap_or("not reported")
         ))
     } else if !launcher {
-        Some("Android boot completed; waiting for Droidloom task launcher".into())
+        Some("Android boot completed; waiting for Droidloom native framework endpoint".into())
     } else if !task_control {
         Some("Android boot completed; waiting for Droidloom task control".into())
     } else {
@@ -1207,22 +1465,6 @@ fn android_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
         }
     }
     Ok(None)
-}
-
-fn android_system_server_pid(spec: &CellSpec) -> Result<u32, ControlError> {
-    for pid in android_namespace_pids(spec)? {
-        let name = match fs::read_to_string(format!("/proc/{pid}/comm")) {
-            Ok(name) => name,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(io_error("read Android process name", source)),
-        };
-        if name.trim() == "system_server" {
-            return Ok(pid);
-        }
-    }
-    Err(ControlError::Invalid(
-        "Android system_server is not available for application catalog access".into(),
-    ))
 }
 
 fn android_namespace_pids(spec: &CellSpec) -> Result<Vec<u32>, ControlError> {
@@ -1263,156 +1505,6 @@ pub fn parse_launch_resolution(value: &str) -> Result<String, ControlError> {
     Ok(value.to_owned())
 }
 
-fn launch_in_cell(
-    init_pid: u32,
-    package: &str,
-    component: Option<&str>,
-    resolution: Option<&str>,
-    user: u32,
-) -> Result<String, ControlError> {
-    let mut arguments = vec!["--user".to_owned(), user.to_string()];
-    if let Some(component) = component {
-        arguments.extend(["--component".to_owned(), component.to_owned()]);
-    }
-    if let Some(resolution) = resolution {
-        arguments.extend(["--resolution".to_owned(), resolution.to_owned()]);
-    }
-    arguments.push(package.to_owned());
-    run_task_launcher_in_cell(init_pid, &arguments, "task launch")
-}
-
-fn set_dpi_in_cell(init_pid: u32, dpi: u32) -> Result<(), ControlError> {
-    let output = run_task_launcher_in_cell(
-        init_pid,
-        &["--set-density".to_owned(), dpi.to_string()],
-        "display density configuration",
-    )?;
-    if output != format!("dpi={dpi}") {
-        return Err(ControlError::Invalid(format!(
-            "Android density configuration returned unexpected output: {output}"
-        )));
-    }
-    Ok(())
-}
-
-fn run_task_launcher_in_cell(
-    init_pid: u32,
-    arguments: &[String],
-    operation: &str,
-) -> Result<String, ControlError> {
-    let pid = init_pid.to_string();
-    let mut command = droidloom_cpu_placement::command("nsenter");
-    command
-        .args([
-            "--target",
-            &pid,
-            "--mount",
-            "--uts",
-            "--ipc",
-            "--net",
-            "--pid",
-            "--cgroup",
-            "--root",
-            "--wd",
-            "--",
-            "/vendor/bin/droidloom-task-launcher",
-        ])
-        .args(arguments);
-    let deadline = Instant::now() + ANDROID_READY_TIMEOUT;
-    loop {
-        // Each retry shares the original deadline. A blocked Binder call in
-        // the launcher must not hold every subsequent lifecycle request forever.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(android_operation_timeout(operation));
-        }
-        let mut bounded = droidloom_cpu_placement::command("timeout");
-        bounded
-            .args([
-                "--kill-after=5s",
-                &format!("{:.3}s", remaining.as_secs_f64().max(0.001)),
-                "nsenter",
-            ])
-            .args(command.get_args());
-        let output = bounded
-            .output()
-            .map_err(|source| io_error("execute Android task launcher", source))?;
-        // Preserve per-stage evidence in the daemon journal; stdout remains
-        // the stable task-binding response consumed by droidloomctl.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        for line in stderr
-            .lines()
-            .filter(|line| line.starts_with("droidloom-launch-timing "))
-        {
-            eprintln!("{line}");
-        }
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        }
-        if matches!(output.status.code(), Some(124 | 137)) {
-            return Err(android_operation_timeout(operation));
-        }
-        if !android_services_are_booting(&stderr) {
-            return Err(ControlError::Invalid(format!(
-                "Android {operation} failed ({}): {}",
-                output.status,
-                stderr.trim()
-            )));
-        }
-        thread::sleep(ANDROID_SERVICE_RETRY_INTERVAL);
-    }
-}
-
-fn run_application_catalog_in_cell(
-    framework_pid: u32,
-    arguments: &[String],
-    operation: &str,
-) -> Result<String, ControlError> {
-    let pid = framework_pid.to_string();
-    // A failed Android boot must not leave catalog requests holding the
-    // lifecycle lock indefinitely and prevent the updater from rolling back.
-    let output = droidloom_cpu_placement::command("timeout")
-        .args(["--kill-after=5s", "110s", "nsenter"])
-        .args([
-            "--target",
-            &pid,
-            "--mount",
-            "--uts",
-            "--ipc",
-            "--net",
-            "--pid",
-            "--cgroup",
-            "--root",
-            "--wd",
-            "--env",
-            "--",
-            "/system/bin/env",
-            APPLICATION_CATALOG_ENV,
-            "/system/bin/app_process",
-            "/system/bin",
-            APPLICATION_CATALOG_CLASS,
-        ])
-        .args(arguments)
-        .output()
-        .map_err(|source| io_error("execute Android application catalog", source))?;
-    if !output.status.success() {
-        if matches!(output.status.code(), Some(124 | 137)) {
-            return Err(android_operation_timeout(operation));
-        }
-        return Err(ControlError::Invalid(format!(
-            "Android {operation} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout).map_err(|error| {
-        ControlError::Invalid(format!(
-            "Android {operation} returned non-UTF-8 output: {error}"
-        ))
-    })?;
-    Ok(stdout.trim().to_owned())
-}
-
 fn android_operation_timeout(operation: &str) -> ControlError {
     ControlError::Invalid(format!(
         "Android looks stuck: {operation} did not finish before its deadline.\n{LOG_HINT}"
@@ -1427,10 +1519,6 @@ fn validate_display_density(dpi: u32) -> Result<(), ControlError> {
         )));
     }
     Ok(())
-}
-
-fn android_services_are_booting(stderr: &str) -> bool {
-    stderr.contains("cmd: Can't find service:")
 }
 
 fn remove_socket(socket: &Path) -> Result<(), ControlError> {
@@ -1455,6 +1543,32 @@ fn io_error(context: &str, source: io::Error) -> ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pen_input_watch_keeps_event_node_changes_and_queue_overflow() {
+        let mut bytes = Vec::new();
+        let name = b"event12\0";
+        bytes.extend_from_slice(&1_i32.to_ne_bytes());
+        bytes.extend_from_slice(&libc::IN_DELETE.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&(-1_i32).to_ne_bytes());
+        bytes.extend_from_slice(&libc::IN_Q_OVERFLOW.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+
+        assert_eq!(
+            parse_pen_input_events(&bytes),
+            [
+                (libc::IN_DELETE, "event12".to_owned()),
+                (libc::IN_Q_OVERFLOW, String::new())
+            ]
+        );
+        assert!(!is_host_event_name("by-path"));
+        assert!(!is_host_event_name("event12x"));
+    }
+
     use std::sync::Arc;
 
     #[test]
@@ -1484,6 +1598,7 @@ mod tests {
                         launch: None,
                         applications: None,
                         application_icon: None,
+                        application_icons: None,
                         diagnostics: None,
                     },
                 )
@@ -1584,16 +1699,16 @@ mod tests {
         assert!(android_boot_phase(b"[sys.boot_completed]: [1]\n", true, true).is_some());
         assert!(
             android_boot_phase(
-                b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [restarting]\n",
+                b"[sys.boot_completed]: [1]\n[sys.droidloom.framework_ready]: [0]\n",
                 true,
                 true
             )
             .unwrap()
-            .contains("input service (restarting)")
+            .contains("framework input/channels (0)")
         );
         assert!(
             android_boot_phase(
-                b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n",
+                b"[sys.boot_completed]: [1]\n[sys.droidloom.framework_ready]: [1]\n",
                 true,
                 true
             )
@@ -1608,11 +1723,11 @@ mod tests {
         assert!(phase.contains("complete boot"));
         assert!(phase.contains("Android runtime: restarting"));
         assert!(phase.contains("boot animation: running"));
-        let ready = b"[sys.boot_completed]: [1]\n[init.svc.droidloom-input-bridge]: [running]\n";
+        let ready = b"[sys.boot_completed]: [1]\n[sys.droidloom.framework_ready]: [1]\n";
         assert!(
             android_boot_phase(ready, false, true)
                 .unwrap()
-                .contains("task launcher")
+                .contains("native framework endpoint")
         );
         assert!(
             android_boot_phase(ready, true, false)
@@ -1705,16 +1820,6 @@ mod tests {
     }
 
     #[test]
-    fn only_missing_android_services_are_treated_as_boot_progress() {
-        assert!(android_services_are_booting(
-            "enable built-in-display freeform tasks exited Some(20): cmd: Can't find service: window"
-        ));
-        assert!(!android_services_are_booting(
-            "Android activity launch failed: package org.example.missing is unknown"
-        ));
-    }
-
-    #[test]
     fn only_root_or_the_exact_cell_owner_is_authorized() {
         assert!(authorize_uid(0, 1000).is_ok());
         assert!(authorize_uid(1000, 1000).is_ok());
@@ -1730,7 +1835,7 @@ mod tests {
             supervisor: directory.path().join("unused-supervisor"),
             spec_directory: directory.path().join("unused-specifications"),
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(Shutdown::new().unwrap());
         let daemon_shutdown = Arc::clone(&shutdown);
         let thread = std::thread::spawn(move || serve(&config, &daemon_shutdown));
 
@@ -1739,7 +1844,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         if !socket.exists() {
-            shutdown.store(true, Ordering::Relaxed);
+            shutdown.request().unwrap();
             let result = thread.join().unwrap();
             if matches!(
                 result,
@@ -1786,7 +1891,7 @@ mod tests {
             assert_eq!(stopped.state, CellState::Stopped);
         }
 
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.request().unwrap();
         thread.join().unwrap().unwrap();
         assert!(!socket.exists());
     }

@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 
 pub mod denial;
+mod headless_fence;
 #[allow(unsafe_code)]
 pub mod gles;
 pub mod minigbm;

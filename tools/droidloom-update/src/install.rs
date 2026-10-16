@@ -14,6 +14,7 @@ const ALIASES: &[(&str, &str)] = &[
         "usr/bin/droidloom-supervisor",
     ),
     ("/usr/bin/droidloom-wayland", "usr/bin/droidloom-wayland"),
+    ("/usr/bin/droidloom-audio", "usr/bin/droidloom-audio"),
     (
         "/usr/bin/droidloom-applications",
         "usr/bin/droidloom-applications",
@@ -43,6 +44,14 @@ const ALIASES: &[(&str, &str)] = &[
         "usr/lib/systemd/user/droidloom-applications.service",
     ),
     (
+        "/usr/lib/systemd/user/droidloom-audio.service",
+        "usr/lib/systemd/user/droidloom-audio.service",
+    ),
+    (
+        "/usr/lib/systemd/user/droidloom-audio.socket",
+        "usr/lib/systemd/user/droidloom-audio.socket",
+    ),
+    (
         "/usr/lib/environment.d/60-droidloom.conf",
         "usr/lib/environment.d/60-droidloom.conf",
     ),
@@ -51,6 +60,42 @@ const ALIASES: &[(&str, &str)] = &[
         "etc/polkit-1/rules.d/49-droidloom.rules",
     ),
 ];
+const CAMERA_ALIASES: &[(&str, &str)] = &[
+    ("/usr/bin/droidloom-camera", "usr/bin/droidloom-camera"),
+    ("/usr/lib/systemd/user/droidloom-camera.service", "usr/lib/systemd/user/droidloom-camera.service"),
+    ("/usr/lib/systemd/user/droidloom-camera.socket", "usr/lib/systemd/user/droidloom-camera.socket"),
+];
+
+fn required_aliases(camera: bool) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    ALIASES.iter().chain(CAMERA_ALIASES.iter().filter(move |_| camera))
+}
+
+fn validate_alias_targets(payload: &Path) -> Result<bool> {
+    let camera = bundle::camera_payload_present(payload);
+    for (_, relative) in required_aliases(camera) {
+        if !payload.join(relative).exists() {
+            return fail(format!("incomplete installation bundle: {relative}"));
+        }
+    }
+    Ok(camera)
+}
+
+fn activate_camera_alias(path: &Path, target: &Path, camera: bool) -> Result<()> {
+    if camera {
+        return atomic_link(target, path);
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() && fs::read_link(path)? == target => {
+            fs::remove_file(path)?;
+            fs::File::open(path.parent().ok_or("camera alias lacks parent")?)?.sync_all()?;
+            Ok(())
+        }
+        Ok(_) => fail(format!("refusing to remove an unowned camera entry point: {}", path.display())),
+    }
+}
+
 fn user(uid: u32) -> Result<String> {
     let record = output(Command::new("getent").args(["passwd", &uid.to_string()]))?;
     Ok(record.split(':').next().ok_or("unknown user")?.into())
@@ -194,7 +239,7 @@ fn stage_bundle(payload: &Path, private: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub fn apply(payload: &Path, uid: u32) -> Result<()> {
+pub fn apply(payload: &Path, uid: u32, start_runtime: bool) -> Result<()> {
     refuse_package_installation()?;
     if unsafe { libc::geteuid() } != 0 {
         return fail("activation requires administrator authentication");
@@ -230,15 +275,16 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
     if spec["host_uid"].as_u64() != Some(u64::from(uid)) {
         return fail("bundle desktop owner differs from authenticated update owner");
     }
-    for (_, relative) in ALIASES {
-        if !private.path().join(relative).exists() {
-            return fail(format!("incomplete installation bundle: {relative}"));
-        }
-    }
+    let camera = validate_alias_targets(private.path())?;
     let id = manifest.build_id.clone();
     let release = base.join("releases").join(&id);
     if release.exists() {
-        bundle::verify(&release)?;
+        // The same build identity must mean the same verified bytes; never
+        // silently reuse a named release for different content.
+        let existing = bundle::verify(&release)?;
+        if existing != manifest {
+            return fail("a release with this build identity already exists with different contents");
+        }
     } else {
         sync_tree(private.path())?;
         fs::rename(private.path(), &release)?;
@@ -257,6 +303,16 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return fail("Android data must remain below /var/lib/droidloom");
+    }
+    // An update must not silently start a second, empty cell: the declared
+    // data directory has to match the currently active release.
+    if let Ok(active) = fs::read_link(base.join("active"))
+        && let Ok(previous) = fs::read(active.join("etc/droidloom/cell.json"))
+        && let Ok(previous) = serde_json::from_slice::<serde_json::Value>(&previous)
+        && let Some(previous) = previous["data_dir"].as_str()
+        && Path::new(previous) != data.as_path()
+    {
+        return fail("bundle data directory differs from the installed cell; refusing to start with new Android data");
     }
     fs::create_dir_all(&data)?;
     mode(&data, 0o700)?;
@@ -291,7 +347,7 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
         was_active: active,
         aliases: Vec::new(),
     };
-    for (index, (path, _)) in ALIASES.iter().enumerate() {
+    for (index, (path, _)) in ALIASES.iter().chain(CAMERA_ALIASES).enumerate() {
         let path = Path::new(path);
         let mut saved = Saved {
             path: path.to_str().unwrap().into(),
@@ -332,20 +388,25 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
                 atomic_link(&base.join("active").join(relative), path)?;
             }
         }
+        for (path, relative) in CAMERA_ALIASES {
+            activate_camera_alias(Path::new(path), &base.join("active").join(relative), camera)?;
+        }
         reload(uid)?;
         run(Command::new("systemctl").args(["disable", "droidloomd.service"]))?;
         run(Command::new("systemctl").args(["--global", "disable", "droidloom.service"]))?;
         run(user_command(uid, "systemctl")?.args(["--user", "disable", "droidloom.service"]))?;
-        start(uid)?;
-        let response =
-            output(user_command(uid, "/usr/bin/droidloomctl")?.args(["--json", "applications"]))?;
-        let response: serde_json::Value = serde_json::from_str(&response)?;
-        if response["ok"] != true
-            || response["applications"]
-                .as_array()
-                .is_none_or(|a| a.is_empty())
-        {
-            return fail("Android readiness check failed");
+        if start_runtime {
+            start(uid)?;
+            let response =
+                output(user_command(uid, "/usr/bin/droidloomctl")?.args(["--json", "applications"]))?;
+            let response: serde_json::Value = serde_json::from_str(&response)?;
+            if response["ok"] != true
+                || response["applications"]
+                    .as_array()
+                    .is_none_or(|a| a.is_empty())
+            {
+                return fail("Android readiness check failed");
+            }
         }
         Ok(())
     })();
@@ -359,10 +420,16 @@ pub fn apply(payload: &Path, uid: u32) -> Result<()> {
     durable_write(
         &base.join("last-update.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"release":id,"source":manifest.source_identity,"input_abi":manifest.input_abi,"readiness":"catalog","autostart":false}),
+            &serde_json::json!({"release":id,"source":manifest.source_identity,"input_abi":manifest.input_abi,"readiness":if start_runtime {"catalog"} else {"not-started"},"autostart":false}),
         )?,
     )?;
-    println!("Droidloom updated and running. Automatic startup remains disabled.");
+    if start_runtime {
+        println!("Droidloom updated and running. Automatic startup remains disabled.");
+    } else {
+        println!(
+            "Droidloom installed and stopped. Runtime readiness has not been checked. Automatic startup remains disabled."
+        );
+    }
     Ok(())
 }
 
@@ -376,6 +443,88 @@ fn refuse_package_installation() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_payload_does_not_require_camera_alias_targets() {
+        let d = tempfile::tempdir().unwrap();
+        crate::bundle::artifact_tests::fixture(d.path(), 5, 5);
+        for (_, relative) in ALIASES {
+            let path = d.path().join(relative);
+            if !path.exists() {
+                write(&path, b"legacy installation target").unwrap();
+            }
+        }
+        assert!(!validate_alias_targets(d.path()).unwrap());
+        write(&d.path().join("usr/bin/droidloom-camera"), b"partial").unwrap();
+        assert!(validate_alias_targets(d.path()).is_err());
+        crate::bundle::artifact_tests::camera_fixture(d.path());
+        assert!(validate_alias_targets(d.path()).unwrap());
+    }
+
+    #[test]
+    fn downgrade_removes_camera_aliases_and_recovery_restores_them() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("base");
+        let old = base.join("old-without-camera");
+        let new = base.join("new-with-camera");
+        fs::create_dir_all(&old).unwrap();
+        let mut aliases = Vec::new();
+        for (path, relative) in CAMERA_ALIASES {
+            write(&new.join(relative), b"camera component").unwrap();
+            let path = d.path().join(path.trim_start_matches('/'));
+            let target = base.join("active").join(relative);
+            atomic_link(&target, &path).unwrap();
+            aliases.push(Saved { path: path.to_str().unwrap().into(), link: Some(target), file: None });
+        }
+        let journal = Journal { uid: 1000, previous: Some(new.clone()), was_active: true, aliases };
+        atomic_link(&old, &base.join("active")).unwrap();
+        for saved in &journal.aliases {
+            activate_camera_alias(Path::new(&saved.path), saved.link.as_ref().unwrap(), false).unwrap();
+            assert!(fs::symlink_metadata(&saved.path).is_err());
+        }
+        restore_files(&base, &journal).unwrap();
+        restore_files(&base, &journal).unwrap();
+        assert_eq!(fs::read_link(base.join("active")).unwrap(), new);
+        for saved in &journal.aliases {
+            assert_eq!(fs::read(&saved.path).unwrap(), b"camera component");
+        }
+    }
+
+    #[test]
+    fn camera_alias_activation_preserves_unowned_files_on_downgrade() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("camera");
+        let target = d.path().join("active/usr/bin/droidloom-camera");
+        write(&path, b"unrelated").unwrap();
+        assert!(activate_camera_alias(&path, &target, false).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"unrelated");
+        fs::remove_file(&path).unwrap();
+        atomic_link(&d.path().join("foreign"), &path).unwrap();
+        assert!(activate_camera_alias(&path, &target, false).is_err());
+        assert_eq!(fs::read_link(&path).unwrap(), d.path().join("foreign"));
+    }
+
+    #[test]
+    fn failed_camera_upgrade_removes_new_aliases_during_recovery() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("base");
+        let old = base.join("old-without-camera");
+        fs::create_dir_all(&old).unwrap();
+        let mut aliases = Vec::new();
+        for (path, relative) in CAMERA_ALIASES {
+            let path = d.path().join(path.trim_start_matches('/'));
+            activate_camera_alias(&path, &base.join("active").join(relative), true).unwrap();
+            aliases.push(Saved { path: path.to_str().unwrap().into(), link: None, file: None });
+        }
+        let journal = Journal { uid: 1000, previous: Some(old.clone()), was_active: true, aliases };
+        atomic_link(&base.join("candidate"), &base.join("active")).unwrap();
+        restore_files(&base, &journal).unwrap();
+        assert_eq!(fs::read_link(base.join("active")).unwrap(), old);
+        for saved in &journal.aliases {
+            assert!(fs::symlink_metadata(&saved.path).is_err());
+        }
+    }
+
     #[test]
     fn failed_first_activation_restores_legacy_files_and_links() {
         let d = tempfile::tempdir().unwrap();
@@ -454,12 +603,30 @@ mod staging_tests {
     fn all_shipped_host_programs_have_stable_entry_points() {
         for name in crate::assemble::HOST_BINARIES {
             assert!(
-                ALIASES
-                    .iter()
+                required_aliases(true)
                     .any(|(path, relative)| *path == format!("/usr/bin/{name}")
                         && *relative == format!("usr/bin/{name}")),
                 "{name}"
             );
+        }
+    }
+    #[test]
+    fn activation_covers_every_shipped_systemd_unit() {
+        // A fresh updater installation writes exactly the alias targets; any unit
+        // the assembler stages into usr/lib/systemd without an alias here would be
+        // silently absent from the live system (for example droidloom-audio.socket).
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for directory in ["system", "user"] {
+            for entry in fs::read_dir(repo.join("packaging/systemd").join(directory)).unwrap() {
+                let name = entry.unwrap().file_name();
+                let relative = format!("usr/lib/systemd/{directory}/{}", name.to_string_lossy());
+                let installed = format!("/{relative}");
+                assert!(
+                    required_aliases(true)
+                        .any(|(path, target)| *path == installed && *target == relative),
+                    "missing activation alias for staged systemd unit: {relative}"
+                );
+            }
         }
     }
     #[test]

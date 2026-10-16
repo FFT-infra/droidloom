@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-source_tree="${1:-$repo_root/.work/aosp-m2-source}"
+source_tree="${1:-$repo_root/.work/arch/build/aosp-source}"
 source_tree="$(readlink -f -- "$source_tree")"
 lock="$repo_root/android/manifest/m2-sparse-source-lock.json"
 manifest="$source_tree/.droidloom-source-manifest.json"
@@ -52,6 +52,8 @@ inputflinger_patch="$repo_root/android/inputflinger/0001-application-token-targe
 inputflinger_patch_applied=false
 inputflinger_binder_patch="$repo_root/android/inputflinger/0002-droidloom-targeted-injection-binder.patch"
 inputflinger_binder_patch_applied=false
+inputflinger_policy_patch="$repo_root/android/inputflinger/0003-droidloom-window-policy.patch"
+inputflinger_policy_patch_applied=false
 binder_context_manager_patch="$repo_root/android/binder-compat/0001-droidloom-context-manager-without-kernel-sid.patch"
 binder_context_manager_patch_applied=false
 servicemanager_context_patch="$repo_root/android/binder-compat/0002-droidloom-servicemanager-pid-context-fallback.patch"
@@ -70,6 +72,12 @@ vold_storage_patch_applied=false
 frameworks_base_checkout="$source_tree/frameworks/base"
 navigation_insets_patch="$repo_root/android/framework/0001-droidloom-bottom-navigation-insets.patch"
 navigation_insets_patch_applied=false
+window_policy_patch="$repo_root/android/framework/0004-droidloom-window-policy.patch"
+window_policy_patch_applied=false
+task_backend_patch="$repo_root/android/framework/0005-droidloom-authoritative-tasks.patch"
+task_backend_patch_applied=false
+host_channels_patch="$repo_root/android/framework/0006-droidloom-direct-host-channels.patch"
+host_channels_patch_applied=false
 framework_app_projection_backup=""
 
 if [[ "$source_tree" == "/" || "$source_tree" == "$repo_root" ]]; then
@@ -173,6 +181,18 @@ if [[ -e "$display_flags_projection" ]]; then
 fi
 
 cleanup() {
+    if [[ "$host_channels_patch_applied" == true ]]; then
+        git -C "$frameworks_base_checkout" apply -R "$host_channels_patch"
+    fi
+    if [[ "$task_backend_patch_applied" == true ]]; then
+        git -C "$frameworks_base_checkout" apply -R "$task_backend_patch"
+    fi
+    if [[ "$inputflinger_policy_patch_applied" == true ]]; then
+        git -C "$frameworks_native_checkout" apply -R "$inputflinger_policy_patch"
+    fi
+    if [[ "$window_policy_patch_applied" == true ]]; then
+        git -C "$frameworks_base_checkout" apply -R "$window_policy_patch"
+    fi
     if [[ -n "$framework_app_projection_backup" ]]; then
         cp -a "$framework_app_projection_backup/." "$source_tree/"
         rm -rf -- "$framework_app_projection_backup"
@@ -349,6 +369,15 @@ if [[ "${DROIDLOOM_SOONG_SERVICES_ONLY:-}" == "1" ]]; then
     git -C "$frameworks_base_checkout" apply --check "$navigation_insets_patch"
     git -C "$frameworks_base_checkout" apply "$navigation_insets_patch"
     navigation_insets_patch_applied=true
+    git -C "$frameworks_base_checkout" apply --check "$window_policy_patch"
+    git -C "$frameworks_base_checkout" apply "$window_policy_patch"
+    window_policy_patch_applied=true
+    git -C "$frameworks_base_checkout" apply --check "$task_backend_patch"
+    git -C "$frameworks_base_checkout" apply "$task_backend_patch"
+    task_backend_patch_applied=true
+    git -C "$frameworks_base_checkout" apply --check "$host_channels_patch"
+    git -C "$frameworks_base_checkout" apply "$host_channels_patch"
+    host_channels_patch_applied=true
 fi
 
 git -C "$connectivity_checkout" apply --check "$netbpfload_patch"
@@ -390,6 +419,9 @@ inputflinger_patch_applied=true
 git -C "$frameworks_native_checkout" apply --check "$inputflinger_binder_patch"
 git -C "$frameworks_native_checkout" apply "$inputflinger_binder_patch"
 inputflinger_binder_patch_applied=true
+git -C "$frameworks_native_checkout" apply --check "$inputflinger_policy_patch"
+git -C "$frameworks_native_checkout" apply "$inputflinger_policy_patch"
+inputflinger_policy_patch_applied=true
 git -C "$source_tree" apply --check "$init_cell_patch"
 git -C "$source_tree" apply "$init_cell_patch"
 init_cell_patch_applied=true
@@ -418,6 +450,10 @@ mkdir -p "$source_tree/vendor/droidloom"
     cd "$repo_root"
     rsync -aR \
         Android.bp \
+        ./runtime/droidloom-cpu-placement \
+        ./runtime/droidloom-timing \
+        ./runtime/droidloom-audio-protocol \
+        ./android/audio \
         LICENSE LICENSES \
         ./graphics/droidloom-composer-aidl \
         ./graphics/droidloom-composer-service \
@@ -430,11 +466,11 @@ mkdir -p "$source_tree/vendor/droidloom"
         ./graphics/droidloom-syncobj \
         ./graphics/droidloom-task-control \
         ./graphics/droidloom-transport \
-        ./android/framework/droidloom-task-launcher \
-        ./android/framework/droidloom-input-bridge \
+        ./android/framework/host-channels \
         ./android/framework/droidloom-ime \
         ./android/framework/droidloom-home \
         ./android/framework/droidloom-systemui \
+        ./android/framework/droidloom-window-policy \
         ./android/lmkd-compat \
         ./android/runtime/droidloom-classpath-wrapper \
         ./android/selinux-compat \
@@ -457,7 +493,7 @@ mkdir -p "$source_tree/vendor/droidloom"
         SOONG_ONLY=true \
             SOONG_INCREMENTAL_ANALYSIS=false \
             ALLOW_MISSING_DEPENDENCIES=true \
-            m -k 20 out/soong/.intermediates/frameworks/base/services/services/android_common/aligned/services.jar
+            m -k 20 out/soong/.intermediates/frameworks/base/services/services/android_common/aligned/services.jar libinputflinger
         install -D -m 0644 \
             out/soong/.intermediates/frameworks/base/services/services/android_common/aligned/services.jar \
             "out/target/product/$product/system/framework/services.jar"
@@ -465,27 +501,11 @@ mkdir -p "$source_tree/vendor/droidloom"
             "out/target/product/$product/system/framework/services.jar"
         exit
     fi
-    if [[ "${DROIDLOOM_SOONG_TASK_LAUNCHER_ONLY:-}" == "1" ]]; then
+    if [[ "${DROIDLOOM_SOONG_FRAMEWORK_NATIVE_ONLY:-}" == "1" ]]; then
         SOONG_ONLY=true \
             SOONG_INCREMENTAL_ANALYSIS=false \
             ALLOW_MISSING_DEPENDENCIES=true \
-            m droidloom-task-launcher
-        exit
-    fi
-    if [[ "${DROIDLOOM_SOONG_FRAMEWORK_BRIDGE_ONLY:-}" == "1" ]]; then
-        SOONG_ONLY=true \
-            SOONG_INCREMENTAL_ANALYSIS=false \
-            ALLOW_MISSING_DEPENDENCIES=true \
-            m android.hardware.graphics.composer3-service.droidloom \
-            droidloom-task-launcher \
-            droidloom-input-bridge
-        exit
-    fi
-    if [[ "${DROIDLOOM_SOONG_INPUT_BRIDGE_ONLY:-}" == "1" ]]; then
-        SOONG_ONLY=true \
-            SOONG_INCREMENTAL_ANALYSIS=false \
-            ALLOW_MISSING_DEPENDENCIES=true \
-            m droidloom-input-bridge
+            m android.hardware.graphics.composer3-service.droidloom libinputflinger
         exit
     fi
     if [[ "${DROIDLOOM_SOONG_SELINUX_COMPAT_ONLY:-}" == "1" ]]; then
@@ -499,17 +519,17 @@ mkdir -p "$source_tree/vendor/droidloom"
         SOONG_ONLY=true \
             SOONG_INCREMENTAL_ANALYSIS=false \
             ALLOW_MISSING_DEPENDENCIES=true \
-            m libinputflinger droidloom-input-bridge
+            m libinputflinger
         exit
     fi
     if [[ "${DROIDLOOM_SOONG_TARGETED_INPUT_ONLY:-}" == "1" ]]; then
         # SurfaceFlinger resolves task IDs to native application tokens and
-        # InputFlinger dispatches directly to that token. system_server and the
-        # boot framework remain stock.
+        # InputFlinger dispatches directly to that token. Build the matching
+        # system_server separately with SERVICES_ONLY or framework-build --tasks.
         SOONG_ONLY=true \
             SOONG_INCREMENTAL_ANALYSIS=false \
             ALLOW_MISSING_DEPENDENCIES=true \
-            m surfaceflinger libinputflinger droidloom-input-bridge
+            m surfaceflinger libinputflinger
         exit
     fi
     if [[ "${DROIDLOOM_SOONG_COMPOSER_TEST_ONLY:-}" == "1" ]]; then
@@ -525,8 +545,7 @@ mkdir -p "$source_tree/vendor/droidloom"
             ALLOW_MISSING_DEPENDENCIES=true \
             m libdroidloom_surface_bridge \
             android.hardware.graphics.composer3-service.droidloom \
-            droidloom-task-launcher \
-            droidloom-input-bridge \
+            libinputflinger \
             android.hardware.graphics.allocator-service.minigbm \
             mapper.minigbm \
             surfaceflinger
@@ -543,15 +562,8 @@ mkdir -p "$source_tree/vendor/droidloom"
         SOONG_ONLY=true \
             SOONG_INCREMENTAL_ANALYSIS=false \
             ALLOW_MISSING_DEPENDENCIES=true \
-            m DroidloomIME DroidloomHome droidloom-input-bridge droidloom-task-launcher \
+            m DroidloomIME DroidloomHome libinputflinger \
                 android.hardware.graphics.composer3-service.droidloom
-        exit
-    fi
-    if [[ "${DROIDLOOM_SOONG_LAUNCHER_ONLY:-}" == "1" ]]; then
-        SOONG_ONLY=true \
-            SOONG_INCREMENTAL_ANALYSIS=false \
-            ALLOW_MISSING_DEPENDENCIES=true \
-            m droidloom-task-launcher
         exit
     fi
     if [[ "${DROIDLOOM_SOONG_VOLD_ONLY:-}" == "1" ]]; then
@@ -579,15 +591,13 @@ mkdir -p "$source_tree/vendor/droidloom"
         libdroidloom_syncobj \
         libdroidloom_surface_bridge \
         libdroidloom_task_control \
-        libdroidloom_task_launcher \
         libdroidloom_selinux_compat \
         libdroidloom_composer \
         libdroidloom_minigbm \
         libdroidloom_composer_aidl \
         droidloom-composer-aidl-tests \
         android.hardware.graphics.composer3-service.droidloom \
-        droidloom-task-launcher \
-        droidloom-input-bridge \
+        droidloom-framework-init \
         DroidloomIME DroidloomHome DroidloomSystemUI \
         droidloom-lmkd-compat \
         droidloom-classpath-wrapper \

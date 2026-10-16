@@ -1,0 +1,16 @@
+--- a/services/inputflinger/Android.bp
++++ b/services/inputflinger/Android.bp
+@@ -192,6 +192,13 @@
+     export_header_lib_headers: [
+         "libinputflinger_headers",
+     ],
++    target: {
++        android: {
++            header_libs: ["jni_headers"],
++            srcs: [":droidloom-task-jni-sources"],
++            whole_static_libs: ["libdroidloom_window_policy"],
++        },
++    },
+ }
+ 
+ /////////////////////////////////////////////////

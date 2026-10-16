@@ -1,0 +1,34 @@
+--- a/services/core/java/com/android/server/wm/WindowManagerInternal.java
++++ b/services/core/java/com/android/server/wm/WindowManagerInternal.java
+@@ -517,1 +517,4 @@
++    /** Resolve the already validated IME client's exact window, without task enumeration. */
++    public abstract int getDroidloomImeTaskId(IBinder window, int uid);
++
+     public abstract IBinder getFocusedWindowToken();
+--- a/services/core/java/com/android/server/wm/WindowManagerService.java
++++ b/services/core/java/com/android/server/wm/WindowManagerService.java
+@@ -8412,2 +8412,12 @@
++        @Override
++        public int getDroidloomImeTaskId(IBinder window, int uid) {
++            synchronized (mGlobalLock) {
++                WindowState target = mWindowMap.get(window);
++                Task task = target == null ? null : target.getTask();
++                return target != null && target.mOwnerUid == uid && task != null
++                        ? task.mTaskId : 0;
++            }
++        }
++
+         @Override
+         public IBinder getFocusedWindowToken() {
+--- a/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
++++ b/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+@@ -2267,1 +2267,9 @@
++        if (android.os.SystemProperties.getBoolean(
++                "ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++            editorInfo.extras = editorInfo.extras == null ? new android.os.Bundle()
++                    : new android.os.Bundle(editorInfo.extras);
++            editorInfo.extras.putInt("com.android.droidloom.ime.task",
++                    mWindowManagerInternal.getDroidloomImeTaskId(
++                            userData.mImeBindingState.mFocusedWindow, cs.mUid));
++        }
+         userData.mCurEditorInfo = editorInfo;

@@ -214,6 +214,40 @@ The native-resolution launch produced 2536x1392 game buffers inside the desktop'
 2542x1397 decorated work area; fullscreen removes that work-area constraint.
 This is an NTE-specific setup, separate from the general `--resolution` option.
 
+## ADB access
+
+While Droidloom runs, it automatically connects Android to your ordinary user's
+local ADB server. The runtime package includes `android-tools`. Run these
+commands as the same user who started Droidloom:
+
+```console
+adb devices -l
+adb -s device:droidloom shell
+adb -s device:droidloom install application.apk
+```
+
+The device appears as `10.177.0.2:5555`, with `model:Droidloom` and
+`device:droidloom` in the detailed list. Android reports `ro.serialno=droidloom`;
+standard ADB uses the connection address for a TCP transport's serial column.
+Use `-s device:droidloom` for a stable selector, including when other Android
+devices are attached. If Droidloom is your only device, plain `adb shell` works.
+
+The connection is authenticated with your host's normal `~/.android/adbkey`.
+Only its public key is projected into Android. The endpoint uses Android's
+private network; Droidloom adds no LAN listener or inbound port forwarding.
+It reconnects automatically after an ADB server restart and disconnects when
+Droidloom stops, leaving your ADB server and other devices running.
+
+Developer installations also need `/usr/bin/adb`, a writable home directory,
+and a running systemd user manager for the configured cell owner. A new ADB
+server runs in a separate `droidloom-adb-server.service` user unit, so stopping
+Droidloom preserves that server. An existing ADB server is reused.
+If these prerequisites are unavailable, Android still starts
+and `journalctl -b -u droidloomd.service` reports `automatic ADB unavailable`.
+Install `android-tools`, fix the owner's home permissions, then restart
+Droidloom to prepare the key and connection. Custom ADB server addresses and
+custom key directories are not selected by the system daemon.
+
 ## Stop, restart, upgrade and remove
 
 ```console

@@ -79,6 +79,7 @@ pub fn stage(repo: &Path, work: &Path, destination: &Path, clean: bool, jobs: us
         &out.join("target/product/droidloom_x86_64"),
         &cargo.join("release"),
         stage.path(),
+        "x86_64",
     )?;
     package_layout(repo, &cargo.join("release"), stage.path())?;
     package_notices(repo, &work, stage.path())?;

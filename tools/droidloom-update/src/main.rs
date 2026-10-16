@@ -3,6 +3,7 @@ mod android;
 mod assemble;
 mod bundle;
 mod dependencies;
+mod derive;
 mod image_policy;
 mod install;
 mod licenses;
@@ -30,6 +31,9 @@ struct Args {
     /// Build and verify a complete bundle without installing it.
     #[arg(long)]
     build_only: bool,
+    /// Android product to build: droidloom_x86_64, droidloom_arm64 or droidloom_sheng.
+    #[arg(long)]
+    product: Option<String>,
     /// Maximum parallel jobs, capped at available CPUs minus two.
     #[arg(short = 'j', long)]
     jobs: Option<usize>,
@@ -66,6 +70,15 @@ enum Action {
         destination: PathBuf,
         #[arg(long)]
         vendor_properties: PathBuf,
+        #[arg(long)]
+        pencilengine_jar: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    DeclareTabletProductImage {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
     },
     /// Compile and stage a portable pacman payload; does not install or start services.
     PackageStage {
@@ -80,11 +93,24 @@ enum Action {
     },
     /// Show the complete build plan without changing anything.
     Plan,
-    /// Verify an already built bundle.
+    /// Verify an already built bundle. Legacy schema 2 is explicitly unverified.
     Verify { payload: PathBuf },
+    /// Stage a verified presenter-only derivative; never installs or restarts.
+    DerivePresenter {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        presenter: PathBuf,
+        #[arg(long)]
+        build_record: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Privileged activation worker; normally invoked automatically through polkit.
     #[command(hide = true)]
     Apply {
+        #[arg(long, default_value_t = false)]
+        no_start: bool,
         payload: PathBuf,
         #[arg(long)]
         uid: u32,
@@ -137,8 +163,17 @@ fn execute(args: Args) -> Result<()> {
             image,
             destination,
             vendor_properties,
+            pencilengine_jar,
         }) => {
-            return image_policy::prune(image, destination, vendor_properties);
+            return image_policy::prune(
+                image,
+                destination,
+                vendor_properties,
+                pencilengine_jar.as_deref(),
+            );
+        }
+        Some(Action::DeclareTabletProductImage { image, destination }) => {
+            return image_policy::declare_tablet_product_image(image, destination);
         }
         Some(Action::PackageStage {
             work,
@@ -155,8 +190,17 @@ fn execute(args: Args) -> Result<()> {
             );
         }
         Some(Action::Recover { uid }) => return install::recover(*uid),
-        Some(Action::Apply { payload, uid }) => {
-            return install::apply(&payload.canonicalize()?, *uid);
+        Some(Action::Apply {
+            payload,
+            uid,
+            no_start,
+        }) => {
+            return install::apply(&payload.canonicalize()?, *uid, !no_start);
+        }
+        Some(Action::DerivePresenter { base, presenter, build_record, output }) => {
+            let id = derive::run(&repository(args.source.clone())?, base, presenter, build_record, output)?;
+            println!("Verified presenter derivative {id}: {} (not installed)", output.display());
+            return Ok(());
         }
         Some(Action::Verify { payload }) => {
             let m = bundle::verify(payload)?;
@@ -181,7 +225,15 @@ fn execute(args: Args) -> Result<()> {
     if arch != "x86_64" {
         return fail("the source builder currently requires an x86_64 Linux build host");
     }
-    let product = "droidloom_x86_64";
+    let product = args
+        .product
+        .clone()
+        .unwrap_or_else(|| "droidloom_x86_64".to_string());
+    // AOSP cross-compiles ARM64 userspace on the x86_64 host; only the Rust
+    // host programs need an explicit cross target. The installer side rejects
+    // foreign-architecture bundles, so cross bundles must be applied on target.
+    let target_arch = android::target_arch(&product)?;
+    let cross = target_arch != arch;
     let package_work = match &args.command {
         Some(Action::NativeBridgeBuild {
             work: Some(work), ..
@@ -233,7 +285,7 @@ fn execute(args: Args) -> Result<()> {
     // A prepared package workspace runs inside the rootless builder, which
     // supplies build tools and does not run host systemd or install services.
     if package_work.is_none() {
-        dependencies::ensure()?;
+        dependencies::ensure(!cross)?;
     }
     if work.join("source-projection.json").exists() {
         android::recover(&work.join("source-projection.json"), &source)?;
@@ -244,7 +296,7 @@ fn execute(args: Args) -> Result<()> {
             &source,
             &out,
             &work,
-            product,
+            &product,
             jobs,
             if tests {
                 &["droidloom-native-bridge", "berberis_arm64_host_tests"]
@@ -260,21 +312,79 @@ fn execute(args: Args) -> Result<()> {
             }
         }
     }
-    let identity = bundle::source_identity(&repo)?;
-    eprintln!("Building complete Droidloom release from {identity}");
+    let provenance = bundle::BuildProvenance::capture(&repo, target_arch)?;
+    eprintln!("Building complete Droidloom release from {}", provenance.source_commit);
+    if cross {
+        eprintln!(
+            "Cross build for {product}: orchestration continues in this host updater; the staged payload carries the fresh {target_arch} binaries"
+        );
+    }
     eprintln!("Compiler budget: {jobs} parallel jobs; two logical CPUs reserved");
     let mut host_build = Command::new("cargo");
+    // Cross builds keep a separate target directory so native and foreign
+    // artifacts never mix. mesa_tools below intentionally stays native: the
+    // compiler helpers run on the build host during the Android build.
+    let cargo_target_dir = if cross {
+        cargo.join("aarch64")
+    } else {
+        cargo.clone()
+    };
     host_build
         .current_dir(&repo)
-        .env("CARGO_TARGET_DIR", &cargo)
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
         .args(["build", "--locked", "--release"])
         .arg(format!("-j{jobs}"));
+    if cross {
+        host_build.args(["--target", "aarch64-unknown-linux-gnu"]);
+        if std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER").is_none() {
+            host_build.env(
+                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+                "aarch64-linux-gnu-gcc",
+            );
+        }
+        // pkg-config reports only direct libraries; the sysroot's transitive
+        // closures (libdrm behind gbm, libffi behind wayland-server) must be
+        // spelled out because --as-needed drops unreferenced indirections.
+        // Crates without any pkg-config dependency (e.g. droidloom-doctor)
+        // emit no sysroot -L at all, so append it explicitly as well.
+        const CROSS_RUSTFLAGS: &str = "-C link-arg=-ldrm -C link-arg=-lffi";
+        let mut rustflags = match std::env::var("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+        {
+            Ok(existing) => format!("{existing} {CROSS_RUSTFLAGS}"),
+            Err(_) => CROSS_RUSTFLAGS.to_string(),
+        };
+        if let Ok(sysroot) = std::env::var("PKG_CONFIG_SYSROOT_DIR")
+            && !sysroot.is_empty()
+        {
+            // Fedora-style sysroots keep target libraries in usr/lib64 while
+            // the older imported set sits in usr/lib; rpath-link lets the
+            // linker resolve the transitives of the GStreamer closure.
+            rustflags.push_str(&format!(
+                " -C link-arg=-L{sysroot}/usr/lib -C link-arg=-L{sysroot}/usr/lib64 -C link-arg=-Wl,-rpath-link,{sysroot}/usr/lib64"
+            ));
+        }
+        host_build.env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            rustflags,
+        );
+    }
     for package in assemble::HOST_PACKAGES {
         host_build.arg("-p").arg(package);
     }
     run_build(&mut host_build)?;
-    let fresh = cargo.join("release/droidloom-update");
-    if !args.bootstrapped {
+    let host_out = if cross {
+        cargo_target_dir.join("aarch64-unknown-linux-gnu/release")
+    } else {
+        cargo.join("release")
+    };
+    let build_record = work.join("presenter-build-record.json");
+    let flags = host_build.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+    derive::PresenterBuildRecord::write_after_build(
+        &repo, &provenance, &host_out.join("droidloom-wayland"), &build_record, flags,
+    )?;
+    eprintln!("Presenter build record: {}", build_record.display());
+    let fresh = host_out.join("droidloom-update");
+    if !args.bootstrapped && !cross {
         // The updater is part of the build too. Use its new orchestration in this update.
         // Release locks before exec so the replacement can acquire them normally.
         drop(_source_lock);
@@ -300,10 +410,10 @@ fn execute(args: Args) -> Result<()> {
             .arg("--uid")
             .arg(uid.to_string()))?;
     }
-    let base = assemble::prepare_inputs(&repo, &work, arch)?;
+    let base = assemble::prepare_inputs(&repo, &work, target_arch)?;
     python::prepare(&repo, &work)?;
     assemble::mesa_tools(&work, jobs)?;
-    android::build(&repo, &source, &out, &work, product, jobs)?;
+    android::build(&repo, &source, &out, &work, &product, jobs)?;
     let staging = tempfile::Builder::new()
         .prefix("bundle-")
         .tempdir_in(&work)?;
@@ -311,16 +421,20 @@ fn execute(args: Args) -> Result<()> {
         &repo,
         &work,
         &base,
-        &out.join("target/product").join(product),
-        &cargo.join("release"),
+        &out.join("target/product").join(&product),
+        &host_out,
         staging.path(),
         uid,
+        target_arch,
     )?;
-    let id = bundle::seal(staging.path(), identity)?;
-    bundle::verify(staging.path())?;
+    provenance.check_unchanged(&repo)?;
+    let id = bundle::seal(staging.path(), &provenance)?;
+    let sealed = bundle::verify(staging.path())?;
     let payload = work.join(format!("release-{id}"));
     if payload.exists() {
-        bundle::verify(&payload)?;
+        if bundle::verify(&payload)? != sealed {
+            return fail("a release with this build identity already exists with different contents");
+        }
     } else {
         fs::rename(staging.path(), &payload)?;
     }

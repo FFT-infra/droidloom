@@ -1,0 +1,24 @@
+[package]
+name = "droidloom-android-policy"
+description = "In-process Rust WindowManager policy for the Droidloom Android cell"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+droidloom-denial-ipc = { path = "../../../graphics/droidloom-denial-ipc" }
+droidloom-task-control = { path = "../../../graphics/droidloom-task-control" }
+droidloom-input-protocol = { path = "../../../graphics/droidloom-input-protocol" }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
