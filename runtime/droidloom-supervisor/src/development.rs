@@ -2137,7 +2137,7 @@ fn create_pen_input_nodes(
             continue;
         };
         let node = input.join(&name);
-        make_device_node(&node, "c", device.major, device.minor, "660")?;
+        make_device_node(&node, "c", device.major, device.minor, "666")?;
         set_owner(&node, 0, ANDROID_INPUT_GID)?;
         active_nodes.push(name);
     }
