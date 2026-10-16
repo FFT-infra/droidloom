@@ -44,6 +44,10 @@ mod lifecycle_wait;
 pub use lifecycle_wait::Shutdown;
 use lifecycle_wait::WaitSources;
 
+#[path = "cell_watch.rs"]
+mod cell_watch;
+pub use cell_watch::supervise_cell;
+
 use progress::{LOG_HINT, Reporter};
 
 /// Default root-owned lifecycle socket.
@@ -616,7 +620,7 @@ impl Daemon {
         let ready_us = started.elapsed().as_micros();
         self.progress
             .report("Android is ready. Launching the application (up to 120 seconds)...");
-        let output = launch_in_cell(init_pid, package, component, resolution, user)?;
+        let output = launch_in_cell(init_pid, package, component, resolution, user, &self.progress)?;
         eprintln!(
             "droidloom-launch-host-timing package={package} user={user} ready_us={ready_us} total_us={}",
             started.elapsed().as_micros(),
@@ -643,6 +647,7 @@ impl Daemon {
         let output = framework_request(
             init,
             framework_wire::CATALOG,
+            &self.progress,
             &serde_json::json!({"user":user}),
         )?;
         let applications: Vec<AndroidApplication> =
@@ -710,6 +715,7 @@ impl Daemon {
         let output = framework_request(
             init,
             framework_wire::ICONS,
+            &self.progress,
             &serde_json::json!({"user":user,"components":[component],"size":size}),
         )?;
         let icons: std::collections::BTreeMap<String, String> = serde_json::from_str(&output)?;
@@ -759,6 +765,7 @@ impl Daemon {
         let result = framework_request(
             init,
             framework_wire::ICONS,
+            &self.progress,
             &serde_json::json!({"user":user,"components":components,"size":size}),
         )?;
         let icons: std::collections::BTreeMap<String, String> = serde_json::from_str(&result)?;
@@ -799,7 +806,7 @@ impl Daemon {
         let init_pid = active.ready_init(&self.progress)?;
         self.progress
             .report("Android is ready. Applying display density (up to 120 seconds)...");
-        set_dpi_in_cell(init_pid, dpi)?;
+        set_dpi_in_cell(init_pid, dpi, &self.progress)?;
         Ok(ControlResponse {
             ok: true,
             state: CellState::Running,
@@ -965,7 +972,7 @@ fn run_loop(
                 let mut delegated = None;
                 let response = match receive_request(&mut stream) {
                     Ok((peer_uid, request, file, streaming)) => {
-                        daemon.progress = Reporter::new(&stream, streaming)?;
+                        daemon.progress = Reporter::new(&stream, streaming)?.with_shutdown(shutdown)?;
                         if matches!(request, ControlRequest::WatchApplications) {
                             match daemon.watch_applications(peer_uid) {
                                 Ok(events) => {
@@ -1331,7 +1338,10 @@ fn wait_for_android_init(spec: &CellSpec, progress: &Reporter) -> Result<u32, Co
     wait_for_boot(
         ANDROID_READY_TIMEOUT,
         Duration::from_millis(100),
-        || android_boot_snapshot(spec),
+        || {
+            progress.check_cancelled().map_err(|e| io_error("cancel Android readiness wait", e))?;
+            android_boot_snapshot(spec)
+        },
         |message| progress.report(message),
     )
 }

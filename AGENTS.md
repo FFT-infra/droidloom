@@ -22,6 +22,13 @@ Play Store compatibility results. Inside Android, run
 `/system/bin/cmd package clear --user 0 --cache-only com.android.vending`, then
 `/system/bin/cmd activity force-stop com.android.vending` and reopen Play Store.
 Clear only the cache; preserve Google account and app data.
+The cache-only command needs Android root/system permissions. On the pinned
+Android 17 build, plain ADB shell lacks `INTERNAL_DELETE_CACHE_FILES`; the
+request is silently ignored and the command hangs. In that case, use Android
+Settings → Apps → Google Play Store → Storage & cache → **Clear cache**, verify
+the cache reaches zero, then force-stop Play Store and reopen the app listing.
+Do not select **Clear storage**. See the exact recovery sequence in
+`docs/BUILDING.md` under “Play Store catalog refresh”.
 
 ## Commands
 

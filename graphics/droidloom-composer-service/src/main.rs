@@ -18,7 +18,7 @@ use droidloom_composer_aidl::minigbm::MinigbmBufferAdapter;
 use droidloom_composer_aidl::service::{ComposerLifecycle, ComposerService, SharedSession};
 use droidloom_denial_ipc::{ProtocolSocket, SeqPacket, SeqPacketListener};
 use droidloom_denial_protocol::{
-    capability, AndroidMessage, DenialMessage, TaskObjectId, PROTOCOL_MAJOR,
+    AndroidMessage, DenialMessage, PROTOCOL_MAJOR, TaskObjectId, capability,
 };
 use droidloom_syncobj::SyncobjDevice;
 
@@ -39,10 +39,14 @@ fn main() {
     let compatibility = std::str::from_utf8(&droidloom_input_protocol::BUILD_COMPATIBILITY)
         .expect("input compatibility marker is ASCII");
     if std::env::args().any(|arg| arg == "--compatibility") {
-        println!("{compatibility} DROIDLOOM_TASK_BACKEND_ABI=2; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;");
+        println!(
+            "{compatibility} DROIDLOOM_TASK_BACKEND_ABI=2; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;"
+        );
         return;
     }
-    eprintln!("Droidloom Composer {compatibility} DROIDLOOM_TASK_BACKEND_ABI=2; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;");
+    eprintln!(
+        "Droidloom Composer {compatibility} DROIDLOOM_TASK_BACKEND_ABI=2; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;"
+    );
     if let Err(error) = run() {
         eprintln!("Droidloom Composer fatal: {error}");
         std::process::exit(1);
@@ -175,7 +179,11 @@ fn handshake(socket: &ProtocolSocket) -> Result<u64, String> {
             &AndroidMessage::ClientHello {
                 min_major: PROTOCOL_MAJOR,
                 max_major: PROTOCOL_MAJOR,
-                capabilities: capability::REQUIRED_V1 | capability::TASK_ACTIVATION | capability::DIRECT_INPUT | capability::LAZY_RENDER_TARGETS,
+                capabilities: capability::REQUIRED_V1
+                    | capability::TASK_ACTIVATION
+                    | capability::DIRECT_INPUT
+                    | capability::LAZY_RENDER_TARGETS
+                    | capability::SCENE_PRESENTATION,
             },
             &[],
         )
@@ -228,8 +236,12 @@ fn event_loop(
             DenialMessage::ServerHello { .. } => {
                 return Err("repeated Denial ServerHello".to_owned());
             }
-            DenialMessage::DisplayPower { .. } | DenialMessage::Input { .. } =>
-                return Err("legacy input forwarding is retired; native input capability is required".into()),
+            DenialMessage::DisplayPower { .. } | DenialMessage::Input { .. } => {
+                return Err(
+                    "legacy input forwarding is retired; native input capability is required"
+                        .into(),
+                );
+            }
             DenialMessage::RegisterRenderTarget {
                 object,
                 configure_serial,
@@ -239,7 +251,10 @@ fn event_loop(
                     continue;
                 }
                 if let Err(error) = sink.register_render_target(
-                    object, configure_serial, buffer, received.descriptors,
+                    object,
+                    configure_serial,
+                    buffer,
+                    received.descriptors,
                 ) {
                     // Retirement may complete between the phase check above
                     // and acquiring the sink's task map.
@@ -258,6 +273,19 @@ fn event_loop(
                         continue;
                     }
                     return Err(error.to_string());
+                }
+            }
+            DenialMessage::ScenePresented {
+                object,
+                timestamp_nanos,
+                refresh_period_nanos,
+                ..
+            } => {
+                if !coordinator.is_retired(object)
+                    && !coordinator.is_removing(object)
+                    && coordinator.is_direct_task(object)
+                {
+                    lifecycle.observe_presentation(timestamp_nanos, refresh_period_nanos);
                 }
             }
             task_message => {
@@ -299,8 +327,7 @@ fn event_loop(
                 // acknowledged to Denial. Wake the reservation before invoking
                 // Android's hotplug callback: during SurfaceFlinger bootstrap
                 // that callback may wait for the reservation owner to proceed.
-                if let AppliedDenialEvent::Configure { .. } = &event
-                {
+                if let AppliedDenialEvent::Configure { .. } = &event {
                     coordinator.display_connected(object)?;
                 }
                 dispatch_event(lifecycle, coordinator, object, display, event)?;
@@ -317,17 +344,16 @@ fn dispatch_event(
     event: AppliedDenialEvent,
 ) -> Result<(), String> {
     match event {
-        AppliedDenialEvent::Configure {
-            width,
-            height,
-            ..
-        } => {
+        AppliedDenialEvent::Configure { width, height, .. } => {
             if coordinator.is_direct_task(object) {
                 if let Err(error) = coordinator.queue_window_command(
                     object,
                     droidloom_task_control::TaskAction::Resize { width, height },
                 ) {
-                    eprintln!("Droidloom deferred Android object {} bounds: {error}", object.0);
+                    eprintln!(
+                        "Droidloom deferred Android object {} bounds: {error}",
+                        object.0
+                    );
                 }
                 return Ok(());
             }
@@ -347,10 +373,9 @@ fn dispatch_event(
         AppliedDenialEvent::Presented(_) => {}
         AppliedDenialEvent::Visibility { focused, .. } => {
             if focused && coordinator.is_direct_task(object) {
-                if let Err(error) = coordinator.queue_window_command(
-                    object,
-                    droidloom_task_control::TaskAction::Focus,
-                ) {
+                if let Err(error) = coordinator
+                    .queue_window_command(object, droidloom_task_control::TaskAction::Focus)
+                {
                     eprintln!(
                         "Droidloom deferred Android object {} keyboard focus: {error}",
                         object.0
@@ -369,17 +394,18 @@ fn dispatch_event(
                 );
                 return Ok(());
             }
-            if let Err(error) = coordinator.queue_window_command(
-                object,
-                droidloom_task_control::TaskAction::Close,
-            ) {
+            if let Err(error) =
+                coordinator.queue_window_command(object, droidloom_task_control::TaskAction::Close)
+            {
                 eprintln!(
                     "Droidloom could not request Android object {} removal for host close: {error}",
                     object.0
                 );
             }
         }
-        AppliedDenialEvent::Input { .. } => return Err("legacy task input forwarding is retired".into()),
+        AppliedDenialEvent::Input { .. } => {
+            return Err("legacy task input forwarding is retired".into());
+        }
     }
     Ok(())
 }
@@ -395,6 +421,7 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Close { object }
         | DenialMessage::BufferReleased { object, .. }
         | DenialMessage::Presented { object, .. }
+        | DenialMessage::ScenePresented { object, .. }
         | DenialMessage::Input { object, .. } => Some(*object),
         DenialMessage::Error { object, .. } => *object,
         DenialMessage::ServerHello { .. }

@@ -182,6 +182,7 @@ pub fn dex(path: &Path) -> Result<Vec<u8>> {
         if !out.status.success() {
             return fail("cannot extract compiled Android DEX");
         }
+        validate_dex(&out.stdout).map_err(|error| format!("{}!{name}: {error}", path.display()))?;
         result.extend(out.stdout);
     }
     if result.is_empty() {
@@ -191,6 +192,45 @@ pub fn dex(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(result)
+}
+fn dex_checksum(data: &[u8]) -> u32 {
+    // Adler-32, as used by ART over the bytes following checksum_ (offset 12).
+    // 5552 bytes bound both accumulators below u32::MAX before reduction.
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for chunk in data.chunks(5552) {
+        for &byte in chunk {
+            a += u32::from(byte);
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    (b << 16) | a
+}
+fn validate_dex(data: &[u8]) -> Result<()> {
+    if data.len() < 112 {
+        return fail("truncated DEX header");
+    }
+    if &data[..4] != b"dex\n"
+        || !matches!(
+            &data[4..8],
+            b"035\0" | b"037\0" | b"038\0" | b"039\0" | b"040\0"
+        )
+    {
+        return fail("unsupported DEX magic/version; expected standard DEX 035-040");
+    }
+    let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    if word(32) as usize != data.len() || word(36) != 112 || word(40) != 0x12345678 {
+        return fail("invalid DEX file size, header size or endian tag");
+    }
+    let actual = dex_checksum(&data[12..]);
+    let expected = word(8);
+    if actual != expected {
+        return fail(format!(
+            "bad DEX checksum ({actual:08x}, expected {expected:08x}); rebuild the Android artifact"
+        ));
+    }
+    Ok(())
 }
 fn architecture(data: &[u8]) -> Result<&'static str> {
     if data.len() < 20 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
@@ -286,6 +326,16 @@ fn compatibility(root: &Path) -> Result<(String, u16)> {
     }
     let policy_abi = b"DROIDLOOM_WINDOW_POLICY_ABI=1;";
     let policy_native = fs::read(runtime.join("lib64/libinputflinger.so"))?;
+    let vulkan_abi = b"DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;";
+    if !services.windows(vulkan_abi.len()).any(|w| w == vulkan_abi)
+        || !policy_native
+            .windows(vulkan_abi.len())
+            .any(|w| w == vulkan_abi)
+    {
+        return fail(
+            "services.jar and libinputflinger.so lack paired Vulkan capability probe ABI 1",
+        );
+    }
     let framework_abi = b"DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;";
     for (name, data) in [
         ("services.jar", services.clone()),
@@ -687,6 +737,21 @@ pub(crate) mod artifact_tests {
             target: host_target(arch).unwrap().into(),
         }
     }
+    fn dex_fixture(payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0; 112];
+        data[..8].copy_from_slice(b"dex\n039\0");
+        data[36..40].copy_from_slice(&112_u32.to_le_bytes());
+        data[40..44].copy_from_slice(&0x12345678_u32.to_le_bytes());
+        data.extend_from_slice(payload);
+        refresh_dex_fixture(&mut data);
+        data
+    }
+    fn refresh_dex_fixture(data: &mut [u8]) {
+        let size = u32::try_from(data.len()).unwrap();
+        data[32..36].copy_from_slice(&size.to_le_bytes());
+        let checksum = dex_checksum(&data[12..]);
+        data[8..12].copy_from_slice(&checksum.to_le_bytes());
+    }
     pub(crate) fn fixture(root: &Path, composer: u16, java: u16) {
         let mut elf = vec![0; 64];
         elf[..4].copy_from_slice(b"\x7fELF");
@@ -696,7 +761,7 @@ pub(crate) mod artifact_tests {
         elf.extend(format!("DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_INPUT_ABI={composer};DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_DIRECT_INPUT_ABI=1;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_HOST_CHANNELS_ABI=1;").bytes());
         write(&root.join("usr/bin/droidloom-wayland"), &elf).unwrap();
         write(&root.join("usr/lib/droidloom/runtime/bin/android.hardware.graphics.composer3-service.droidloom"), &elf).unwrap();
-        elf.extend(format!("DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_INPUT_ABI={java};").bytes());
+        elf.extend(format!("DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;DROIDLOOM_INPUT_ABI={java};").bytes());
         write(
             &root.join("usr/lib/droidloom/runtime/lib64/libinputflinger.so"),
             elf,
@@ -710,7 +775,14 @@ pub(crate) mod artifact_tests {
             .unwrap();
         }
         let d = tempfile::tempdir().unwrap();
-        write(&d.path().join("classes.dex"), format!("dex\n039\0DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_HOST_CHANNELS_ABI=1;DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;Lcom/android/server/wm/DroidloomApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks")).unwrap();
+        let payload = format!(
+            "DROIDLOOM_FRAMEWORK_CONTROL_ABI=1;DROIDLOOM_INPUT_ABI={java};DROIDLOOM_SYSTEMUI_ABI=1;DROIDLOOM_CLIPBOARD_ABI=1;DROIDLOOM_HOST_CHANNELS_ABI=1;DROIDLOOM_NOTIFICATIONS_ABI=2;DROIDLOOM_WINDOW_POLICY_ABI=1;DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;DROIDLOOM_TASK_BACKEND_ABI=2;DROIDLOOM_NATIVE_INPUT_ABI=2;Lcom/android/server/wm/DroidloomApplicationCatalog;Lcom/android/droidloom/home/HomeActivity;ro.vendor.droidloom.surfaceflinger_tasks"
+        );
+        write(
+            &d.path().join("classes.dex"),
+            dex_fixture(payload.as_bytes()),
+        )
+        .unwrap();
         let jar = root.join("usr/lib/droidloom/runtime/framework/services.jar");
         fs::create_dir_all(jar.parent().unwrap()).unwrap();
         run(Command::new("zip")
@@ -830,6 +902,134 @@ pub(crate) mod artifact_tests {
         .unwrap();
         assert!(verify(d.path()).is_err());
         assert!(seal(d.path(), &provenance).is_err());
+    }
+    #[test]
+    fn direct_channels_and_owned_input_require_every_matching_peer() {
+        for (relative, marker) in [
+            (
+                "framework/services.jar",
+                b"DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;".as_slice(),
+            ),
+            (
+                "lib64/libinputflinger.so",
+                b"DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;".as_slice(),
+            ),
+            (
+                "framework/services.jar",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "systemui/SystemUI.apk",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "ime/DroidloomIME.apk",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "../../../bin/droidloom-wayland",
+                b"DROIDLOOM_HOST_CHANNELS_ABI=1;".as_slice(),
+            ),
+            (
+                "framework/services.jar",
+                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
+            ),
+            (
+                "lib64/libinputflinger.so",
+                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
+            ),
+            (
+                "bin/android.hardware.graphics.composer3-service.droidloom",
+                b"DROIDLOOM_NATIVE_INPUT_ABI=2;".as_slice(),
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            fixture(root.path(), 7, 7);
+            let path = root.path().join("usr/lib/droidloom/runtime").join(relative);
+            let archive = matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("jar" | "apk")
+            );
+            let mut data = if archive {
+                dex(&path).unwrap()
+            } else {
+                fs::read(&path).unwrap()
+            };
+            while let Some(start) = data.windows(marker.len()).position(|w| w == marker) {
+                data.drain(start..start + marker.len());
+            }
+            if archive {
+                refresh_dex_fixture(&mut data);
+                let temporary = tempfile::tempdir().unwrap();
+                write(&temporary.path().join("classes.dex"), &data).unwrap();
+                run(Command::new("zip")
+                    .current_dir(temporary.path())
+                    .args(["-q"])
+                    .arg(&path)
+                    .arg("classes.dex"))
+                .unwrap();
+            } else {
+                write(&path, data).unwrap();
+            }
+            let error = seal(root.path(), &test_provenance("x86_64"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ABI"), "{relative}: {error}");
+        }
+    }
+    #[test]
+    fn dex_checksums_match_adler32_reference_vectors() {
+        assert_eq!(dex_checksum(b""), 1);
+        assert_eq!(dex_checksum(b"Wikipedia"), 0x11e60398);
+    }
+    #[test]
+    fn rejects_damaged_dex_headers_and_payloads() {
+        let good = dex_fixture(b"compiled bytecode");
+        validate_dex(&good).unwrap();
+        for offset in [0, 8, 12, 32, 36, 40, 112] {
+            let mut damaged = good.clone();
+            damaged[offset] ^= 1;
+            assert!(validate_dex(&damaged).is_err(), "offset {offset}");
+        }
+        for length in [0, 7, 111, good.len() - 1] {
+            assert!(validate_dex(&good[..length]).is_err(), "length {length}");
+        }
+    }
+    #[test]
+    fn rejects_corrupt_secondary_dex_even_with_valid_zip_crc() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path(), 7, 7);
+        let jar = d
+            .path()
+            .join("usr/lib/droidloom/runtime/framework/services.jar");
+        let temporary = tempfile::tempdir().unwrap();
+        let mut secondary = dex_fixture(b"secondary bytecode");
+        write(&temporary.path().join("classes2.dex"), &secondary).unwrap();
+        let append = || {
+            run(Command::new("zip")
+                .current_dir(temporary.path())
+                .arg("-q")
+                .arg(&jar)
+                .arg("classes2.dex"))
+            .unwrap();
+        };
+        append();
+        seal(d.path(), &test_provenance("x86_64")).unwrap();
+        // Repack a corrupted DEX, giving the ZIP member a correct CRC. This
+        // reproduces a damaged compiler output that transfer hashing accepts.
+        secondary[112] ^= 1;
+        write(&temporary.path().join("classes2.dex"), secondary).unwrap();
+        append();
+        let message = seal(d.path(), &test_provenance("x86_64"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("services.jar!classes2.dex"), "{message}");
+        assert!(message.contains("bad DEX checksum"), "{message}");
+        // A schema-3 bundle also records the repacked archive's content hash,
+        // so verification rejects it before it needs to parse the DEX again.
+        let message = verify(d.path()).unwrap_err().to_string();
+        assert!(message.contains("bundle content hash changed"), "{message}");
+        assert!(message.contains("services.jar"), "{message}");
     }
     #[test]
     fn refuses_mixed_native_java_bundle() {

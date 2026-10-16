@@ -1,7 +1,8 @@
 //! Minimal executable cell path for the first Android boot proof.
 //!
 //! This intentionally omits the production user-ID map, cgroup limits and
-//! seccomp policy. It still creates private mount, PID, cgroup, IPC and UTS
+//! general seccomp policy. A mandatory inherited filter protects shared host
+//! filesystems. It creates private mount, PID, cgroup, IPC and UTS
 //! namespaces. A bounded veth/NAT path gives the private Android network
 //! namespace outbound connectivity without exposing host network control.
 
@@ -32,8 +33,6 @@ const EXT4_MAGIC_OFFSET: u64 = 1024 + 56;
 const EXT4_MAGIC: [u8; 2] = 0xef53_u16.to_le_bytes();
 const ANDROID_SPARSE_MAGIC: [u8; 4] = 0xed26_ff3a_u32.to_le_bytes();
 const DEVELOPMENT_LOOP_DEVICES: u32 = 256;
-const ANDROID_DATA_IMAGE: &str = "data.img";
-const ANDROID_METADATA_IMAGE: &str = "metadata.img";
 const ANDROID_SHARED_STORAGE_ROOT: &str = "data/media/0";
 const ANDROID_MEDIA_RW_ID: u32 = 1023;
 const MEDIA_PROVIDER_PACKAGE: &str = "com.android.providers.media.module";
@@ -189,19 +188,7 @@ pub fn validate_development_inputs(spec: &CellSpec) -> Result<(), DevelopmentErr
     for directory in &spec.shared_storage_directories {
         validate_shared_storage_directory(&directory.source, (spec.host_uid, directory.host_gid))?;
     }
-    for name in [ANDROID_DATA_IMAGE, ANDROID_METADATA_IMAGE] {
-        let image = spec.data_dir.join(name);
-        verify_magic(&image, EXT4_MAGIC_OFFSET, &EXT4_MAGIC, "raw ext4")?;
-        if !fs::metadata(&image)
-            .map_err(|source| io_error("stat Android writable image", source))?
-            .is_file()
-        {
-            return Err(DevelopmentError::InvalidInput(format!(
-                "{} is not a regular file",
-                image.display()
-            )));
-        }
-    }
+    validate_writable_storage(spec)?;
 
     let render =
         fs::metadata(&spec.render_node).map_err(|source| io_error("stat render node", source))?;
@@ -220,6 +207,34 @@ pub fn validate_development_inputs(spec: &CellSpec) -> Result<(), DevelopmentErr
         )));
     }
     Ok(())
+}
+
+/// Validate whichever writable layout this cell was provisioned with.
+///
+/// New cells bind host directories; cells created before that layout still
+/// carry one detached raw ext4 image per directory and keep booting until
+/// `droidloom-supervisor migrate-storage` can copy them with enough free
+/// space.
+fn validate_writable_storage(spec: &CellSpec) -> Result<(), DevelopmentError> {
+    match crate::host_storage::writable_storage(&spec.data_dir) {
+        crate::host_storage::WritableStorage::Directories => {
+            crate::host_storage::validate(&spec.data_dir)
+                .map_err(|error| io_error("validate direct host Android storage", error))
+        }
+        crate::host_storage::WritableStorage::LegacyImages => {
+            crate::host_storage::validate_legacy(&spec.data_dir)
+                .map_err(|error| io_error("validate legacy Android storage images", error))?;
+            for name in crate::host_storage::LEGACY_IMAGES {
+                verify_magic(
+                    &spec.data_dir.join(name),
+                    EXT4_MAGIC_OFFSET,
+                    &EXT4_MAGIC,
+                    "raw ext4",
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_android_init_override(path: &Path) -> Result<(), DevelopmentError> {
@@ -722,6 +737,10 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
             spec.runtime_dir.join("android-cgroups.json"),
             "remove Android development cgroup configuration",
         ),
+        (
+            spec.runtime_dir.join("android-tracing.prop"),
+            "remove Android container tracing properties",
+        ),
     ] {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -891,18 +910,12 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
         bind_mount_read_only_executable(&directory.source, &target)?;
     }
 
-    // Never expose a host filesystem directly as Android-writable storage.
-    // Android init may issue filesystem-wide shutdown ioctls during a failed
-    // boot. Dedicated loop-backed filesystems contain that effect to the cell.
-    mount_writable_ext4_image(&spec.data_dir.join(ANDROID_DATA_IMAGE), &root.join("data"))?;
+    mount_writable_storage(spec, "data", &root.join("data"))?;
     crate::gapps::prepare_data(spec, &root)
         .map_err(|error| DevelopmentError::InvalidInput(error.to_string()))?;
     crate::package_cache::invalidate_systemui_cache(&root)
         .map_err(|source| io_error("invalidate overlaid SystemUI package cache", source))?;
-    mount_writable_ext4_image(
-        &spec.data_dir.join(ANDROID_METADATA_IMAGE),
-        &root.join("metadata"),
-    )?;
+    mount_writable_storage(spec, "metadata", &root.join("metadata"))?;
     mount_proc_and_sys(spec, &root)?;
     mount_shared_storage_directories(spec, &root)?;
     create_private_dev(spec, &root)?;
@@ -913,6 +926,7 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     bind_development_cgroups(spec, &root, cpu_backends.cpuset)?;
     bind_cpu_policy(spec, &root, &cpu_backends)?;
     bind_adb_configuration(spec, &root)?;
+    bind_tracing_configuration(spec, &root)?;
 
     // The reusable base is a system-as-root image, but Droidloom has already
     // supplied the mounts that Android first-stage init normally constructs.
@@ -931,6 +945,8 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     if spec.graphics_backend == crate::GraphicsBackend::KgslDmaHeap {
         init.env("MESA_LOADER_DRIVER_OVERRIDE", "zink");
     }
+    crate::filesystem_guard::install()
+        .map_err(|error| io_error("install shared-filesystem protection", error))?;
     let error = std::os::unix::process::CommandExt::exec(
         init.arg("second_stage")
             // Android's mount-namespace decision runs before ro.boot.*
@@ -1022,7 +1038,7 @@ fn prepare_host_directories(spec: &CellSpec) -> Result<(), DevelopmentError> {
     }
     set_mode(&spec.runtime_dir, 0o700)?;
     let data = fs::metadata(&spec.data_dir)
-        .map_err(|source| io_error("stat development data-image directory", source))?;
+        .map_err(|source| io_error("stat Android storage parent", source))?;
     if !data.is_dir() {
         return Err(DevelopmentError::InvalidInput(format!(
             "{} is not a directory",
@@ -1063,6 +1079,34 @@ fn mount_read_only_image(image: &Path, target: &Path) -> Result<(), DevelopmentE
         target,
         true,
     )
+}
+
+fn mount_host_storage(source: &Path, target: &Path) -> Result<(), DevelopmentError> {
+    bind_mount(source, target, false)?;
+    run_os(
+        "mount",
+        [
+            OsString::from("-o"),
+            OsString::from("remount,bind,rw,nodev,nosuid"),
+            target.as_os_str().to_owned(),
+        ],
+    )
+}
+
+/// Mount one Android writable directory from whichever layout owns this cell.
+fn mount_writable_storage(
+    spec: &CellSpec,
+    name: &str,
+    target: &Path,
+) -> Result<(), DevelopmentError> {
+    match crate::host_storage::writable_storage(&spec.data_dir) {
+        crate::host_storage::WritableStorage::Directories => {
+            mount_host_storage(&spec.data_dir.join(name), target)
+        }
+        crate::host_storage::WritableStorage::LegacyImages => {
+            mount_writable_ext4_image(&spec.data_dir.join(format!("{name}.img")), target)
+        }
+    }
 }
 
 fn mount_writable_ext4_image(image: &Path, target: &Path) -> Result<(), DevelopmentError> {
@@ -1351,15 +1395,43 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
 }
 
 fn publish_cpu_topology_sysfs(sys: &Path) -> Result<(), DevelopmentError> {
-    // get_nprocs(), get_nprocs_conf() and therefore Java's
-    // Runtime.availableProcessors() read this subtree. With a synthetic sysfs
-    // that does not contain it, bionic falls back to its hardcoded single CPU
-    // while the cell really schedules on every allowed core. Applications which
-    // size a pool, a renderer or a code path from the core count then misjudge
-    // the cell, so publish the CPU set this cell actually inherits rather than
-    // the host's full topology.
     let cpus = droidloom_cpu_placement::CpuSet::current()
         .map_err(|source| io_error("read the cell's allowed CPU set", source))?;
+    let cpu = publish_cpu_masks(sys, &cpus)?;
+    // Capacity/prime-tier classifiers (Unity, ADPF consumers, ART) read these
+    // immutable host facts. Project them read-only for the CPUs the cell
+    // actually has, so the numbers describe cores it can schedule on, while the
+    // masks written above stay authoritative for the cell's size.
+    for (source, relative) in discover_cpu_attributes(Path::new("/sys/devices/system/cpu"))? {
+        let cell_cpu = relative
+            .components()
+            .next()
+            .and_then(|first| first.as_os_str().to_str())
+            .and_then(|name| name.strip_prefix("cpu"))
+            .and_then(|index| index.parse::<usize>().ok());
+        if !cell_cpu.is_some_and(|index| cpus.contains(index)) {
+            continue;
+        }
+        let target = cpu.join(&relative);
+        fs::create_dir_all(target.parent().expect("CPU attribute has a parent"))
+            .map_err(|error| io_error("create CPU discovery directory", error))?;
+        create_mount_target(&target)?;
+        bind_mount(&source, &target, true)?;
+    }
+    Ok(())
+}
+
+// get_nprocs(), get_nprocs_conf() and therefore Java's
+// Runtime.availableProcessors() read this subtree. With a synthetic sysfs
+// that does not contain it, bionic falls back to its hardcoded single CPU
+// while the cell really schedules on every allowed core. Applications which
+// size a pool, a renderer or a code path from the core count then misjudge
+// the cell, so publish the CPU set this cell actually inherits rather than
+// the host's full topology.
+fn publish_cpu_masks(
+    sys: &Path,
+    cpus: &droidloom_cpu_placement::CpuSet,
+) -> Result<PathBuf, DevelopmentError> {
     let cpu = sys.join("devices/system/cpu");
     fs::create_dir_all(&cpu).map_err(|source| io_error("create synthetic CPU topology", source))?;
     for name in ["possible", "present", "online"] {
@@ -1368,7 +1440,40 @@ fn publish_cpu_topology_sysfs(sys: &Path) -> Result<(), DevelopmentError> {
             .map_err(|source| io_error("publish synthetic CPU topology", source))?;
         set_mode(&node, 0o444)?;
     }
-    Ok(())
+    Ok(cpu)
+}
+
+// Unity and ADPF consumers classify workers using per-CPU capacity and maximum
+// frequency. Bind only those immutable discovery attributes read-only: neither
+// hotplug nor frequency controls belong in the cell, and the masks written
+// above stay authoritative for its size.
+fn discover_cpu_attributes(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, DevelopmentError> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).map_err(|error| io_error("read host CPU sysfs", error))? {
+        let entry = entry.map_err(|error| io_error("read host CPU entry", error))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(index) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        // Optional on homogeneous hosts or kernels without cpufreq/capacity.
+        for attribute in ["cpu_capacity", "cpufreq/cpuinfo_max_freq"] {
+            let source = entry.path().join(attribute);
+            match fs::metadata(&source) {
+                Ok(metadata) if metadata.is_file() => {
+                    files.push((source, PathBuf::from(name).join(attribute)));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("read CPU discovery attribute", error)),
+            }
+        }
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(files)
 }
 
 fn discover_power_supply_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, DevelopmentError> {
@@ -1693,6 +1798,43 @@ fn loop_device_minor(index: u32, max_part: u32) -> Result<u32, DevelopmentError>
         })
 }
 
+// Uevent multicast reaches the cell even though its sysfs is synthetic.
+// Without a sealed input directory, ueventd recreates Bluetooth/USB evdev
+// nodes on hotplug and InputReader bypasses host focus (and doubles forwarded
+// keys). All physical input belongs to the host compositor; the synthetic
+// Host Keyboard and targeted injection need no device node here.
+//
+// The pen relay's button and gesture devices are the exception: it creates
+// them for an Android reader and nothing else on the host reads them, so the
+// cell takes exactly those two and Android's InputReader turns them into the
+// key events note-taking applications bind their eraser and gesture actions
+// to. The pen tip stays on the routed path, so no stroke is delivered twice.
+//
+// A private tmpfs keeps host nodes out while the relay still receives one
+// generation of headroom for retired nodes that Android has not closed yet.
+// The read-only bind afterwards is the seal itself: ueventd cannot create
+// anything in this directory, while the relay adds the next generation
+// through a detached clone of the same writable superblock.
+fn mount_private_input(dev: &Path) -> Result<(), DevelopmentError> {
+    let input = dev.join("input");
+    fs::create_dir_all(&input)
+        .map_err(|source| io_error("create sealed Android input directory", source))?;
+    mount_tmpfs(
+        &input,
+        "mode=0755,nosuid,nodev,noexec,size=16k,nr_inodes=16",
+    )?;
+    create_pen_input_nodes(&input, 0, &discover_pen_input_devices()?)?;
+    bind_mount(&input, &input, false)?;
+    run_os(
+        "mount",
+        [
+            OsString::from("-o"),
+            OsString::from("remount,bind,ro,nosuid"),
+            input.into_os_string(),
+        ],
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
     let dev = root.join("dev");
@@ -1707,6 +1849,7 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             dev.as_os_str().to_owned(),
         ],
     )?;
+    mount_private_input(&dev)?;
     for directory in ["pts", "binderfs", "block", "dri", "socket/droidloom"] {
         fs::create_dir_all(dev.join(directory))
             .map_err(|source| io_error("create private device directory", source))?;
@@ -1728,33 +1871,6 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     ] {
         make_device_node(&dev.join(name), "c", major, minor, mode)?;
     }
-
-    // Kernel hotplug uevents reach every listener, including the cell's
-    // ueventd, so a device attached to the host would otherwise be published
-    // here as /dev/input/event* even though this private /dev never creates
-    // it, and Android would read that device directly alongside this
-    // runtime's routed input.
-    //
-    // The pen relay's button and gesture devices are the exception: it creates
-    // them for an Android reader and nothing else on the host reads them, so
-    // the cell takes exactly those two and Android's InputReader turns them
-    // into the key events note-taking applications bind their eraser and
-    // gesture actions to. The pen tip stays on the routed path, so no stroke
-    // is delivered twice. The directory is read-only afterwards, which keeps
-    // every other host device out.
-    let input = dev.join("input");
-    fs::create_dir_all(&input)
-        .map_err(|source| io_error("create private input directory", source))?;
-    create_pen_input_nodes(&input, 0, &discover_pen_input_devices()?)?;
-    bind_mount(&input, &input, false)?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-o"),
-            OsString::from("remount,bind,ro,nosuid"),
-            input.into_os_string(),
-        ],
-    )?;
 
     // The pinned CI base contains ext4-payload APEX packages. apexd obtains
     // unused loop minors through loop-control; provide only loop devices, not
@@ -2419,6 +2535,24 @@ fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), Developmen
     bind_mount(&source, &target, true)
 }
 
+// Tracing is independent of whether host ADB and its authentication keys exist.
+fn bind_tracing_configuration(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
+    let target = ["product/etc/build.prop", "product/build.prop"]
+        .into_iter()
+        .map(|path| root.join(path))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            DevelopmentError::InvalidInput("Android product build properties are missing".into())
+        })?;
+    let original = fs::read_to_string(&target)
+        .map_err(|source| io_error("read Android tracing properties", source))?;
+    let source = spec.runtime_dir.join("android-tracing.prop");
+    fs::write(&source, crate::tracing::container_properties(&original))
+        .map_err(|source| io_error("write Android container tracing properties", source))?;
+    set_mode(&source, 0o644)?;
+    bind_mount(&source, &target, true)
+}
+
 fn bind_cpu_policy(
     spec: &CellSpec,
     root: &Path,
@@ -2731,6 +2865,76 @@ mod tests {
     }
 
     #[test]
+    fn physical_input_hotplug_cannot_create_nodes() {
+        const CHILD: &str = "DROIDLOOM_TEST_INPUT_ISOLATION";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                std::process::Command::new("unshare")
+                    .args(["--user", "--map-root-user", "--mount"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "development::tests::physical_input_hotplug_cannot_create_nodes"
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        let dev = tempfile::tempdir().unwrap();
+        mount_private_input(dev.path()).unwrap();
+        let input = dev.path().join("input");
+        // The private mount may carry the pen relay's own nodes and nothing
+        // else; host input devices never reach it.
+        let nodes: Vec<_> = fs::read_dir(&input)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(nodes.len() <= 2, "{nodes:?}");
+        assert!(
+            nodes
+                .iter()
+                .all(|name| name.starts_with("droidloom-pen-buttons-")
+                    || name.starts_with("droidloom-pen-gestures-")),
+            "{nodes:?}"
+        );
+        let node =
+            std::ffi::CString::new(input.join("event0").as_os_str().as_encoded_bytes()).unwrap();
+        // Even root in this namespace cannot recreate a host input node.
+        // The temporary node is never opened; successful creation is a failure.
+        assert_eq!(
+            unsafe { libc::mknod(node.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(13, 64)) },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EROFS));
+        assert_eq!(
+            fs::write(input.join("ordinary-file"), b"x")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        fs::write(dev.path().join("other-device-state"), b"unchanged").unwrap();
+        // The read-only bind sits on top of the private tmpfs; both belong to
+        // this test's temporary namespace.
+        assert!(
+            std::process::Command::new("umount")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("umount")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
     fn loop_device_minors_follow_host_partition_geometry() {
         assert_eq!(loop_device_minor(0, 7).unwrap(), 0);
         assert_eq!(loop_device_minor(6, 0).unwrap(), 6);
@@ -2899,6 +3103,64 @@ mod tests {
     }
 
     #[test]
+    fn cpu_projection_projects_classifiers_and_excludes_controls() {
+        let root = tempfile::tempdir().unwrap();
+        // The runtime writes the affinity masks itself, so discovery only
+        // contributes the immutable per-CPU classifiers.
+        assert!(discover_cpu_attributes(root.path()).unwrap().is_empty());
+        for name in [
+            "cpu0/cpu_capacity",
+            "cpu0/cpufreq/cpuinfo_max_freq",
+            "cpu0/online",
+            "cpu0/uevent",
+            "cpu0/cpufreq/scaling_max_freq",
+            "cpu0/cpufreq/scaling_governor",
+            "cpu0extra/cpu_capacity",
+            "cpufreq/policy0/scaling_setspeed",
+            "smt/control",
+            "possible",
+            "present",
+            "online",
+        ] {
+            let p = root.path().join(name);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "1024\n").unwrap();
+        }
+        let selected: Vec<_> = discover_cpu_attributes(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|(_, relative)| relative)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                PathBuf::from("cpu0/cpu_capacity"),
+                PathBuf::from("cpu0/cpufreq/cpuinfo_max_freq"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cpu_projection_allows_absent_optional_topology_and_policy_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("cpu0")).unwrap();
+        fs::create_dir(root.path().join("cpu1")).unwrap();
+        fs::create_dir_all(root.path().join("cpufreq/policy0")).unwrap();
+        fs::write(
+            root.path().join("cpufreq/policy0/cpuinfo_max_freq"),
+            "4000000\n",
+        )
+        .unwrap();
+        symlink("../cpufreq/policy0", root.path().join("cpu0/cpufreq")).unwrap();
+        let files = discover_cpu_attributes(root.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files.iter().any(|(source, relative)| {
+            relative == Path::new("cpu0/cpufreq/cpuinfo_max_freq")
+                && fs::read_to_string(source).unwrap() == "4000000\n"
+        }));
+    }
+
+    #[test]
     fn power_supply_projection_selects_only_health_state() {
         let root = tempfile::tempdir().unwrap();
         let battery = root.path().join("battery");
@@ -2976,8 +3238,9 @@ mod tests {
     #[test]
     fn synthetic_sysfs_reports_the_cell_cpu_set() {
         let sys = tempfile::tempdir().unwrap();
-        publish_cpu_topology_sysfs(sys.path()).unwrap();
-        let cpus = droidloom_cpu_placement::CpuSet::current().unwrap().list();
+        let inherited = droidloom_cpu_placement::CpuSet::current().unwrap();
+        publish_cpu_masks(sys.path(), &inherited).unwrap();
+        let cpus = inherited.list();
         for name in ["possible", "present", "online"] {
             let node = sys.path().join("devices/system/cpu").join(name);
             // Linux's own format: digits, commas and ranges. Consumers count

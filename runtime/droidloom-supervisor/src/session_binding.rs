@@ -483,7 +483,18 @@ mod tests {
         let lease = SessionLock::open(&directory.directory.join("owner.lock"), directory.uid, true).unwrap();
         assert!(directory.owner_locked().unwrap());
         drop(lease);
-        assert!(!directory.owner_locked().unwrap());
+        // Closing the lease releases its flock, but a concurrently forked child
+        // holds an inherited copy of the descriptor until CLOEXEC closes it at
+        // exec. Poll instead of sampling one instant while other tests fork.
+        let mut released = false;
+        for _ in 0..200 {
+            if !directory.owner_locked().unwrap() {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(released, "a dropped lease must release the owner lock");
     }
 
     #[test]

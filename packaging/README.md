@@ -73,7 +73,7 @@ only root-owned, non-group/world-writable specifications below
 
 `droidloomctl dpi DPI` applies Android's standard built-in-display density
 override. WindowManager persists the
-value in the per-user Android data image, which the installer retains across
+value in the per-user Android data directory, which the installer retains across
 Droidloom upgrades and host restarts. The display's pixel canvas remains the
 host output's oriented physical resolution; DPI changes UI sizing, not render
 resolution.

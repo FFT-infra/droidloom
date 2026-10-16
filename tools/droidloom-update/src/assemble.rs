@@ -264,7 +264,9 @@ pub fn mesa_tools(work: &Path, jobs: usize) -> Result<()> {
         .env("PYTHONDONTWRITEBYTECODE", "1");
     configure.arg("setup");
     if build.join("build.ninja").exists() {
-        configure.arg("--reconfigure");
+        // Container/toolchain upgrades can retire a previously detected LLVM
+        // soname. Re-probe dependencies while retaining Ninja objects/ccache.
+        configure.args(["--reconfigure", "--clearcache"]);
     }
     configure.arg(&build).arg(work.join("mesa-source")).args([
         "-Dplatforms=",
@@ -597,6 +599,7 @@ pub fn assemble_artifacts(
     for name in [
         "system/droidloomd.service",
         "user/droidloom.service",
+        "user/droidloom-recovery.service",
         "user/droidloom-audio.service",
         "user/droidloom-audio.socket",
         "user/droidloom-camera.service",

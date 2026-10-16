@@ -327,6 +327,7 @@ pub struct DenialEndpoint {
     activation_requests: bool,
     direct_input: bool,
     lazy_render_targets: bool,
+    scene_presentation: bool,
     tasks: BTreeMap<TaskObjectId, TaskEndpoint>,
 }
 
@@ -348,6 +349,7 @@ impl DenialEndpoint {
             activation_requests: false,
             direct_input: false,
             lazy_render_targets: false,
+            scene_presentation: false,
             tasks: BTreeMap::new(),
         }
     }
@@ -828,6 +830,40 @@ impl DenialEndpoint {
         Ok(())
     }
 
+    /// Opt into real display observations for direct layer scenes.
+    pub fn with_scene_presentation(mut self) -> Self {
+        self.scene_presentation = true;
+        self
+    }
+
+    /// Whether direct-scene feedback is mutually supported.
+    pub fn scene_presentation(&self) -> bool {
+        self.ready && self.scene_presentation
+    }
+
+    /// Forward display timing for a committed direct scene. This never accesses
+    /// composed-frame ownership or signals any release timeline.
+    pub fn send_scene_presented(
+        &mut self,
+        object: TaskObjectId,
+        scene: u64,
+        timestamp_nanos: u64,
+        refresh_period_nanos: u64,
+        sequence: u64,
+    ) -> Result<(), EndpointError> {
+        if !self.scene_presentation() || self.task_mut(object)?.retiring {
+            return Ok(());
+        }
+        self.socket.send_denial(&DenialMessage::ScenePresented {
+            object,
+            scene,
+            timestamp_nanos,
+            refresh_period_nanos,
+            sequence,
+        })?;
+        Ok(())
+    }
+
     /// Retain a frame identity for optional presentation feedback after release.
     /// Returns false when the bounded feedback queue is full; callers should
     /// still submit the frame, without requesting another timing callback.
@@ -928,10 +964,13 @@ impl DenialEndpoint {
         self.activation_requests &= capabilities & capability::TASK_ACTIVATION != 0;
         self.direct_input &= capabilities & capability::DIRECT_INPUT != 0;
         self.lazy_render_targets &= capabilities & capability::LAZY_RENDER_TARGETS != 0;
+        self.scene_presentation &= capabilities & capability::SCENE_PRESENTATION != 0;
         self.socket.send_denial(&DenialMessage::ServerHello {
             major: PROTOCOL_MAJOR,
-            minor: if self.lazy_render_targets {
+            minor: if self.scene_presentation {
                 PROTOCOL_MINOR
+            } else if self.lazy_render_targets {
+                7
             } else {
                 6
             },
@@ -943,6 +982,11 @@ impl DenialEndpoint {
                 }
                 | if self.direct_input {
                     capability::DIRECT_INPUT
+                } else {
+                    0
+                }
+                | if self.scene_presentation {
+                    capability::SCENE_PRESENTATION
                 } else {
                     0
                 }
@@ -1342,7 +1386,7 @@ mod tests {
                 capabilities & capability::LAZY_RENDER_TARGETS != 0,
                 supported
             );
-            assert_eq!(minor, if supported { PROTOCOL_MINOR } else { 6 });
+            assert_eq!(minor, if supported { 7 } else { 6 });
             let object = TaskObjectId(7);
             let request = AndroidMessage::RequestRenderTargets {
                 object,
@@ -1658,5 +1702,86 @@ mod tests {
             denial.receive_action(),
             Err(EndpointError::HandshakeRequired)
         ));
+    }
+
+    #[test]
+    fn scene_feedback_is_negotiated_and_does_not_release_composed_frames() {
+        for host in [false, true] {
+            for client in [false, true] {
+                let (android, mut endpoint) = pair();
+                if host {
+                    endpoint = endpoint.with_scene_presentation();
+                }
+                android
+                    .send_android(
+                        &AndroidMessage::ClientHello {
+                            min_major: 1,
+                            max_major: 1,
+                            capabilities: capability::REQUIRED_V1
+                                | if client {
+                                    capability::SCENE_PRESENTATION
+                                } else {
+                                    0
+                                },
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                endpoint.receive_action().unwrap();
+                let DenialMessage::ServerHello {
+                    minor,
+                    capabilities,
+                    ..
+                } = android.receive_denial().unwrap().message
+                else {
+                    panic!("hello");
+                };
+                assert_eq!(endpoint.scene_presentation(), host && client);
+                assert_eq!(
+                    capabilities & capability::SCENE_PRESENTATION != 0,
+                    host && client
+                );
+                assert_eq!(minor, if host && client { 8 } else { 6 });
+                let object = TaskObjectId(7);
+                android
+                    .send_android(
+                        &AndroidMessage::CreateTask {
+                            object,
+                            display: AndroidDisplayId(9),
+                            package: "org.test.app".into(),
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                endpoint.receive_action().unwrap();
+                endpoint
+                    .send_scene_presented(object, 22, 1234, 16_666_667, 5)
+                    .unwrap();
+                assert!(endpoint.tasks[&object].pending.is_empty());
+                assert!(endpoint.tasks[&object].presentation_frames.is_empty());
+                assert!(endpoint.tasks[&object].timelines.is_none());
+                if host && client {
+                    assert_eq!(
+                        android.receive_denial().unwrap().message,
+                        DenialMessage::ScenePresented {
+                            object,
+                            scene: 22,
+                            timestamp_nanos: 1234,
+                            refresh_period_nanos: 16_666_667,
+                            sequence: 5
+                        }
+                    );
+                    assert!(
+                        endpoint
+                            .send_scene_presented(TaskObjectId(99), 22, 1234, 16_666_667, 5)
+                            .is_err()
+                    );
+                }
+                endpoint.tasks.get_mut(&object).unwrap().retiring = true;
+                endpoint
+                    .send_scene_presented(object, 23, 4321, 16_666_667, 6)
+                    .unwrap();
+            }
+        }
     }
 }

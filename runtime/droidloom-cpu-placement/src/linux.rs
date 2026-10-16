@@ -45,6 +45,11 @@ impl CpuSet {
             .join(",")
     }
 
+    /// Test membership; the kernel index list is sorted and deduplicated.
+    pub fn contains(&self, cpu: usize) -> bool {
+        self.0.binary_search(&cpu).is_ok()
+    }
+
     /// Read the calling thread's effective CPU mask.
     pub fn current() -> io::Result<Self> {
         // SAFETY: cpu_set_t is initialized writable storage with its exact size.
@@ -219,6 +224,7 @@ mod tests {
             assert!(CpuSet::parse(invalid).is_err());
         }
         let all = CpuSet::parse("0-3").unwrap();
+        assert!(all.contains(0) && all.contains(3) && !all.contains(4));
         let g = Groups::from_capacities(all.clone(), &[(0, 429), (1, 429), (2, 854), (3, 1024)])
             .unwrap()
             .unwrap();

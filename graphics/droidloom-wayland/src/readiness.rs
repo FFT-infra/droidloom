@@ -11,6 +11,7 @@ pub const FRAMES: u8 = 8;
 pub const UNMAP: u8 = 16;
 pub const CLEANUP: u8 = 32;
 pub const RESIZE: u8 = 64;
+pub const TIMELINE: u8 = 128;
 
 #[derive(Default)]
 pub struct Tasks {

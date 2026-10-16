@@ -42,6 +42,8 @@ struct State {
     engine: Engine,
     tokens: BTreeMap<i32, Token>,
     sink: Option<Sink>,
+    recovering: bool,
+    pending_retire: BTreeMap<i32, u64>,
 }
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -65,27 +67,94 @@ fn now() -> u64 {
         .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
 }
 impl State {
-    fn dispatch(&self, event: &Event, token: usize) {
+    fn dispatch(&self, event: &Event, token: usize) -> bool {
         if let Some(sink) = self.sink {
             // SAFETY: C++ keeps its context alive until stop joins the worker;
             // the state lock retains the token allocation throughout this call.
-            if !unsafe { (sink.inject)(sink.context, event, token) } {
+            let accepted = unsafe { (sink.inject)(sink.context, event, token) };
+            if !accepted {
                 eprintln!(
-                    "Droidloom native input dispatch rejected kind {}",
-                    event.kind
+                    "Droidloom native input dispatch rejected kind {} action {}",
+                    event.kind, event.action
                 );
             }
+            return accepted;
         }
+        false
     }
-    fn dispatch_routed(&self, event: &RoutedEvent) {
+    fn dispatch_routed(&self, event: &RoutedEvent) -> bool {
         if let Some(token) = self.tokens.get(&event.target.task) {
-            self.dispatch(&event.event, token.pointer);
+            return self.dispatch(&event.event, token.pointer);
         }
+        false
     }
-    fn reset(&mut self) {
-        for event in self.engine.reset(now()) {
-            self.dispatch_routed(&event);
+    fn cancel(&mut self, events: Vec<RoutedEvent>) -> bool {
+        let mut accepted = true;
+        for event in events {
+            if self.dispatch_routed(&event) {
+                self.engine.acknowledge_cancel(&event);
+            } else {
+                accepted = false;
+            }
         }
+        self.recovering |= !accepted;
+        accepted
+    }
+    fn reset(&mut self) -> bool {
+        let mut next = self.engine.clone();
+        if !self.cancel(next.reset(now())) {
+            return false;
+        }
+        self.engine = next;
+        self.recovering = false;
+        for (task, incarnation) in std::mem::take(&mut self.pending_retire) {
+            self.engine.retire(task, incarnation, now());
+            self.tokens.remove(&task);
+        }
+        true
+    }
+    fn process(&mut self, sample: droidloom_input_protocol::Sample) -> Result<(), &'static str> {
+        if self.recovering && !self.reset() {
+            return Err("Android cancellation still rejected");
+        }
+        let mut next = self.engine.clone();
+        for event in next.process_batch(sample)? {
+            if !self.dispatch_routed(&event) {
+                self.recovering = true;
+                return Err("Android input dispatch rejected");
+            }
+        }
+        self.engine = next;
+        Ok(())
+    }
+    fn publish(&mut self, target: Target, token: Token) -> bool {
+        if self.recovering && !self.reset() {
+            return false;
+        }
+        let mut next = self.engine.clone();
+        if !self.cancel(next.publish(target, now())) {
+            return false;
+        }
+        self.engine = next;
+        self.tokens.insert(target.task, token);
+        true
+    }
+    fn retire(&mut self, task: i32, incarnation: u64) {
+        if incarnation == 0
+            || self
+                .tokens
+                .get(&task)
+                .is_none_or(|t| t.incarnation != incarnation)
+        {
+            return;
+        }
+        let mut next = self.engine.clone();
+        if !self.cancel(next.retire(task, incarnation, now())) {
+            self.pending_retire.insert(task, incarnation);
+            return;
+        }
+        self.engine = next;
+        self.tokens.remove(&task);
     }
 }
 
@@ -122,12 +191,7 @@ pub extern "C" fn droidloom_input_publish(
         left,
         top,
     };
-    let mut state = state();
-    for event in state.engine.publish(target, now()) {
-        state.dispatch_routed(&event);
-    }
-    state.tokens.insert(task, token);
-    true
+    state().publish(target, token)
 }
 
 #[unsafe(no_mangle)]
@@ -135,19 +199,7 @@ pub extern "C" fn droidloom_input_retire(task: i32, incarnation: i64) {
     let Ok(incarnation) = u64::try_from(incarnation) else {
         return;
     };
-    let mut state = state();
-    if incarnation == 0
-        || state
-            .tokens
-            .get(&task)
-            .is_none_or(|token| token.incarnation != incarnation)
-    {
-        return;
-    }
-    for event in state.engine.retire(task, incarnation, now()) {
-        state.dispatch_routed(&event);
-    }
-    state.tokens.remove(&task);
+    state().retire(task, incarnation);
 }
 
 pub struct Handle {
@@ -336,10 +388,12 @@ pub unsafe extern "C" fn droidloom_input_destroy(handle: *mut Handle) {
         worker.stop();
     }
     let mut state = state();
-    state.reset();
+    let retired = state.reset();
     state.sink = None;
-    state.engine = Engine::default();
-    state.tokens.clear();
+    if retired {
+        state.engine = Engine::default();
+        state.tokens.clear();
+    }
 }
 
 fn ready(fd: std::os::fd::BorrowedFd<'_>, wake: &SeqPacket) -> Result<bool, String> {
@@ -394,7 +448,11 @@ fn receive(listener: &SeqPacketListener, wake: &SeqPacket) -> Result<(), String>
         if credentials.uid != 0 && credentials.uid != 1000 && !fixture_peer {
             continue;
         }
-        state().reset();
+        if !state().reset() {
+            // Reject this connection while retaining the old gesture/token for
+            // another recovery attempt; never admit a fresh DOWN over it.
+            continue;
+        }
         let mut bytes = [0; RECORD_BYTES];
         while ready(client.as_fd(), wake)? {
             let record = match client.receive_record_into(&mut bytes) {
@@ -419,12 +477,8 @@ fn receive(listener: &SeqPacketListener, wake: &SeqPacket) -> Result<(), String>
                         0,
                     );
                 }
-                Record::Input(sample) => match state.engine.process_batch(sample) {
-                    Ok(events) => {
-                        for event in events {
-                            state.dispatch_routed(&event);
-                        }
-                    }
+                Record::Input(sample) => match state.process(sample) {
+                    Ok(()) => {} // accepted, suppressed or stale task incarnation
                     Err(error) => {
                         eprintln!("Droidloom native input sample rejected: {error}");
                         state.reset();
@@ -470,6 +524,7 @@ mod tests {
         sender: mpsc::Sender<Event>,
         starts: AtomicUsize,
         stops: AtomicUsize,
+        verifier: Mutex<Verifier>,
     }
     unsafe extern "C" fn lifecycle(context: usize, starting: bool) -> bool {
         // SAFETY: the test retains the callback context until both workers join.
@@ -488,12 +543,194 @@ mod tests {
     unsafe extern "C" fn inject(context: usize, event: *const Event, _: usize) -> bool {
         // SAFETY: test owns both allocations until the receiver is joined.
         let context = unsafe { &*(context as *const Context) };
-        context.sender.send(unsafe { *event }).is_ok()
+        let mut verifier = context.verifier.lock().unwrap();
+        (unsafe { verify((&raw mut *verifier) as usize, event, 0) })
+            && context.sender.send(unsafe { *event }).is_ok()
     }
     unsafe extern "C" fn release(token: usize) {
         // SAFETY: publish transfers exactly one Box allocated by this test.
         drop(unsafe { Box::from_raw(token as *mut u64) });
     }
+
+    #[derive(Default)]
+    struct Verifier {
+        pointers: BTreeMap<i32, std::collections::BTreeSet<i32>>,
+        events: Vec<Event>,
+        reject_cancel: bool,
+    }
+    unsafe extern "C" fn verify(context: usize, event: *const Event, _: usize) -> bool {
+        // SAFETY: local tests retain the verifier until their State is dropped.
+        let verifier = unsafe { &mut *(context as *mut Verifier) };
+        let event = unsafe { *event };
+        verifier.events.push(event);
+        if event.kind != 1 {
+            return true;
+        }
+        let count = usize::try_from(event.count).unwrap();
+        let ids: std::collections::BTreeSet<_> =
+            event.pointers[..count].iter().map(|p| p.id).collect();
+        let held = verifier.pointers.entry(event.display).or_default();
+        let action = event.action & 0xff;
+        let index = usize::try_from(event.action >> 8).unwrap();
+        match action {
+            0 if held.is_empty() && ids.len() == 1 => *held = ids,
+            5 if index < count => {
+                let added = event.pointers[index].id;
+                let mut expected = held.clone();
+                if !expected.insert(added) || expected != ids {
+                    return false;
+                }
+                *held = expected;
+            }
+            2 if *held == ids => {}
+            6 if *held == ids && index < count => {
+                held.remove(&event.pointers[index].id);
+            }
+            1 if *held == ids && ids.len() == 1 => held.clear(),
+            3 if *held == ids && event.flags & 0x20 != 0 && !verifier.reject_cancel => held.clear(),
+            _ => return false,
+        }
+        true
+    }
+    unsafe extern "C" fn keep_token(_: usize) {}
+    fn verified_state(verifier: &mut Verifier) -> State {
+        let mut state = State {
+            sink: Some(Sink {
+                context: std::ptr::from_mut(verifier) as usize,
+                inject: verify,
+                lifecycle: startup_failure,
+            }),
+            ..State::default()
+        };
+        state.engine.publish(
+            Target {
+                task: 42,
+                display: 0,
+                incarnation: 7,
+                token: 9,
+                left: 0,
+                top: 0,
+            },
+            1,
+        );
+        state.tokens.insert(
+            42,
+            Token {
+                pointer: 9,
+                incarnation: 7,
+                release: keep_token,
+            },
+        );
+        state
+    }
+    fn sample(id: u32, action: u8) -> droidloom_input_protocol::Sample {
+        droidloom_input_protocol::Sample {
+            task: 42,
+            display: 0,
+            incarnation: 7,
+            timestamp: 100,
+            action,
+            code: id,
+            payload: droidloom_input_protocol::Payload::Touch {
+                x: 2.0,
+                y: 3.0,
+                pressure: 1.0,
+            },
+        }
+    }
+    #[test]
+    fn rejected_cancel_retains_exact_android_pointer_set_until_retry_accepts() {
+        let mut verifier = Verifier::default();
+        let mut state = verified_state(&mut verifier);
+        state.process(sample(0, 0)).unwrap();
+        state.process(sample(1, 0)).unwrap();
+        verifier.reject_cancel = true;
+        assert!(!state.reset());
+        assert!(state.process(sample(2, 0)).is_err());
+        assert_eq!(verifier.pointers[&0], [0, 1].into_iter().collect());
+        assert_eq!(verifier.events.last().unwrap().action, 3);
+        assert_eq!(verifier.events.last().unwrap().count, 2);
+        verifier.reject_cancel = false;
+        assert!(state.reset());
+        assert!(verifier.pointers[&0].is_empty());
+        state.process(sample(0, 0)).unwrap();
+        state.process(sample(0, 2)).unwrap();
+        assert!(verifier.pointers[&0].is_empty());
+    }
+    #[test]
+    fn rejected_up_and_duplicate_down_recover_before_the_next_gesture() {
+        let mut verifier = Verifier::default();
+        let mut state = verified_state(&mut verifier);
+        state.process(sample(0, 0)).unwrap();
+        assert!(state.process(sample(0, 0)).is_err());
+        assert!(state.reset());
+        state.process(sample(0, 0)).unwrap();
+        // Simulate a dispatcher refusal independently from engine bookkeeping.
+        verifier.pointers.get_mut(&0).unwrap().insert(1);
+        assert!(state.process(sample(0, 2)).is_err());
+        assert!(!state.reset()); // Partial cancellation cannot clear Android {0,1}.
+        verifier.pointers.get_mut(&0).unwrap().remove(&1);
+        assert!(state.reset());
+        state.process(sample(0, 0)).unwrap();
+        state.process(sample(0, 2)).unwrap();
+        assert!(verifier.pointers[&0].is_empty());
+    }
+
+    #[test]
+    fn rejected_task_rebinding_and_retirement_keep_the_old_token_for_recovery() {
+        let mut verifier = Verifier::default();
+        let mut state = verified_state(&mut verifier);
+        state.process(sample(0, 0)).unwrap();
+        state.process(sample(1, 0)).unwrap();
+        verifier.reject_cancel = true;
+        let target = Target {
+            task: 42,
+            display: 0,
+            incarnation: 8,
+            token: 10,
+            left: 0,
+            top: 0,
+        };
+        assert!(!state.publish(
+            target,
+            Token {
+                pointer: 10,
+                incarnation: 8,
+                release: keep_token
+            }
+        ));
+        assert_eq!(state.tokens[&42].pointer, 9);
+        assert_eq!(verifier.pointers[&0].len(), 2);
+        state.retire(42, 7);
+        assert_eq!(state.tokens[&42].pointer, 9);
+        assert_eq!(state.pending_retire[&42], 7);
+        verifier.reject_cancel = false;
+        assert!(state.reset());
+        assert!(!state.tokens.contains_key(&42));
+        assert!(verifier.pointers[&0].is_empty());
+        assert!(state.publish(
+            target,
+            Token {
+                pointer: 10,
+                incarnation: 8,
+                release: keep_token
+            }
+        ));
+        state
+            .process(droidloom_input_protocol::Sample {
+                incarnation: 8,
+                ..sample(0, 0)
+            })
+            .unwrap();
+        state
+            .process(droidloom_input_protocol::Sample {
+                incarnation: 8,
+                ..sample(0, 2)
+            })
+            .unwrap();
+        assert!(verifier.pointers[&0].is_empty());
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // Exercise the full reconnect/retire/shutdown lifecycle.
     fn inherited_socket_dispatches_cancels_and_replaces_without_an_idle_poll() {
@@ -505,6 +742,7 @@ mod tests {
             sender,
             starts: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            verifier: Mutex::new(Verifier::default()),
         }));
         let handle = droidloom_input_create(context as usize, inject, lifecycle);
         assert!(droidloom_input_publish(
@@ -577,12 +815,10 @@ mod tests {
             55
         );
         droidloom_input_retire(42, 7);
+        let cancelled = received.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
-            received
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .action,
-            3
+            (cancelled.action, cancelled.flags, cancelled.count),
+            (3, 0x20, 1)
         );
         assert_eq!(
             received.recv_timeout(Duration::from_secs(2)).unwrap().flags & 0x20,
@@ -622,6 +858,61 @@ mod tests {
         replacement_client
             .send_record(&droidloom_input_protocol::encode_display_power(false), &[])
             .unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            6
+        );
+        for id in 0..2 {
+            replacement_client
+                .send_record(
+                    &encode_touch(0, 42, 104 + u64::from(id), 0, id, 0, 0, u16::MAX, 8).unwrap(),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(2)).unwrap().count,
+                i32::try_from(id).unwrap() + 1
+            );
+        }
+        drop(replacement_client);
+        let cancelled = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (cancelled.action, cancelled.flags, cancelled.count),
+            (3, 0x20, 2)
+        );
+        let recovered = SeqPacket::connect(dir.path().join("replacement")).unwrap();
+        for action in [0, 2] {
+            recovered
+                .send_record(
+                    &encode_touch(0, 42, 110, action, 0, 0, 0, u16::MAX, 8).unwrap(),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                received
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .action,
+                i32::from(action != 0)
+            );
+        }
+        for id in 0..2 {
+            recovered
+                .send_record(
+                    &encode_touch(0, 42, 111, 0, id, 0, 0, u16::MAX, 8).unwrap(),
+                    &[],
+                )
+                .unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        recovered
+            .send_record(&droidloom_input_protocol::encode_display_power(false), &[])
+            .unwrap();
+        let cancelled = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (cancelled.action, cancelled.flags, cancelled.count),
+            (3, 0x20, 2)
+        );
         assert_eq!(
             received.recv_timeout(Duration::from_secs(2)).unwrap().kind,
             6

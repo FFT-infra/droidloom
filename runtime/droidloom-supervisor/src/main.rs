@@ -41,6 +41,17 @@ enum Command {
         #[arg(long)]
         spec: PathBuf,
     },
+    /// Copy stopped legacy Android images into new direct host directories.
+    MigrateStorage {
+        /// Existing data_dir containing detached data.img and metadata.img.
+        #[arg(long)]
+        source: PathBuf,
+        /// New data_dir; must not exist. Configuration is not changed.
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long, hide = true)]
+        private_worker: bool,
+    },
     /// Private namespace re-entry used only by `development-run`.
     #[command(hide = true)]
     DevelopmentEnter {
@@ -72,6 +83,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::DevelopmentRun { spec } => {
             let cell = load_spec(&spec)?;
             run_development_cell(&spec, &cell)?;
+        }
+        Command::MigrateStorage {
+            source,
+            destination,
+            private_worker,
+        } => {
+            droidloom_supervisor::storage_migration::migrate(
+                &source,
+                &destination,
+                private_worker,
+            )?;
         }
         Command::DevelopmentEnter { spec } => {
             let spec = load_spec(&spec)?;
