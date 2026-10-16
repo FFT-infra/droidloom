@@ -1,0 +1,11 @@
+--- a/ta/src/keys.rs
++++ b/ta/src/keys.rs
+@@ -37,7 +37,7 @@ use spki::SubjectPublicKeyInfoOwned;
+ use x509_cert::ext::pkix::KeyUsages;
+ 
+ /// Maximum size of an attestation challenge value.
+-const MAX_ATTESTATION_CHALLENGE_LEN: usize = 128;
++const MAX_ATTESTATION_CHALLENGE_LEN: usize = 1024;
+ 
+ /// Contents of wrapping key data
+ ///
