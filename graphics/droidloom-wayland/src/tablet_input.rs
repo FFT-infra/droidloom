@@ -70,23 +70,16 @@ impl App {
     pub(super) fn flush_native_pen(&mut self, tool_id: u32) {
         // Smithay 0.7 can swallow wl_touch.cancel when no touch frame is
         // pending. A pen entering the same application is a safe resync point:
-        // cancel its current touch contacts before sending stylus input, and
-        // retain the pending pen frame if Android cannot accept the cancel yet.
+        // cancel its current touch contacts before sending stylus input. The
+        // cancellation and the pen records share one ordered connection, so
+        // the pending pen frame stays valid while they drain.
         if self.tablet_tool_mut(tool_id).pending_down {
             self.text_input.note_touch();
             let surface = self.tablet_tool_mut(tool_id).surface.clone();
             if let Some(surface) = surface
                 && let Some(object) = self.task_for_surface(&surface)
             {
-                match self.cancel_task_touch_contacts(object) {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(error) => {
-                        eprintln!("Droidloom pen touch cancellation: {error}");
-                        self.fail(&error);
-                        return;
-                    }
-                }
+                self.retire_contacts(Some(object));
             }
         }
 

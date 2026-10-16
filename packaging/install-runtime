@@ -31,6 +31,7 @@ for required in \
     "$payload/usr/bin/droidloom-supervisor" \
     "$payload/usr/bin/droidloom-wayland" \
     "$payload/usr/lib/systemd/user/droidloom-applications.service" \
+    "$payload/usr/lib/systemd/user/droidloom-recovery.service" \
     "$payload/usr/lib/systemd/user/droidloom-audio.service" \
     "$payload/usr/lib/systemd/user/droidloom-audio.socket" \
     "$payload/usr/lib/systemd/user/droidloom.service" \
@@ -41,8 +42,6 @@ for required in \
     "$payload/var/lib/droidloom/images/images/system_ext.img" \
     "$payload/var/lib/droidloom/images/images/product.img" \
     "$payload/var/lib/droidloom/images/images/vendor.raw.img" \
-    "$payload/var/lib/droidloom/users/$host_uid/data/data.img" \
-    "$payload/var/lib/droidloom/users/$host_uid/data/metadata.img" \
     "$payload/etc/droidloom/cell.json"; do
     [[ -f "$required" ]] || {
         echo "incomplete Droidloom payload: $required" >&2
@@ -72,6 +71,12 @@ for source in paths:
     if not path.exists():
         raise SystemExit(f'incomplete runtime input: {path}')
 PYCODE
+
+if [[ -e "/var/lib/droidloom/users/$host_uid/data/data.img" ||
+      -e "/var/lib/droidloom/users/$host_uid/data/metadata.img" ]]; then
+    echo "Legacy Android images require offline migrate-storage before this installer" >&2
+    exit 2
+fi
 
 # Mandatory before stopping any service or writing any installed file.
 python3 "$(dirname -- "$0")/verify-bundle" verify "$payload"
@@ -120,12 +125,16 @@ if [[ ! -d "$images_final" ]]; then
     mv -T -- "$images_incoming" "$images_final"
 fi
 
-if [[ ! -e "/var/lib/droidloom/users/$host_uid/data/data.img" ]]; then
-    cp -a -- "$payload/var/lib/droidloom/users/$host_uid/data/." \
-        "/var/lib/droidloom/users/$host_uid/data/"
-fi
-chown -R root:root "/var/lib/droidloom/users/$host_uid/data"
-chmod 0700 "/var/lib/droidloom/users/$host_uid/data"
+for storage_name in data metadata; do
+    storage_path="/var/lib/droidloom/users/$host_uid/data/$storage_name"
+    if [[ -L "$storage_path" || ( -e "$storage_path" && ! -d "$storage_path" ) ]]; then
+        echo "Unsafe Android storage directory: $storage_path" >&2
+        exit 2
+    fi
+    if [[ ! -d "$storage_path" ]]; then
+        install -d -m 0700 "$storage_path"
+    fi
+done
 
 for pending_link in \
     /usr/lib/droidloom/.current-new \
@@ -151,6 +160,8 @@ install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom.service" \
     /usr/lib/systemd/user/droidloom.service
 install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-applications.service" \
     /usr/lib/systemd/user/droidloom-applications.service
+install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-recovery.service" \
+    /usr/lib/systemd/user/droidloom-recovery.service
 install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-audio.service" \
     /usr/lib/systemd/user/droidloom-audio.service
 install -D -m 0644 "$payload/usr/lib/systemd/user/droidloom-audio.socket" \

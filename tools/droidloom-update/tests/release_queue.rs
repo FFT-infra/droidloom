@@ -15,6 +15,7 @@ fn layer_pipeline_supports_bounded_async_imports_commits_and_legacy_replies() {
         "0013-droidloom-lazy-render-targets.patch",
         "0014-droidloom-task-work-gate.patch",
         "0015-droidloom-scene-batches.patch",
+        "0018-droidloom-import-retention.patch",
     ] {
         let output = Command::new("git")
             .current_dir(temp.path())
@@ -23,6 +24,7 @@ fn layer_pipeline_supports_bounded_async_imports_commits_and_legacy_replies() {
                 "--include=services/surfaceflinger/DroidloomLayers.cpp",
                 "--include=services/surfaceflinger/DroidloomLayers.h",
                 "--include=services/surfaceflinger/DroidloomTaskWork.h",
+                "--include=services/surfaceflinger/DroidloomImportRetention.h",
             ])
             .arg(repo.join("android/surfaceflinger").join(patch))
             .output()
@@ -129,5 +131,50 @@ fn host_fences_do_not_block_other_apps_or_commit_callbacks() {
     assert!(
         status.success(),
         "release queue regression failed or deadlocked: {status}"
+    );
+}
+
+#[test]
+fn resize_imports_retire_after_release_without_churning_rotating_pools() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let patch = fs::read_to_string(
+        repo.join("android/surfaceflinger/0018-droidloom-import-retention.patch"),
+    )
+    .unwrap();
+    let section = patch
+        .split("diff --git ")
+        .find(|section| {
+            section.starts_with("a/services/surfaceflinger/DroidloomImportRetention.h ")
+        })
+        .expect("retention policy is part of the Android patch");
+    let header: String = section
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .map(|line| format!("{}\n", &line[1..]))
+        .collect();
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("DroidloomImportRetention.h"), header).unwrap();
+    let binary = temp.path().join("import-retention-test");
+    let output = Command::new("c++")
+        .args(["-std=c++20", "-Wall", "-Wextra", "-Werror", "-I"])
+        .arg(temp.path())
+        .arg(repo.join("android/surfaceflinger/tests/import_retention.cpp"))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = Command::new("timeout")
+        .arg("15s")
+        .arg(binary)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "import retention regression failed: {status}"
     );
 }

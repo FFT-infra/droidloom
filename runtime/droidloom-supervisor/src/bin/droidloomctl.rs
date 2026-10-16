@@ -79,6 +79,13 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CELL_SPEC)]
         spec: PathBuf,
     },
+    /// Keep the cell running for the session recovery service.
+    #[command(hide = true)]
+    Supervise {
+        /// Authorized cell specification.
+        #[arg(long, default_value = DEFAULT_CELL_SPEC)]
+        spec: PathBuf,
+    },
     /// Report whether the cell is running.
     Status,
     /// Connect the host's adb client to the running cell's adbd.
@@ -247,6 +254,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Command::Start { spec, .. } => ControlRequest::Start { spec },
             Command::Stop => ControlRequest::Stop,
             Command::Restart { spec, .. } => ControlRequest::Restart { spec },
+            Command::Supervise { spec } => {
+                return Ok(droidloom_supervisor::control::supervise_cell(
+                    &cli.socket, &spec,
+                )?);
+            }
             Command::Status => ControlRequest::Status,
             Command::Wait => ControlRequest::WaitReady,
             Command::Logs {

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 struct PipeWire {
     child: Child,
+    policy: Option<Child>,
     directory: tempfile::TempDir,
     channels: u32,
     quantum: u32,
@@ -45,6 +46,10 @@ impl Drop for PipeWire {
                     .collect::<Vec<_>>()
                     .join("\n")
             );
+        }
+        if let Some(policy) = &mut self.policy {
+            let _ = policy.kill();
+            let _ = policy.wait();
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -87,6 +92,7 @@ context.modules = [
   { name = libpipewire-module-client-node }
   { name = libpipewire-module-adapter }
   { name = libpipewire-module-link-factory }
+  { name = libpipewire-module-metadata }
   { name = libpipewire-module-access }
 ]
 context.objects = [
@@ -125,6 +131,7 @@ context.objects = [
             .unwrap();
         let mut server = Self {
             child,
+            policy: None,
             directory,
             channels,
             quantum,
@@ -140,6 +147,54 @@ context.objects = [
             thread::sleep(Duration::from_millis(10));
         }
         server
+    }
+    fn start_policy_without_sink(&mut self) {
+        let objects = self.ports();
+        let sink = objects
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|object| object["info"]["props"]["node.name"] == "test.sink")
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            self.command("pw-cli")
+                .args(["destroy", &sink.to_string()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let log = std::fs::File::create(self.directory.path().join("wireplumber.log")).unwrap();
+        self.policy = Some(
+            self.command("wireplumber")
+                .args(["--profile", "policy"])
+                .env("XDG_CONFIG_HOME", self.directory.path())
+                .env("XDG_STATE_HOME", self.directory.path())
+                .env("XDG_CACHE_HOME", self.directory.path())
+                .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                self.policy.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "policy exited: {}",
+                std::fs::read_to_string(self.directory.path().join("wireplumber.log")).unwrap()
+            );
+            if self.ports().as_array().unwrap().iter().any(|object| {
+                object["type"] == "PipeWire:Interface:Metadata"
+                    && object["props"]["metadata.name"] == "sm-settings"
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "policy did not initialize");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     fn remote(&self) -> std::path::PathBuf {
         self.directory.path().join("pipewire-test")
@@ -303,6 +358,152 @@ fn position_queries_before_linking_and_while_paused_keep_the_stream_alive() {
     assert!(playback.position().unwrap().monotonic_ns >= initial.monotonic_ns);
     drop(playback);
     let _ = worker.join().unwrap();
+}
+
+#[test]
+fn playback_without_a_link_keeps_a_clock() {
+    let pipewire = PipeWire::new();
+    let (mut playback, worker) = pipewire.connect_with_frames(
+        &pipewire.directory.path().join("unlinked-playback.sock"),
+        Direction::Playback,
+        8192,
+    );
+    playback.control(START).unwrap();
+    let start = Instant::now();
+    let mut frames = 0;
+    for _ in 0..96 {
+        let region = playback.acquire(256).unwrap();
+        // SAFETY: the acquired region is exclusively owned until submit.
+        unsafe {
+            std::slice::from_raw_parts_mut(region.pointer, region.frames as usize * 2).fill(0);
+        }
+        frames += region.frames;
+        playback.submit(region.frames).unwrap();
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "unlinked playback must be paced"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "unlinked playback must not time out"
+    );
+    assert!(playback.position().unwrap().frames > 0);
+    assert_eq!(frames, 96 * 256);
+    // A device arriving later must attach to the same healthy stream.
+    let before_link = playback.position().unwrap().frames;
+    pipewire.link(&playback.node_name(), true);
+    for _ in 0..32 {
+        let region = playback.acquire(256).unwrap();
+        unsafe {
+            std::slice::from_raw_parts_mut(region.pointer, region.frames as usize * 2).fill(0);
+        }
+        playback.submit(region.frames).unwrap();
+    }
+    assert!(playback.position().unwrap().frames >= before_link);
+    playback.control(STANDBY).unwrap();
+    drop(playback);
+    let _ = worker.join().unwrap();
+}
+
+#[test]
+fn playback_without_devices_survives_session_policy() {
+    let mut pipewire = PipeWire::new();
+    pipewire.start_policy_without_sink();
+    let (mut playback, worker) = pipewire.connect_with_frames(
+        &pipewire.directory.path().join("no-device.sock"),
+        Direction::Playback,
+        8192,
+    );
+    playback.control(START).unwrap();
+    let start = Instant::now();
+    let pump = |playback: &mut Client| {
+        for _ in 0..128 {
+            let region = playback.acquire(256).unwrap();
+            // SAFETY: this client owns the acquired sample region until submit.
+            unsafe {
+                std::slice::from_raw_parts_mut(region.pointer, region.frames as usize * 2).fill(0);
+            }
+            playback.submit(region.frames).unwrap();
+            playback.position().unwrap();
+        }
+    };
+    pump(&mut playback);
+    assert!(start.elapsed() >= Duration::from_millis(500));
+    assert!(playback.position().unwrap().frames > 0);
+    // Let real session policy attach a newly available output to the existing
+    // stream, then remove it again. Both transitions must preserve the clock.
+    let held = playback.acquire(256).unwrap();
+    let before_reconfigure = playback.position().unwrap().discontinuities;
+    let result = pipewire.command("pw-cli").args(["create-node", "adapter",
+        "{ factory.name = support.null-audio-sink node.name = test.sink media.class = Audio/Sink audio.format = S16LE audio.rate = 48000 audio.channels = 1 audio.position = [ MONO ] object.linger = true adapter.auto-port-config = { mode = dsp monitor = true } }"])
+        .output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while playback.position().unwrap().discontinuities == before_reconfigure {
+        assert!(
+            Instant::now() < deadline,
+            "policy did not reconfigure the stream"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The pool mapping must remain writable even if its PipeWire wrapper was
+    // removed while Android owned a credit. Submitting it releases the credit
+    // without queuing stale audio into the new graph.
+    unsafe {
+        std::slice::from_raw_parts_mut(held.pointer, held.frames as usize * 2).fill(0);
+    }
+    playback.submit(held.frames).unwrap();
+    pump(&mut playback);
+    let objects = pipewire.ports();
+    assert!(
+        objects
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["type"] == "PipeWire:Interface:Link"
+                && object["info"]["state"] == "active")
+    );
+    let sink = objects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["info"]["props"]["node.name"] == "test.sink")
+        .unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let before_remove = playback.position().unwrap().frames;
+    assert!(
+        pipewire
+            .command("pw-cli")
+            .args(["destroy", &sink.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    pump(&mut playback);
+    assert!(playback.position().unwrap().frames > before_remove);
+    playback.control(STANDBY).unwrap();
+    let name = playback.node_name();
+    drop(playback);
+    let _ = worker.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pipewire
+        .ports()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["info"]["props"]["node.name"] == name)
+    {
+        assert!(Instant::now() < deadline, "closed playback node leaked");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

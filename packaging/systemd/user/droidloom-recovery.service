@@ -1,0 +1,17 @@
+[Unit]
+Description=Droidloom Android cell crash recovery
+BindsTo=droidloom.service
+PartOf=droidloom.service
+After=droidloom.service
+ConditionPathExists=/etc/droidloom/cell.json
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/systemctl start droidloomd.service
+ExecStart=/usr/bin/droidloomctl supervise --cell
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=150
+TimeoutStopSec=10

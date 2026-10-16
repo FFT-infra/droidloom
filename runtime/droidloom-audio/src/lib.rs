@@ -265,7 +265,7 @@ pub fn serve_connection(socket: SeqPacket, options: &Options) -> io::Result<()> 
                     u64::from(format.channels),
                     u64::from(format.frames),
                     BUFFERS as u64,
-                    SHARED_POOL,
+                    SHARED_POOL | (open.values[4] & BURST_POSITION),
                 ],
                 ..open
             }
@@ -274,8 +274,8 @@ pub fn serve_connection(socket: SeqPacket, options: &Options) -> io::Result<()> 
         )
         .map_err(ipc)?;
     eprintln!(
-        "droidloom-audio: {:?} {}/{} PCM16, four shared buffers, generation {generation:x}",
-        format.direction, format.rate, format.channels
+        "droidloom-audio: {:?} {}/{} PCM16, four shared buffers, generation {generation:x}, burst_position={}",
+        format.direction, format.rate, format.channels, open.values[4] & BURST_POSITION != 0
     );
     let mut previous_request = open.request;
     let mut held: Option<Region> = None;
@@ -302,8 +302,9 @@ pub fn serve_connection(socket: SeqPacket, options: &Options) -> io::Result<()> 
         previous_request = request.request;
         let result = (|| {
             match request.op {
-                ACQUIRE
-                    if active
+                ACQUIRE | ACQUIRE_POSITION
+                    if (request.op == ACQUIRE || open.values[4] & BURST_POSITION != 0)
+                        && active
                         && held.is_none()
                         && request.values[1..] == [0; 4]
                         && request.values[0] > 0
@@ -319,21 +320,31 @@ pub fn serve_connection(socket: SeqPacket, options: &Options) -> io::Result<()> 
                     {
                         return Err(invalid("PipeWire returned an invalid sample region"));
                     }
-                    reply(
-                        &socket,
-                        request,
-                        ACQUIRE,
+                    let values = if request.op == ACQUIRE_POSITION {
+                        let position = stream.position()?;
+                        [
+                            pack_credit(region.slot, region.frames, region.offset)?,
+                            position.frames,
+                            position.monotonic_ns,
+                            position.latency_ns,
+                            position.discontinuities,
+                        ]
+                    } else {
                         [
                             u64::from(region.slot),
                             u64::from(region.frames),
                             u64::from(region.offset),
                             u64::from(format.frames),
                             0,
-                        ],
-                    )?;
+                        ]
+                    };
+                    reply(&socket, request, request.op, values)?;
                     held = Some(region);
                 }
-                SUBMIT if request.values[2..] == [0; 3] => {
+                SUBMIT | SUBMIT_POSITION
+                    if (request.op == SUBMIT || open.values[4] & BURST_POSITION != 0)
+                        && request.values[2..] == [0; 3] =>
+                {
                     let region = held.as_ref().ok_or_else(|| invalid("no audio credit"))?;
                     if request.values[0] != u64::from(region.slot)
                         || request.values[1] > u64::from(region.frames)
@@ -342,7 +353,23 @@ pub fn serve_connection(socket: SeqPacket, options: &Options) -> io::Result<()> 
                     }
                     stream.submit(region.slot, request.values[1] as u32)?;
                     held = None;
-                    reply(&socket, request, ACK, [0; 5])?;
+                    if request.op == SUBMIT_POSITION {
+                        let position = stream.position()?;
+                        reply(
+                            &socket,
+                            request,
+                            STATUS,
+                            [
+                                position.frames,
+                                position.monotonic_ns,
+                                position.latency_ns,
+                                position.discontinuities,
+                                0,
+                            ],
+                        )?;
+                    } else {
+                        reply(&socket, request, ACK, [0; 5])?;
+                    }
                 }
                 CONTROL
                     if held.is_none()

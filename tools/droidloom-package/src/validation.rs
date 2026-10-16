@@ -160,8 +160,8 @@ fn transactions(
             "setup did not use the target account, fixture GPU and package image paths".into(),
         );
     }
-    let data = "/var/lib/droidloom/users/1234/data/data.img";
-    // This checks persistence of the user's data file, not binary identity.
+    let data = "/var/lib/droidloom/users/1234/data/data";
+    // Existing Android directory identity must survive package reinstalls.
     let data_identity = output(work, name, &["stat", "--format=%i:%s", data])?;
     exec(
         work,

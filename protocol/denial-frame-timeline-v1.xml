@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <protocol name="denial_frame_timeline_v1">
   <copyright>
-    Copyright 2026 Droidloom contributors
+    Copyright 2026 Denial and Droidloom contributors
 
     Permission is hereby granted, free of charge, to any person obtaining a
     copy of this software and associated documentation files (the "Software"),
@@ -116,6 +116,12 @@
     </enum>
 
     <request name="set_target">
+      <description summary="target the next surface commit">
+        The target is a scheduling constraint, not a client-liveness contract.
+        A commit is eligible only at its named latch; late commits are never
+        relabelled onto a later grant or burst to catch up. Semantic scheduling
+        misses discard the next buffer update without disconnecting the client.
+      </description>
       <arg name="timeline" type="object" interface="denial_output_frame_timeline_v1"/>
       <arg name="epoch_hi" type="uint"/>
       <arg name="epoch_lo" type="uint"/>

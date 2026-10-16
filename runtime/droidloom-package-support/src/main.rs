@@ -269,7 +269,7 @@ fn prepare() -> Result<()> {
         "The installed helper will write {SPEC}, {ENVIRONMENT}, {STATE}, and {RULE}. These files are administrator-owned."
     );
     eprintln!(
-        "It will create missing Android data.img and metadata.img regular files in {data}, initialize only new files as ext4, and preserve existing Android data. It authorizes only start/stop of droidloomd.service for this user."
+        "It will create missing Android data and metadata directories in {data}, use host filesystem capacity directly, and preserve existing Android data. Legacy images require explicit offline migration. It authorizes only start/stop of droidloomd.service for this user."
     );
     eprintln!(
         "That system service needs root to create Android namespaces, mount the image files, and configure Droidloom's network connection."
@@ -325,27 +325,7 @@ fn setup(
     )?;
     let data = Path::new(spec["data_dir"].as_str().unwrap());
     root_directory(data, 0o700)?;
-    for (name, bytes) in [
-        ("data.img", 12_u64 * 1024 * 1024 * 1024),
-        ("metadata.img", 128_u64 * 1024 * 1024),
-    ] {
-        let path = data.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0 => continue,
-            Ok(_) => {
-                return Err(format!("refusing unsafe Android data file {}", path.display()).into());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let file = tempfile::NamedTempFile::new_in(data)?;
-        file.as_file().set_len(bytes)?;
-        run(Command::new("/usr/bin/mkfs.ext4")
-            .args(["-F", "-q"])
-            .arg(file.path()))?;
-        file.as_file().sync_all()?;
-        file.persist_noclobber(&path)?;
-    }
+    droidloom_supervisor::host_storage::prepare(data)?;
     let old_state: Option<SetupState> = optional_json(Path::new(STATE))?
         .map(serde_json::from_value)
         .transpose()?;

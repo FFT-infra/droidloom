@@ -1,0 +1,168 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -575,7 +575,7 @@
+     const bool accepted = presentFrame(output, width, height);
+     {
+         std::lock_guard lock(mState->mutex);
+-        mState->retryOnRelease = !accepted;
++        mState->retryOnRelease = !accepted || mRetireOnRelease;
+     }
+     if (!accepted) invalidate();
+     return accepted;
+@@ -623,8 +623,6 @@
+              std::bit_cast<uint32_t>(e.source.bottom), e.transform, e.alpha, e.color,
+              static_cast<uint64_t>(e.opaque), e.format});
+     }
+-    if (scene == mScene) return true;
+-
+     const bool asyncImports = (config[0] & 32) != 0;
+     const auto retire = [&](uint64_t buffer) {
+         {
+@@ -641,20 +639,25 @@
+         std::lock_guard lock(mState->mutex);
+         return mState->imports.forget(buffer);
+     };
+-    // Retire imports only after their reads have completed, never while an
+-    // Android producer or the desktop compositor still owns a submission.
+-    if (mBuffers.size() + buffers.size() > kMaxBuffers) {
+-        for (auto it = mBuffers.begin(); it != mBuffers.end();) {
+-            if (buffers.contains(it->first)) {
+-                ++it;
+-                continue;
+-            }
+-            if (retire(it->first))
+-                it = mBuffers.erase(it);
+-            else
+-                ++it;
+-        }
+-    }
++    std::map<uint64_t, DroidloomImportUse> currentImports;
++    // Count allocations using the mapper's actual size (including alignment),
++    // not width*height. Zero/unknown sizes are never retained as spare imports.
++    if (++mCacheSerial == 0) {
++        for (auto& [id, cached] : mBuffers) cached.use.serial = 0;
++        ++mCacheSerial;
++    }
++    for (const auto& e : exports) {
++        if (!e.buffer) continue;
++        const auto* h = handle(e.buffer);
++        if (!h) return false;
++        currentImports.emplace(e.buffer->getId(), DroidloomImportUse{
++                e.id, h->width, h->height, e.format, h->totalSize, mCacheSerial});
++    }
++    mRetireOnRelease = trimDroidloomImports(mBuffers, currentImports, retire);
++    // A release can wake an otherwise unchanged scene solely to retire imports.
++    // Do not reattach buffers or create new reads for that cleanup.
++    if (scene == mScene) return true;
++
+     for (const auto& e : exports) {
+         if (!e.buffer) continue;
+         auto cached = mBuffers.find(e.buffer->getId());
+@@ -700,7 +703,8 @@
+             return false;
+         }
+         if (attempt == 1) ALOGI("Droidloom asynchronous imports enabled (16 per task)");
+-        mBuffers.emplace(e.buffer->getId(), Cached{e.buffer, e.format});
++        mBuffers.emplace(e.buffer->getId(),
++                         Cached{e.buffer, e.format, currentImports.at(e.buffer->getId())});
+     }
+     if (asyncImports) {
+         std::lock_guard lock(mState->mutex);
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ #pragma once
++#include "DroidloomImportRetention.h"
+ #include <android-base/unique_fd.h>
+ #include <gui/ITransactionCompletedListener.h>
+ #include <ui/GraphicBuffer.h>
+@@ -46,6 +47,7 @@
+     struct Cached {
+         sp<GraphicBuffer> buffer;
+         uint32_t format;
++        DroidloomImportUse use;
+     };
+     struct Last {
+         uint64_t buffer;
+@@ -55,6 +57,8 @@
+     std::unordered_map<uint64_t, Cached> mBuffers;
+     std::unordered_map<uint32_t, Last> mLayers;
+     uint64_t mNextTicket = 0;
++    uint64_t mCacheSerial = 0;
++    bool mRetireOnRelease = false;
+     bool mSubscribed = false;
+     bool transact(uint32_t opcode, const std::vector<uint8_t>& payload,
+                   const std::vector<int>& fds = {});
+diff --git a/services/surfaceflinger/DroidloomImportRetention.h b/services/surfaceflinger/DroidloomImportRetention.h
+new file mode 100644
+--- /dev/null
++++ b/services/surfaceflinger/DroidloomImportRetention.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstddef>
++#include <map>
++#include <vector>
++
++namespace android {
++struct DroidloomImportUse {
++    uint32_t layer, width, height, format;
++    uint64_t bytes, serial;
++
++    bool compatible(const DroidloomImportUse& other) const {
++        return layer == other.layer && width == other.width && height == other.height &&
++                format == other.format;
++    }
++};
++
++// Keep rotating producer pools warm, not every allocation seen during a resize.
++// These bounds apply to reusable spares. Current and GPU-busy allocations must
++// survive even above budget; the existing protocol cap still bounds admission.
++// Only the host's successful unregister reply permits erasing an owning entry.
++template <typename Cache, typename Retire>
++bool trimDroidloomImports(Cache& cache,
++                         const std::map<uint64_t, DroidloomImportUse>& current,
++                         Retire retire) {
++    constexpr std::size_t kSpareCount = 12, kSparesPerLayer = 3;
++    constexpr uint64_t kSpareBytes = 96ull * 1024 * 1024;
++    std::map<uint32_t, DroidloomImportUse> layers;
++    for (const auto& [id, use] : current) {
++        layers.insert_or_assign(use.layer, use);
++        auto it = cache.find(id);
++        if (it != cache.end()) it->second.use = use;
++    }
++    std::vector<uint64_t> idle;
++    idle.reserve(cache.size());
++    for (const auto& [id, entry] : cache) {
++        if (!current.contains(id)) idle.push_back(id);
++    }
++    std::sort(idle.begin(), idle.end(), [&](uint64_t a, uint64_t b) {
++        const auto sa = cache.at(a).use.serial, sb = cache.at(b).use.serial;
++        return sa != sb ? sa > sb : a > b;
++    });
++    uint64_t retainedBytes = 0;
++    std::size_t retainedCount = 0;
++    std::map<uint32_t, std::size_t> perLayer;
++    bool retry = false;
++    for (uint64_t id : idle) {
++        const auto& use = cache.at(id).use;
++        auto layer = layers.find(use.layer);
++        if (layer != layers.end() && use.compatible(layer->second) &&
++            retainedCount < kSpareCount && perLayer[use.layer] < kSparesPerLayer &&
++            use.bytes != 0 && use.bytes <= kSpareBytes - retainedBytes) {
++            ++retainedCount;
++            ++perLayer[use.layer];
++            retainedBytes += use.bytes;
++            continue;
++        }
++        if (retire(id)) cache.erase(id);
++        else retry = true;
++    }
++    return retry;
++}
++} // namespace android

@@ -72,3 +72,35 @@ Every consumed grant ends in exactly one state:
 
 Android GPU completion, Wayland buffer release, and physical host presentation
 remain three independent synchronization events.
+
+## Droidloom presenter
+
+`graphics/droidloom-wayland` selects exact mode automatically when the global
+is advertised at startup. Without it, ordinary portable commits and existing
+presentation feedback continue unchanged. Exact mode verifies that
+`wp_presentation` uses CLOCK_MONOTONIC, as required by Droidloom's host timing
+records, before subscribing to an output.
+
+Each task subscribes to its presentation output, then its entered output, or
+an available output for the first mapping. It retains at most one composed
+frame awaiting a grant, or the layer stream's existing single pending scene.
+A newer submission can supersede work which has not consumed a grant. Once
+consumed, the identity is sent with `set_target` before the corresponding
+buffer commit, including changed synchronized children. A late commit keeps
+its identity and is left to the compositor to discard. No presentation
+timestamp is used to reconstruct an identity or to drive a private timer.
+
+Completion metadata is bounded to 64 composed-frame callbacks and eight scene
+callbacks per task. Exact producers wait for feedback capacity; portable mode
+can omit optional observations. Scene and composed callbacks share terminal
+cleanup on configure, epoch changes and window destruction. Output changes
+discard queued work and subscribe again; losing the global pauses existing
+exact producers. None of these timing operations releases a submitted GPU
+read or substitutes for the compositor's buffer-release fence.
+
+The shared XMLs are checked byte for byte against Denial's `dev` checkout by
+the Shared Wayland protocols CI workflow. To check a local Denial tree:
+
+```sh
+DROIDLOOM_DENIAL_SOURCE=/home/logix/denial cargo test --locked -j 1 -p droidloom-contracts --test repository_contracts shared_wayland_protocols_match_denial
+```

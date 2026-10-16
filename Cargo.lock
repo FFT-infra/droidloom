@@ -826,6 +826,7 @@ dependencies = [
  "droidloom-image",
  "droidloom-mesa",
  "droidloom-source",
+ "droidloom-supervisor",
  "hex",
  "libc",
  "serde",

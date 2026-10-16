@@ -1,0 +1,22 @@
+--- a/services/core/java/com/android/server/SystemConfig.java
++++ b/services/core/java/com/android/server/SystemConfig.java
+@@ -2105,6 +2105,19 @@
+     // This only needs to be called once after all features have been parsed
+     // from various partition/apex sources.
+     private void readAllPermissionsFromEnvironment() {
++        if (isSystemProcess()
++                && SystemProperties.getBoolean("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++            // Recompute on every system_server start. Static vendor declarations
++            // must not survive a driver/backend change or a failed probe.
++            removeFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION);
++            removeFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL);
++            final int[] vulkan = DroidloomGraphicsCapabilities.detectVulkan();
++            if (vulkan != null) {
++                addFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, vulkan[0]);
++                addFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL, vulkan[1]);
++            }
++        }
++
+         // Some devices can be field-converted to FBE, so offer to splice in
+         // those features if not already defined by the static config
+         if (StorageManager.isFileEncrypted()) {

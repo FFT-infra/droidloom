@@ -6,6 +6,7 @@ mod activation;
 mod chrome;
 mod clipboard;
 mod fence_wakeup;
+mod frame_timeline;
 mod gesture;
 mod gesture_feedback;
 mod immersion;
@@ -239,13 +240,24 @@ struct FrameFeedback {
     frame: FrameId,
     buffer: BufferId,
     submitted_nanos: u64,
+    grant: Option<frame_timeline::Identity>,
 }
+
+// Bounded optional timing metadata: no buffer, FD, or release fence ownership.
+struct SceneFeedback {
+    proxy: WpPresentationFeedback,
+    scene: u64,
+    configure_serial: u32,
+    grant: Option<frame_timeline::Identity>,
+}
+const MAX_SCENE_FEEDBACK: usize = 8;
 
 struct TaskWindow {
     chrome: Option<chrome::Chrome>,
     gesture_feedback: Option<gesture_feedback::Feedback>,
     controls_until: Option<Instant>,
     fullscreen: bool,
+    timeline: frame_timeline::Timeline,
     layers: Option<layers::Stream>,
     package: String,
     android_task: Option<u64>,
@@ -265,9 +277,11 @@ struct TaskWindow {
     targets: BTreeMap<BufferId, RenderTarget>,
     pending: VecDeque<PendingFrame>,
     presentation_feedback: Vec<FrameFeedback>,
+    scene_feedback: Vec<SceneFeedback>,
     presentation_audit: Option<presentation_audit::Audit>,
     content_opaque: bool,
     applied_opaque: Option<bool>,
+    composed_root: bool,
     focused: bool,
     unmap_requested: bool,
     closing: bool,
@@ -335,6 +349,18 @@ impl Contact {
             },
         }
     }
+}
+
+// A cancelled/replaced shared stream also invalidates contacts waiting behind
+// clipboard synchronization. Preserve keyboard events, which are independent.
+fn clear_contact_state(
+    pointer: &mut Option<Contact>,
+    touches: &mut BTreeMap<i32, Contact>,
+    deferred: &mut VecDeque<(TaskObjectId, InputEvent)>,
+) {
+    *pointer = None;
+    touches.clear();
+    deferred.retain(|(_, event)| !matches!(event, InputEvent::Touch { .. }));
 }
 
 struct TabletToolState {
@@ -418,6 +444,7 @@ struct App {
     host_display_powered: Option<bool>,
     published_display_power: Option<bool>,
     presentation_time: PresentationTimeState,
+    presentation_clock: Option<u32>,
     seat_state: SeatState,
     tablet_manager: Option<ZwpTabletManagerV2>,
     tablet_seats: Vec<(wl_seat::WlSeat, ZwpTabletSeatV2)>,
@@ -431,6 +458,7 @@ struct App {
     compositor: CompositorState,
     xdg_shell: XdgShell,
     insets_manager: Option<insets::DenialInsetsManagerV1>,
+    frame_timeline_manager: Option<frame_timeline::Manager>,
     viewporter: WpViewporter,
     fractional_scale_manager: WpFractionalScaleManagerV1,
     sync_manager: WpLinuxDrmSyncobjManagerV1,
@@ -469,8 +497,57 @@ struct App {
 
 struct OutputPowerState {
     output: wl_output::WlOutput,
-    control: ZwlrOutputPowerV1,
+    control: Option<ZwlrOutputPowerV1>,
     powered: Option<bool>,
+}
+
+// A failed power control belongs to one output, not the Wayland transport.
+// Keep the output unknown until wl_output removal: failure can also mean that
+// power management is unsupported on an output which is still connected.
+fn update_output_power(
+    states: &mut [OutputPowerState],
+    control: &ZwlrOutputPowerV1,
+    event: zwlr_output_power_v1::Event,
+) -> bool {
+    let Some(output) = states
+        .iter_mut()
+        .find(|output| output.control.as_ref() == Some(control))
+    else {
+        return false; // Late events after control/global retirement.
+    };
+    match event {
+        zwlr_output_power_v1::Event::Mode { mode } => {
+            output.powered = match mode {
+                WEnum::Value(zwlr_output_power_v1::Mode::On) => Some(true),
+                WEnum::Value(zwlr_output_power_v1::Mode::Off) => Some(false),
+                _ => None,
+            };
+        }
+        zwlr_output_power_v1::Event::Failed => {
+            // The protocol requires destruction even when the output has gone.
+            // Taking ownership prevents a second destroy on global removal.
+            if let Some(control) = output.control.take() {
+                control.destroy();
+            }
+            output.powered = None;
+            eprintln!("Droidloom output-power control retired; waiting for output topology");
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn remove_output_power(states: &mut Vec<OutputPowerState>, output: &wl_output::WlOutput) {
+    states.retain_mut(|state| {
+        if state.output == *output {
+            if let Some(control) = state.control.take() {
+                control.destroy();
+            }
+            false
+        } else {
+            true
+        }
+    });
 }
 
 impl Drop for App {
@@ -503,6 +580,9 @@ impl App {
             }
         } else {
             endpoint.send_display_power(powered)?;
+        }
+        if !powered || (endpoint.direct_input() && self.direct_input.fd().is_none()) {
+            self.clear_contacts();
         }
         self.published_display_power = Some(powered);
         Ok(())
@@ -741,6 +821,11 @@ impl App {
                 gesture_feedback: None,
                 controls_until: None,
                 fullscreen: false,
+                timeline: frame_timeline::Timeline::new(
+                    self.frame_timeline_manager.as_ref(),
+                    window.as_ref().map(Window::wl_surface),
+                    qh,
+                ),
                 layers: None,
                 package: package.to_owned(),
                 android_task: None,
@@ -760,8 +845,10 @@ impl App {
                 targets: BTreeMap::new(),
                 pending: VecDeque::new(),
                 presentation_feedback: Vec::new(),
+                scene_feedback: Vec::new(),
                 content_opaque: false,
                 applied_opaque: None,
+                composed_root: false,
                 presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref()
                     == Some(std::ffi::OsStr::new("1")))
                 .then(presentation_audit::Audit::default),
@@ -852,6 +939,7 @@ impl App {
             return Ok(());
         }
 
+        self.abort_timeline_work(object, frame_timeline::Terminal::Configure)?;
         self.retire_host_targets(object)?;
         let serial = self
             .tasks
@@ -1148,6 +1236,7 @@ impl App {
         qh: &QueueHandle<Self>,
         frame: &AcceptedWireFrame,
         acquire_fence: &OwnedFd,
+        target_grant: Option<frame_timeline::Target>,
     ) -> Result<(), PresenterError> {
         let object = frame.object;
         let mut frame_trace = presentation_audit::FrameTrace::new(
@@ -1316,6 +1405,7 @@ impl App {
             None
         };
         surface.attach(target.wayland.as_ref(), 0, 0);
+        task.composed_root = true;
         if layers_hidden {
             // Android damage compares app frames, not our constant root backing.
             // Replacing that root with a composed target changes the whole image.
@@ -1337,6 +1427,9 @@ impl App {
         if let Some(trace) = frame_trace.as_mut() {
             trace.commit();
         }
+        if let (Some(timeline), Some(grant)) = (&task.timeline.surface, &target_grant) {
+            timeline.target(grant);
+        }
         surface.commit();
         self.activation.mapped(object, &surface);
         target.busy = true;
@@ -1349,6 +1442,7 @@ impl App {
         });
         if let Some(feedback) = feedback {
             task.presentation_feedback.push(FrameFeedback {
+                grant: target_grant.map(|g| g.identity),
                 proxy: feedback,
                 frame: frame.frame,
                 buffer: frame.buffer,
@@ -1474,10 +1568,13 @@ impl App {
     }
 
     fn remove_task(&mut self, object: TaskObjectId) {
+        self.retire_feedback(object, frame_timeline::Terminal::Epoch);
         self.release_task_inputs(object);
+        self.retire_contacts(Some(object));
         self.task_work.remove(object);
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
+            task.timeline.stop();
             if let Some(fractional_scale) = task.fractional_scale.take() {
                 fractional_scale.destroy();
             }
@@ -1496,23 +1593,6 @@ impl App {
         if self.focused == Some(object) {
             self.focused = None;
         }
-        self.pointer_contact = self
-            .pointer_contact
-            .filter(|contact| contact.object != object);
-        self.touch_contacts
-            .retain(|_, contact| contact.object != object);
-        if let Some(task) = self.tasks.get(&object) {
-            for tool in &mut self.tablet_tools {
-                if tool
-                    .surface
-                    .as_ref()
-                    .is_some_and(|s| task.contains_surface(s))
-                {
-                    tool.is_down = false;
-                    tool.surface = None;
-                }
-            }
-        }
         if self.endpoint.is_some() {
             if let Err(error) = self.update_output_refreshes() {
                 self.fail(&error);
@@ -1521,7 +1601,9 @@ impl App {
     }
 
     fn unmap_task_window(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        self.abort_timeline_work(object, frame_timeline::Terminal::Configure)?;
         self.release_task_inputs(object);
+        self.retire_contacts(Some(object));
         self.activation.remove(object);
         let task = self
             .tasks
@@ -1538,11 +1620,7 @@ impl App {
         // already submitted before its task removal completed.
         surface.attach(None, 0, 0);
         surface.commit();
-        for feedback in task.presentation_feedback.drain(..) {
-            if let Some(endpoint) = self.endpoint.as_mut() {
-                endpoint.forget_presentation(object, feedback.frame);
-            }
-        }
+        task.timeline.stop();
         if let Some(stream) = task.layers.as_mut() {
             stream.hide();
         }
@@ -1572,11 +1650,6 @@ impl App {
         if self.focused == Some(object) {
             self.focused = None;
         }
-        self.pointer_contact = self
-            .pointer_contact
-            .filter(|contact| contact.object != object);
-        self.touch_contacts
-            .retain(|_, contact| contact.object != object);
         eprintln!(
             "Droidloom destroyed terminal Android xdg_toplevel object={}",
             object.0
@@ -1666,6 +1739,7 @@ impl App {
                     .is_some_and(|old| old != next)
                 {
                     self.release_task_inputs(object);
+                    self.retire_contacts(Some(object));
                 }
                 if let Some(window) = self.tasks.get_mut(&object) {
                     window.input_route = Some(next);
@@ -1737,7 +1811,7 @@ impl App {
             EndpointAction::Present {
                 frame,
                 acquire_fence,
-            } => self.present(qh, &frame, &acquire_fence)?,
+            } => self.queue_present(qh, frame, acquire_fence)?,
         }
         Ok(())
     }
@@ -1753,7 +1827,10 @@ impl App {
                 } else {
                     endpoint
                 };
-                let endpoint = endpoint.with_direct_input().with_lazy_render_targets();
+                let endpoint = endpoint
+                    .with_direct_input()
+                    .with_lazy_render_targets()
+                    .with_scene_presentation();
                 endpoint.socket().socket().set_nonblocking(true)?;
                 self.endpoint = Some(endpoint);
             }
@@ -1804,6 +1881,77 @@ impl App {
         }
     }
 
+    fn clear_contacts(&mut self) {
+        clear_contact_state(
+            &mut self.pointer_contact,
+            &mut self.touch_contacts,
+            &mut self.clipboard_inputs,
+        );
+    }
+
+    fn retire_contacts(&mut self, object: Option<TaskObjectId>) {
+        if let Some(object) = object {
+            let route = self.tasks.get(&object).and_then(|task| task.input_route);
+            if let Some(route) = route {
+                match monotonic_timestamp_nanos() {
+                    Ok(timestamp) => {
+                        if let Err(error) = self.direct_input.retire_route(route, timestamp) {
+                            eprintln!("Droidloom input retirement: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Droidloom input retirement: {error}");
+                        self.direct_input.disconnect();
+                    }
+                }
+            }
+            if !self
+                .pointer_contact
+                .is_some_and(|contact| contact.object == object)
+                && !self
+                    .touch_contacts
+                    .values()
+                    .any(|contact| contact.object == object)
+                && !self.clipboard_inputs.iter().any(|(owner, event)| {
+                    *owner == object && matches!(event, InputEvent::Touch { .. })
+                })
+            {
+                return;
+            }
+        }
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input)
+        {
+            match monotonic_timestamp_nanos() {
+                Ok(timestamp) => {
+                    if let Err(error) = self.direct_input.cancel_all(timestamp) {
+                        eprintln!("Droidloom input retirement: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Droidloom input retirement: {error}");
+                    self.direct_input.disconnect();
+                }
+            }
+        } else if self.endpoint.is_some() {
+            let mut contacts: Vec<_> = self.touch_contacts.values().copied().collect();
+            contacts.extend(self.pointer_contact);
+            // Legacy policy groups by task. Every route needs retirement.
+            contacts.sort_by_key(|contact| contact.object);
+            contacts.dedup_by_key(|contact| contact.object);
+            for contact in contacts {
+                if let Err(error) =
+                    self.send_input(contact.object, contact.event(TouchAction::Cancel))
+                {
+                    eprintln!("Droidloom input retirement: {error}");
+                }
+            }
+        }
+        self.clear_contacts();
+    }
+
     fn send_input(
         &mut self,
         object: TaskObjectId,
@@ -1816,7 +1964,15 @@ impl App {
             .is_some_and(DenialEndpoint::direct_input);
         // Native key/touch/mouse/pen records share one connection-owned FIFO.
         self.direct_input.set_blocked(self.clipboard.blocked());
-        if !direct && self.clipboard.blocked() {
+        // A cancellation must not wait behind clipboard synchronization.
+        let cancel = matches!(
+            event,
+            InputEvent::Touch {
+                action: TouchAction::Cancel,
+                ..
+            }
+        );
+        if !cancel && !direct && self.clipboard.blocked() {
             if self.clipboard_inputs.len() >= 512 {
                 self.disconnect_endpoint();
                 return Ok(false);
@@ -1851,7 +2007,15 @@ impl App {
                 .tasks
                 .get(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
-            if window.closing {
+            if window.closing
+                && !matches!(
+                    event,
+                    InputEvent::Touch {
+                        action: TouchAction::Cancel,
+                        ..
+                    }
+                )
+            {
                 return Ok(false);
             }
             let Some(route) = window.input_route else {
@@ -1882,66 +2046,14 @@ impl App {
         Ok(true)
     }
 
-    /// Cancel every tracked touch for a task and keep the local contacts until
-    /// Android has accepted the cancellation. A native touch's original route
-    /// remains usable even if the Wayland task route is being rebound.
-    fn cancel_task_touch_contacts(&mut self, object: TaskObjectId) -> Result<bool, String> {
-        let contacts = self
-            .touch_contacts
-            .values()
-            .filter(|contact| contact.object == object)
-            .copied()
-            .collect::<Vec<_>>();
-        if contacts.is_empty() {
-            return Ok(true);
-        }
-
-        let direct = self
-            .endpoint
-            .as_ref()
-            .is_some_and(DenialEndpoint::direct_input);
-        if direct {
-            let timestamp = monotonic_timestamp_nanos().map_err(|error| error.to_string())?;
-            for contact in contacts {
-                if let Err(error) =
-                    self.direct_input
-                        .cancel_task_pointer(object.0, contact.pointer_id, timestamp)
-                {
-                    self.direct_input.disconnect();
-                    self.clear_input_tracking();
-                    return Err(error);
-                }
-            }
-            self.touch_contacts
-                .retain(|_, contact| contact.object != object);
-            return Ok(true);
-        }
-
-        let contact = contacts[0];
-        match self.send_input(object, contact.event(TouchAction::Cancel)) {
-            Ok(true) => {
-                self.touch_contacts
-                    .retain(|_, contact| contact.object != object);
-                Ok(true)
-            }
-            Ok(false) => Ok(false),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
     fn clear_input_tracking(&mut self) {
-        self.clipboard_inputs.clear();
         self.abandon_gestures();
         self.clear_control_presses();
         self.end_capture();
         self.pressed_keys.clear();
-        if let Some(contact) = self.pointer_contact.take() {
-            let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
-        }
-        let contacts = std::mem::take(&mut self.touch_contacts);
-        for (_, contact) in contacts {
-            let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
-        }
+        // Retiring every contact cancels held touches on the native stream and
+        // drops deferred touches; clipboard-ordered key events survive.
+        self.retire_contacts(None);
         self.mouse_focus = None;
         self.mouse_buttons = 0;
         for tool in &mut self.tablet_tools {
@@ -2006,11 +2118,6 @@ impl App {
             self.mouse_focus = None;
             self.mouse_buttons = 0;
         }
-        self.pointer_contact = self
-            .pointer_contact
-            .filter(|contact| contact.object != object);
-        self.touch_contacts
-            .retain(|_, contact| contact.object != object);
         if let Some(task) = self.tasks.get(&object) {
             for tool in &mut self.tablet_tools {
                 if tool
@@ -2178,6 +2285,14 @@ impl App {
         if let Err(error) = self.direct_input.flush() {
             eprintln!("Droidloom input: {error}");
             self.clear_input_tracking();
+        }
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input)
+            && self.direct_input.fd().is_none()
+        {
+            self.clear_contacts();
         }
         if let Some(endpoint) = self
             .endpoint
@@ -2520,7 +2635,7 @@ impl OutputHandler for App {
             .get_output_power(&output, qh, output.clone());
         self.output_power.push(OutputPowerState {
             output,
-            control,
+            control: Some(control),
             powered: None,
         });
         if let Err(error) = self
@@ -2551,14 +2666,7 @@ impl OutputHandler for App {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.output_power.retain(|state| {
-            if state.output == output {
-                state.control.destroy();
-                false
-            } else {
-                true
-            }
-        });
+        remove_output_power(&mut self.output_power, &output);
         if let Err(error) = self.recompute_display_power() {
             self.fail(&error);
         }
@@ -2586,33 +2694,10 @@ impl Dispatch<ZwlrOutputPowerV1, wl_output::WlOutput> for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        match event {
-            zwlr_output_power_v1::Event::Mode {
-                mode: WEnum::Value(mode),
-            } => {
-                let powered = match mode {
-                    zwlr_output_power_v1::Mode::On => true,
-                    zwlr_output_power_v1::Mode::Off => false,
-                    _ => return,
-                };
-                if let Some(output) = state
-                    .output_power
-                    .iter_mut()
-                    .find(|output| output.control == *control)
-                {
-                    output.powered = Some(powered);
-                }
-                if let Err(error) = state.recompute_display_power() {
-                    state.fail(&error);
-                }
+        if update_output_power(&mut state.output_power, control, event) {
+            if let Err(error) = state.recompute_display_power() {
+                state.fail(&error);
             }
-            zwlr_output_power_v1::Event::Mode {
-                mode: WEnum::Unknown(_),
-            }
-            | zwlr_output_power_v1::Event::Failed => {
-                state.fail(&"compositor output-power state became unavailable");
-            }
-            _ => unreachable!(),
         }
     }
 }
@@ -2634,11 +2719,78 @@ impl PresentationTimeHandler for App {
         sequence: u64,
         flags: WEnum<wp_presentation_feedback::Kind>,
     ) {
+        if let Some((object, index)) = self.tasks.iter().find_map(|(object, task)| {
+            task.scene_feedback
+                .iter()
+                .position(|f| f.proxy == *feedback)
+                .map(|index| (*object, index))
+        }) {
+            let task = self.tasks.get_mut(&object).unwrap();
+            let observed = task.scene_feedback.swap_remove(index);
+            // Late feedback may belong to a previous configure or removed output.
+            // The actual buffer-release path remains completely independent.
+            let output = outputs
+                .iter()
+                .find(|o| task.entered_outputs.contains(o))
+                .cloned()
+                .or_else(|| {
+                    (outputs.is_empty() && task.entered_outputs.len() == 1)
+                        .then(|| task.entered_outputs[0].clone())
+                });
+            if !task.accepts_present()
+                || observed.configure_serial != task.configure_serial
+                || output.is_none()
+                || time.clk_id != libc::CLOCK_MONOTONIC as u32
+            {
+                task.timeline
+                    .finish(observed.grant, frame_timeline::Terminal::Configure);
+                self.task_work
+                    .mark(object, readiness::TIMELINE | readiness::RELEASES);
+                return;
+            }
+            task.timeline
+                .finish(observed.grant, frame_timeline::Terminal::Presented);
+            self.task_work
+                .mark(object, readiness::TIMELINE | readiness::RELEASES);
+            let changed = task.presentation_output != output;
+            task.presentation_output = output;
+            let result = (|| {
+                if changed {
+                    self.update_task_refresh(object)?;
+                }
+                let refresh =
+                    presentation_refresh_period(refresh, self.tasks[&object].refresh_millihz)?;
+                let timestamp = presentation_timestamp_nanos(time.tv_sec, time.tv_nsec)?;
+                if observed.scene != 0 {
+                    self.endpoint
+                        .as_mut()
+                        .ok_or(PresenterError::Configuration("endpoint is absent"))?
+                        .send_scene_presented(
+                            object,
+                            observed.scene,
+                            timestamp,
+                            refresh,
+                            sequence,
+                        )?;
+                }
+                Ok::<(), PresenterError>(())
+            })();
+            if let Err(error) = result {
+                self.fail(&error);
+            }
+            return;
+        }
         let Some(object) = self.task_for_surface(surface) else {
             return;
         };
         let task = self.tasks.get_mut(&object).expect("surface has a task");
-        if task.closing {
+        // Retired callbacks can still arrive after resize/epoch/unmap cleanup.
+        if task.closing
+            || !task
+                .presentation_feedback
+                .iter()
+                .any(|f| f.proxy == *feedback)
+        {
             return;
         }
         // Presentation feedback identifies the timing output for overlapping
@@ -2674,6 +2826,10 @@ impl PresentationTimeHandler for App {
                         "presentation feedback has no submitted frame",
                     ))?;
                 let completed = task.presentation_feedback.swap_remove(index);
+                task.timeline
+                    .finish(completed.grant, frame_timeline::Terminal::Presented);
+                self.task_work
+                    .mark(object, readiness::TIMELINE | readiness::RELEASES);
                 (completed, task.refresh_millihz)
             };
             let frame = completed.frame;
@@ -2735,6 +2891,20 @@ impl PresentationTimeHandler for App {
         feedback: &WpPresentationFeedback,
         surface: &wl_surface::WlSurface,
     ) {
+        if let Some((object, index)) = self.tasks.iter().find_map(|(object, task)| {
+            task.scene_feedback
+                .iter()
+                .position(|f| f.proxy == *feedback)
+                .map(|index| (*object, index))
+        }) {
+            let task = self.tasks.get_mut(&object).unwrap();
+            let completed = task.scene_feedback.swap_remove(index);
+            task.timeline
+                .finish(completed.grant, frame_timeline::Terminal::Missed);
+            self.task_work
+                .mark(object, readiness::TIMELINE | readiness::RELEASES);
+            return;
+        }
         let Some(object) = self.task_for_surface(surface) else {
             return;
         };
@@ -2747,6 +2917,10 @@ impl PresentationTimeHandler for App {
             .position(|candidate| candidate.proxy == *feedback)
         {
             let completed = task.presentation_feedback.swap_remove(index);
+            task.timeline
+                .finish(completed.grant, frame_timeline::Terminal::Missed);
+            self.task_work
+                .mark(object, readiness::TIMELINE | readiness::RELEASES);
             let frame = completed.frame;
             if droidloom_syncobj::frame_trace::sampled(frame.0) {
                 droidloom_syncobj::frame_trace::event(
@@ -2823,11 +2997,19 @@ impl SeatHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
+        seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
         match capability {
-            Capability::Keyboard => {
+            Capability::Keyboard
+                if self
+                    .keyboard
+                    .as_ref()
+                    .and_then(|keyboard| {
+                        keyboard.data::<smithay_client_toolkit::seat::keyboard::KeyboardData<App>>()
+                    })
+                    .is_some_and(|data| data.seat() == &seat) =>
+            {
                 if let Err(error) = self.set_focus(None) {
                     self.fail(&error);
                 }
@@ -2835,7 +3017,18 @@ impl SeatHandler for App {
                 self.keyboard_seat = None;
                 self.text_input.remove_resource();
             }
-            Capability::Pointer => {
+            Capability::Pointer
+                if self
+                    .pointer
+                    .as_ref()
+                    .and_then(|pointer| {
+                        pointer
+                            .pointer()
+                            .data::<smithay_client_toolkit::seat::pointer::PointerData>()
+                    })
+                    .is_some_and(|data| data.seat() == &seat) =>
+            {
+                self.retire_contacts(None);
                 self.end_capture();
                 if let Some(object) = self.mouse_focus {
                     let _ = self.send_mouse(
@@ -2846,39 +3039,37 @@ impl SeatHandler for App {
                         (0, 0),
                     );
                 }
-                if let Some(contact) = self.pointer_contact.take() {
-                    let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
-                }
+                self.retire_contacts(None);
                 self.mouse_focus = None;
                 self.mouse_buttons = 0;
                 self.pointer = None;
-                self.pointer_contact = None;
             }
-            Capability::Touch => {
+            Capability::Touch
+                if self
+                    .touch
+                    .as_ref()
+                    .and_then(|touch| {
+                        touch.data::<smithay_client_toolkit::seat::touch::TouchData>()
+                    })
+                    .is_some_and(|data| data.seat() == &seat) =>
+            {
+                self.retire_contacts(None);
                 self.abandon_gestures();
                 self.clear_control_presses();
-                let contacts = std::mem::take(&mut self.touch_contacts);
-                for (_, contact) in contacts {
-                    let _ = self.send_input(contact.object, contact.event(TouchAction::Cancel));
-                }
+                self.retire_contacts(None);
                 self.touch = None;
-                self.touch_contacts.clear();
             }
             _ => {}
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        for capability in [Capability::Keyboard, Capability::Pointer, Capability::Touch] {
+            self.remove_capability(conn, qh, seat.clone(), capability);
+        }
         self.direct_input.disconnect();
         self.clear_input_tracking();
         self.unbind_tablet_seat(&seat);
-        self.text_input.remove_resource();
-        self.keyboard = None;
-        self.keyboard_seat = None;
-        self.pointer = None;
-        self.touch = None;
-        self.pointer_contact = None;
-        self.touch_contacts.clear();
     }
 }
 
@@ -3288,11 +3479,10 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 if state.direct_input.supports_mouse() {
                     state.cancel_tablet_tool(tool_id);
                 }
-                if let Some(object) = state.task_for_surface(&surface)
-                    && let Err(error) = state.cancel_task_touch_contacts(object)
-                {
-                    eprintln!("Droidloom pen proximity touch cancellation: {error}");
-                    state.fail(&error);
+                if let Some(object) = state.task_for_surface(&surface) {
+                    // A stylus that lands on a running touch gesture owns the
+                    // shared stream from here on.
+                    state.retire_contacts(Some(object));
                 }
                 let prev_surface = state.tablet_tool_mut(tool_id).surface.take();
                 let was_down = state.tablet_tool_mut(tool_id).is_down;
@@ -3796,6 +3986,9 @@ impl PointerHandler for App {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        if self.pointer.as_ref().map(|pointer| pointer.pointer()) != Some(_pointer) {
+            return;
+        }
         for event in events {
             if self.immersion.is_none()
                 && matches!(
@@ -3836,9 +4029,10 @@ impl PointerHandler for App {
                 continue;
             }
             match event.kind {
-                PointerEventKind::Press { button, .. }
-                    if button == LEFT_BUTTON && self.pointer_contact.is_none() =>
-                {
+                PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
+                    if self.pointer_contact.is_some() {
+                        self.retire_contacts(None);
+                    }
                     let Some(object) = object else { continue };
                     self.text_input.note_touch();
                     let position = self.surface_position(object, &event.surface, event.position);
@@ -3848,58 +4042,40 @@ impl PointerHandler for App {
                         pointer_id: u32::MAX,
                         position_fixed: (x_fixed, y_fixed),
                     };
-                    match self.send_input(
-                        object,
-                        InputEvent::Touch {
-                            action: TouchAction::Down,
-                            pointer_id: contact.pointer_id,
-                            x_fixed,
-                            y_fixed,
-                            pressure: u16::MAX,
-                        },
-                    ) {
+                    match self.send_input(object, contact.event(TouchAction::Down)) {
+                        Err(error) => self.fail(&error),
                         Ok(true) => self.pointer_contact = Some(contact),
                         Ok(false) => {}
-                        Err(error) => self.fail(&error),
                     }
                 }
                 PointerEventKind::Motion { .. } => {
-                    let Some(contact) = self.pointer_contact else {
+                    let Some(mut contact) = self.pointer_contact else {
                         continue;
                     };
-                    let position =
-                        self.surface_position(contact.object, &event.surface, event.position);
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, position);
-                    if let Err(error) = self.send_input(
-                        contact.object,
-                        InputEvent::Touch {
-                            action: TouchAction::Motion,
-                            pointer_id: contact.pointer_id,
-                            x_fixed,
-                            y_fixed,
-                            pressure: u16::MAX,
-                        },
-                    ) {
-                        self.fail(&error);
+                    // Coordinates belong to event.surface, not a newly focused task.
+                    if object == Some(contact.object) {
+                        let position =
+                            self.surface_position(contact.object, &event.surface, event.position);
+                        contact.position_fixed = self.fixed_position(contact.object, position);
+                    }
+                    match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+                        Err(error) => self.fail(&error),
+                        Ok(true) => self.pointer_contact = Some(contact),
+                        Ok(false) => {}
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
-                    let Some(contact) = self.pointer_contact.take() else {
+                    let Some(mut contact) = self.pointer_contact.take() else {
                         continue;
                     };
-                    let position =
-                        self.surface_position(contact.object, &event.surface, event.position);
-                    let (x_fixed, y_fixed) = self.fixed_position(contact.object, position);
-                    if let Err(error) = self.send_input(
-                        contact.object,
-                        InputEvent::Touch {
-                            action: TouchAction::Up,
-                            pointer_id: contact.pointer_id,
-                            x_fixed,
-                            y_fixed,
-                            pressure: 0,
-                        },
-                    ) {
+                    if object == Some(contact.object) {
+                        let position =
+                            self.surface_position(contact.object, &event.surface, event.position);
+                        contact.position_fixed = self.fixed_position(contact.object, position);
+                    }
+                    if let Err(error) =
+                        self.send_input(contact.object, contact.event(TouchAction::Up))
+                    {
                         self.fail(&error);
                     }
                 }
@@ -3926,6 +4102,12 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
+        if id < 0 || self.touch_contacts.contains_key(&id) {
+            self.retire_contacts(None);
+        }
         tablet_trace!(
             "Droidloom touch trace: stage=down id={id} surface={:?} task={:?} position={position:?}",
             surface.id(),
@@ -3961,11 +4143,11 @@ impl TouchHandler for App {
             position_fixed: (x_fixed, y_fixed),
         };
         match self.send_input(object, contact.event(TouchAction::Down)) {
+            Err(error) => self.fail(&error),
             Ok(true) => {
                 self.touch_contacts.insert(id, contact);
             }
             Ok(false) => {}
-            Err(error) => self.fail(&error),
         }
     }
 
@@ -3978,9 +4160,16 @@ impl TouchHandler for App {
         _time: u32,
         id: i32,
     ) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
         if let Some((object, action)) = self.chrome_touches.remove(&id) {
             self.clear_control_presses();
-            if self.tasks.get(&object).is_some_and(|task| task.controls_until.is_some()) {
+            if self
+                .tasks
+                .get(&object)
+                .is_some_and(|task| task.controls_until.is_some())
+            {
                 self.control_action(object, action);
             }
             return;
@@ -4005,6 +4194,9 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
         if self.chrome_touches.contains_key(&id) {
             if !chrome::button_contains(position.0, position.1) {
                 self.chrome_touches.remove(&id);
@@ -4020,11 +4212,11 @@ impl TouchHandler for App {
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
         match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+            Err(error) => self.fail(&error),
             Ok(true) => {
                 self.touch_contacts.insert(id, contact);
             }
             Ok(false) => {}
-            Err(error) => self.fail(&error),
         }
     }
 
@@ -4050,29 +4242,16 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
         tablet_trace!(
             "Droidloom touch trace: stage=cancel contacts={}",
             self.touch_contacts.len()
         );
         self.abandon_gestures();
         self.clear_control_presses();
-        let objects = self
-            .touch_contacts
-            .values()
-            .map(|contact| contact.object)
-            .collect::<std::collections::BTreeSet<_>>();
-        for object in objects {
-            match self.cancel_task_touch_contacts(object) {
-                Ok(true) => {}
-                Ok(false) => {
-                    tablet_trace!(
-                        "Droidloom touch trace: cancel deferred for task={} until its route is ready",
-                        object.0
-                    );
-                }
-                Err(error) => self.fail(&error),
-            }
-        }
+        self.retire_contacts(None);
     }
 }
 
@@ -4081,7 +4260,7 @@ impl ProvidesRegistryState for App {
         &mut self.registry_state
     }
 
-    registry_handlers![OutputState, SeatState];
+    registry_handlers![OutputState, SeatState, frame_timeline::Registry];
 }
 
 smithay_client_toolkit::delegate_compositor!(App);
@@ -4089,7 +4268,7 @@ smithay_client_toolkit::delegate_output!(App);
 smithay_client_toolkit::delegate_xdg_shell!(App);
 smithay_client_toolkit::delegate_xdg_window!(App);
 smithay_client_toolkit::delegate_dmabuf!(App);
-smithay_client_toolkit::delegate_presentation_time!(App);
+wayland_client::delegate_dispatch!(App: [WpPresentationFeedback: smithay_client_toolkit::presentation_time::PresentationTimeData] => PresentationTimeState);
 smithay_client_toolkit::delegate_seat!(App);
 smithay_client_toolkit::delegate_keyboard!(App);
 smithay_client_toolkit::delegate_pointer!(App);
@@ -4238,6 +4417,7 @@ fn run() -> Result<(), PresenterError> {
         host_display_powered: None,
         published_display_power: None,
         presentation_time,
+        presentation_clock: None,
         seat_state,
         tablet_manager,
         tablet_seats,
@@ -4251,6 +4431,7 @@ fn run() -> Result<(), PresenterError> {
         compositor,
         xdg_shell,
         insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
         viewporter,
         fractional_scale_manager,
         sync_manager,
@@ -4319,6 +4500,8 @@ fn run_presenter_loop(
         app.apply_pending_resizes(&qh)?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
+        app.refresh_frame_timelines(&qh)?;
+        app.flush_timeline_frames(&qh)?;
         app.pump_direct_input()?;
         app.drain_layers(&qh, &mut layer_tasks)?;
         app.pump_text_input();
@@ -4498,7 +4681,12 @@ fn poll_sources(
     }
     app.clipboard.notify_ready(descriptors);
     app.direct_input.notify_ready(descriptors);
-    if app.direct_input.fd().is_none() {
+    if app
+        .endpoint
+        .as_ref()
+        .is_some_and(DenialEndpoint::direct_input)
+        && app.direct_input.fd().is_none()
+    {
         app.clear_input_tracking();
     }
     app.task_work.notify_fallback(Instant::now());
@@ -4775,16 +4963,23 @@ fn select_surface_refresh<T: PartialEq>(
 
 fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
     let mut saw_output = false;
-    let mut any_powered = false;
+    let mut unknown = false;
     for state in states {
         saw_output = true;
         match state {
-            Some(powered) => any_powered |= powered,
-            None => return None,
+            Some(true) => return Some(true),
+            Some(false) => (),
+            None => unknown = true,
         }
     }
-    saw_output.then_some(any_powered)
+    // One known powered output is enough to keep Android awake. Sleep only
+    // when every remaining output explicitly reports off; unknown/empty is
+    // not evidence of screen-off.
+    (saw_output && !unknown).then_some(false)
 }
+
+#[cfg(test)]
+mod output_power_test;
 
 #[cfg(test)]
 mod tests {
@@ -4800,6 +4995,7 @@ mod tests {
     #[test]
     fn closing_window_does_not_reconfigure_a_retired_android_object() {
         let mut task = TaskWindow {
+            timeline: frame_timeline::Timeline::default(),
             chrome: None,
             gesture_feedback: None,
             controls_until: None,
@@ -4823,9 +5019,11 @@ mod tests {
             targets: BTreeMap::new(),
             pending: VecDeque::new(),
             presentation_feedback: Vec::new(),
+            scene_feedback: Vec::new(),
             presentation_audit: None,
             content_opaque: false,
             applied_opaque: None,
+            composed_root: false,
             focused: false,
             unmap_requested: false,
             closing: false,
@@ -4853,8 +5051,52 @@ mod tests {
     }
 
     #[test]
-    fn display_power_waits_for_all_outputs_and_tracks_any_powered_output() {
+    fn contact_retirement_clears_shared_task_routes_pointer_and_deferred_touches() {
+        let first = Contact {
+            object: TaskObjectId(1),
+            pointer_id: 0,
+            position_fixed: (10, 20),
+        };
+        let second = Contact {
+            object: TaskObjectId(2),
+            pointer_id: 1,
+            ..first
+        };
+        let mouse = Contact {
+            pointer_id: u32::MAX,
+            ..first
+        };
+        let mut pointer = Some(mouse);
+        let mut touches = BTreeMap::from([(0, first), (1, second)]);
+        let key = InputEvent::Key {
+            action: KeyAction::Down,
+            keycode: 30,
+            repeat: 0,
+        };
+        let mut deferred = VecDeque::from([
+            (first.object, first.event(TouchAction::Down)),
+            (second.object, second.event(TouchAction::Motion)),
+            (mouse.object, mouse.event(TouchAction::Up)),
+            (first.object, key.clone()),
+        ]);
+        clear_contact_state(&mut pointer, &mut touches, &mut deferred);
+        assert!(pointer.is_none() && touches.is_empty());
+        assert_eq!(deferred, VecDeque::from([(first.object, key)]));
+        // Late UP/MOTION callbacks cannot find an old owner after reconnect,
+        // surface removal or seat/capability retirement.
+        assert!(touches.remove(&0).is_none());
+        assert!(touches.get(&1).is_none());
+        touches.insert(0, first);
+        pointer = Some(mouse);
+        assert_eq!(touches[&0].object, first.object);
+        assert_eq!(pointer.unwrap().pointer_id, u32::MAX);
+    }
+
+    #[test]
+    fn display_power_sleeps_only_when_all_outputs_are_known_off() {
         assert_eq!(aggregate_display_power([]), None);
+        assert_eq!(aggregate_display_power([None, Some(true)]), Some(true));
+        assert_eq!(aggregate_display_power([Some(true), None]), Some(true));
         assert_eq!(aggregate_display_power([Some(false), None]), None);
         assert_eq!(
             aggregate_display_power([Some(false), Some(false)]),

@@ -1,0 +1,12 @@
+--- a/services/inputflinger/Android.bp
++++ b/services/inputflinger/Android.bp
+@@ -196,7 +196,8 @@
+     ],
+     target: {
+         android: {
+-            header_libs: ["jni_headers"],
++            header_libs: ["jni_headers", "vulkan_headers"],
++            shared_libs: ["libdl"],
+             include_dirs: [
+                 "vendor/droidloom/android/framework/droidloom-window-policy/jni",
+                 "frameworks/native/services/inputflinger",

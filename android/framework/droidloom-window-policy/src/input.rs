@@ -2,7 +2,9 @@
 
 use crate::input_keys::android_keycode;
 use droidloom_input_protocol::{Payload, Sample};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+const FLAG_CANCELED: i32 = 0x20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -55,6 +57,7 @@ pub struct RoutedEvent {
     pub event: Event,
 }
 
+#[derive(Clone)]
 struct Gesture {
     down_time: u64,
     last_time: u64,
@@ -68,7 +71,7 @@ struct Key {
     code: i32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Mouse {
     buttons: u32,
     x: f32,
@@ -77,6 +80,7 @@ struct Mouse {
     last_time: u64,
 }
 
+#[derive(Clone)]
 struct Pen {
     tool: u32,
     down: bool,
@@ -87,7 +91,7 @@ struct Pen {
     event: Event,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Engine {
     targets: BTreeMap<i32, Target>,
     gestures: BTreeMap<i32, Gesture>,
@@ -95,6 +99,10 @@ pub struct Engine {
     locks: BTreeMap<i32, i32>,
     mice: BTreeMap<i32, Mouse>,
     pens: BTreeMap<i32, Pen>,
+    // Android resolves injected touchscreen input to one device per display,
+    // not one device per task. Keep the first task's ownership until release;
+    // contacts begun on another task must never become a new DOWN mid-contact.
+    suppressed: BTreeSet<(i32, u32)>,
 }
 
 impl Engine {
@@ -128,6 +136,7 @@ impl Engine {
     }
 
     pub fn reset(&mut self, now: u64) -> Vec<RoutedEvent> {
+        self.suppressed.clear();
         let tasks: Vec<_> = self.targets.keys().copied().collect();
         tasks
             .into_iter()
@@ -145,7 +154,12 @@ impl Engine {
             Payload::Mouse { .. } | Payload::Stylus { .. } => {
                 return Err("pointer requires batch dispatch");
             }
-            Payload::Touch { x, y, pressure } => self.touch(sample, target, x, y, pressure)?,
+            Payload::Touch { x, y, pressure } => {
+                if self.suppress_touch(sample) {
+                    return Ok(None);
+                }
+                self.touch(sample, target, x, y, pressure)?
+            }
             Payload::Key { repeat, serial } => {
                 // An unmapped but valid evdev key (for example a vendor Fn
                 // key) must not cancel another held key or mouse gesture.
@@ -502,6 +516,43 @@ impl Engine {
         event
     }
 
+    fn suppress_touch(&mut self, sample: Sample) -> bool {
+        let identity = (sample.task, sample.code);
+        if self.suppressed.contains(&identity) {
+            if sample.action == 2 {
+                self.suppressed.remove(&identity);
+            } else if sample.action == 3 {
+                self.suppressed.retain(|(task, _)| *task != sample.task);
+            }
+            return true;
+        }
+        if self.gestures.keys().any(|task| {
+            *task != sample.task
+                && self
+                    .targets
+                    .get(task)
+                    .is_some_and(|t| t.display == sample.display)
+        }) {
+            if sample.action == 0 {
+                self.suppressed.insert(identity);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Commit only the retirement Android accepted. Failed cancellations keep
+    /// their original pointer set/token available for a later reset attempt.
+    pub fn acknowledge_cancel(&mut self, event: &RoutedEvent) {
+        if event.event.kind == 1 {
+            self.gestures.remove(&event.target.task);
+        } else if event.event.kind == 2 {
+            if let Ok(scan_code) = u32::try_from(event.event.scan_code) {
+                self.keys.remove(&(event.target.task, scan_code));
+            }
+        }
+    }
+
     fn touch(
         &mut self,
         sample: Sample,
@@ -510,6 +561,9 @@ impl Engine {
         y: f32,
         pressure: f32,
     ) -> Result<Event, &'static str> {
+        if sample.code > droidloom_input_protocol::MAX_POINTER_ID || sample.action > 3 {
+            return Err("invalid touch sample");
+        }
         if sample.action == 0 {
             if self
                 .gestures
@@ -572,7 +626,7 @@ impl Engine {
             kind: 1,
             display: target.display,
             action,
-            flags: 0,
+            flags: if action == 3 { FLAG_CANCELED } else { 0 },
             count: i32::try_from(gesture.pointers.len()).unwrap(),
             down_time: gesture.down_time,
             event_time: gesture.last_time,
@@ -661,6 +715,7 @@ impl Engine {
     }
 
     fn cancel_task(&mut self, task: i32, now: u64) -> Vec<RoutedEvent> {
+        self.suppressed.retain(|(owner, _)| *owner != task);
         let Some(target) = self.targets.get(&task).copied() else {
             return Vec::new();
         };
@@ -1148,7 +1203,7 @@ mod tests {
         assert_eq!(cancelled.len(), 2);
         assert!(cancelled.iter().all(|event| event.target.token == 9));
         assert_eq!(cancelled[0].event.action, 3);
-        assert_eq!(cancelled[0].event.flags, 0);
+        assert_eq!(cancelled[0].event.flags & FLAG_CANCELED, FLAG_CANCELED);
         assert_eq!(cancelled[1].event.flags, 0x28);
         assert_eq!(cancelled[1].event.flags & 0x20, 0x20);
         assert!(engine.process(touch(0, 0)).unwrap().is_none());
@@ -1254,6 +1309,76 @@ mod tests {
                 })
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_task_contacts_keep_one_display_owner_until_their_physical_up() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.publish(
+            Target {
+                task: 43,
+                ..target()
+            },
+            1,
+        );
+        engine.process(touch(0, 0)).unwrap();
+        let other = |id, action| Sample {
+            task: 43,
+            ..touch(id, action)
+        };
+        // A second app cannot start another DeviceId(-1) stream or contribute
+        // coordinates to the first app's pointer set.
+        assert!(engine.process(other(1, 0)).unwrap().is_none());
+        assert!(engine.process(other(1, 1)).unwrap().is_none());
+        let second = engine.process(touch(2, 0)).unwrap().unwrap().event;
+        assert_eq!((second.action, second.count), (5 | 1 << 8, 2));
+        let cancelled = engine.retire(42, 7, 200);
+        assert_eq!(
+            (cancelled[0].event.count, cancelled[0].event.flags),
+            (2, FLAG_CANCELED)
+        );
+        assert!(engine.process(other(1, 1)).unwrap().is_none());
+        assert!(engine.process(other(1, 2)).unwrap().is_none());
+        assert_eq!(
+            engine.process(other(1, 0)).unwrap().unwrap().event.action,
+            0
+        );
+        assert_eq!(
+            engine.process(other(1, 2)).unwrap().unwrap().event.action,
+            1
+        );
+    }
+
+    #[test]
+    fn separate_displays_can_hold_independent_gestures_and_reset_exact_sets() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.publish(
+            Target {
+                task: 43,
+                display: 1,
+                ..target()
+            },
+            1,
+        );
+        engine.process(touch(0, 0)).unwrap();
+        engine.process(touch(1, 0)).unwrap();
+        let other = Sample {
+            task: 43,
+            display: 1,
+            ..touch(0, 0)
+        };
+        assert_eq!(engine.process(other).unwrap().unwrap().event.action, 0);
+        let cancelled = engine.reset(200);
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(cancelled[0].event.count, 2);
+        assert_eq!(cancelled[1].event.count, 1);
+        assert!(cancelled.iter().all(|e| e.event.flags == FLAG_CANCELED));
+        assert_eq!(
+            engine.process(touch(0, 0)).unwrap().unwrap().event.action,
+            0
         );
     }
 }

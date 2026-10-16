@@ -178,10 +178,14 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
             coords[0].setAxisValue(AMOTION_EVENT_AXIS_ORIENTATION, event->pointers[1].y);
         }
         // The ABI's single flags word carries the mouse/stylus button state and
-        // is unused for touch streams. A cancel is expressed by the action, but
-        // InputDispatcher rejects injected cancels that lack MotionFlag::CANCELED
-        // and then keeps the stale pointers down for the device forever.
+        // the cancel marker for touch streams. InputDispatcher rejects injected
+        // cancels that lack MotionFlag::CANCELED and then keeps the stale
+        // pointers down for the device forever, so derive that flag from both
+        // the ABI word and the action.
         ftl::Flags<MotionFlag> motionFlags;
+        if (!mouse && !stylus) {
+            motionFlags = ftl::Flags<MotionFlag>(event->flags);
+        }
         if ((event->action & AMOTION_EVENT_ACTION_MASK) == AMOTION_EVENT_ACTION_CANCEL) {
             motionFlags |= MotionFlag::CANCELED;
         }
@@ -196,6 +200,9 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
                 event->eventTime, event->count, properties.data(), coords.data());
         androidEvent = &motion;
     } else return false;
+    // The pinned dispatcher validates and updates its injection verifier before
+    // enqueueing even in NONE mode. FAILED therefore must reach Rust; a socket
+    // reconnect alone cannot retire Android's accepted pointer identities.
     const auto result = input.mDispatcher.injectInputEventToApplication(androidEvent, std::nullopt,
             android::os::InputEventInjectionSync::NONE, std::chrono::milliseconds(30'000),
             POLICY_FLAG_DISABLE_KEY_REPEAT, target);

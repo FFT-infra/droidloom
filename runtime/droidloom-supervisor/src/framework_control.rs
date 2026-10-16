@@ -24,8 +24,12 @@ pub(super) fn connect(init: u32, endpoint: &str) -> Result<UnixStream, ControlEr
 pub(super) fn framework_request(
     init: u32,
     op: u16,
+    progress: &Reporter,
     request: &serde_json::Value,
 ) -> Result<String, ControlError> {
+    progress
+        .check_cancelled()
+        .map_err(|e| io_error("cancel framework request", e))?;
     let mut stream = connect(init, "control")?;
     stream
         .set_read_timeout(Some(Duration::from_secs(120)))
@@ -40,8 +44,11 @@ pub(super) fn framework_request(
         framework_wire::MAX_REQUEST,
     )
     .map_err(|e| io_error("send framework request", e))?;
-    let (reply, bytes) = framework_wire::read(&mut stream, framework_wire::MAX_RESPONSE)
-        .map_err(|e| io_error("read framework reply", e))?;
+    let (reply, bytes) = framework_wire::read(
+        &mut progress.reader(&mut stream, Duration::from_secs(120)),
+        framework_wire::MAX_RESPONSE,
+    )
+    .map_err(|e| io_error("read framework reply", e))?;
     let text = String::from_utf8(bytes)
         .map_err(|_| ControlError::Invalid("framework reply is not UTF-8".into()))?;
     if reply == (op | framework_wire::ERROR) {
@@ -62,6 +69,7 @@ pub(super) fn launch_in_cell(
     component: Option<&str>,
     resolution: Option<&str>,
     user: u32,
+    progress: &Reporter,
 ) -> Result<String, ControlError> {
     let mut request = serde_json::json!({"user":user,"package":package});
     if let Some(component) = component {
@@ -73,7 +81,7 @@ pub(super) fn launch_in_cell(
         request["width"] = width.parse::<u32>().unwrap().into();
         request["height"] = height.parse::<u32>().unwrap().into();
     }
-    let output = framework_request(init, framework_wire::LAUNCH, &request)?;
+    let output = framework_request(init, framework_wire::LAUNCH, progress, &request)?;
     if !valid_launch_binding(&output) {
         return Err(ControlError::Invalid(
             "invalid framework launch binding".into(),
@@ -126,10 +134,15 @@ mod tests {
         }
     }
 }
-pub(super) fn set_dpi_in_cell(init: u32, dpi: u32) -> Result<(), ControlError> {
+pub(super) fn set_dpi_in_cell(
+    init: u32,
+    dpi: u32,
+    progress: &Reporter,
+) -> Result<(), ControlError> {
     let response = framework_request(
         init,
         framework_wire::DENSITY,
+        progress,
         &serde_json::json!({"user":0,"dpi":dpi}),
     )?;
     if response != format!("dpi={dpi}") {
