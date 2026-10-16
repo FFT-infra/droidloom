@@ -1889,13 +1889,57 @@ impl App {
         );
     }
 
+    fn cancel_task_touch_contacts(&mut self, object: TaskObjectId) -> Result<bool, String> {
+        let contacts = self
+            .touch_contacts
+            .values()
+            .filter(|contact| contact.object == object)
+            .copied()
+            .collect::<Vec<_>>();
+        if contacts.is_empty() {
+            return Ok(true);
+        }
+
+        let direct = self
+            .endpoint
+            .as_ref()
+            .is_some_and(DenialEndpoint::direct_input);
+        if direct {
+            let timestamp = monotonic_timestamp_nanos().map_err(|error| error.to_string())?;
+            for contact in contacts {
+                if let Err(error) =
+                    self.direct_input
+                        .cancel_task_pointer(object.0, contact.pointer_id, timestamp)
+                {
+                    self.direct_input.disconnect();
+                    self.clear_input_tracking();
+                    return Err(error);
+                }
+            }
+            self.touch_contacts
+                .retain(|_, contact| contact.object != object);
+            return Ok(true);
+        }
+
+        let contact = contacts[0];
+        match self.send_input(object, contact.event(TouchAction::Cancel)) {
+            Ok(true) => {
+                self.touch_contacts
+                    .retain(|_, contact| contact.object != object);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn retire_contacts(&mut self, object: Option<TaskObjectId>) {
         if let Some(object) = object {
             let route = self.tasks.get(&object).and_then(|task| task.input_route);
             if let Some(route) = route {
                 match monotonic_timestamp_nanos() {
                     Ok(timestamp) => {
-                        if let Err(error) = self.direct_input.retire_route(route, timestamp) {
+                        if let Err(error) = self.direct_input.cancel_route(route, timestamp) {
                             eprintln!("Droidloom input retirement: {error}");
                         }
                     }
@@ -1905,19 +1949,8 @@ impl App {
                     }
                 }
             }
-            if !self
-                .pointer_contact
-                .is_some_and(|contact| contact.object == object)
-                && !self
-                    .touch_contacts
-                    .values()
-                    .any(|contact| contact.object == object)
-                && !self.clipboard_inputs.iter().any(|(owner, event)| {
-                    *owner == object && matches!(event, InputEvent::Touch { .. })
-                })
-            {
-                return;
-            }
+            let _ = self.cancel_task_touch_contacts(object);
+            return;
         }
         if self
             .endpoint
@@ -3482,7 +3515,7 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 if let Some(object) = state.task_for_surface(&surface) {
                     // A stylus that lands on a running touch gesture owns the
                     // shared stream from here on.
-                    state.retire_contacts(Some(object));
+                    let _ = state.cancel_task_touch_contacts(object);
                 }
                 let prev_surface = state.tablet_tool_mut(tool_id).surface.take();
                 let was_down = state.tablet_tool_mut(tool_id).is_down;
@@ -4105,8 +4138,11 @@ impl TouchHandler for App {
         if self.touch.as_ref() != Some(_touch) {
             return;
         }
-        if id < 0 || self.touch_contacts.contains_key(&id) {
-            self.retire_contacts(None);
+        if id < 0 {
+            return;
+        }
+        if let Some(old_contact) = self.touch_contacts.remove(&id) {
+            let _ = self.send_input(old_contact.object, old_contact.event(TouchAction::Cancel));
         }
         tablet_trace!(
             "Droidloom touch trace: stage=down id={id} surface={:?} task={:?} position={position:?}",
@@ -4251,7 +4287,14 @@ impl TouchHandler for App {
         );
         self.abandon_gestures();
         self.clear_control_presses();
-        self.retire_contacts(None);
+        let objects = self
+            .touch_contacts
+            .values()
+            .map(|contact| contact.object)
+            .collect::<std::collections::BTreeSet<_>>();
+        for object in objects {
+            let _ = self.cancel_task_touch_contacts(object);
+        }
     }
 }
 

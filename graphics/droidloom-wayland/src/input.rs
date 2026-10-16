@@ -315,6 +315,40 @@ impl DirectInput {
         Ok(())
     }
 
+    pub fn cancel_task_pointer(
+        &mut self,
+        task: u64,
+        pointer_id: u32,
+        timestamp: u64,
+    ) -> Result<bool, String> {
+        if self.socket.is_none() {
+            return Err("native input is reconnecting".into());
+        }
+        let Some((android_id, route)) = self
+            .pointers
+            .iter()
+            .find(|((_, host_id), (_, owner))| *host_id == pointer_id && owner.task == task)
+            .map(|(_, contact)| *contact)
+        else {
+            return Ok(false);
+        };
+        let record = encode_touch(
+            route.display,
+            route.task,
+            timestamp,
+            TouchAction::Cancel as u8,
+            android_id,
+            0,
+            0,
+            0,
+            route.incarnation,
+        )
+        .map_err(|error| error.to_string())?;
+        self.enqueue(Some(route), record)?;
+        self.pointers.retain(|(_, _), (_, owner)| *owner != route);
+        Ok(true)
+    }
+
     pub fn cancel_all(&mut self, timestamp: u64) -> Result<(), String> {
         while let Some((_, (_, route))) = self.pointers.first_key_value() {
             let display = route.display;
@@ -323,6 +357,7 @@ impl DirectInput {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn retire_route(&mut self, route: Route, timestamp: u64) -> Result<(), String> {
         if self.pointers.values().any(|(_, owner)| *owner == route) {
             self.cancel_display(route.display, timestamp)?;

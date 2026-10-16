@@ -79,7 +79,7 @@ impl App {
             if let Some(surface) = surface
                 && let Some(object) = self.task_for_surface(&surface)
             {
-                self.retire_contacts(Some(object));
+                let _ = self.cancel_task_touch_contacts(object);
             }
         }
 
