@@ -1130,7 +1130,7 @@ impl DenialEndpoint {
             configure_serial,
             acquire_point,
             release_point,
-            damage,
+            damage.clone(),
         ) {
             Ok(accepted) => accepted,
             Err(TaskStateError::StaleConfigure { .. }) => {
@@ -1154,6 +1154,27 @@ impl DenialEndpoint {
                 timelines.signal_release(release_point)?;
                 self.socket.send_denial(&released)?;
                 return Ok(EndpointAction::SupersededPresentDiscarded { object, frame });
+            }
+            Err(TaskStateError::UnacknowledgedConfigure) => {
+                if task.state.acknowledge_configure(configure_serial).is_ok() {
+                    match task.state.present(
+                        object,
+                        frame,
+                        buffer,
+                        configure_serial,
+                        acquire_point,
+                        release_point,
+                        damage,
+                    ) {
+                        Ok(accepted) => accepted,
+                        Err(retry_err) => {
+                            eprintln!("droidloom-denial-endpoint: retried present after UnacknowledgedConfigure failed: {retry_err}");
+                            return Ok(EndpointAction::SupersededPresentDiscarded { object, frame });
+                        }
+                    }
+                } else {
+                    return Ok(EndpointAction::SupersededPresentDiscarded { object, frame });
+                }
             }
             Err(error) => return Err(error.into()),
         };
