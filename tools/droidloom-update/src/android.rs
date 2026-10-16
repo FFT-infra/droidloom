@@ -360,6 +360,10 @@ const PATCHES: &[(&str, &str)] = &[
         "hardware/interfaces",
         "android/aosp-patches/0033-static-virtual-accelerometer.patch",
     ),
+    (
+        "system/keymint",
+        "android/aosp-patches/0035-keymint-allow-extended-attestation-challenge.patch",
+    ),
 ];
 #[derive(Serialize, Deserialize)]
 struct Original {
