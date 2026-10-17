@@ -368,6 +368,9 @@ pub struct SourceState<'a> {
     pub imported: bool,
     /// Outstanding source read, if any.
     pub ticket: Option<u64>,
+    /// Whether another read can start while `ticket` is outstanding: the
+    /// allocation has a timeline with no read in flight, or can add one.
+    pub spare_timeline: bool,
 }
 
 /// Validate an entire scene before issuing any Wayland surface mutations.
@@ -389,7 +392,9 @@ pub fn validate_scene<'a>(
 pub enum SceneStatus {
     /// All source allocations can be attached now.
     Ready,
-    /// At least one new read needs its allocation's preceding read to finish.
+    /// At least one new read needs its allocation's preceding read to finish:
+    /// that read is not shown by the layer now asking for the allocation, and
+    /// the allocation has no spare timeline for another read.
     Busy,
     /// The scene violates the transport or current attachment contract.
     Invalid,
@@ -438,7 +443,16 @@ pub fn assess_scene<'a>(
             if l.ticket <= last_ticket || !tickets.insert(l.ticket) {
                 return SceneStatus::Invalid;
             }
-            busy |= b.ticket.is_some();
+            // The producer cannot have rewritten an allocation whose read is
+            // outstanding, so a new ticket names unchanged content. A new
+            // ticket for the read this same layer still shows relabels it:
+            // the attachment stays and the new ticket ends with that read.
+            // Any other new read starts on a spare timeline. Waiting would
+            // deadlock in both cases: a compositor may release a detached
+            // read only with its next frame, which this scene provides.
+            busy |= !b.spare_timeline
+                && b.ticket
+                    .is_some_and(|held| attached(l.id) != Some((l.buffer, held)));
         }
     }
     if busy {
@@ -934,7 +948,8 @@ mod tests {
                     |id| (id == b.id).then_some(SourceState {
                         buffer: &b,
                         imported,
-                        ticket: None
+                        ticket: None,
+                        spare_timeline: true,
                     }),
                     |_| None,
                 ),
@@ -990,6 +1005,7 @@ mod tests {
                         buffer: &b,
                         imported: true,
                         ticket: busy.then_some(9),
+                        spare_timeline: false,
                     })
                 },
                 |id| (id == attached_layer).then_some((8, 9)),
@@ -1008,11 +1024,11 @@ mod tests {
     }
 
     #[test]
-    fn new_read_waits_for_the_preceding_read_but_same_ticket_reuse_stays_strict() {
+    fn new_read_of_an_allocation_still_read_elsewhere_takes_a_spare_timeline_or_waits() {
         let b = buffer();
         let mut l = layer();
         l.ticket = 10;
-        let assess = |ticket, has_acquire, attached| {
+        let assess = |ticket, has_acquire, attached, spare_timeline| {
             assess_scene(
                 [(&l, has_acquire)].into_iter(),
                 1,
@@ -1024,16 +1040,41 @@ mod tests {
                         buffer: &b,
                         imported: true,
                         ticket,
+                        spare_timeline,
                     })
                 },
                 |_| attached,
             )
         };
-        assert_eq!(assess(Some(9), true, Some((8, 9))), SceneStatus::Busy);
-        assert_eq!(assess(None, true, Some((8, 9))), SceneStatus::Ready);
-        assert_eq!(assess(Some(10), false, Some((8, 10))), SceneStatus::Ready);
-        assert_eq!(assess(Some(10), true, Some((8, 10))), SceneStatus::Invalid);
-        assert_eq!(assess(Some(10), false, None), SceneStatus::Invalid);
+        for spare in [false, true] {
+            // This layer shows ticket 9 of the allocation: ticket 10 relabels it.
+            assert_eq!(
+                assess(Some(9), true, Some((8, 9)), spare),
+                SceneStatus::Ready
+            );
+            assert_eq!(assess(None, true, Some((8, 9)), spare), SceneStatus::Ready);
+            assert_eq!(
+                assess(Some(10), false, Some((8, 10)), spare),
+                SceneStatus::Ready
+            );
+            assert_eq!(
+                assess(Some(10), true, Some((8, 10)), spare),
+                SceneStatus::Invalid
+            );
+            assert_eq!(assess(Some(10), false, None, spare), SceneStatus::Invalid);
+        }
+        // Ticket 9 was detached from this layer and is still being released.
+        // A new read starts beside it, or waits once no timeline is spare.
+        assert_eq!(assess(Some(9), true, None, true), SceneStatus::Ready);
+        assert_eq!(
+            assess(Some(9), true, Some((7, 9)), true),
+            SceneStatus::Ready
+        );
+        assert_eq!(assess(Some(9), true, None, false), SceneStatus::Busy);
+        assert_eq!(
+            assess(Some(9), true, Some((7, 9)), false),
+            SceneStatus::Busy
+        );
     }
 
     #[test]
@@ -1056,6 +1097,7 @@ mod tests {
                         buffer: &b,
                         imported: true,
                         ticket: Some(8),
+                        spare_timeline: false,
                     })
                 },
                 |_| None,
@@ -1098,6 +1140,7 @@ mod tests {
                         } else {
                             unchanged_ticket
                         },
+                        spare_timeline: false,
                     })
                 },
                 |id| (id == 3).then_some((10, 11)),

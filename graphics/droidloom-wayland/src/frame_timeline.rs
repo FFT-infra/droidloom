@@ -220,6 +220,20 @@ impl Timeline {
         self.surface = None;
         self.schedule.clear(Terminal::Epoch);
     }
+    /// Grant state for stall reports. Terminal counts are in `Terminal` order:
+    /// presented, skipped, missed, configure, epoch.
+    pub fn describe(&self) -> String {
+        format!(
+            "exact={} subscribed={} epoch={:?} last grant={} offered={} consumed={} terminals={:?}",
+            self.exact,
+            self.subscription.is_some(),
+            self.schedule.epoch,
+            self.schedule.last_sequence,
+            self.schedule.offered.is_some(),
+            self.schedule.consumed.len(),
+            self.schedule.terminal,
+        )
+    }
 }
 
 impl App {

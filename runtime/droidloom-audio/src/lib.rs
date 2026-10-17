@@ -275,7 +275,10 @@ pub fn serve_connection(socket: SeqPacket, options: &Options) -> io::Result<()> 
         .map_err(ipc)?;
     eprintln!(
         "droidloom-audio: {:?} {}/{} PCM16, four shared buffers, generation {generation:x}, burst_position={}",
-        format.direction, format.rate, format.channels, open.values[4] & BURST_POSITION != 0
+        format.direction,
+        format.rate,
+        format.channels,
+        open.values[4] & BURST_POSITION != 0
     );
     let mut previous_request = open.request;
     let mut held: Option<Region> = None;

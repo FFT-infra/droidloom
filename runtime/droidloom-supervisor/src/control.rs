@@ -620,7 +620,14 @@ impl Daemon {
         let ready_us = started.elapsed().as_micros();
         self.progress
             .report("Android is ready. Launching the application (up to 120 seconds)...");
-        let output = launch_in_cell(init_pid, package, component, resolution, user, &self.progress)?;
+        let output = launch_in_cell(
+            init_pid,
+            package,
+            component,
+            resolution,
+            user,
+            &self.progress,
+        )?;
         eprintln!(
             "droidloom-launch-host-timing package={package} user={user} ready_us={ready_us} total_us={}",
             started.elapsed().as_micros(),
@@ -972,7 +979,8 @@ fn run_loop(
                 let mut delegated = None;
                 let response = match receive_request(&mut stream) {
                     Ok((peer_uid, request, file, streaming)) => {
-                        daemon.progress = Reporter::new(&stream, streaming)?.with_shutdown(shutdown)?;
+                        daemon.progress =
+                            Reporter::new(&stream, streaming)?.with_shutdown(shutdown)?;
                         if matches!(request, ControlRequest::WatchApplications) {
                             match daemon.watch_applications(peer_uid) {
                                 Ok(events) => {
@@ -1339,7 +1347,9 @@ fn wait_for_android_init(spec: &CellSpec, progress: &Reporter) -> Result<u32, Co
         ANDROID_READY_TIMEOUT,
         Duration::from_millis(100),
         || {
-            progress.check_cancelled().map_err(|e| io_error("cancel Android readiness wait", e))?;
+            progress
+                .check_cancelled()
+                .map_err(|e| io_error("cancel Android readiness wait", e))?;
             android_boot_snapshot(spec)
         },
         |message| progress.report(message),
