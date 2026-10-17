@@ -1558,21 +1558,23 @@ impl App {
                 // Only the compositor's real release fence controls reuse.
                 // Presentation feedback retains its own bounded frame identity.
                 if pending.release_point > sync.timeline.signalled_point()? {
-                    let stalled_for = now.saturating_duration_since(pending.submitted_at);
-                    if stalled_for >= FRAME_RELEASE_RESTART_AFTER {
-                        return Err(PresenterError::FrameReleaseStalled {
-                            object,
-                            frame: pending.frame,
-                            buffer: pending.buffer,
-                            pending: task.pending.len(),
-                            age_ms: stalled_for.as_millis(),
-                        });
-                    }
-                    if task.frame_release_watchdog.wake_due(now, stalled_for) {
-                        task.frame_release_watchdog.record_wake(now);
-                        if let Some(surface) = task.surface() {
-                            surface.damage_buffer(0, 0, 1, 1);
-                            surface.commit();
+                    if task.pending.len() > 1 {
+                        let stalled_for = now.saturating_duration_since(pending.submitted_at);
+                        if stalled_for >= FRAME_RELEASE_RESTART_AFTER {
+                            return Err(PresenterError::FrameReleaseStalled {
+                                object,
+                                frame: pending.frame,
+                                buffer: pending.buffer,
+                                pending: task.pending.len(),
+                                age_ms: stalled_for.as_millis(),
+                            });
+                        }
+                        if task.frame_release_watchdog.wake_due(now, stalled_for) {
+                            task.frame_release_watchdog.record_wake(now);
+                            if let Some(surface) = task.surface() {
+                                surface.damage_buffer(0, 0, 1, 1);
+                                surface.commit();
+                            }
                         }
                     }
                     break;
@@ -4789,9 +4791,12 @@ fn poll_sources(
         .unblock_deadline()
         .filter(|_| app.clipboard.blocked());
     let watchdog_deadline = app.tasks.values().filter_map(|task| {
-        task.pending.front().map(|pending| {
-            task.frame_release_watchdog.deadline(now, pending.submitted_at)
-        })
+        (task.pending.len() > 1)
+            .then(|| task.pending.front())
+            .flatten()
+            .map(|pending| {
+                task.frame_release_watchdog.deadline(now, pending.submitted_at)
+            })
     }).min();
     let deadline = clipboard_deadline
         .into_iter()
@@ -4828,9 +4833,11 @@ fn poll_sources(
     }
     let poll_now = Instant::now();
     for (&object, task) in &app.tasks {
-        if let Some(pending) = task.pending.front() {
-            if poll_now.saturating_duration_since(pending.submitted_at) >= FRAME_RELEASE_WAKE_AFTER {
-                app.task_work.mark(object, readiness::FRAMES);
+        if task.pending.len() > 1 {
+            if let Some(pending) = task.pending.front() {
+                if poll_now.saturating_duration_since(pending.submitted_at) >= FRAME_RELEASE_WAKE_AFTER {
+                    app.task_work.mark(object, readiness::FRAMES);
+                }
             }
         }
     }
