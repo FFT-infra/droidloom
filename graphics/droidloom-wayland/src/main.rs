@@ -890,19 +890,16 @@ impl App {
         qh: &QueueHandle<Self>,
         now: Instant,
     ) -> Result<(), PresenterError> {
-        // Wayland callbacks only replace pending geometry. Apply the final
-        // size/scale before draining Android frames or publishing layer config.
-        //
-        // A window inside a live resize grab is left queued; the poll deadline
-        // below wakes this loop when the grab's fallback expires, so geometry
-        // is always applied exactly once.
-        let settled = self
+        // Wayland callbacks only replace pending geometry. Interactive samples
+        // acknowledge Denial with an empty surface commit so it can pace its
+        // next configure without forcing Android to relayout an obsolete size.
+        let actionable = self
             .tasks
             .iter()
-            .filter(|(_, task)| task.accepts_present() && task.resize.ready(now))
+            .filter(|(_, task)| task.accepts_present() && task.resize.action(now).is_some())
             .map(|(object, _)| *object)
             .collect::<Vec<_>>();
-        for object in settled {
+        for object in actionable {
             self.task_work.mark(object, readiness::RESIZE);
         }
         while let Some(object) = self.task_work.pop(readiness::RESIZE) {
@@ -912,21 +909,30 @@ impl App {
             if !task.accepts_present() {
                 continue;
             }
-            // A live grab previews through the compositor, so only settled
-            // geometry is applied. Geometry still inside a grab is re-queued
-            // by the loop above once its own fallback deadline arrives.
-            if !task.resize.ready(now) {
+            let Some(action) = self
+                .tasks
+                .get(&object)
+                .expect("checked above")
+                .resize
+                .action(now)
+            else {
                 continue;
-            }
-            let Some(configure) = self
+            };
+            let resize::Action::ApplyFinal(_) = action else {
+                let task = self.tasks.get_mut(&object).expect("checked above");
+                task.surface()
+                    .expect("accepts_present guarantees a mapped window")
+                    .commit();
+                task.resize.committed();
+                continue;
+            };
+            let configure = self
                 .tasks
                 .get_mut(&object)
                 .expect("checked above")
                 .resize
                 .take()
-            else {
-                continue;
-            };
+                .expect("ApplyFinal guarantees queued geometry");
             self.configure_task(qh, object, configure)?;
             if configure.remember {
                 let package = &self
@@ -4012,13 +4018,17 @@ impl KeyboardHandler for App {
         // After focus enters, this also clears Ctrl from a stale enter key
         // array when an input method filtered its release outside that task.
         if let Some(object) = self.focused {
-            for (keycode, action) in self
-                .pressed_keys
-                .modifiers(object, modifiers.shift, modifiers.ctrl)
+            for (keycode, action) in
+                self.pressed_keys
+                    .modifiers(object, modifiers.shift, modifiers.ctrl)
             {
                 match self.send_input(
                     object,
-                    InputEvent::Key { action, keycode, repeat: 0 },
+                    InputEvent::Key {
+                        action,
+                        keycode,
+                        repeat: 0,
+                    },
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -4725,7 +4735,10 @@ fn poll_sources(
             }
         }
     }
-    let clipboard_deadline = app.clipboard.unblock_deadline().filter(|_| app.clipboard.blocked());
+    let clipboard_deadline = app
+        .clipboard
+        .unblock_deadline()
+        .filter(|_| app.clipboard.blocked());
     let deadline = clipboard_deadline
         .into_iter()
         .chain(fallback_deadline)
