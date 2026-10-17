@@ -248,7 +248,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Command::Restart { spec, .. } => ControlRequest::Restart { spec },
             Command::Supervise { spec } => {
                 return Ok(droidloom_supervisor::control::supervise_cell(
-                    &cli.socket, &spec,
+                    &cli.socket,
+                    &spec,
                 )?);
             }
             Command::Status => ControlRequest::Status,
