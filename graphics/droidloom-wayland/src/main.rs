@@ -885,19 +885,48 @@ impl App {
         Ok(())
     }
 
-    fn apply_pending_resizes(&mut self, qh: &QueueHandle<Self>) -> Result<(), PresenterError> {
+    fn apply_pending_resizes(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        now: Instant,
+    ) -> Result<(), PresenterError> {
         // Wayland callbacks only replace pending geometry. Apply the final
         // size/scale before draining Android frames or publishing layer config.
+        //
+        // A window inside a live resize grab is left queued; the poll deadline
+        // below wakes this loop when the grab's fallback expires, so geometry
+        // is always applied exactly once.
+        let settled = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.accepts_present() && task.resize.ready(now))
+            .map(|(object, _)| *object)
+            .collect::<Vec<_>>();
+        for object in settled {
+            self.task_work.mark(object, readiness::RESIZE);
+        }
         while let Some(object) = self.task_work.pop(readiness::RESIZE) {
-            let Some(task) = self.tasks.get_mut(&object) else {
-                continue;
-            };
-            let Some(configure) = task.resize.take() else {
+            let Some(task) = self.tasks.get(&object) else {
                 continue;
             };
             if !task.accepts_present() {
                 continue;
             }
+            // A live grab previews through the compositor, so only settled
+            // geometry is applied. Geometry still inside a grab is re-queued
+            // by the loop above once its own fallback deadline arrives.
+            if !task.resize.ready(now) {
+                continue;
+            }
+            let Some(configure) = self
+                .tasks
+                .get_mut(&object)
+                .expect("checked above")
+                .resize
+                .take()
+            else {
+                continue;
+            };
             self.configure_task(qh, object, configure)?;
             if configure.remember {
                 let package = &self
@@ -2604,7 +2633,7 @@ impl WindowHandler for App {
             .get_mut(&object)
             .expect("surface has a task")
             .resize
-            .configure(size, remember);
+            .configure(size, remember, configure.is_resizing());
         self.task_work.mark(object, readiness::RESIZE);
     }
 }
@@ -4540,7 +4569,7 @@ fn run_presenter_loop(
         if let Some(error) = app.fatal.take() {
             return Err(PresenterError::Wayland(error));
         }
-        app.apply_pending_resizes(&qh)?;
+        app.apply_pending_resizes(&qh, Instant::now())?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
         app.refresh_frame_timelines(&qh)?;
@@ -4700,6 +4729,13 @@ fn poll_sources(
     let deadline = clipboard_deadline
         .into_iter()
         .chain(fallback_deadline)
+        // A resize that is still settling has already left the work queues;
+        // only this deadline brings it back for its one authoritative apply.
+        .chain(
+            app.tasks
+                .values()
+                .filter_map(|task| task.resize.deadline(now)),
+        )
         .chain(app.tasks.values().filter_map(|task| task.controls_until))
         .min();
     let timeout = if app.task_work.pending() {
