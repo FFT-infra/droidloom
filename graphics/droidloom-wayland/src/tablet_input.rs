@@ -26,25 +26,26 @@ impl App {
         let Some(object) = target else {
             return false;
         };
-        let Some(task) = self
+        let Some((route, scale_120, task_surface)) = self
             .tasks
             .get(&object)
             .filter(|task| task.accepts_present())
+            .and_then(|task| {
+                task.input_route
+                    .map(|route| (route, task.applied_scale_120, task.surface().cloned()))
+            })
         else {
-            return false;
-        };
-        let Some(route) = task.input_route else {
             return false;
         };
         let surface = if let Some(s) = surface {
             s
-        } else if let Some(s) = task.surface() {
+        } else if let Some(s) = task_surface {
             self.tablet_tool_mut(tool_id).surface = Some(s.clone());
-            s.clone()
+            s
         } else {
             return false;
         };
-        let scale = (task.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR);
+        let scale = (scale_120, FRACTIONAL_SCALE_DENOMINATOR);
         let position = self.surface_position(object, &surface, (tool_x, tool_y));
         let fixed = self.fixed_position(object, position);
         let pen = droidloom_input_protocol::Stylus {
