@@ -4,26 +4,24 @@ use std::time::{Duration, Instant};
 
 use droidloom_window_policy::LogicalSize;
 
-/// Interval between lightweight surface commits during a live resize grab.
+/// Shortest interval between two relayouts of one live resize grab.
 ///
 /// A compositor previews a live resize by scaling the last committed buffer to
 /// the pointer, so intermediate geometry needs no work from this side: applying
 /// it would retire a three-buffer pool, allocate another, and drive a full
 /// Android task relayout for an image that is about to be replaced.
 ///
-/// Denial paces its next configure on the client's commit. An empty
-/// `wl_surface.commit` acknowledges that while preserving the attached buffer,
-/// so it can keep the configure loop alive without forcing any Android work.
-/// The interval is armed once per burst of samples; later samples coalesce into
-/// the same commit without pushing it back.
-const RESIZE_SETTLE: Duration = Duration::from_millis(400);
-
-/// Safety net for a compositor that never sends a terminating resize configure.
+/// Waiting for the whole grab is not an option either. Denial paces its
+/// configures on the client's commit, so a window that never commits stops
+/// receiving sizes and stays rendered as its last buffer stretched onto the
+/// last target. Committing on this interval keeps that loop alive while
+/// bounding a drag to a few relayouts instead of one per pointer sample.
 ///
-/// Once the grab has gone quiet for this long, apply the latest geometry even
-/// if no non-resizing configure arrives. Continuous drags keep refreshing the
-/// deadline and therefore never take this path.
-const RESIZE_GRAB_FALLBACK: Duration = Duration::from_secs(5);
+/// The interval is armed once per burst of samples, so later samples replace
+/// the queued geometry without pushing the commit back. The grab's terminating
+/// configure applies the real final size immediately, and the same interval
+/// covers a compositor that never sends one.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Configure {
@@ -44,20 +42,8 @@ pub struct Pending {
     remember: bool,
     /// The compositor owns a live interactive resize of this window.
     interactive: bool,
-    /// Earliest instant at which the next lightweight resize commit may run.
+    /// Earliest instant at which the queued geometry may be applied.
     apply_after: Option<Instant>,
-    /// Latest interactive configure, used to detect a grab that never ends.
-    last_interactive: Option<Instant>,
-    /// The current interactive configure still needs a lightweight commit.
-    commit_pending: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Action {
-    /// Acknowledge a live grab without changing the committed buffer.
-    CommitExisting,
-    /// Apply the final geometry through a complete Android task relayout.
-    ApplyFinal(Configure),
 }
 
 impl Pending {
@@ -68,8 +54,6 @@ impl Pending {
             remember: false,
             interactive: false,
             apply_after: None,
-            last_interactive: None,
-            commit_pending: false,
         }
     }
 
@@ -86,10 +70,10 @@ impl Pending {
 
     /// Queue geometry against an explicit clock.
     ///
-    /// `interactive` marks a live resize grab. Intermediate geometry only
-    /// requests a lightweight commit at [`RESIZE_SETTLE`]. A terminating
-    /// configure applies the final size immediately; a grab that stays silent
-    /// for [`RESIZE_GRAB_FALLBACK`] is also applied as a safety net.
+    /// `interactive` marks a live resize grab. A grab's intermediate geometry
+    /// waits for [`RESIZE_SETTLE`]; the compositor's terminating configure
+    /// applies the real size and the interval applies it if that configure
+    /// never arrives.
     pub fn configure_at(
         &mut self,
         size: LogicalSize,
@@ -99,17 +83,7 @@ impl Pending {
     ) {
         if self.size == Some(size) && self.interactive == interactive {
             // Repeating one geometry must not push its own deadline forward,
-            // or a chattering grab could postpone the commit indefinitely.
-            if interactive {
-                // Repeated identical configures are still paced events. They
-                // must request a lightweight commit, but must not postpone an
-                // already armed interval.
-                self.last_interactive = Some(now);
-                self.commit_pending = true;
-                self.apply_after.get_or_insert(now + RESIZE_SETTLE);
-            } else {
-                self.apply_after = Some(now);
-            }
+            // or a chattering grab could postpone the relayout indefinitely.
             self.remember = remember;
             return;
         }
@@ -118,14 +92,10 @@ impl Pending {
         self.interactive = interactive;
         if !interactive {
             self.apply_after = Some(now);
-        } else {
-            self.last_interactive = Some(now);
-            self.commit_pending = true;
-            if self.apply_after.is_none() {
-                // Arm once per burst: restarting the interval on every sample
-                // would starve the lightweight acknowledgement.
-                self.apply_after = Some(now + RESIZE_SETTLE);
-            }
+        } else if self.apply_after.is_none() {
+            // Arm once per burst: restarting the interval on every sample would
+            // starve the commit for the length of the drag.
+            self.apply_after = Some(now + RESIZE_SETTLE);
         }
     }
 
@@ -135,46 +105,14 @@ impl Pending {
         self.interactive
     }
 
-    /// What, if anything, should happen to the queued geometry at `now`.
-    pub fn action(&self, now: Instant) -> Option<Action> {
-        let size = self.size?;
-        if !self.interactive {
-            return Some(Action::ApplyFinal(Configure {
-                size,
-                scale_120: self.scale_120,
-                remember: self.remember,
-            }));
-        }
-        if self
-            .last_interactive
-            .is_some_and(|last| now.saturating_duration_since(last) >= RESIZE_GRAB_FALLBACK)
-        {
-            return Some(Action::ApplyFinal(Configure {
-                size,
-                scale_120: self.scale_120,
-                remember: self.remember,
-            }));
-        }
-        (self.commit_pending && self.apply_after.is_none_or(|after| now >= after))
-            .then_some(Action::CommitExisting)
+    /// Whether the queued geometry may be applied at `now`.
+    pub fn ready(&self, now: Instant) -> bool {
+        self.size.is_some() && self.apply_after.is_none_or(|after| now >= after)
     }
 
     /// Wake-up deadline of geometry that is still settling.
     pub fn deadline(&self, now: Instant) -> Option<Instant> {
-        let commit = self
-            .commit_pending
-            .then_some(self.apply_after)
-            .flatten()
-            .filter(|after| *after > now);
-        let fallback = if self.interactive {
-            self.size
-                .and(self.last_interactive)
-                .map(|last| last + RESIZE_GRAB_FALLBACK)
-                .filter(|after| *after > now)
-        } else {
-            None
-        };
-        commit.into_iter().chain(fallback).min()
+        self.size.and(self.apply_after).filter(|after| *after > now)
     }
 
     pub fn preferred_scale(&mut self, scale_120: u32, applied: Option<(u32, u32)>) -> bool {
@@ -190,19 +128,14 @@ impl Pending {
             // Never leave it waiting behind a grab that is still settling.
             self.interactive = false;
             self.apply_after = Some(Instant::now());
-            self.last_interactive = None;
-            self.commit_pending = false;
         }
         self.size.is_some()
     }
 
-    /// Consume the final configure after [`Action::ApplyFinal`] is selected.
     pub fn take(&mut self) -> Option<Configure> {
         let size = self.size.take()?;
         self.apply_after = None;
         self.interactive = false;
-        self.last_interactive = None;
-        self.commit_pending = false;
         let remember = std::mem::take(&mut self.remember);
         Some(Configure {
             size,
@@ -211,19 +144,11 @@ impl Pending {
         })
     }
 
-    /// Record that a lightweight commit was sent.
-    pub fn committed(&mut self) {
-        self.commit_pending = false;
-        self.apply_after = None;
-    }
-
     pub fn cancel(&mut self) {
         self.size = None;
         self.remember = false;
         self.interactive = false;
         self.apply_after = None;
-        self.last_interactive = None;
-        self.commit_pending = false;
     }
 }
 
@@ -357,11 +282,10 @@ mod tests {
     }
 
     #[test]
-    fn long_live_grab_commits_without_intermediate_android_relayouts() {
+    fn live_grab_relayouts_once_per_interval_instead_of_once_per_sample() {
         let start = Instant::now();
         let mut pending = Pending::new(120);
-        let mut commits = Vec::new();
-        let mut relayouts = Vec::new();
+        let mut applied = 0;
         // Nine seconds of dragging sampled every 65 ms, with the two-pixel
         // alternation that the old every-sample relayout amplified.
         for sample in 0..140_u64 {
@@ -369,120 +293,70 @@ mod tests {
             let width = 1_806 + i32::try_from(sample % 4).unwrap() - 2;
             pending.configure_at(size(u32::try_from(width).unwrap(), 1_928), false, true, now);
             assert!(pending.is_resizing());
-            match pending.action(now) {
-                Some(Action::CommitExisting) => {
-                    commits.push(now);
-                    pending.committed();
-                }
-                Some(Action::ApplyFinal(configure)) => relayouts.push((now, configure)),
-                None => {}
+            if pending.ready(now) {
+                applied += 1;
+                pending.take();
             }
         }
+        // One relayout per interval rather than one per sample. Each commit
+        // clears the deadline, so the next sample starts the following
+        // interval: 9.1 s at 150 ms plus sample granularity commits ~40-60 times
+        // against 140 samples, and the compositor previews every sample in
+        // between.
         assert!(
-            relayouts.is_empty(),
-            "interactive geometry must not drive Android relayouts"
+            (35..=65).contains(&applied),
+            "a live grab must be rate limited, not per sample (applied {applied})"
         );
-        assert!(commits.len() >= 2, "paced commits keep Denial configuring");
 
-        // Once Denial clears interactive state, one full relayout applies the
-        // final geometry immediately.
+        // The compositor's terminating configure carries the real final size
+        // and applies it at once, without waiting out the settle window.
         let end = start + Duration::from_millis(140 * 65);
         pending.configure_at(size(1_754, 1_606), true, false, end);
         assert!(!pending.is_resizing());
+        assert!(pending.ready(end));
         assert_eq!(
-            pending.action(end),
-            Some(Action::ApplyFinal(Configure {
+            pending.take(),
+            Some(Configure {
                 size: size(1_754, 1_606),
                 scale_120: 120,
                 remember: true,
-            }))
+            })
         );
-        assert_eq!(pending.take().unwrap().size, size(1_754, 1_606));
-        assert_eq!(pending.action(end), None);
         assert!(pending.deadline(end).is_none());
+        assert!(pending.take().is_none());
     }
 
     #[test]
-    fn repeated_unchanged_geometry_still_acknowledges_each_paced_configure() {
+    fn stalled_grab_still_applies_its_last_size_by_the_interval() {
+        let start = Instant::now();
+        let mut pending = Pending::new(120);
+        pending.configure_at(size(1_200, 800), true, true, start);
+        assert!(!pending.ready(start));
+        let settled = start + RESIZE_SETTLE;
+        assert_eq!(pending.deadline(start), Some(settled));
+        assert!(!pending.ready(start + RESIZE_SETTLE - Duration::from_millis(1)));
+        assert!(pending.ready(settled));
+        assert_eq!(pending.take().unwrap().size, size(1_200, 800));
+    }
+
+    #[test]
+    fn later_grab_samples_do_not_push_the_interval_back() {
         let start = Instant::now();
         let mut pending = Pending::new(120);
         let geometry = size(1_100, 700);
         pending.configure_at(geometry, false, true, start);
-        assert_eq!(pending.action(start), None);
-        let first = start + RESIZE_SETTLE;
-        assert_eq!(pending.action(first), Some(Action::CommitExisting));
-        pending.committed();
-        assert_eq!(pending.action(first), None);
-
-        // An unchanged configure is still a new paced event and must produce
-        // its own acknowledgement.
-        pending.configure_at(geometry, false, true, first);
-        assert_eq!(
-            pending.action(first + RESIZE_SETTLE - Duration::from_millis(1)),
-            None
-        );
-        assert_eq!(
-            pending.action(first + RESIZE_SETTLE),
-            Some(Action::CommitExisting)
-        );
-        pending.committed();
-        assert_eq!(pending.action(first + RESIZE_SETTLE), None);
-    }
-
-    #[test]
-    fn immediate_termination_applies_the_queued_final_size() {
-        let start = Instant::now();
-        let mut pending = Pending::new(120);
-        pending.configure_at(size(1_200, 800), false, true, start);
-        pending.configure_at(size(900, 700), true, false, start);
-        assert_eq!(
-            pending.action(start),
-            Some(Action::ApplyFinal(Configure {
-                size: size(900, 700),
-                scale_120: 120,
-                remember: true,
-            }))
-        );
-    }
-
-    #[test]
-    fn stalled_grab_applies_once_after_the_fallback() {
-        let start = Instant::now();
-        let mut pending = Pending::new(120);
-        pending.configure_at(size(1_200, 800), true, true, start);
-        assert!(!matches!(
-            pending.action(start),
-            Some(Action::ApplyFinal(_))
-        ));
-        let fallback = start + RESIZE_GRAB_FALLBACK;
-        assert_eq!(
-            pending.action(fallback),
-            Some(Action::ApplyFinal(Configure {
-                size: size(1_200, 800),
-                scale_120: 120,
-                remember: true,
-            }))
-        );
-        pending.take();
-        assert_eq!(pending.action(fallback), None);
-    }
-
-    #[test]
-    fn continuous_grab_samples_refresh_only_the_fallback() {
-        let start = Instant::now();
-        let mut pending = Pending::new(120);
-        pending.configure_at(size(1_100, 700), false, true, start);
         for sample in 1..40_u64 {
             pending.configure_at(
                 size(1_100 + sample as u32, 700),
                 false,
                 true,
-                start + Duration::from_millis(sample * 100),
+                start + Duration::from_millis(sample * 10),
             );
         }
-        let last = start + Duration::from_millis(3_900);
-        assert_eq!(pending.deadline(last), Some(last + RESIZE_GRAB_FALLBACK));
-        assert!(!matches!(pending.action(last), Some(Action::ApplyFinal(_))));
+        let edge = start + Duration::from_millis(140);
+        assert_eq!(pending.deadline(edge), Some(start + RESIZE_SETTLE));
+        assert!(!pending.ready(edge));
+        assert!(pending.ready(start + RESIZE_SETTLE));
     }
 
     #[test]

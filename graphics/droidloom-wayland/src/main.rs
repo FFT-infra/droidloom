@@ -127,6 +127,9 @@ use wayland_protocols_wlr::output_power_management::v1::client::{
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
 const TARGET_POOL_LENGTH: usize = 3;
 const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
+const FRAME_RELEASE_WAKE_AFTER: Duration = Duration::from_millis(500);
+const FRAME_RELEASE_WAKE_INTERVAL: Duration = Duration::from_secs(2);
+const FRAME_RELEASE_RESTART_AFTER: Duration = Duration::from_secs(5);
 const LEFT_BUTTON: u32 = 0x110;
 const PAD_BUTTON_BASE: u32 = 0x106;
 const PAD_BUTTON_COUNT: u32 = 4;
@@ -172,6 +175,16 @@ enum PresenterError {
     },
     #[error("Droidloom configuration is invalid: {0}")]
     Configuration(&'static str),
+    #[error(
+        "visible frame release stalled for {age_ms} ms; task={object:?} frame={frame:?} buffer={buffer:?} pending={pending}"
+    )]
+    FrameReleaseStalled {
+        object: TaskObjectId,
+        frame: FrameId,
+        buffer: BufferId,
+        pending: usize,
+        age_ms: u128,
+    },
     #[error("window decoration failure: {0}")]
     WindowDecoration(String),
 }
@@ -230,8 +243,44 @@ struct PendingFrame {
     frame: FrameId,
     buffer: BufferId,
     release_point: u64,
+    submitted_at: Instant,
     submitted_nanos: u64,
     trace: Option<presentation_audit::FrameTrace>,
+}
+
+#[derive(Default)]
+struct FrameReleaseWatchdog {
+    wake_sent_at: Option<Instant>,
+}
+
+impl FrameReleaseWatchdog {
+    fn wake_due(&self, now: Instant, stalled_for: Duration) -> bool {
+        stalled_for >= FRAME_RELEASE_WAKE_AFTER
+            && self
+                .wake_sent_at
+                .is_none_or(|sent| now >= sent + FRAME_RELEASE_WAKE_INTERVAL)
+    }
+
+    fn deadline(&self, now: Instant, submitted_at: Instant) -> Instant {
+        let wake = submitted_at + FRAME_RELEASE_WAKE_AFTER;
+        let restart = submitted_at + FRAME_RELEASE_RESTART_AFTER;
+        if now >= restart {
+            now
+        } else if now < wake {
+            wake
+        } else {
+            self.wake_sent_at
+                .map_or(now, |sent| (sent + FRAME_RELEASE_WAKE_INTERVAL).min(restart))
+        }
+    }
+
+    fn record_wake(&mut self, now: Instant) {
+        self.wake_sent_at = Some(now);
+    }
+
+    fn reset(&mut self) {
+        self.wake_sent_at = None;
+    }
 }
 
 // Timing metadata outlives buffer ownership; no buffer or fence is retained here.
@@ -283,6 +332,7 @@ struct TaskWindow {
     applied_opaque: Option<bool>,
     composed_root: bool,
     focused: bool,
+    frame_release_watchdog: FrameReleaseWatchdog,
     unmap_requested: bool,
     closing: bool,
 }
@@ -853,6 +903,7 @@ impl App {
                     == Some(std::ffi::OsStr::new("1")))
                 .then(presentation_audit::Audit::default),
                 focused: false,
+                frame_release_watchdog: FrameReleaseWatchdog::default(),
                 unmap_requested: false,
                 closing: false,
             },
@@ -890,49 +941,25 @@ impl App {
         qh: &QueueHandle<Self>,
         now: Instant,
     ) -> Result<(), PresenterError> {
-        // Wayland callbacks only replace pending geometry. Interactive samples
-        // acknowledge Denial with an empty surface commit so it can pace its
-        // next configure without forcing Android to relayout an obsolete size.
         let actionable = self
             .tasks
             .iter()
-            .filter(|(_, task)| task.accepts_present() && task.resize.action(now).is_some())
+            .filter(|(_, task)| task.accepts_present() && task.resize.ready(now))
             .map(|(object, _)| *object)
             .collect::<Vec<_>>();
         for object in actionable {
             self.task_work.mark(object, readiness::RESIZE);
         }
         while let Some(object) = self.task_work.pop(readiness::RESIZE) {
-            let Some(task) = self.tasks.get(&object) else {
+            let Some(task) = self.tasks.get_mut(&object) else {
                 continue;
             };
-            if !task.accepts_present() {
+            if !task.accepts_present() || !task.resize.ready(now) {
                 continue;
             }
-            let Some(action) = self
-                .tasks
-                .get(&object)
-                .expect("checked above")
-                .resize
-                .action(now)
-            else {
+            let Some(configure) = task.resize.take() else {
                 continue;
             };
-            let resize::Action::ApplyFinal(_) = action else {
-                let task = self.tasks.get_mut(&object).expect("checked above");
-                task.surface()
-                    .expect("accepts_present guarantees a mapped window")
-                    .commit();
-                task.resize.committed();
-                continue;
-            };
-            let configure = self
-                .tasks
-                .get_mut(&object)
-                .expect("checked above")
-                .resize
-                .take()
-                .expect("ApplyFinal guarantees queued geometry");
             self.configure_task(qh, object, configure)?;
             if configure.remember {
                 let package = &self
@@ -1472,6 +1499,7 @@ impl App {
             frame: frame.frame,
             buffer: frame.buffer,
             release_point,
+            submitted_at: Instant::now(),
             submitted_nanos,
             trace: frame_trace,
         });
@@ -1491,6 +1519,7 @@ impl App {
 
     fn release_ready_frames(&mut self) -> Result<(), PresenterError> {
         let mut ready = Vec::new();
+        let now = Instant::now();
         while let Some(object) = self.task_work.pop(readiness::FRAMES) {
             let Some(task) = self.tasks.get_mut(&object) else {
                 continue;
@@ -1529,8 +1558,26 @@ impl App {
                 // Only the compositor's real release fence controls reuse.
                 // Presentation feedback retains its own bounded frame identity.
                 if pending.release_point > sync.timeline.signalled_point()? {
+                    let stalled_for = now.saturating_duration_since(pending.submitted_at);
+                    if stalled_for >= FRAME_RELEASE_RESTART_AFTER {
+                        return Err(PresenterError::FrameReleaseStalled {
+                            object,
+                            frame: pending.frame,
+                            buffer: pending.buffer,
+                            pending: task.pending.len(),
+                            age_ms: stalled_for.as_millis(),
+                        });
+                    }
+                    if task.frame_release_watchdog.wake_due(now, stalled_for) {
+                        task.frame_release_watchdog.record_wake(now);
+                        if let Some(surface) = task.surface() {
+                            surface.damage_buffer(0, 0, 1, 1);
+                            surface.commit();
+                        }
+                    }
                     break;
                 }
+                task.frame_release_watchdog.reset();
                 let pending = task.pending.pop_front().expect("front was present");
                 if let Some(audit) = task.presentation_audit.as_mut() {
                     audit.released(pending.submitted_nanos, monotonic_timestamp_nanos()?);
@@ -1539,6 +1586,7 @@ impl App {
             }
             if task.pending.is_empty() {
                 self.task_work.frames.remove(&object);
+                task.frame_release_watchdog.reset();
             }
             let fallback = task.pending.iter().any(|pending| {
                 task.targets
@@ -3628,7 +3676,6 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                         _ => return,
                     }
                     tool.dirty_buttons = true;
-                    return;
                 }
                 let action = match button_state {
                     WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
@@ -3644,11 +3691,13 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                     .iter()
                     .find(|t| t.tool_id == tool_id)
                     .and_then(|t| t.surface.clone());
-                if let Some(surface) = surface
-                    && let Some(object) = state.task_for_surface(&surface)
-                {
+                let target_object = surface
+                    .as_ref()
+                    .and_then(|s| state.task_for_surface(s))
+                    .or(state.focused);
+                if let Some(object) = target_object {
                     tablet_trace!(
-                        "Droidloom tablet: Button tool_id={tool_id}, button={button}, action={action:?}"
+                        "Droidloom tablet: Button tool_id={tool_id}, button={button:#x}, action={action:?}, target={object:?}"
                     );
                     let _ = state.send_input(
                         object,
@@ -4739,6 +4788,11 @@ fn poll_sources(
         .clipboard
         .unblock_deadline()
         .filter(|_| app.clipboard.blocked());
+    let watchdog_deadline = app.tasks.values().filter_map(|task| {
+        task.pending.front().map(|pending| {
+            task.frame_release_watchdog.deadline(now, pending.submitted_at)
+        })
+    }).min();
     let deadline = clipboard_deadline
         .into_iter()
         .chain(fallback_deadline)
@@ -4750,6 +4804,7 @@ fn poll_sources(
                 .filter_map(|task| task.resize.deadline(now)),
         )
         .chain(app.tasks.values().filter_map(|task| task.controls_until))
+        .chain(watchdog_deadline)
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.
@@ -4769,6 +4824,14 @@ fn poll_sources(
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error.into());
+        }
+    }
+    let poll_now = Instant::now();
+    for (&object, task) in &app.tasks {
+        if let Some(pending) = task.pending.front() {
+            if poll_now.saturating_duration_since(pending.submitted_at) >= FRAME_RELEASE_WAKE_AFTER {
+                app.task_work.mark(object, readiness::FRAMES);
+            }
         }
     }
     app.clipboard.notify_ready(descriptors);
@@ -5117,6 +5180,7 @@ mod tests {
             applied_opaque: None,
             composed_root: false,
             focused: false,
+            frame_release_watchdog: FrameReleaseWatchdog::default(),
             unmap_requested: false,
             closing: false,
         };
