@@ -129,7 +129,6 @@ const TARGET_POOL_LENGTH: usize = 3;
 const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 const FRAME_RELEASE_WAKE_AFTER: Duration = Duration::from_millis(500);
 const FRAME_RELEASE_WAKE_INTERVAL: Duration = Duration::from_secs(2);
-const FRAME_RELEASE_RESTART_AFTER: Duration = Duration::from_secs(5);
 const LEFT_BUTTON: u32 = 0x110;
 const PAD_BUTTON_BASE: u32 = 0x106;
 const PAD_BUTTON_COUNT: u32 = 4;
@@ -175,16 +174,6 @@ enum PresenterError {
     },
     #[error("Droidloom configuration is invalid: {0}")]
     Configuration(&'static str),
-    #[error(
-        "visible frame release stalled for {age_ms} ms; task={object:?} frame={frame:?} buffer={buffer:?} pending={pending}"
-    )]
-    FrameReleaseStalled {
-        object: TaskObjectId,
-        frame: FrameId,
-        buffer: BufferId,
-        pending: usize,
-        age_ms: u128,
-    },
     #[error("window decoration failure: {0}")]
     WindowDecoration(String),
 }
@@ -263,14 +252,11 @@ impl FrameReleaseWatchdog {
 
     fn deadline(&self, now: Instant, submitted_at: Instant) -> Instant {
         let wake = submitted_at + FRAME_RELEASE_WAKE_AFTER;
-        let restart = submitted_at + FRAME_RELEASE_RESTART_AFTER;
-        if now >= restart {
-            now
-        } else if now < wake {
+        if now < wake {
             wake
         } else {
             self.wake_sent_at
-                .map_or(now, |sent| (sent + FRAME_RELEASE_WAKE_INTERVAL).min(restart))
+                .map_or(now, |sent| sent + FRAME_RELEASE_WAKE_INTERVAL)
         }
     }
 
@@ -944,22 +930,43 @@ impl App {
         let actionable = self
             .tasks
             .iter()
-            .filter(|(_, task)| task.accepts_present() && task.resize.ready(now))
+            .filter(|(_, task)| task.accepts_present() && task.resize.action(now).is_some())
             .map(|(object, _)| *object)
             .collect::<Vec<_>>();
         for object in actionable {
             self.task_work.mark(object, readiness::RESIZE);
         }
         while let Some(object) = self.task_work.pop(readiness::RESIZE) {
-            let Some(task) = self.tasks.get_mut(&object) else {
+            let Some(task) = self.tasks.get(&object) else {
                 continue;
             };
-            if !task.accepts_present() || !task.resize.ready(now) {
+            if !task.accepts_present() {
                 continue;
             }
-            let Some(configure) = task.resize.take() else {
+            let Some(action) = self
+                .tasks
+                .get(&object)
+                .expect("checked above")
+                .resize
+                .action(now)
+            else {
                 continue;
             };
+            let resize::Action::ApplyFinal(_) = action else {
+                let task = self.tasks.get_mut(&object).expect("checked above");
+                task.surface()
+                    .expect("accepts_present guarantees a mapped window")
+                    .commit();
+                task.resize.committed();
+                continue;
+            };
+            let configure = self
+                .tasks
+                .get_mut(&object)
+                .expect("checked above")
+                .resize
+                .take()
+                .expect("ApplyFinal guarantees queued geometry");
             self.configure_task(qh, object, configure)?;
             if configure.remember {
                 let package = &self
@@ -1560,15 +1567,6 @@ impl App {
                 if pending.release_point > sync.timeline.signalled_point()? {
                     if task.pending.len() > 1 {
                         let stalled_for = now.saturating_duration_since(pending.submitted_at);
-                        if stalled_for >= FRAME_RELEASE_RESTART_AFTER {
-                            return Err(PresenterError::FrameReleaseStalled {
-                                object,
-                                frame: pending.frame,
-                                buffer: pending.buffer,
-                                pending: task.pending.len(),
-                                age_ms: stalled_for.as_millis(),
-                            });
-                        }
                         if task.frame_release_watchdog.wake_due(now, stalled_for) {
                             task.frame_release_watchdog.record_wake(now);
                             if let Some(surface) = task.surface() {
@@ -3678,6 +3676,14 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                         _ => return,
                     }
                     tool.dirty_buttons = true;
+                    if tool.surface.is_none()
+                        && let Some(focused) = state.focused
+                        && let Some(task) = state.tasks.get(&focused)
+                        && let Some(surface) = task.surface()
+                    {
+                        tool.surface = Some(surface.clone());
+                    }
+                    state.flush_tablet_tool(tool_id);
                 }
                 let action = match button_state {
                     WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {

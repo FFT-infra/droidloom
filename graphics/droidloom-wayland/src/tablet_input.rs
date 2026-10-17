@@ -18,10 +18,12 @@ impl App {
         else {
             return false;
         };
-        let Some(surface) = tool.surface.as_ref() else {
-            return false;
-        };
-        let Some(object) = self.task_for_surface(surface) else {
+        let surface = tool.surface.clone();
+        let target = surface
+            .as_ref()
+            .and_then(|s| self.task_for_surface(s))
+            .or(self.focused);
+        let Some(object) = target else {
             return false;
         };
         let Some(task) = self
@@ -34,8 +36,16 @@ impl App {
         let Some(route) = task.input_route else {
             return false;
         };
+        let surface = if let Some(s) = surface {
+            s
+        } else if let Some(s) = task.surface() {
+            self.tablet_tool_mut(tool_id).surface = Some(s.clone());
+            s.clone()
+        } else {
+            return false;
+        };
         let scale = (task.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR);
-        let position = self.surface_position(object, surface, (tool.x, tool.y));
+        let position = self.surface_position(object, &surface, (tool.x, tool.y));
         let fixed = self.fixed_position(object, position);
         let pen = droidloom_input_protocol::Stylus {
             tool: tool_id,
