@@ -3665,6 +3665,17 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
             } => {
                 if state.direct_input.supports_mouse() && matches!(button, 0x14b | 0x14c) {
                     let bit = if button == 0x14b { 1 } else { 2 };
+                    let fallback_surface = state
+                        .tablet_tools
+                        .iter()
+                        .find(|t| t.tool_id == tool_id)
+                        .and_then(|t| t.surface.clone())
+                        .or_else(|| {
+                            state
+                                .focused
+                                .and_then(|f| state.tasks.get(&f))
+                                .and_then(|t| t.surface().cloned())
+                        });
                     let tool = state.tablet_tool_mut(tool_id);
                     match button_state {
                         WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
@@ -3676,12 +3687,8 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                         _ => return,
                     }
                     tool.dirty_buttons = true;
-                    if tool.surface.is_none()
-                        && let Some(focused) = state.focused
-                        && let Some(task) = state.tasks.get(&focused)
-                        && let Some(surface) = task.surface()
-                    {
-                        tool.surface = Some(surface.clone());
+                    if tool.surface.is_none() {
+                        tool.surface = fallback_surface;
                     }
                     state.flush_tablet_tool(tool_id);
                 }

@@ -11,14 +11,14 @@ pub(super) fn tilt_degrees(value: f64) -> i8 {
 
 impl App {
     pub(super) fn send_native_pen(&mut self, tool_id: u32, action: u8) -> bool {
-        let Some(tool) = self
+        let Some((surface, tool_x, tool_y, tool_pressure, tool_tilt, tool_eraser, tool_buttons)) = self
             .tablet_tools
             .iter()
             .find(|tool| tool.tool_id == tool_id)
+            .map(|t| (t.surface.clone(), t.x, t.y, t.pressure, t.tilt, t.eraser, t.buttons))
         else {
             return false;
         };
-        let surface = tool.surface.clone();
         let target = surface
             .as_ref()
             .and_then(|s| self.task_for_surface(s))
@@ -45,7 +45,7 @@ impl App {
             return false;
         };
         let scale = (task.applied_scale_120, FRACTIONAL_SCALE_DENOMINATOR);
-        let position = self.surface_position(object, &surface, (tool.x, tool.y));
+        let position = self.surface_position(object, &surface, (tool_x, tool_y));
         let fixed = self.fixed_position(object, position);
         let pen = droidloom_input_protocol::Stylus {
             tool: tool_id,
@@ -55,12 +55,12 @@ impl App {
             pressure: if matches!(action, 2 | 4 | 5) {
                 0
             } else {
-                tool.pressure
+                tool_pressure
             },
-            tilt_x: tool.tilt.0,
-            tilt_y: tool.tilt.1,
-            eraser: tool.eraser,
-            buttons: tool.buttons,
+            tilt_x: tool_tilt.0,
+            tilt_y: tool_tilt.1,
+            eraser: tool_eraser,
+            buttons: tool_buttons,
         };
         let Ok(timestamp) = monotonic_timestamp_nanos() else {
             return false;
