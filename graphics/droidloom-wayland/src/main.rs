@@ -1590,10 +1590,9 @@ impl App {
     }
 
     fn destroy_task(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
-        let task = self
-            .tasks
-            .get_mut(&object)
-            .ok_or(PresenterError::UnknownTask(object))?;
+        let Some(task) = self.tasks.get_mut(&object) else {
+            return Ok(());
+        };
         task.closing = true;
         task.unmap_requested = true;
         self.task_work.mark(
@@ -1705,10 +1704,9 @@ impl App {
             | EndpointAction::Pong { .. }
             | EndpointAction::SetFrameRate { .. } => {}
             EndpointAction::SetContentState { object, flags } => {
-                self.tasks
-                    .get_mut(&object)
-                    .ok_or(PresenterError::UnknownTask(object))?
-                    .content_opaque = flags & droidloom_denial_protocol::content_state::OPAQUE != 0;
+                if let Some(task) = self.tasks.get_mut(&object) {
+                    task.content_opaque = flags & droidloom_denial_protocol::content_state::OPAQUE != 0;
+                }
             }
             EndpointAction::BindTask { object, task } => {
                 if let Some(window) = self.tasks.get_mut(&object) {
@@ -1727,15 +1725,12 @@ impl App {
                 planes,
             } => self.register_android_buffer(qh, object, buffer, planes)?,
             EndpointAction::UnregisterBuffer { object, buffer } => {
-                let target = self
-                    .tasks
-                    .get_mut(&object)
-                    .ok_or(PresenterError::UnknownTask(object))?
-                    .targets
-                    .remove(&buffer)
-                    .ok_or(PresenterError::UnknownBuffer { object, buffer })?;
-                if let Some(buffer) = target.wayland {
-                    buffer.destroy();
+                if let Some(task) = self.tasks.get_mut(&object) {
+                    if let Some(target) = task.targets.remove(&buffer) {
+                        if let Some(buffer) = target.wayland {
+                            buffer.destroy();
+                        }
+                    }
                 }
             }
             EndpointAction::Present {
@@ -1792,6 +1787,12 @@ impl App {
                 Some(endpoint) => match endpoint.receive_action() {
                     Ok(action) => action,
                     Err(error) if endpoint_would_block(&error) => return Ok(()),
+                    Err(droidloom_denial_endpoint::EndpointError::UnknownObject(object)) => {
+                        eprintln!(
+                            "droidloom-wayland: ignoring late message for retired/unknown task object {object:?}"
+                        );
+                        continue;
+                    }
                     Err(error) => {
                         eprintln!("droidloom-wayland: Android endpoint disconnected: {error}");
                         self.disconnect_endpoint();
@@ -1800,7 +1801,13 @@ impl App {
                 },
                 None => return Ok(()),
             };
-            self.process_action(qh, action)?;
+            if let Err(error) = self.process_action(qh, action) {
+                if matches!(error, PresenterError::UnknownTask(_)) {
+                    eprintln!("droidloom-wayland: ignoring late action for retired task: {error}");
+                } else {
+                    return Err(error);
+                }
+            }
         }
     }
 
