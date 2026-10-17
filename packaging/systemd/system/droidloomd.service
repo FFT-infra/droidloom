@@ -7,6 +7,9 @@ Type=simple
 ExecStart=/usr/bin/droidloomd
 TimeoutStopSec=20s
 KillMode=mixed
+# A kernel OOM kill of one Android process is Android's to handle. The default
+# (stop) would tear down the whole cell and every Droidloom window with it.
+OOMPolicy=continue
 Restart=on-failure
 RestartSec=1s
 RuntimeDirectory=droidloom

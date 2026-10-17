@@ -3177,7 +3177,9 @@ fn poll_sources(
         Err(error) => return Err(PresenterError::Wayland(error.to_string())),
     };
     let now = Instant::now();
+    app.report_stalled_scenes(now);
     let fallback_deadline = app.task_work.deadline(now, RELEASE_POLL_FALLBACK);
+    let stall_deadline = app.stalled_scene_deadline();
     // Pending Wayland events must be dispatched before sleeping. The previous
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
@@ -3269,6 +3271,7 @@ fn poll_sources(
     let deadline = clipboard_deadline
         .into_iter()
         .chain(fallback_deadline)
+        .chain(stall_deadline)
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.

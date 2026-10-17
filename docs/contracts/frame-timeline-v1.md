@@ -37,13 +37,14 @@ T                physical presentation target
 `set_target(epoch, sequence)` is double-buffered state consumed by the next
 `wl_surface.commit`.
 
-- A ready commit is eligible only at its named latch.
-- A commit missing that latch is discarded; the previous surface contents
-  remain current.
+- A commit is latched for its grant only if it is ready by the named latch.
+- A commit missing that latch counts as a miss for its grant. It is not
+  discarded: it applies untargeted once ready, is shown at the next
+  opportunity, and its buffer is released like any other.
 - A late commit is never relabelled onto a later grant.
 - Multiple late commits are never burst to catch up.
-- Expired, unissued, wrong-epoch, inactive, and regressing targets discard only
-  their next buffer update; they are scheduling misses, not client-fatal
+- Expired, unissued, wrong-epoch, inactive, and regressing targets leave only
+  their commit untargeted; they are scheduling misses, not client-fatal
   protocol errors.
 - Cross-client object references remain protocol errors.
 - Untargeted clients retain normal Wayland behavior.
@@ -87,8 +88,9 @@ frame awaiting a grant, or the layer stream's existing single pending scene.
 A newer submission can supersede work which has not consumed a grant. Once
 consumed, the identity is sent with `set_target` before the corresponding
 buffer commit, including changed synchronized children. A late commit keeps
-its identity and is left to the compositor to discard. No presentation
-timestamp is used to reconstruct an identity or to drive a private timer.
+its identity; the compositor records the miss and shows it untargeted. No
+presentation timestamp is used to reconstruct an identity or to drive a
+private timer.
 
 Completion metadata is bounded to 64 composed-frame callbacks and eight scene
 callbacks per task. Exact producers wait for feedback capacity; portable mode

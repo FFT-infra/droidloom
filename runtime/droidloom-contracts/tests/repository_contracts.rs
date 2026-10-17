@@ -215,6 +215,10 @@ fn host_presentation_is_ordinary_wayland_without_plugin_artifacts() {
     assert!(!service.contains("ExecStopPost=/usr/bin/droidloomctl stop"));
     assert!(service.contains("Wants=droidloom-applications.service"));
 
+    let cell_service = fs::read_to_string(root.join("packaging/systemd/system/droidloomd.service"))
+        .expect("read cell service");
+    assert!(cell_service.contains("OOMPolicy=continue"));
+
     let catalog_service =
         fs::read_to_string(root.join("packaging/systemd/user/droidloom-applications.service"))
             .expect("read application catalog service");

@@ -31,9 +31,56 @@ pub(super) struct Globals {
 struct Source {
     metadata: Buffer,
     buffer: Option<wl_buffer::WlBuffer>,
-    sync: BufferSync,
+    lanes: Vec<Lane>,
     ticket: Option<u64>,
+}
+
+/// One timeline for reads of an allocation. Its points complete in order, so
+/// a read starts on it only once its previous read ended. A compositor may
+/// keep a detached read until its next frame; a new read of the unchanged
+/// allocation then starts on another lane, and its scene brings that frame.
+struct Lane {
+    sync: BufferSync,
     availability_wakeup: crate::fence_wakeup::FenceWakeup,
+}
+
+/// Reads one allocation may have in flight before a new one waits.
+const MAX_LANES: usize = 4;
+
+impl Source {
+    /// A lane with no read in flight, if any.
+    fn free_lane(&self, id: u64, reads: &[Read]) -> Option<usize> {
+        (0..self.lanes.len()).find(|&lane| !reads.iter().any(|r| r.buffer == id && r.lane == lane))
+    }
+
+    fn spare_timeline(&self, id: u64, reads: &[Read]) -> bool {
+        self.lanes.len() < MAX_LANES || self.free_lane(id, reads).is_some()
+    }
+}
+
+fn new_lane(
+    syncobj: &SyncobjDevice,
+    sync_manager: &WpLinuxDrmSyncobjManagerV1,
+    qh: &QueueHandle<App>,
+) -> Result<Lane, PresenterError> {
+    let timeline = WaylandTimeline::create(syncobj)?;
+    let fd = timeline.export_descriptor()?;
+    let proxy = sync_manager.import_timeline(fd.as_fd(), qh, ());
+    // SAFETY: eventfd returns a new owned descriptor without pointers.
+    let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if event < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(Lane {
+        sync: BufferSync {
+            timeline,
+            proxy,
+            next_point: 0,
+            // SAFETY: ownership of the successful eventfd transfers once.
+            release_wakeup: Some(unsafe { OwnedFd::from_raw_fd(event) }),
+        },
+        availability_wakeup: crate::fence_wakeup::FenceWakeup::default(),
+    })
 }
 struct View {
     timeline: Option<frame_timeline::Surface>,
@@ -192,6 +239,7 @@ impl Drop for View {
 }
 struct Read {
     buffer: u64,
+    lane: usize,
     ticket: u64,
     point: u64,
     fence_sent: bool,
@@ -202,6 +250,7 @@ pub(super) struct Stream {
     buffers: BTreeMap<u64, Source>,
     staged: wire::Staging<OwnedFd>,
     waiting: Option<PendingCommit>,
+    parked: Option<Parked>,
     views: BTreeMap<u64, View>,
     spare_views: Vec<View>,
     reads: Vec<Read>,
@@ -225,6 +274,19 @@ struct PendingCommit {
     count: u32,
 }
 
+/// Why the stream's scene waits, kept from the first park until the wait ends.
+struct Parked {
+    object: TaskObjectId,
+    scene: Option<u64>,
+    since: Instant,
+    reason: &'static str,
+    reported: bool,
+}
+
+/// A parked scene freezes its window. A wait this long is reported while it
+/// lasts, with what holds it, and again when it ends.
+const PARKED_SCENE_REPORT: Duration = Duration::from_millis(500);
+
 impl Stream {
     pub(super) fn abort_timeline_wait(&mut self) -> Result<(), PresenterError> {
         if let Some(commit) = self.waiting.take() {
@@ -236,7 +298,86 @@ impl Stream {
                 self.ack(-11)?;
             }
         }
+        self.end_wait("aborted");
         Ok(())
+    }
+
+    fn park(&mut self, object: TaskObjectId, commit: PendingCommit, reason: &'static str) {
+        let since = self.parked.as_ref().map_or_else(Instant::now, |p| p.since);
+        let reported = self.parked.as_ref().is_some_and(|p| p.reported);
+        self.parked = Some(Parked {
+            object,
+            scene: commit.scene,
+            since,
+            reason,
+            reported,
+        });
+        self.waiting = Some(commit);
+    }
+
+    fn stall_deadline(&self) -> Option<Instant> {
+        self.parked
+            .as_ref()
+            .filter(|p| !p.reported)
+            .map(|p| p.since + PARKED_SCENE_REPORT)
+    }
+
+    /// Each staged read whose allocation still has an earlier read
+    /// outstanding: where that read stands, and which layer still shows it.
+    fn busy_detail(&self) -> String {
+        use std::fmt::Write as _;
+        let mut detail = String::new();
+        for (l, _) in self.staged.layers() {
+            let Some(b) = self.buffers.get(&l.buffer) else {
+                continue;
+            };
+            let Some(held) = b.ticket.filter(|held| *held != l.ticket) else {
+                continue;
+            };
+            let read = self
+                .reads
+                .iter()
+                .find(|r| r.buffer == l.buffer && r.ticket == held)
+                .map(|r| (r.lane, r.point, r.fence_sent));
+            let signalled =
+                read.and_then(|(lane, ..)| b.lanes[lane].sync.timeline.signalled_point().ok());
+            let lanes = b.lanes.len();
+            let shown_by = self
+                .views
+                .iter()
+                .find(|(_, v)| v.source() == Some((l.buffer, held)))
+                .map(|(id, _)| *id);
+            let in_scene =
+                shown_by.is_some_and(|id| self.staged.layers().iter().any(|(x, _)| x.id == id));
+            let _ = write!(
+                detail,
+                "; layer {} wants buffer {} as ticket {} but ticket {held} is unreleased \
+                 (read lane, point and fence sent {read:?}, signalled point {signalled:?}, \
+                 lanes {lanes}, shown by layer {shown_by:?}, that layer in this scene: \
+                 {in_scene})",
+                l.id, l.buffer, l.ticket,
+            );
+        }
+        detail
+    }
+
+    fn end_wait(&mut self, outcome: &str) {
+        if self.waiting.is_some() {
+            return;
+        }
+        let Some(parked) = self.parked.take() else {
+            return;
+        };
+        let waited = parked.since.elapsed();
+        if parked.reported || waited >= PARKED_SCENE_REPORT {
+            eprintln!(
+                "Droidloom task {}: scene {} {outcome} after waiting {} ms ({})",
+                parked.object.0,
+                parked.scene.unwrap_or(0),
+                waited.as_millis(),
+                parked.reason,
+            );
+        }
     }
     pub fn busy(&self) -> bool {
         !self.reads.is_empty()
@@ -246,12 +387,12 @@ impl Stream {
             .then_some((self.requests.as_fd().as_raw_fd(), readiness::REQUESTS))
             .into_iter()
             .chain(self.reads.iter().flat_map(|read| {
-                let source = self.buffers.get(&read.buffer);
-                let available = source
-                    .and_then(|source| source.availability_wakeup.fd())
+                let lane = self.buffers.get(&read.buffer).map(|b| &b.lanes[read.lane]);
+                let available = lane
+                    .and_then(|lane| lane.availability_wakeup.fd())
                     .filter(|_| self.connected && !read.fence_sent);
-                let released = source
-                    .and_then(|source| source.sync.release_wakeup.as_ref())
+                let released = lane
+                    .and_then(|lane| lane.sync.release_wakeup.as_ref())
                     .map(AsFd::as_fd);
                 [available, released]
                     .into_iter()
@@ -261,16 +402,11 @@ impl Stream {
     }
     pub fn poll_fallback(&self) -> bool {
         self.reads.iter().any(|r| {
+            let lane = self.buffers.get(&r.buffer).map(|b| &b.lanes[r.lane]);
             (self.connected
                 && !r.fence_sent
-                && self
-                    .buffers
-                    .get(&r.buffer)
-                    .is_some_and(|b| b.availability_wakeup.fd().is_none()))
-                || self
-                    .buffers
-                    .get(&r.buffer)
-                    .is_some_and(|b| b.sync.release_wakeup.is_none())
+                && lane.is_some_and(|lane| lane.availability_wakeup.fd().is_none()))
+                || lane.is_some_and(|lane| lane.sync.release_wakeup.is_none())
         })
     }
     fn ack(&self, code: i32) -> Result<(), PresenterError> {
@@ -295,29 +431,43 @@ impl Stream {
         // the real timeline below still decides ownership and safe reuse.
         let mut index = 0;
         while index < self.reads.len() {
-            let read = &mut self.reads[index];
-            let source = self
-                .buffers
-                .get_mut(&read.buffer)
-                .expect("read owns source");
-            if self.connected && !read.fence_sent {
-                if let Some(fence) = source.sync.timeline.try_export_release_fence(read.point)? {
-                    self.events
-                        .send_record(&wire::release_fence(read.ticket), &[fence.as_fd()])?;
-                    read.fence_sent = true;
+            let read = &self.reads[index];
+            let (buffer, lane, ticket, point, fence_sent) = (
+                read.buffer,
+                read.lane,
+                read.ticket,
+                read.point,
+                read.fence_sent,
+            );
+            let source = self.buffers.get_mut(&buffer).expect("read owns source");
+            let timeline = &mut source.lanes[lane].sync.timeline;
+            if self.connected && !fence_sent {
+                if let Some(fence) = timeline.try_export_release_fence(point)? {
+                    // A point exports once. Relabelled reads share it, so this
+                    // fence serves every ticket still waiting for one there.
+                    for read in self.reads.iter_mut().filter(|r| {
+                        r.buffer == buffer && r.lane == lane && r.point == point && !r.fence_sent
+                    }) {
+                        self.events
+                            .send_record(&wire::release_fence(read.ticket), &[fence.as_fd()])?;
+                        read.fence_sent = true;
+                    }
                 }
             }
-            if source.sync.timeline.signalled_point()? < read.point {
+            if timeline.signalled_point()? < point {
                 index += 1;
                 continue;
             }
             // Completion comes from the actual Wayland buffer read. Neither
             // presentation timing nor socket acknowledgements release sources.
-            let packet = wire::response(0x8003, &[read.ticket as u32, (read.ticket >> 32) as u32]);
+            let packet = wire::response(0x8003, &[ticket as u32, (ticket >> 32) as u32]);
             if self.connected {
                 self.events.send_record(&packet, &[])?;
             }
-            source.ticket = None;
+            // A relabelled read shares this point and completes in this pass.
+            if source.ticket == Some(ticket) {
+                source.ticket = None;
+            }
             self.reads.swap_remove(index);
         }
         Ok(())
@@ -465,6 +615,7 @@ impl App {
             buffers: BTreeMap::new(),
             staged: wire::Staging::default(),
             waiting: None,
+            parked: None,
             views: BTreeMap::new(),
             spare_views: Vec::new(),
             reads: Vec::new(),
@@ -483,6 +634,43 @@ impl App {
             .mark(object, readiness::REQUESTS | readiness::CONFIG);
         Ok(())
     }
+    pub(super) fn stalled_scene_deadline(&self) -> Option<Instant> {
+        self.tasks
+            .values()
+            .filter_map(|task| task.layers.as_ref()?.stall_deadline())
+            .min()
+    }
+    /// Report each scene parked for PARKED_SCENE_REPORT once, while its
+    /// window is still frozen, with the state that decides how it can resume.
+    pub(super) fn report_stalled_scenes(&mut self, now: Instant) {
+        for task in self.tasks.values_mut() {
+            let Some(stream) = task.layers.as_mut() else {
+                continue;
+            };
+            if stream.stall_deadline().is_none_or(|due| now < due) {
+                continue;
+            }
+            let parked = stream.parked.as_ref().expect("a stall deadline is parked");
+            let line = format!(
+                "Droidloom task {}: scene {} still waiting after {} ms ({}){}; direct={}, \
+                 queued composed frame={}, scene feedback={}, presentation feedback={}, \
+                 configure={}, timeline: {}",
+                parked.object.0,
+                parked.scene.unwrap_or(0),
+                now.saturating_duration_since(parked.since).as_millis(),
+                parked.reason,
+                stream.busy_detail(),
+                stream.active,
+                task.timeline.queued.is_some(),
+                task.scene_feedback.len(),
+                task.presentation_feedback.len(),
+                task.configure_serial,
+                task.timeline.describe(),
+            );
+            stream.parked.as_mut().unwrap().reported = true;
+            eprintln!("{line}");
+        }
+    }
     pub(super) fn drain_layers(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -497,6 +685,7 @@ impl App {
                 } else {
                     Ok(())
                 };
+                stream.end_wait("retried");
                 self.task_work
                     .layer_fallback(object, stream.poll_fallback());
                 self.tasks.get_mut(&object).unwrap().layers = Some(stream);
@@ -522,6 +711,7 @@ impl App {
                     Err(IpcError::PeerClosed) => {
                         stream.connected = false;
                         stream.waiting = None;
+                        stream.end_wait("dropped at disconnect");
                         stream.staged.clear();
                         stream.hide();
                         if let Some(surface) = self.tasks[&object].surface() {
@@ -715,20 +905,7 @@ impl App {
                 for (i, (p, fd)) in metadata.planes.iter().zip(&fds).enumerate() {
                     params.add(fd.as_fd(), i as u32, p.offset, p.stride, metadata.modifier);
                 }
-                let timeline = WaylandTimeline::create(&self.syncobj)?;
-                let fd = timeline.export_descriptor()?;
-                let proxy = self.sync_manager.import_timeline(fd.as_fd(), qh, ());
-                // SAFETY: eventfd returns a new owned descriptor without pointers.
-                let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-                if event < 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
-                let sync = BufferSync {
-                    timeline,
-                    proxy,
-                    next_point: 0,
-                    release_wakeup: Some(unsafe { OwnedFd::from_raw_fd(event) }),
-                };
+                let lane = new_lane(&self.syncobj, &self.sync_manager, qh)?;
                 let id = metadata.id;
                 let params = params.create(
                     metadata.width as i32,
@@ -741,9 +918,8 @@ impl App {
                     Source {
                         metadata,
                         buffer: None,
-                        sync,
+                        lanes: vec![lane],
                         ticket: None,
-                        availability_wakeup: crate::fence_wakeup::FenceWakeup::default(),
                     },
                 );
                 assert!(stream.imports.insert(imports::Pending {
@@ -755,8 +931,10 @@ impl App {
                 // normal capability fallback, never a fatal Wayland error.
             }
             Request::Unregister(id) => {
+                // Any read in flight keeps the allocation, not only the newest.
                 if stream.imports.contains(id)
-                    || stream.buffers.get(&id).is_none_or(|b| b.ticket.is_some())
+                    || !stream.buffers.contains_key(&id)
+                    || stream.reads.iter().any(|r| r.buffer == id)
                 {
                     return stream.ack(-16);
                 }
@@ -783,6 +961,7 @@ impl App {
                         .events
                         .send_record(&wire::commit_result(scene, -95), &[])?;
                 }
+                stream.end_wait("aborted by SurfaceFlinger");
                 stream.ack(0)?;
             }
             Request::Commit {
@@ -868,6 +1047,7 @@ impl App {
                         buffer: &b.metadata,
                         imported: b.buffer.is_some(),
                         ticket: b.ticket,
+                        spare_timeline: b.spare_timeline(id, &stream.reads),
                     })
                 },
                 |id| stream.views.get(&id).and_then(View::source),
@@ -881,7 +1061,7 @@ impl App {
             // admission and pins producer reads until actual attachment
             // or explicit rejection. Real release eventfds retry it;
             // no wait, polling spin, or fallback render is introduced.
-            stream.waiting = Some(commit);
+            stream.park(object, commit, "busy: a reused buffer is not released yet");
             return Ok(());
         }
         if status != wire::SceneStatus::Ready {
@@ -904,11 +1084,11 @@ impl App {
                 .discard_frame(object, queued.frame.frame)?;
         }
         if task.timeline.exact && task.scene_feedback.len() >= MAX_SCENE_FEEDBACK {
-            stream.waiting = Some(commit);
+            stream.park(object, commit, "presentation feedback limit");
             return Ok(());
         }
         let Some(target) = task.timeline.reserve(monotonic_timestamp_nanos()?) else {
-            stream.waiting = Some(commit);
+            stream.park(object, commit, "no frame grant");
             return Ok(());
         };
         self.commit_layers(
@@ -1051,11 +1231,21 @@ impl App {
                         configure_serial: task.configure_serial,
                     });
                 }
-                if (l.buffer == 0
-                    || stream
+                // A new ticket for the read this view shows relabels it. Any
+                // other new ticket is a new read of the allocation.
+                let held = stream
+                    .buffers
+                    .get(&l.buffer)
+                    .and_then(|b| b.ticket)
+                    .filter(|held| *held != l.ticket);
+                let relabel = held.filter(|held| v.source() == Some((l.buffer, *held)));
+                let new_read = l.buffer != 0
+                    && relabel.is_none()
+                    && stream
                         .buffers
                         .get(&l.buffer)
-                        .is_some_and(|b| b.ticket.is_none()))
+                        .is_some_and(|b| b.ticket != Some(l.ticket));
+                if (l.buffer == 0 || new_read)
                     && let (Some(timeline), Some(grant)) = (&v.timeline, target_grant)
                 {
                     timeline.target(grant);
@@ -1097,8 +1287,21 @@ impl App {
                     v.surface.attach(v.solid.as_ref().map(|(_, b)| b), 0, 0);
                 } else {
                     let b = stream.buffers.get_mut(&l.buffer).unwrap();
-                    if b.ticket.is_none() {
-                        let acquire_point = b
+                    if new_read {
+                        // A read still in flight keeps its lane, such as one
+                        // whose view the compositor has not released since
+                        // composition hid it. assess_scene admitted this read
+                        // only with a free lane or room for one.
+                        let lane = match b.free_lane(l.buffer, &stream.reads) {
+                            Some(lane) => lane,
+                            None => {
+                                b.lanes
+                                    .push(new_lane(&self.syncobj, &self.sync_manager, qh)?);
+                                b.lanes.len() - 1
+                            }
+                        };
+                        let s = &mut b.lanes[lane];
+                        let acquire_point = s
                             .sync
                             .next_point
                             .checked_add(1)
@@ -1107,32 +1310,59 @@ impl App {
                             .checked_add(1)
                             .ok_or(PresenterError::Configuration("layer timeline exhausted"))?;
                         if let Some(fd) = acquire {
-                            b.sync
+                            s.sync
                                 .timeline
                                 .import_acquire_fence(acquire_point, fd.as_fd())?;
                         } else {
-                            b.sync.timeline.signal_acquire(acquire_point)?;
+                            s.sync.timeline.signal_acquire(acquire_point)?;
                         }
-                        b.sync.next_point = release;
-                        b.sync.arm_release_wakeup(release)?;
+                        s.sync.next_point = release;
+                        s.sync.arm_release_wakeup(release)?;
                         // Fence availability unblocks Android callbacks. Completion
                         // separately permits this allocation/timeline to be reused.
-                        b.availability_wakeup.arm(&b.sync.timeline, release)?;
+                        s.availability_wakeup.arm(&s.sync.timeline, release)?;
                         let sync = v.sync.get_or_insert_with(|| {
                             self.sync_manager.get_surface(&v.surface, qh, ())
                         });
                         let (hi, lo) = split_point(acquire_point);
-                        sync.set_acquire_point(&b.sync.proxy, hi, lo);
+                        sync.set_acquire_point(&s.sync.proxy, hi, lo);
                         let (hi, lo) = split_point(release);
-                        sync.set_release_point(&b.sync.proxy, hi, lo);
+                        sync.set_release_point(&s.sync.proxy, hi, lo);
                         v.surface.attach(b.buffer.as_ref(), 0, 0);
                         b.ticket = Some(l.ticket);
                         stream.last_ticket = stream.last_ticket.max(l.ticket);
                         stream.reads.push(Read {
                             buffer: l.buffer,
+                            lane,
                             ticket: l.ticket,
                             point: release,
                             fence_sent: false,
+                        });
+                    } else if let Some(held) = relabel {
+                        // SurfaceFlinger forgets its attachments when it falls
+                        // back to composition and re-sends the read this view
+                        // shows under a new ticket. Keep the attachment: a new
+                        // acquire point on this lane would sit behind the
+                        // unsignalled release point it replaces. The new
+                        // ticket ends with the read it relabels.
+                        let (lane, point, fence_sent) = stream
+                            .reads
+                            .iter()
+                            .find(|r| r.buffer == l.buffer && r.ticket == held)
+                            .map(|r| (r.lane, r.point, r.fence_sent))
+                            .ok_or(PresenterError::Configuration(
+                                "relabelled layer read is not outstanding",
+                            ))?;
+                        b.ticket = Some(l.ticket);
+                        stream.last_ticket = stream.last_ticket.max(l.ticket);
+                        // A point exports one fence. If the relabelled read's
+                        // went out already, this ticket ends by completion.
+                        stream.reads.push(Read {
+                            buffer: l.buffer,
+                            lane,
+                            ticket: l.ticket,
+                            point,
+                            fence_sent,
                         });
                     }
                 }
