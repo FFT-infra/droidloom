@@ -732,7 +732,7 @@ fn private_filesystem_mounts(spec: &CellSpec) -> Vec<LinuxOperation> {
             None,
             Path::new("/dev/input"),
             true,
-            true,
+            false,
             true,
             true,
         ),
@@ -1024,7 +1024,7 @@ mod tests {
                 .any(|op| {
                     matches!(op, LinuxOperation::Mount {
                 kind: MountKind::Tmpfs, source: None, target,
-                read_only: true, nodev: true, nosuid: true, noexec: true,
+                read_only: true, nodev: false, nosuid: true, noexec: true,
             } if target == Path::new("/dev/input"))
                 })
         );

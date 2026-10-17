@@ -40,7 +40,7 @@ scans are never lifecycle authority.
 | `/proc` | private procfs | nosuid, nodev, noexec, hide host processes |
 | `/sys` | minimal read-only projection/synthetic tree | read-only, nosuid, nodev, noexec |
 | `/dev` | private tmpfs | nosuid, strict modes |
-| `/dev/input` | private tmpfs carrying only the pen relay's button/gesture nodes; host owns physical input | read-only, nosuid, nodev, noexec |
+| `/dev/input` | private tmpfs carrying only the pen relay's button/gesture nodes; host owns physical input | read-only, nosuid, noexec |
 | `/dev/pts` | private devpts | nosuid, noexec, newinstance |
 | `/dev/binderfs` | private binderfs | three named devices only |
 

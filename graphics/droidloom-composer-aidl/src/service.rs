@@ -634,11 +634,6 @@ impl ComposerLifecycle {
         self.vsync.update_period(display, configure_refresh_period(configure)?)?;
         let display = i64::try_from(display.0).map_err(|_| service_error(ErrorCode::BadDisplay))?;
         if let Some(callback) = lock(&self.callback)?.as_ref() {
-            // SurfaceFlinger caches physical display modes. onRefresh alone
-            // redraws layers without rereading the changed vsync period.
-            // Reannounce this existing display so it reloads the mode while
-            // preserving its identity; only changed host configures get here.
-            callback.onHotplugEvent(display, DisplayHotplugEvent::CONNECTED)?;
             callback.onRefresh(display)?;
         }
         Ok(())

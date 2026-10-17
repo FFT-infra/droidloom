@@ -1821,7 +1821,7 @@ fn mount_private_input(dev: &Path) -> Result<(), DevelopmentError> {
         .map_err(|source| io_error("create sealed Android input directory", source))?;
     mount_tmpfs(
         &input,
-        "mode=0755,nosuid,nodev,noexec,size=16k,nr_inodes=16",
+        "mode=0755,nosuid,noexec,size=16k,nr_inodes=16",
     )?;
     create_pen_input_nodes(&input, 0, &discover_pen_input_devices()?)?;
     bind_mount(&input, &input, false)?;
