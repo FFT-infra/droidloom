@@ -43,10 +43,11 @@ PRODUCT_PACKAGES += \
     libdroidloom_selinux_compat \
     android.hardware.security.keymint-service.nonsecure \
     android.hardware.health-service.example \
-    android.hardware.power-service.example \
+    android.hardware.power-service.droidloom \
     com.android.hardware.audio.droidloom \
     DroidloomFrameworkDisplayOverlay \
     DroidloomConnectivityOverlay \
+    DroidloomSettingsOverlay \
     android.hardware.ethernet.prebuilt.xml \
     android.hardware.graphics.composer3-service.droidloom \
     droidloom-framework-init \
@@ -68,6 +69,7 @@ PRODUCT_COPY_FILES += \
     vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_input.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_input.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.activities_on_secondary_displays.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.activities_on_secondary_displays.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.app_widgets.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.app_widgets.xml \
+    vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_app_compatibility.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_app_compatibility.xml \
     vendor/droidloom/android/device/droidloom_arm64/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
     vendor/droidloom/android/device/droidloom_arm64/droidloom_primary_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/droidloom_primary_audio_policy_configuration.xml \
     frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
@@ -77,9 +79,15 @@ PRODUCT_COPY_FILES += \
 # Android's loaders derive these exact filenames from the properties:
 # lib{EGL,GLESv1_CM,GLESv2}_mesa.so and vulkan.freedreno.so.
 # The ARM64 Mesa rendering path supports GLES 3.2 (0x00030002 = 196610).
+# The 64-bit-only base has no dex2oat32, so ART must select dex2oat64 for
+# installation and background optimization, as core_64_bit_only.mk does.
+# HWUI reports each frame's work to a hint session, which Droidloom's power
+# service turns into utilization floors for the UI thread and RenderThread.
 PRODUCT_VENDOR_PROPERTIES += \
+    debug.hwui.use_hint_manager=true \
     persist.audio.normal_playback_period_ms=5 \
     ro.zygote=zygote64 \
+    dalvik.vm.dex2oat64.enabled=true \
     ro.vendor.droidloom.surfaceflinger_direct=true \
     ro.vendor.droidloom.surfaceflinger_tasks=true \
     ro.hardware.egl=mesa \

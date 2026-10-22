@@ -1,0 +1,9 @@
+# SYS_NICE sets utilization floors on other applications' threads. readproc
+# lets the service find each session's Mesa driver queue below /proc.
+service vendor.power-droidloom /vendor/bin/hw/android.hardware.power-service.droidloom
+    class hal
+    user system
+    group system readproc
+    capabilities SYS_NICE
+    interface aidl android.hardware.power.IPower/default
+    stdio_to_kmsg

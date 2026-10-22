@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <!--
+      Google Play filters applications by the features a device declares. It
+      also implies hardware features from permissions: BLUETOOTH implies
+      android.hardware.bluetooth, the location permissions imply
+      android.hardware.location, CAMERA implies a camera, and RECORD_AUDIO a
+      microphone. Ordinary phone applications (Telegram, TikTok) are
+      therefore hidden unless the device declares them, even when they work
+      without that hardware.
+
+      Droidloom declares the features of a typical phone. Where the cell has
+      no device behind one, Android's normal "absent or turned off" paths
+      apply: no camera or sensor is enumerated, location comes only from
+      network providers, and Bluetooth and Wi-Fi stay off (the
+      SettingsProvider overlay defaults Bluetooth off).
+
+      Deliberately not declared, because they start stacks that need real
+      hardware or conflict with the host: telephony and telecom (radio
+      services), USB host/accessory (would drive the host's USB gadget), NFC,
+      UWB, biometrics and consumer IR. Vulkan levels are detected at runtime
+      by the framework, not declared here.
+    -->
+    <feature name="android.hardware.bluetooth" />
+    <feature name="android.hardware.bluetooth_le" />
+    <feature name="android.hardware.location" />
+    <feature name="android.hardware.location.network" />
+    <feature name="android.hardware.location.gps" />
+    <feature name="android.hardware.wifi" />
+    <feature name="android.hardware.camera" />
+    <feature name="android.hardware.camera.any" />
+    <feature name="android.hardware.camera.autofocus" />
+    <feature name="android.hardware.camera.flash" />
+    <feature name="android.hardware.camera.front" />
+    <feature name="android.hardware.microphone" />
+    <feature name="android.hardware.audio.output" />
+    <feature name="android.hardware.sensor.accelerometer" />
+    <feature name="android.hardware.sensor.compass" />
+    <feature name="android.hardware.sensor.gyroscope" />
+    <feature name="android.hardware.sensor.light" />
+    <feature name="android.hardware.sensor.proximity" />
+    <!-- The product declares OpenGL ES 3.2 (ro.opengles.version). -->
+    <feature name="android.hardware.opengles.aep" />
+
+    <feature name="android.software.input_methods" />
+    <feature name="android.software.home_screen" />
+    <feature name="android.software.device_admin" />
+    <feature name="android.software.managed_users" />
+    <feature name="android.software.backup" />
+    <feature name="android.software.print" />
+    <feature name="android.software.midi" />
+    <feature name="android.software.autofill" />
+    <feature name="android.software.secure_lock_screen" />
+    <feature name="android.software.companion_device_setup" />
+</permissions>

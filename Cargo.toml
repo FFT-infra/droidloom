@@ -2,6 +2,7 @@
 members = [
     "android/framework/droidloom-window-policy",
     "android/runtime/droidloom-classpath-wrapper",
+    "android/power/droidloom-power",
     "runtime/droidloom-applications",
     "runtime/droidloom-audio",
     "runtime/droidloom-audio-protocol",

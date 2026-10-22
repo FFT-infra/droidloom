@@ -277,9 +277,12 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
     assert!(android_bp.contains("\"android.hardware.graphics.composer3-V5-rust\""));
     assert!(android_bp.contains("crate_root: \"graphics/droidloom-denial-protocol/src/lib.rs\""));
     assert!(android_bp.contains("crate_root: \"graphics/droidloom-denial-ipc/src/lib.rs\""));
+    assert!(android_bp.contains("name: \"android.hardware.power-service.droidloom\""));
+    assert!(android_bp.contains("crate_root: \"android/power/droidloom-power/src/lib.rs\""));
+    assert!(android_bp.contains("\"android.hardware.power-V7-rust\""));
     // Five shared transport/codec crates also build platform variants for WMS
     // and its native input receiver.
-    assert_eq!(android_bp.matches("vendor: true").count(), 12);
+    assert_eq!(android_bp.matches("vendor: true").count(), 14);
 
     let product = fs::read_to_string(
         repository_root().join("android/device/droidloom_arm64/droidloom_arm64.mk"),
@@ -289,6 +292,10 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
     assert!(product.contains("android.hardware.graphics.allocator-service.minigbm"));
     assert!(product.contains("mapper.minigbm"));
     assert!(product.contains("droidloom-classpath-wrapper"));
+    // Hint sessions only help when HWUI opens them and the HAL acts on them.
+    assert!(product.contains("android.hardware.power-service.droidloom"));
+    assert!(!product.contains("android.hardware.power-service.example"));
+    assert!(product.contains("debug.hwui.use_hint_manager=true"));
     assert!(product.contains("DroidloomConnectivityOverlay"));
     assert!(product.contains("android.hardware.ethernet.prebuilt.xml"));
     for forbidden in [

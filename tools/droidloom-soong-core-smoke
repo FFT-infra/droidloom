@@ -608,7 +608,8 @@ mkdir -p "$source_tree/vendor/droidloom"
         libandroid_net_connectivity_com_android_net_module_util_jni \
         "out/soong/.intermediates/packages/modules/Connectivity/service/libservice-connectivity/$connectivity_variant/libservice-connectivity.so" \
         android.hardware.health-service.example \
-        android.hardware.power-service.example \
+        libdroidloom_power \
+        android.hardware.power-service.droidloom \
         com.android.hardware.audio.droidloom \
         libmeminfo \
         libmemevents \
