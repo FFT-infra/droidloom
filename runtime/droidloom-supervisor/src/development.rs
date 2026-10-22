@@ -734,6 +734,10 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
             "remove Android development cmdline",
         ),
         (
+            spec.runtime_dir.join("android-bootconfig"),
+            "remove Android development bootconfig",
+        ),
+        (
             spec.runtime_dir.join("android-cgroups.json"),
             "remove Android development cgroup configuration",
         ),
@@ -2449,7 +2453,21 @@ fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentE
         ),
     )
     .map_err(|source| io_error("write Android development cmdline", source))?;
-    bind_mount(&cmdline, &root.join("proc/cmdline"), true)
+    bind_mount(&cmdline, &root.join("proc/cmdline"), true)?;
+
+    // A host booted by an Android bootloader with a bootconfig carries its own
+    // androidboot values (hardware, serial number, verified boot state).
+    // Android init prefers them to the cmdline, so they would replace the
+    // cell's identity and the KeyMint root of trust: every existing key blob
+    // would then be rejected, and system_server would die unlocking user 0.
+    let bootconfig = root.join("proc/bootconfig");
+    if !bootconfig.exists() {
+        return Ok(());
+    }
+    let empty = spec.runtime_dir.join("android-bootconfig");
+    fs::write(&empty, b"")
+        .map_err(|source| io_error("write Android development bootconfig", source))?;
+    bind_mount(&empty, &bootconfig, true)
 }
 
 fn bind_development_cgroups(
