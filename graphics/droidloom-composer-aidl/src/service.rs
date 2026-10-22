@@ -96,6 +96,34 @@ struct VsyncSchedule {
 struct ScheduledVsync {
     period_nanos: u64,
     next_nanos: u64,
+    // False until a host sample at this period has set the phase.
+    phased: bool,
+}
+
+impl ScheduledVsync {
+    // Start on the host's phase when a sample at this period exists; otherwise
+    // run one period out and take the phase from the first sample that does.
+    fn start(now: u64, period_nanos: u64, phase: Option<(u64, u64)>) -> Self {
+        match phase.filter(|(_, phase_period)| periods_compatible(period_nanos, *phase_period)) {
+            Some((phase, _)) => Self {
+                period_nanos,
+                next_nanos: next_vsync_after(now, phase, period_nanos),
+                phased: true,
+            },
+            None => Self {
+                period_nanos,
+                next_nanos: now.saturating_add(period_nanos),
+                phased: false,
+            },
+        }
+    }
+
+    fn observe(&mut self, now: u64, timestamp_nanos: u64, period_nanos: u64) {
+        if !self.phased && periods_compatible(self.period_nanos, period_nanos) {
+            self.next_nanos = next_vsync_after(now, timestamp_nanos, self.period_nanos);
+            self.phased = true;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -147,23 +175,8 @@ impl VsyncScheduler {
         let now = monotonic_timestamp_nanos()?;
         let mut schedule = lock(&self.shared.schedule)?;
         if enabled {
-            let next_nanos = schedule.presentation_phase.map_or_else(
-                || now.saturating_add(period_nanos),
-                |(phase, phase_period)| {
-                    if periods_compatible(period_nanos, phase_period) {
-                        next_vsync_after(now, phase, period_nanos)
-                    } else {
-                        now.saturating_add(period_nanos)
-                    }
-                },
-            );
-            schedule.displays.insert(
-                display,
-                ScheduledVsync {
-                    period_nanos,
-                    next_nanos,
-                },
-            );
+            let scheduled = ScheduledVsync::start(now, period_nanos, schedule.presentation_phase);
+            schedule.displays.insert(display, scheduled);
         } else {
             schedule.displays.remove(&display);
         }
@@ -178,12 +191,12 @@ impl VsyncScheduler {
         }
         let now = monotonic_timestamp_nanos()?;
         let mut schedule = lock(&self.shared.schedule)?;
+        let phase = schedule.presentation_phase;
         if let Some(active) = schedule.displays.get_mut(&display) {
             if active.period_nanos == period_nanos {
                 return Ok(());
             }
-            active.period_nanos = period_nanos;
-            active.next_nanos = now.saturating_add(period_nanos);
+            *active = ScheduledVsync::start(now, period_nanos, phase);
         }
         // A configure must not enable a clock disabled by SurfaceFlinger.
         drop(schedule);
@@ -275,11 +288,13 @@ impl VsyncScheduler {
             .max(phase_error_max_nanos);
 
         // Presentation feedback is delivered well after the physical vblank.
-        // It is a useful phase seed for the next HWC-vsync enable, but moving
-        // an already-running absolute timer here can delete its imminent tick.
-        // Keep the active clock free-running; SurfaceFlinger periodically
-        // disables HWC vsync after learning the model and gets a fresh phase
-        // through `set_enabled` if it later enables the source again.
+        // Moving a phased clock here could delete its imminent tick, so only
+        // a clock still waiting for its first sample at this period moves.
+        for scheduled in schedule.displays.values_mut() {
+            scheduled.observe(now, timestamp_nanos, period_nanos);
+        }
+        drop(schedule);
+        self.shared.wake.notify_one();
     }
 }
 
@@ -1282,7 +1297,22 @@ fn configure_refresh_period(configure: Configure) -> binder::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_vsync_after, periods_compatible, phase_distance};
+    use super::{next_vsync_after, periods_compatible, phase_distance, ScheduledVsync};
+
+    #[test]
+    fn period_change_keeps_the_host_phase() {
+        let started = ScheduledVsync::start(1_000, 10, Some((83, 10)));
+        assert_eq!((started.next_nanos, started.phased), (1_003, true));
+
+        let mut changed = ScheduledVsync::start(1_000, 20, Some((83, 10)));
+        assert_eq!((changed.next_nanos, changed.phased), (1_020, false));
+        changed.observe(1_005, 997, 10);
+        assert_eq!((changed.next_nanos, changed.phased), (1_020, false));
+        changed.observe(1_005, 991, 20);
+        assert_eq!((changed.next_nanos, changed.phased), (1_011, true));
+        changed.observe(1_006, 1_002, 20);
+        assert_eq!(changed.next_nanos, 1_011);
+    }
 
     #[test]
     fn predicted_vsync_advances_from_the_host_phase_without_drift() {
