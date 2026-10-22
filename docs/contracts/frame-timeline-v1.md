@@ -104,5 +104,5 @@ The shared XMLs are checked byte for byte against Denial's `dev` checkout by
 the Shared Wayland protocols CI workflow. To check a local Denial tree:
 
 ```sh
-DROIDLOOM_DENIAL_SOURCE=/home/logix/denial cargo test --locked -j 1 -p droidloom-contracts --test repository_contracts shared_wayland_protocols_match_denial
+DROIDLOOM_DENIAL_SOURCE=/mnt/development/denial-os/denial cargo test --locked -j 1 -p droidloom-contracts --test repository_contracts shared_wayland_protocols_match_denial
 ```

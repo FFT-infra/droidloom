@@ -1,19 +1,19 @@
 # Working on Droidloom
 
-## Moto Edge 70 test device (.154)
+## Updating Droidloom
 
-- Device workspace: `/mnt/development/moto70edge`.
-- Wi-Fi SSH: `root@192.168.1.154` (Moto Edge 70, `roadstr`, serial `ZY22MMG59D`).
-- Use `/mnt/development/droidloom/.work/moto-ssh` from this checkout; the helper
-  selects the workspace key and verifies the known host key.
-- Host command: `.work/moto-ssh uname -a`.
-- Android command: `.work/moto-ssh --android /system/bin/getprop sys.boot_completed`.
-  Arguments are passed literally; Android commands need absolute paths.
-- Before device work, read `/mnt/development/AGENTS.md`,
-  `/mnt/development/denial-ace3/procedures.md`, and the device workspace's
-  `WORKFLOW.md`. Follow their device identity and activation rules. Android
-  image-only updates require a Droidloom restart, not a phone reboot.
-- This is an ARM64 device; the x86_64 desktop pacman packages do not apply.
+An Android image-only update needs a Droidloom restart, not a reboot. ARM64
+hosts need the ARM64 packages; the x86_64 desktop packages do not apply.
+
+When Droidloom still runs on Android storage created by an earlier release,
+start it on fresh storage rather than carrying that storage forward, even for
+the direct `data`/`metadata` directories without images. Point `data_dir` in
+`/etc/droidloom/cell.json` at a new `host-storage-YYYYMMDD` directory;
+`droidloom-update apply` creates and prepares it. Leave the old directory on
+disk untouched. The user signs in to their Google account again inside Android.
+On 2026-10-19 storage from the 2026-10-16 release could not unlock user 0:
+Keystore rejected the synthetic-password key as an invalid key blob, and
+system_server restarted every 36 s.
 
 ## Play Store catalog reset
 
@@ -68,8 +68,8 @@ Local reference: `.work/translation/bench-reference/result.json`; keep results o
 
 Keep packages, APKs, build outputs, caches and local test journals out of Git.
 Update existing guides instead of adding dated plans. Documentation and ordinary
-development tasks do not authorize installation, hardware operations or restarting
-a user's graphical session.
+development tasks do not authorize installing anything or restarting the user's
+graphical session.
 
 ## Shipping
 

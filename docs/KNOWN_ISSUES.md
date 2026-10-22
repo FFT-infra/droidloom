@@ -102,8 +102,9 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
   (`com.zhiliaoapp.musically/com.ss.android.ugc.aweme.splash.SplashActivity`)
   because launching by package name alone did not resolve the activity.
   Installation also recorded ART `dex2oat32` execution failures (`ENOENT`) for
-  its dex splits, although installation completed and TikTok opened. Compiler
-  selection and ahead-of-time optimization need separate investigation.
+  its dex splits, although installation completed and TikTok opened. The
+  64-bit-only base has no `dex2oat32`; the ARM64 vendor image now sets
+  `dalvik.vm.dex2oat64.enabled=true`, as `core_64_bit_only.mk` does.
   NTE 1.3.1.84649's ARM64 XAPK installs, but revision 15 fails when Unreal
   reserves a 76 GiB arena without `MAP_NORESERVE` on a desktop using heuristic
   overcommit. Revision 16, built from the Digitalis development checkout, fixes

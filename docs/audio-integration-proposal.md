@@ -1,8 +1,7 @@
 # Audio integration proposal
 
-See [Host service integration](architecture.md#host-service-integration-direction)
-for the shared SMS/call/audio ownership model, Linux-generic backend boundaries
-and implementation milestones.
+See [Host service integration](architecture.md#host-service-integration)
+for the audio ownership model and Linux-generic backend boundaries.
 
 Status: shared-pool bridge implemented; host loopback validated and activated
 in the local x86_64 test cell. Fruit Ninja playback through Bluetooth headphones
@@ -369,8 +368,9 @@ The last recorded Moto inspection in
 found no ALSA cards and only PipeWire `auto_null`, without a capture source.
 That is historical evidence and was not rechecked for this source audit. Real
 Moto playback/capture needs host device support as well as this portable bridge;
-null-sink tests cannot prove speaker or microphone operation. Cellular call
-audio, telephony routing, IMS and echo cancellation remain separate milestones.
+null-sink tests cannot prove speaker or microphone operation. Echo cancellation
+remains a separate milestone. Cellular call audio belongs to native telephony,
+outside Droidloom.
 
 ## Pinned source entry points
 

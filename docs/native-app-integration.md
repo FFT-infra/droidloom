@@ -426,7 +426,7 @@ machines into existing services and retain separate bounded channels for input,
 graphics, audio and slower operations. Never perform host I/O while holding
 WindowManager/ActivityManager locks, on InputDispatcher's dispatch thread, or in
 real-time audio callbacks. Backpressure in clipboard or desktop services must
-not stall input, rendering, audio or telephony.
+not stall input, rendering or audio.
 
 Framework-reported package names and Wayland `app_id` values are attribution,
 not independent host credentials. Host policy authenticates the cell and its
@@ -714,9 +714,7 @@ input-to-display latency against the existing path. Unit or package checks alone
 cannot establish these results.
 
 This work is compatible with the Linux ownership model in
-[host service integration](architecture.md#host-service-integration-direction).
-SMS/call history, modem control and host receipt must retain their independent
-lifetimes when Android or the graphical session stops.
+[host service integration](architecture.md#host-service-integration).
 
 Alongside that first slice, unify desktop identity and add normal cold launch.
 Then complete document/link handling, clipboard and IME behavior; add native

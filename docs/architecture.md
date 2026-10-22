@@ -15,7 +15,12 @@ Host focus, resize and close use the existing authenticated Composer task-contro
 endpoint to reach the Rust backend inside system_server. ATMS/WMS validate the
 registered task incarnation and apply normal Android window/lifecycle operations
 directly. A bounded acknowledged queue coalesces obsolete updates; socket waits
-stay outside the WMS lock. InputFlinger owns the native input listener; the
+stay outside the WMS lock. A task's first resize skips the 80 ms debounce: it
+still has Android's provisional freeform launch bounds, and SurfaceFlinger does
+not present a new task until its layer bounds match the window's configured
+size. That initial wait is bounded at 250 ms, then the task is presented anyway
+and the mismatch is logged. Later resizes, including interactive desktop
+resizing, are not gated. InputFlinger owns the native input listener; the
 framework policy handles power changes. IME and SystemUI use authenticated
 descriptor delegation for direct host channels, without a standalone input bridge.
 
@@ -747,6 +752,57 @@ big/little/normal transitions, inherited masks, and unchanged v2 membership.
 Run it as root only inside a disposable private mount namespace; it is not a
 visual test. The Mesa worker test is documented in `android/mesa/README.md`.
 
+### Performance hint sessions
+
+Android's hint sessions name the threads that produce a client's frames and
+report how long each frame's work took against a target. HWUI opens one per
+window for its UI thread and RenderThread when `debug.hwui.use_hint_manager`
+is set, which the vendor image does. The AOSP example power HAL accepted the
+reports and did nothing, so frame threads started every burst of work at
+whatever utilization the kernel last measured: often on a little CPU at its
+lowest frequency. On the Moto, Telegram's dropped frames were "slow issue
+draw commands": RenderThread and driver work on CPUs often at 480 MHz. Fixed
+floors of 512 on those threads made it smooth.
+
+`android.hardware.power-service.droidloom` implements Power AIDL V7. The
+host-testable controller in `android/power/droidloom-power` turns sessions into
+`sched_util_min` floors, which act only while a thread is runnable:
+
+| Event | Floor |
+| --- | --- |
+| Session opened, CPU_LOAD_RESET | At least the baseline, just above the smallest tier |
+| Work over its target | Raised by half the overrun's fraction of the target, 16 to 256 units |
+| Work under 70% of its target | Decays by 4 units per report |
+| CPU_LOAD_UP / CPU_LOAD_DOWN | Plus or minus 128 |
+| CPU_LOAD_SPIKE | Ceiling for the next work, which is not learned from |
+| User interaction (PowerManager INTERACTION boost) | At least midway between baseline and ceiling, and no decay below that until 1.5 s after the last input, as Denial holds its own floors |
+| No report for 10 target periods (100 ms to 2 s), pause | Removed; the learned floor returns with the next report or hint |
+| POWER_EFFICIENCY, close, thread removed | Removed |
+| Battery saver (LOW_POWER mode) | Capped at the baseline |
+
+The ceiling is 80% of the largest capacity tier with at least two CPUs:
+schedutil then runs that tier at its highest frequency. A higher floor would
+push both of an application's frame threads onto a single prime CPU. On the
+Moto (capacities 364/829/1024) baseline, interaction and ceiling are 428, 545
+and 663. A thread in several sessions takes the highest of their floors.
+Real-time threads never go below the kernel's RT default.
+
+Mesa's gallium driver queue (`<process>:gdrvN`) performs the driver half of
+every GL frame, but no Android API can name it. Each session therefore also
+floors the driver queue threads of its own process, found by that name at
+session creation, on RESET/RESUME hints and at most once per second while the
+session has a floor. This is the only thread-name match.
+
+The service runs as `system` with `CAP_SYS_NICE` and `readproc`, and accepts
+sessions only from root or `system` callers, which have validated the threads.
+It works because the development cell has no user namespace, so Android's
+`CAP_SYS_NICE` is the host's. The production UID map will need a host-side
+actuator behind the same `Actuator` trait. The service advertises no message
+queue channel, CPU/GPU headroom or composition data, and returns a channel
+without an event flag, which HintManagerService treats as "Binder reports".
+`dumpsys android.hardware.power.IPower/default` prints sessions, floors and
+the applied clamps.
+
 ### Implementation validation on Moto
 
 The final `cpu-placement2` bundle booted Android successfully with all three
@@ -889,151 +945,75 @@ a kernel upgrade. Verify effective masks, profile success, child inheritance,
 foreground/background transitions and background exceptions before treating the
 Android integration as complete.
 
-## Host service integration direction
+## Host service integration
 
-Proposal for review, 2026-09-12. This extends the SMS and audio proposals into a
-Linux-generic architecture. It is not an implemented capability claim.
+Proposed 2026-09-12 for SMS, calls and audio; narrowed to audio on 2026-10-21.
+This section describes ownership, not implemented capability. The audio bridge's
+status is in the [audio proposal](audio-integration-proposal.md).
+
+### Telephony is out of scope
+
+Decision of 2026-10-21: Droidloom does not handle telephony (calls, SMS, MMS or
+the modem). Core telephony stays native. The Phonewave modem service
+(`phonewave/services/modem/`) owns the modem and offers its own API to the
+native Dialer and Messages apps. Droidloom only runs optional third-party
+Android apps, and its image declares no telephony or telecom features.
+
+This withdraws the earlier plans for a Droidloom radio HAL, a host
+communications service with a shared message store, and a ModemManager
+backend.
 
 ### Product contract and ownership
 
 Droidloom should make Android a client of Linux-owned services. Android apps
 retain Android APIs, permissions and familiar behavior; native Linux clients
-can access the same underlying devices and communications without Android
-running. The lifecycle supervisor continues to construct cells; it must not
-become the modem controller, message database, audio engine and notification
-server in one privileged process.
+can access the same underlying devices without Android running. The lifecycle
+supervisor continues to construct cells; it must not become the audio engine
+and notification server in one privileged process.
 
 | Responsibility | Authority |
 | --- | --- |
-| Physical modem, SIM operations, network registration, modem protocols | Host telephony backend; initially ModemManager |
-| Durable message identities, submission outcomes, delivery journal, client reconciliation | Host communications service |
-| Physical call state | Host telephony backend; communications service arbitrates client commands |
 | Physical audio devices and stream graph | PipeWire with host session-manager policy |
-| Android app permissions, SMS role, telephony/Telecom and audio APIs | Existing Android framework plus narrowly scoped adapters |
-| Android conversation/provider records | Android view reconciled with host message state |
+| Android app permissions and audio APIs | Existing Android framework plus narrowly scoped adapters |
 | User assignment, grants, privacy and presentation ownership | Host policy plus Android app permissions |
 | Cell construction, authenticated endpoint delegation and teardown | Existing Droidloom supervisor |
-
-The host message store is a new proposal. It extends the earlier SMS plan,
-which retained Android-owned conversation storage without a shared native
-history. Android still needs its TelephonyProvider and normal app-facing APIs;
-its records become a reconciled view of host message state. HAL integration
-alone cannot synchronize read/deleted/sent history with native apps.
 
 ### Service boundaries
 
 Use Rust for new host services, transport codecs/state machines, and Android
 AIDL adapters where supported by the pinned product. Retain the existing
-Android framework. ModemManager and the underlying Linux libraries remain their
+Android framework. PipeWire and the underlying Linux libraries remain their
 existing implementations; this is not a rewrite of all dependencies in Rust.
 
-Proposed source boundaries (names are illustrative, not existing APIs):
-
-- `runtime/droidloom-communications`: modem discovery, subscriptions, SMS/call
-  domain operations, policy-aware durable delivery and native D-Bus API.
 - `runtime/droidloom-audio`: per-user PipeWire integration and negotiated stream
-  control; separate process and failure domain from telephony.
-- Shared protocol/types/state crates: capability negotiation, event cursors,
-  request correlation, session generations, bounded framing and replay rules.
-- Android radio and audio services: implement the appropriate stable AIDL
-  contracts on private Binder; speak the delegated host transport.
-- A narrowly scoped Android framework/provider integration: reconcile shared
-  message history and report read/delete changes. Keep APKs unmodified.
+  control in its own process and failure domain.
+- Android audio service: implements the stable AIDL audio contracts on private
+  Binder and speaks the delegated host transport. Keep APKs unmodified.
 
-Use existing Linux APIs southbound: ModemManager D-Bus, PipeWire,
-WirePlumber/session policy, desktop notifications and logind where available.
-The native communications API is a documented Droidloom interface initially,
-not an invented freedesktop standard. Native clients must explicitly adopt it
-or use an adapter; existing MM clients will not automatically share history.
-Do not expose the unrestricted host system/session bus inside Android.
+Use existing Linux APIs southbound: PipeWire, WirePlumber/session policy,
+desktop notifications and logind where available. Do not expose the
+unrestricted host system/session bus inside Android.
 
-Telephony needs to survive Android and graphical-session exits. Provide an
-independently supervised communications component under a dedicated identity,
-with explicit persistent modem/SIM-to-user assignment. Scope mailboxes by user
-and subscription. A session switch must not transfer a SIM or expose message
-history to the newly active user. Session agents handle UI and user audio;
-headless receipt must not require the presenter. A mobile installation may keep
-an assigned user's audio session alive by policy; a desktop must not silently
-create a root PipeWire instance.
+Session agents handle user audio. A mobile installation may keep an assigned
+user's audio session alive by policy; a desktop must not silently create a root
+PipeWire instance.
 
-Reuse protocol/authentication primitives from graphics, but give communications
-and audio their own endpoints. SMS must not depend on the render loop, and PCM
-must not pass through JSON, D-Bus method payloads or the message journal.
-Use bounded shared-memory audio buffers and negotiated formats with control
-messages on a separate channel. Measure the actual copy count and latency;
-zero-copy is not established by choosing shared memory alone.
+Reuse protocol/authentication primitives from graphics, but give audio its own
+endpoint. PCM must not pass through JSON or D-Bus method payloads. Use bounded
+shared-memory audio buffers and negotiated formats with control messages on a
+separate channel. Measure the actual copy count and latency; zero-copy is not
+established by choosing shared memory alone.
 
-### Start with SMS as the first complete integration
-
-The acceptance scenario is: Android is stopped, an SMS arrives, Linux retains
-it and presents one notification; the user opens Android Messages and sees it,
-replies there, and native Linux clients observe the same submission outcome.
-Then repeat across restarts, duplicate delivery and SIM replacement.
-
-1. Discover the host backend and an explicitly assigned subscription. Enumerate
-   absent, locked, ready and unavailable states; do not assume slot 1, modem 0,
-   QRTR, a particular carrier or a phone-form-factor host.
-2. Subscribe and reconcile using stable host identifiers and event cursors.
-   MM object paths and Android row IDs are mappings, not primary identities.
-3. Persist accepted incoming parts/events before acknowledging ownership of
-   them. Distinguish modem/network ACK from Android-consumption ACK. If the
-   backend acknowledges a transfer-only SMS before durable storage, a broker
-   layered above it cannot close that loss window: that backend must expose a
-   durable handoff or be reported as lacking crash-safe receipt.
-4. Deliver real SMS PDUs into the Android radio path with correct subscription,
-   status and acknowledgement behavior. Android assembles and dispatches via
-   its normal telephony framework. Do not forge public SMS broadcasts or have
-   a host process edit Android's SQLite files.
-5. Add the framework/provider reconciliation boundary for history, sent
-   messages from native clients, read/unread and deletion. Specify stable ID
-   mapping, origin/revision markers, tombstones and conflict rules. Do not
-   trigger SMS re-delivery merely to restore an already-read history record.
-   Deduplicate replay by event identity, not only sender/text/timestamp: two
-   identical messages can be intentional.
-6. Outgoing requests receive durable operation IDs. Separate queued,
-   submitting, accepted, delivered, failed and outcome-unknown. Neither a
-   transport disconnect nor Android retry permits blind retransmission after
-   an ambiguous modem result. Carrier delivery reports are optional evidence,
-   not a universal guarantee.
-7. One component owns user-visible presentation for each message. Reconcile
-   host notifications with Android notifications by stable message identity;
-   the existing notification forwarding cannot deduplicate SMS by itself.
-   Read/delete changes propagate without generating new arrival notifications.
-   Inline reply requires explicit protocol/permission work; it is not supported
-   by the current notification bridge.
-
-A real technical gate remains: Android expects encoded SMS packets and per-part
-status, while stock MM's public SMS API exposes decoded/assembled messages.
-Define separate capabilities for basic native SMS, lossless Android SMS, and
-durable receipt. A versioned generic MM extension or an equivalent backend
-interface may supply the missing packet contract. Do not put QMI WMS calls in
-Droidloom core, or pass an encoded TPDU as MM `Data` (which means payload).
-Do not claim full Android radio compatibility through text reconstruction.
-
-### Extend the same ownership model to calls and audio
-
-Call control and call sound are distinct capabilities. MM can expose voice
-operations on supported modems; that does not prove a usable microphone,
-earpiece, Bluetooth route or carrier IMS service. A Linux-generic call backend
-must report both signaling availability and its audio-path requirements.
-Hardware-specific DSP/ALSA/UCM/routing support belongs below the portable service.
-A backend that cannot provide real call audio must not advertise complete calling.
-
-Maintain one authoritative call identity/state and arbitrate answer/hangup/hold
-commands across Android Telecom and native clients. Reconcile competing commands
-against current state. Android process death should not itself hang up an active
-call; its control UI can reconnect. Define host behavior if no UI/audio session
-is available. Emergency dialing needs a separately validated route and policy;
-never fabricate success or availability from generic voice support.
+### Audio
 
 The Android audio HAL should expose negotiated host outputs/capture to ordinary
 Android apps. PipeWire carries audio; WirePlumber or the selected session manager
 owns device selection and access policy. Linux routing changes, headset removal,
 Bluetooth profile changes, mute and microphone revocation must be reflected
-back into Android. Android audio focus and host communication-stream policy need
-an explicit mapping, so a call can interrupt/duck media without two independent
-managers fighting over global volume. Android master mute must not silently
-become system-wide mute.
+back into Android. Android audio focus and host stream policy need an explicit
+mapping, so a native call or other host stream can interrupt or duck Android
+media without two independent managers fighting over global volume. Android
+master mute must not silently become system-wide mute.
 
 The initial bridge maps Android mix streams to PipeWire through a dedicated
 shared sample pool. Host loopback tests validate pool negotiation in both
@@ -1046,74 +1026,42 @@ App labels supplied by a compromised cell are not trusted host identities.
 
 ### What Linux-generic means
 
-The first supported host profile is Linux with ModemManager, PipeWire and the
-relevant session services. Other backends can implement the same contracts;
-do not implement speculative oFono/ALSA/remote-phone backends before needed.
-Generic does not mean every modem supports SMS/calls, or every distribution
-already exposes the required packet and media APIs.
+The first supported host profile is Linux with PipeWire and the relevant
+session services. Other backends can implement the same contracts; do not
+implement speculative ALSA backends before needed. Generic does not mean every
+distribution already exposes the required media APIs.
 
-No Moto model names, Qualcomm nodes, fixed SIM numbers, driver commands, IMS
-workarounds or kernel release checks belong in Droidloom core. Those remain in
-host drivers, ModemManager/vendor adapters and distribution/device packages.
-Source should be buildable for ARM64 and x86_64 with separate dependencies for
-optional communications and audio. A desktop with no modem still runs Android
-and audio; adding/removing a modem produces capability events without restarting
-the Android cell. An initially non-telephony image may require a different
-product feature profile; never assume all Android feature declarations can be
-changed dynamically. Test the chosen cellular-capable image with no SIM/modem
-and with subsequent insertion.
+No Moto model names, Qualcomm nodes, driver commands or kernel release checks
+belong in Droidloom core. Those remain in host drivers and distribution/device
+packages. Source should be buildable for ARM64 and x86_64 with separate
+dependencies for optional audio. Capabilities distinguish unsupported, absent,
+temporarily unavailable and ready; feature presence is not operational
+readiness.
 
-Capabilities distinguish unsupported, absent, locked, temporarily unavailable
-and ready; feature presence is not operational readiness. RCS is a separate
-service/account transport and does not work in the current setup. SMS success
-does not enable RCS, MMS or IMS.
-
-### Lifecycle, policy and validation
-
-Use event-driven reception. Brief, bounded sleep inhibitors may protect journal
-handoff or a route transition; an inhibitor does not wake already-suspended
-hardware. Real modem wake support is a backend/kernel capability to test.
-An active call may need an explicit host sleep policy; idle telephony must not
-hold a permanent wake lock or repeatedly poll to keep Android alive.
+### Policy and validation
 
 Host permission bounds apply in addition to Android permissions. Grant a cell
-only its assigned subscription and operations; separate send, receive/history,
-call control, SIM administration and microphone grants. Never store/retry PINs
-implicitly. The current preview's root identities and incomplete isolation are
-not production patterns. New device-service authority requires updating the
-threat model as specified there before shipping an implemented boundary.
+only its assigned operations, with microphone grants separate from playback.
+The current preview's root identities and incomplete isolation are not
+production patterns. New device-service authority requires updating the threat
+model as specified there before shipping an implemented boundary.
 
 Validate protocol state machines with fake backends, malformed packets, lost
 responses, queue limits and crash/replay tests on ordinary development hosts.
-Then test the real MM backend on the Moto and a second independent modem/host.
 Validate PipeWire playback/capture on an ordinary working Linux audio machine
 before attributing Moto hardware-driver gaps to the Android bridge. Include
-native/Android coexistence, session changes, Android stopped, no modem, locked
-SIM, USB removal, suspend, reconnect and actual battery measurements. Do not
-promise exactly-once network delivery; prove the local replay/idempotency rules.
-
-Milestones: (1) contracts and native headless SMS service; (2) Android radio and
-shared Messages history; (3) playback/capture and host audio policy; (4) cellular
-calls/Telecom and real call routing. Define the common interfaces first, but
-ship each milestone end-to-end rather than building an unused general platform.
+native/Android coexistence, session changes, Android stopped, suspend, reconnect
+and actual battery measurements.
 
 ### Current evidence from the Moto
-
-The device demonstrates native MM receipt of a real SMS. Outgoing SMS, durable
-receipt across service restart and Android Messages integration are not yet
-validated. The first missing test messages were RCS; that was not an SMS fault.
-The device workspace records an independently proven private-libqmi List
-Messages encoding repair and unproven candidate initialization/routing changes;
-none belongs in generic Droidloom without a portable backend contract.
 
 Read-only inspection on 2026-09-12 found PipeWire and WirePlumber active, but
 `/proc/asound/cards` reported no sound cards and PipeWire exposed only
 `auto_null`, with no capture source. The new host-backed HAL has been tested
 against an isolated host graph. Real Moto audio therefore needs host hardware bring-up as
-well as the portable Android adapter. Calls and IMS remain unvalidated.
+well as the portable Android adapter.
 
-References: [SMS proposal](sms-integration-proposal.md),
-[audio proposal](audio-integration-proposal.md),
+References: [audio proposal](audio-integration-proposal.md),
 [desktop integration](desktop-integration.md), [threat model](threat-model-v2.md),
 [PipeWire session policy](https://docs.pipewire.org/page_session_manager.html),
 [PipeWire access control](https://docs.pipewire.org/page_access.html),

@@ -3,11 +3,12 @@
 - [Install Droidloom and APKs](INSTALL.md): package installation, first start and app management.
 - [Build packages](BUILDING.md): prerequisites, Rust builder and package checks.
 - [Known issues](KNOWN_ISSUES.md): preview limitations and workarounds.
+- [Latency opportunities](latency-opportunities.md): where input and frames lose time, and what to try.
 
-- [Architecture](architecture.md): Android cell, graphics path and source boundaries; [proposed Linux host integration](architecture.md#host-service-integration-direction) for SMS, calls and audio.
+- [Architecture](architecture.md): Android cell, graphics path and source boundaries; [Linux host integration](architecture.md#host-service-integration) for audio. Telephony stays native, outside Droidloom.
 - [Desktop integration](desktop-integration.md): windows, clipboard, notifications and diagnostics.
 - [Native application integration proposal](native-app-integration.md): system-service backends and ordinary Linux application behavior.
-- [Audio bridge and remaining work](audio-integration-proposal.md); [SMS proposal](sms-integration-proposal.md).
+- [Audio bridge and remaining work](audio-integration-proposal.md).
 - [Security requirements](threat-model-v2.md): trust boundaries and isolation limitations.
 
 ## Integration contracts

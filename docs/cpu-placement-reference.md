@@ -24,4 +24,4 @@ Composer also declares `ServiceCapacityLow`, targeting `system-background`. That
 
 I’d reuse Denial’s approach for the host presenter, then repair Android’s profile backend. The kernel already exposes the required controllers.
 
-Saved the findings in [Droidloom’s architecture guide](/mnt/development/droidloom/docs/architecture.md:246). This was inspection only; runtime allocation remains unchanged.
+Saved the findings in [Droidloom’s architecture guide](/mnt/development/denial-os/droidloom/docs/architecture.md:246). This was inspection only; runtime allocation remains unchanged.
