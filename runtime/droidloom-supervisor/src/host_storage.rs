@@ -60,6 +60,11 @@ pub fn validate(parent: &Path) -> io::Result<()> {
 }
 
 /// Provision a new directory layout; never replace images or reset existing data.
+///
+/// Each new directory starts like the root of a freshly formatted image
+/// (0755, root): Android's system services must traverse `/metadata` before
+/// init adjusts anything below it, or aconfigd cannot create the flag storage
+/// and system_server aborts. The private parent keeps host users out.
 pub fn prepare(parent: &Path) -> io::Result<()> {
     check_parent(parent)?;
     reject_legacy(parent)?;
@@ -75,7 +80,7 @@ pub fn prepare(parent: &Path) -> io::Result<()> {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&path)?;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
             }
             Err(e) => return Err(e),
         }
