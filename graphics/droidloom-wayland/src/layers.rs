@@ -463,6 +463,13 @@ impl Stream {
             let packet = wire::response(0x8003, &[ticket as u32, (ticket >> 32) as u32]);
             if self.connected {
                 self.events.send_record(&packet, &[])?;
+            } else {
+                // Retiring a task closes only SF's request socket; its event
+                // reader stays open for the reads it still tracks. Each app's
+                // releases are ordered, so a read left unresolved here would
+                // hold every later release of that app. A reader that is gone
+                // too has nothing left to release.
+                let _ = self.events.send_record(&packet, &[]);
             }
             // A relabelled read shares this point and completes in this pass.
             if source.ticket == Some(ticket) {

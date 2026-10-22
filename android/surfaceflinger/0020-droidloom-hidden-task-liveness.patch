@@ -1,0 +1,43 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 8137de9..aa61c83 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3577,6 +3577,13 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // explicit retirement transaction to Composer, which destroys the
+         // ordinary Denial window through its normal lifecycle.
+         const nsecs_t taskNow = systemTime();
++        // The composition list holds only visible layers, but a hidden task
++        // still exists: display power-off sets the layer stack to -1 and a
++        // task moved to the back stops drawing. Confirm a task that stays
++        // missing against the layer hierarchy, which WindowManager's removal
++        // detaches it from. Composition owns the visible snapshots here, so
++        // read the requested layer state rather than the snapshot list.
++        std::optional<std::unordered_set<int32_t>> attachedTasks;
+         for (auto output = taskOutputs.begin(); output != taskOutputs.end();) {
+             if (taskFrames.find(output->first) == taskFrames.end()) {
+                 output->second.invalidated = true;
+@@ -3595,6 +3602,24 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 ++output;
+                 continue;
+             }
++            if (!attachedTasks) {
++                attachedTasks.emplace();
++                mLayerHierarchyBuilder.getHierarchy().traverse(
++                        [&](const frontend::LayerHierarchy& hierarchy,
++                            const frontend::LayerHierarchy::TraversalPath& path) {
++                            if (path.isClone()) return false;
++                            const int32_t task =
++                                    hierarchy.getLayer()->metadata.getInt32(gui::METADATA_TASK_ID,
++                                                                            -1);
++                            if (task > 0) attachedTasks->insert(task);
++                            return true;
++                        });
++            }
++            if (attachedTasks->count(output->first) != 0) {
++                output->second.missingSince = taskNow;
++                ++output;
++                continue;
++            }
+             ALOGI("Retiring Denial-native output for destroyed Android task %d", output->first);
+             output = taskOutputs.erase(output);
+         }

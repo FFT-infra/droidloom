@@ -79,11 +79,16 @@ pub struct PendingCommand {
 pub struct CommandQueue {
     pending: BTreeMap<u64, PendingCommand>,
     closed: BTreeSet<u64>,
+    resized: BTreeSet<u64>,
     next: u64,
 }
 
 impl CommandQueue {
     /// Coalesce superseded resizes/focus transitions; close supersedes its object's work.
+    ///
+    /// An object's first resize is delivered at once: the task still has
+    /// Android's provisional launch bounds, and its window is not presented
+    /// until the host size is applied. Later resizes are debounced.
     ///
     /// # Errors
     /// Rejects malformed commands, bounded backlog exhaustion and serial overflow.
@@ -113,7 +118,9 @@ impl CommandQueue {
             self.closed.insert(command.object);
         }
         let ready = now
-            + if matches!(command.action, TaskAction::Resize { .. }) {
+            + if matches!(command.action, TaskAction::Resize { .. })
+                && !self.resized.insert(command.object)
+            {
                 RESIZE_DEBOUNCE
             } else {
                 Duration::ZERO
@@ -154,6 +161,7 @@ impl CommandQueue {
         self.pending
             .retain(|_, entry| entry.command.object != object);
         self.closed.remove(&object);
+        self.resized.remove(&object);
     }
 }
 
@@ -172,9 +180,26 @@ mod tests {
     }
 
     #[test]
+    fn first_resize_is_immediate_and_later_resizes_are_debounced() {
+        let mut queue = CommandQueue::default();
+        let now = Instant::now();
+        let resize = |width| command(7, TaskAction::Resize { width, height: 600 });
+        queue.push(resize(400), now).unwrap();
+        let first = queue.ready(now).unwrap();
+        queue.acknowledge(first.serial);
+        queue.push(resize(500), now).unwrap();
+        assert!(queue.ready(now).is_none());
+        assert!(queue.ready(now + RESIZE_DEBOUNCE).is_some());
+        queue.discard(7);
+        queue.push(resize(600), now).unwrap(); // a re-registered object starts again
+        assert!(queue.ready(now).is_some());
+    }
+
+    #[test]
     fn resize_debounce_retains_final_size_and_stale_ack_cannot_remove_successor() {
         let mut queue = CommandQueue::default();
         let now = Instant::now();
+        queue.resized.insert(7);
         queue
             .push(
                 command(
@@ -248,6 +273,7 @@ mod tests {
     fn latest_focus_wins_without_waiting_for_resize_debounce() {
         let mut queue = CommandQueue::default();
         let now = Instant::now();
+        queue.resized.insert(7);
         queue
             .push(
                 command(

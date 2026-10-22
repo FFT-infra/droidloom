@@ -1,0 +1,59 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 1d35b3e..8137de9 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3493,6 +3493,12 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             nsecs_t retryAfter = 0;
+             uint32_t retryAttempts = 0;
+             nsecs_t missingSince = 0;
++            // A new task still has Android's provisional launch bounds when
++            // its first buffers arrive. Hold the first presentation until the
++            // task matches the window's configured size, so the window never
++            // maps showing the provisional frame at its top-left.
++            bool presented = false;
++            nsecs_t geometryWaitSince = 0;
+         };
+         static std::unordered_map<int32_t, DirectTaskOutput> taskOutputs;
+         std::unordered_map<int32_t, DirectTaskFrame> taskFrames;
+@@ -3642,6 +3648,21 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 taskOutput.engine->setHwComposer(mHWComposer.get());
+             }
+             const ui::Size targetSize = taskOutput.window->getTargetSize(*this);
++            if (!taskOutput.presented &&
++                (frame.sourceCrop.getWidth() != targetSize.width ||
++                 frame.sourceCrop.getHeight() != targetSize.height)) {
++                // Bounded: a task that never reaches the configured size, for
++                // example one smaller than its window, is presented anyway.
++                if (taskOutput.geometryWaitSince == 0) taskOutput.geometryWaitSince = taskNow;
++                if (taskNow - taskOutput.geometryWaitSince < 250'000'000) {
++                    taskOutput.invalidated = true;
++                    scheduleComposite(FrameHint::kNone);
++                    continue;
++                }
++                ALOGW("Presenting Android task %d at %dx%d before it reached %dx%d", task,
++                      frame.sourceCrop.getWidth(), frame.sourceCrop.getHeight(),
++                      targetSize.width, targetSize.height);
++            }
+             // Capture before preparation. Asynchronous completions/configures
+             // increment this before scheduling composition, avoiding lost work.
+             const uint64_t workRevision = taskOutput.window->getWorkRevision();
+@@ -3771,6 +3792,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                 publishTiming.outcome(accepted);
+                 publishTiming.stop();
+                 if (accepted) {
++                    taskOutput.presented = true;
+                     taskOutput.invalidated = false;
+                     taskOutput.work.accept(workRevision);
+                     continue;
+@@ -3840,7 +3862,10 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             const int readyFence = renderFence != Fence::NO_FENCE ? renderFence->dup() : -1;
+             status = nativeWindow->queueBuffer(nativeWindow, nativeBuffer, readyFence);
+             taskOutput.invalidated = status != NO_ERROR;
+-            if (status == NO_ERROR) taskOutput.work.accept(workRevision);
++            if (status == NO_ERROR) {
++                taskOutput.presented = true;
++                taskOutput.work.accept(workRevision);
++            }
+             if (status != NO_ERROR) {
+                 ALOGE("Failed to present Android task %d: %d", task, status);
+             }

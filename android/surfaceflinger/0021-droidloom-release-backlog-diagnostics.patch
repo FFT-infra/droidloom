@@ -1,0 +1,224 @@
+diff --git a/services/surfaceflinger/DroidloomLayers.cpp b/services/surfaceflinger/DroidloomLayers.cpp
+index c09d105..79bcb96 100644
+--- a/services/surfaceflinger/DroidloomLayers.cpp
++++ b/services/surfaceflinger/DroidloomLayers.cpp
+@@ -443,13 +443,14 @@ bool droidloomAsyncReleasesEnabled() {
+     return enabled;
+ }
+ void enqueueDroidloomCallback(const std::vector<ReleaseCallbackId>& ids, const void* lane,
+-                             std::function<void(DroidloomReadFences)> callback) {
++                             std::function<void(DroidloomReadFences)> callback,
++                             std::string label) {
+     std::vector<DroidloomReleaseQueue<sp<Fence>>::Key> keys;
+     for (const auto& id : ids) keys.emplace_back(id.bufferId, id.framenumber);
+     reads.defer(keys, lane, [callback = std::move(callback)](DroidloomReadFences fences) {
+         BackgroundExecutor::getInstanceForTransaction().sendCallbacks({
+             [callback, fences = std::move(fences)]() mutable { callback(std::move(fences)); }});
+-    });
++    }, std::move(label));
+ }
+ sp<Fence> mergeDroidloomReleaseFence(const ReleaseCallbackId& id, sp<Fence> fence,
+                                     const DroidloomReadFences& readFences) {
+diff --git a/services/surfaceflinger/DroidloomLayers.h b/services/surfaceflinger/DroidloomLayers.h
+index a83739e..ba80615 100644
+--- a/services/surfaceflinger/DroidloomLayers.h
++++ b/services/surfaceflinger/DroidloomLayers.h
+@@ -21,7 +21,8 @@ class Output;
+ bool droidloomAsyncReleasesEnabled();
+ using DroidloomReadFences = DroidloomReleaseQueue<sp<Fence>>::Fences;
+ void enqueueDroidloomCallback(const std::vector<ReleaseCallbackId>& ids, const void* lane,
+-                             std::function<void(DroidloomReadFences)> callback);
++                             std::function<void(DroidloomReadFences)> callback,
++                             std::string label = {});
+ // Failure to preserve a dependency is fatal: later completion callbacks can
+ // otherwise make BLAST recycle a buffer whose earlier release was withheld.
+ sp<Fence> mergeDroidloomReleaseFence(const ReleaseCallbackId& id, sp<Fence> fence,
+diff --git a/services/surfaceflinger/DroidloomReleaseQueue.h b/services/surfaceflinger/DroidloomReleaseQueue.h
+index f41cb80..c42c1a6 100644
+--- a/services/surfaceflinger/DroidloomReleaseQueue.h
++++ b/services/surfaceflinger/DroidloomReleaseQueue.h
+@@ -2,6 +2,8 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cinttypes>
+ #include <cstdint>
+ #include <functional>
+ #include <map>
+@@ -9,9 +11,12 @@
+ #include <mutex>
+ #include <optional>
+ #include <set>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
++#include <log/log.h>
++
+ namespace android {
+ 
+ // Fence availability is a dependency, never a wait on a callback executor.
+@@ -58,12 +63,14 @@ public:
+ 
+     // Non-null lanes preserve completion order for a listener. Commit
+     // notifications and independent buffer releases use no lane.
+-    void defer(const std::vector<Key>& keys, const void* lane, Callback callback) {
++    void defer(const std::vector<Key>& keys, const void* lane, Callback callback,
++               std::string label = {}) {
+         std::lock_guard dispatch(mDispatchMutex);
+         std::vector<std::function<void()>> ready;
+         {
+             std::lock_guard lock(mMutex);
+-            Job job{{}, lane, std::move(callback)};
++            Job job{{}, lane, std::move(callback), std::move(label),
++                    std::chrono::steady_clock::now()};
+             for (const auto& key : keys) {
+                 auto it = mReads.find(key);
+                 if (it != mReads.end()) job.reads.emplace(key, it->second);
+@@ -79,36 +86,76 @@ private:
+         std::map<Key, std::vector<std::shared_ptr<Read>>> reads;
+         const void* lane;
+         Callback callback;
++        std::string label;
++        std::chrono::steady_clock::time_point queued;
+     };
+     std::vector<std::function<void()>> takeReadyLocked() {
+         std::vector<std::function<void()>> ready;
+         std::set<const void*> blocked;
+         for (auto it = mJobs.begin(); it != mJobs.end();) {
++            // A blocked lane keeps its later jobs in order; skip them without
++            // visiting their reads. Collect fences only for a ready job.
+             bool available = !it->lane || !blocked.contains(it->lane);
+-            Fences fences;
+-            for (const auto& [key, reads] : it->reads) {
+-                for (const auto& read : reads) {
+-                    if (!read->fence) { available = false; break; }
+-                    fences[key].push_back(*read->fence);
+-                }
++            for (auto entry = it->reads.begin(); available && entry != it->reads.end(); ++entry) {
++                available = std::all_of(entry->second.begin(), entry->second.end(),
++                                        [](const auto& read) { return read->fence.has_value(); });
+             }
+             if (!available) {
+                 if (it->lane) blocked.insert(it->lane);
+                 ++it;
+                 continue;
+             }
++            Fences fences;
++            for (const auto& [key, reads] : it->reads) {
++                auto& values = fences[key];
++                for (const auto& read : reads) values.push_back(*read->fence);
++            }
+             ready.push_back([callback = std::move(it->callback), fences = std::move(fences)]() mutable {
+                 callback(std::move(fences));
+             });
+             it = mJobs.erase(it);
+         }
++        noteBacklogLocked();
+         return ready;
+     }
++    // Diagnostic: report a growing backlog at most every two seconds.
++    void noteBacklogLocked() {
++        if (mJobs.size() < 64) return;
++        const auto now = std::chrono::steady_clock::now();
++        if (now < mNextBacklogReport) return;
++        mNextBacklogReport = now + std::chrono::seconds(2);
++        std::map<const void*, std::pair<size_t, const Job*>> lanes;
++        for (const auto& job : mJobs) {
++            auto& entry = lanes[job.lane];
++            if (entry.first++ == 0) entry.second = &job;
++        }
++        ALOGW("Droidloom release backlog: %zu jobs in %zu lanes, %zu tracked keys", mJobs.size(),
++              lanes.size(), mReads.size());
++        for (const auto& [lane, entry] : lanes) {
++            if (entry.first < 8) continue;
++            const Job& job = *entry.second;
++            Key missing{0, 0};
++            size_t waiting = 0;
++            for (const auto& [key, reads] : job.reads) {
++                for (const auto& read : reads) {
++                    if (read->fence) continue;
++                    if (waiting++ == 0) missing = key;
++                }
++            }
++            const auto age =
++                    std::chrono::duration_cast<std::chrono::milliseconds>(now - job.queued).count();
++            ALOGW("Droidloom release backlog lane %p: %zu jobs; first is %lld ms old and waits on "
++                  "%zu reads, buffer %" PRIu64 " frame %" PRIu64 " [%s]",
++                  lane, entry.first, static_cast<long long>(age), waiting, missing.first,
++                  missing.second, job.label.c_str());
++        }
++    }
+     std::mutex mMutex;
+     // Preserve enqueue order across concurrent event/transaction threads.
+     // Callbacks only enqueue work; recursive entry remains safe for callers.
+     std::recursive_mutex mDispatchMutex;
+     std::map<Key, std::vector<std::shared_ptr<Read>>> mReads;
+     std::vector<Job> mJobs;
++    std::chrono::steady_clock::time_point mNextBacklogReport;
+ };
+ } // namespace android
+diff --git a/services/surfaceflinger/TransactionCallbackInvoker.cpp b/services/surfaceflinger/TransactionCallbackInvoker.cpp
+index 66690c5..ce528e2 100644
+--- a/services/surfaceflinger/TransactionCallbackInvoker.cpp
++++ b/services/surfaceflinger/TransactionCallbackInvoker.cpp
+@@ -26,6 +26,12 @@
+ #include "DroidloomLayers.h"
+ #include "BackgroundExecutor.h"
+ #include "Utils/FenceUtils.h"
++#include "FrontEnd/LayerHandle.h"
++#include "Layer.h"
++#include "SurfaceFlinger.h"
++
++#include <android-base/stringprintf.h>
++#include <cinttypes>
+ 
+ #include <binder/IInterface.h>
+ #include <common/FlagManager.h>
+@@ -231,6 +237,8 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+         // A release channel only depends on this buffer, never another app.
+         for (auto& release : mBufferReleases) {
+             const auto id = release.callbackId;
++            const auto releaseLabel = base::StringPrintf("release %" PRIu64 "/%" PRIu64,
++                                                         id.bufferId, id.framenumber);
+             enqueueDroidloomCallback({id}, nullptr,
+                     [release = std::move(release), mergers](DroidloomReadFences reads) {
+                         auto it = mergers->find(release.callbackId);
+@@ -247,7 +255,7 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+                         const auto status = release.channel->writeReleaseFence(
+                                 release.callbackId, fence, release.currentMaxAcquiredBufferCount);
+                         if (status != OK) ALOGE("Droidloom writeReleaseFence failed: %d", status);
+-                    });
++                    }, releaseLabel);
+         }
+         for (auto& stats : listenerStatsToSend) {
+             // Commit acknowledgements unblock BLAST's synchronized frame
+@@ -268,9 +276,18 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+             }
+             if (!completions.transactionStats.empty()) {
+                 std::vector<ReleaseCallbackId> ids;
++                std::string label;
+                 for (const auto& transaction : completions.transactionStats) {
+                     for (const auto& surface : transaction.surfaceStats) {
+                         ids.push_back(surface.previousReleaseCallbackId);
++                        if (label.size() < 120) {
++                            base::StringAppendF(&label, "%slayer %u prev %" PRIu64 "/%" PRIu64,
++                                                label.empty() ? "" : ", ",
++                                                surfaceflinger::LayerHandle::getLayerId(
++                                                        surface.surfaceControl),
++                                                surface.previousReleaseCallbackId.bufferId,
++                                                surface.previousReleaseCallbackId.framenumber);
++                        }
+                     }
+                 }
+                 const auto* lane = completions.listener.get();
+@@ -288,7 +305,7 @@ void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+                             }
+                             interface_cast<ITransactionCompletedListener>(stats.listener)
+                                     ->onTransactionCompleted(stats);
+-                        });
++                        }, std::move(label));
+             }
+         }
+         mReleaseIdToFenceMerger.clear();
