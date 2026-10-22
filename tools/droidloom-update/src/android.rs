@@ -214,6 +214,18 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "frameworks/native",
+        "android/surfaceflinger/0019-droidloom-initial-task-geometry.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0020-droidloom-hidden-task-liveness.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0021-droidloom-release-backlog-diagnostics.patch",
+    ),
+    (
+        "frameworks/native",
         "android/inputflinger/0001-application-token-targeted-injection.patch",
     ),
     (
@@ -639,7 +651,7 @@ pub fn build_targets(
         || targets == TASK_BACKEND_TARGETS;
     let audio_only = targets == AUDIO_TARGETS;
     if !audio_only {
-        remove_retired_input_support(&out.join("target/product").join(product))?;
+        remove_retired_vendor_modules(&out.join("target/product").join(product))?;
     }
     let native_bridge_source = if audio_only || framework_only || product == "droidloom_arm64" {
         None
@@ -713,6 +725,7 @@ pub fn build_targets(
         "runtime/droidloom-audio-protocol",
         "android/audio",
         "android/framework",
+        "android/power",
         "android/lmkd-compat",
         "android/runtime",
         "android/native-bridge",
@@ -956,17 +969,25 @@ fn framework_output(name: &str, product: &str) -> Option<PathBuf> {
     }
 }
 
-fn remove_retired_input_support(product: &Path) -> Result<()> {
+// Files of modules removed from PRODUCT_PACKAGES.
+const RETIRED_VENDOR_FILES: &[&str] = &[
+    "vendor/bin/droidloom-input-bridge",
+    "vendor/framework/droidloom-input-bridge.jar",
+    "vendor/etc/init/droidloom-input-bridge.rc",
+    "vendor/bin/droidloom-task-launcher",
+    "vendor/lib64/libdroidloom_task_launcher.dylib.so",
+    "vendor/framework/droidloom-application-catalog.jar",
+    // Replaced by android.hardware.power-service.droidloom, which registers
+    // the same IPower/default instance.
+    "vendor/bin/hw/android.hardware.power-service.example",
+    "vendor/etc/init/power-default.rc",
+    "vendor/etc/vintf/manifest/power-default.xml",
+];
+
+fn remove_retired_vendor_modules(product: &Path) -> Result<()> {
     // Incremental product trees can retain files from a module removed from
     // PRODUCT_PACKAGES. Never let its old init service enter a new vendor image.
-    for relative in [
-        "vendor/bin/droidloom-input-bridge",
-        "vendor/framework/droidloom-input-bridge.jar",
-        "vendor/etc/init/droidloom-input-bridge.rc",
-        "vendor/bin/droidloom-task-launcher",
-        "vendor/lib64/libdroidloom_task_launcher.dylib.so",
-        "vendor/framework/droidloom-application-catalog.jar",
-    ] {
+    for relative in RETIRED_VENDOR_FILES {
         match fs::remove_file(product.join(relative)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1012,21 +1033,14 @@ mod tests {
     #[test]
     fn retired_service_is_pruned_from_incremental_products_without_removing_neighbors() {
         let root = tempfile::tempdir().unwrap();
-        let retired = [
-            "vendor/bin/droidloom-input-bridge",
-            "vendor/framework/droidloom-input-bridge.jar",
-            "vendor/etc/init/droidloom-input-bridge.rc",
-            "vendor/bin/droidloom-task-launcher",
-            "vendor/lib64/libdroidloom_task_launcher.dylib.so",
-            "vendor/framework/droidloom-application-catalog.jar",
-        ];
+        let retired = RETIRED_VENDOR_FILES;
         for relative in retired {
             write(&root.path().join(relative), b"retired").unwrap();
         }
         let neighbor = root.path().join("vendor/etc/init/droidloom-composer.rc");
         write(&neighbor, b"preserve").unwrap();
-        remove_retired_input_support(root.path()).unwrap();
-        remove_retired_input_support(root.path()).unwrap();
+        remove_retired_vendor_modules(root.path()).unwrap();
+        remove_retired_vendor_modules(root.path()).unwrap();
         assert!(retired.iter().all(|path| !root.path().join(path).exists()));
         assert!(
             !root

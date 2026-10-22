@@ -602,8 +602,117 @@ fn configure_target(repo: &Path, payload: &Path, spec: &Value, user: &str) -> Re
 
 pub struct CrossTarget<'a> {
     pub product: &'a str,
-    pub cell_spec: &'a Path,
+    pub cell: &'a Value,
     pub user: &'a str,
+}
+
+/// Linux target of the ARM64 device programs.
+pub const CROSS_TARGET: &str = "aarch64-unknown-linux-gnu";
+
+/// Cross-compile the host programs for an ARM64 device. The Cargo output is a
+/// persistent cache below `work`, so later builds compile only what changed.
+pub fn host_build(repo: &Path, work: &Path, sysroot: &Path, jobs: usize) -> Result<PathBuf> {
+    let sysroot = sysroot.canonicalize()?;
+    let lib = sysroot.join("usr/lib");
+    if !lib.join("pkgconfig").is_dir() {
+        return fail("the ARM64 sysroot has no usr/lib/pkgconfig");
+    }
+    let root = sysroot
+        .to_str()
+        .filter(|root| !root.contains(char::is_whitespace));
+    let root = root.ok_or("the ARM64 sysroot path must be UTF-8 without whitespace")?;
+    let target = work.join(format!("cargo-{CROSS_TARGET}"));
+    let _lock = Lock::acquire(&work.join("host-cross-build.lock"))?;
+    let mut build = Command::new("cargo");
+    build
+        .current_dir(repo)
+        .env("CARGO_TARGET_DIR", &target)
+        .env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+            "aarch64-linux-gnu-gcc",
+        )
+        .env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            format!(
+                "-C link-arg=--sysroot={root} -C link-arg=-L{root}/usr/lib -C link-arg=-Wl,-rpath-link,{root}/usr/lib"
+            ),
+        )
+        .env("CC_aarch64_unknown_linux_gnu", "aarch64-linux-gnu-gcc")
+        .env("CFLAGS_aarch64_unknown_linux_gnu", format!("--sysroot={root}"))
+        .env("PKG_CONFIG_ALLOW_CROSS", "1")
+        .env("PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu", root)
+        .env(
+            "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu",
+            format!("{root}/usr/lib/pkgconfig:{root}/usr/share/pkgconfig"),
+        )
+        .args(["build", "--locked", "--release", "--target", CROSS_TARGET])
+        .arg(format!("-j{jobs}"));
+    for package in HOST_PACKAGES {
+        build.arg("-p").arg(package);
+    }
+    run_build(&mut build)?;
+    let release = target.join(CROSS_TARGET).join("release");
+    for name in HOST_BINARIES {
+        if !release.join(name).is_file() {
+            return fail(format!("cross build did not produce {name}"));
+        }
+    }
+    println!("ARM64 host programs: {}", release.display());
+    Ok(release)
+}
+
+/// Fields a device profile may set. Runtime mappings belong to the recipe.
+const DEVICE_FIELDS: &[&str] = &[
+    "host_uid",
+    "subordinate_uids",
+    "subordinate_gids",
+    "data_dir",
+    "runtime_dir",
+    "denial_socket",
+    "render_node",
+    "graphics_backend",
+    "gapps_dir",
+    "shared_storage_directories",
+];
+
+/// Combine the product's tracked cell recipe with a device profile from
+/// `packaging/devices`, returning the cell and the device's desktop user.
+pub fn device_cell(repo: &Path, product: &str, device: &str) -> Result<(Value, String)> {
+    if device.is_empty()
+        || !device
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return fail("device names contain only letters, digits and hyphens");
+    }
+    let profile = json(
+        &repo
+            .join("packaging/devices")
+            .join(format!("{device}.json")),
+    )?;
+    if profile["product"].as_str() != Some(product) {
+        return fail(format!("device {device} is not a {product} device"));
+    }
+    let recipe = match product {
+        "droidloom_arm64" => "packaging/cell-spec-arm64.json",
+        _ => return fail("device profiles exist only for droidloom_arm64"),
+    };
+    let mut cell = json(&repo.join(recipe))?;
+    merge_device(&mut cell, &profile["cell"])?;
+    let user = profile["user"]
+        .as_str()
+        .ok_or("device profile has no desktop user")?;
+    Ok((cell, user.to_owned()))
+}
+
+fn merge_device(cell: &mut Value, device: &Value) -> Result<()> {
+    for (field, value) in device.as_object().ok_or("device profile has no cell")? {
+        if !DEVICE_FIELDS.contains(&field.as_str()) {
+            return fail(format!("device profiles cannot set {field}"));
+        }
+        cell[field] = value.clone();
+    }
+    Ok(())
 }
 
 pub fn stage_cross(
@@ -616,7 +725,7 @@ pub fn stage_cross(
 ) -> Result<()> {
     let CrossTarget {
         product,
-        cell_spec,
+        cell,
         user,
     } = target;
     let _lock = Lock::acquire(&work.join("package-build.lock"))?;
@@ -653,7 +762,7 @@ pub fn stage_cross(
         host,
         staging.path(),
     )?;
-    configure_target(repo, staging.path(), &json(cell_spec)?, user)?;
+    configure_target(repo, staging.path(), cell, user)?;
     let notices = staging.path().join("usr/share/licenses/droidloom");
     crate::licenses::project(repo, &notices)?;
     crate::licenses::rust(repo, &notices.join("rust"))?;
@@ -716,5 +825,42 @@ mod tests {
         );
         assert_eq!(candidate["android_file_overrides"], json!(["new"]));
         assert!(preserve_settings(&mut candidate, &existing, 1001).is_err());
+    }
+    #[test]
+    fn device_profiles_set_device_fields_but_not_runtime_mappings() {
+        let mut cell = json!({"host_uid":1001,"android_file_overrides":["recipe"]});
+        merge_device(
+            &mut cell,
+            &json!({"host_uid":1000,"graphics_backend":"drm"}),
+        )
+        .unwrap();
+        assert_eq!(cell["host_uid"], json!(1000));
+        assert_eq!(cell["graphics_backend"], json!("drm"));
+        let mapping = json!({"android_file_overrides":["device"]});
+        assert!(merge_device(&mut cell, &mapping).is_err());
+        assert_eq!(cell["android_file_overrides"], json!(["recipe"]));
+    }
+    #[test]
+    fn tracked_device_profiles_build_complete_cells() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for entry in fs::read_dir(repo.join("packaging/devices")).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_stem().unwrap().to_str().unwrap();
+            let (cell, user) = device_cell(&repo, "droidloom_arm64", name).unwrap();
+            assert!(!user.is_empty());
+            let uid = cell["host_uid"].as_u64().unwrap();
+            assert_eq!(
+                cell["runtime_dir"],
+                json!(format!("/run/droidloom/cells/u{uid}"))
+            );
+            for entry in cell["android_file_overrides"].as_array().unwrap() {
+                let source = entry["source"].as_str().unwrap();
+                assert!(
+                    source.starts_with("/usr/lib/droidloom/current/")
+                        || source == "/usr/lib/droidloom/storage/vold",
+                    "{name}: {source} is not part of the release"
+                );
+            }
+        }
     }
 }

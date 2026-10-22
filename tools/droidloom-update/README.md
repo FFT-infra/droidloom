@@ -43,22 +43,82 @@ ABI 1; SystemUI and the presenter require notification ABI 2.
 SurfaceFlinger and the presenter negotiate asynchronous layer commits and bounded
 allocation imports separately.
 
-For a remote ARM64 host, cross-build the Linux programs with an AArch64 linker
-and a sysroot matching the target's native dependencies. Build the complete
-Android userspace closure on the x86_64 workstation with:
+For a remote ARM64 host, build everything on the x86_64 workstation. These three
+commands are the whole recipe. Every cache is persistent, so repeating them after
+a change compiles only what changed:
 
 ```console
 cargo run --locked -j 1 -p droidloom-update -- --jobs 4 android-build \
   --work .work/arch/build --product droidloom_arm64
+cargo run --locked -j 1 -p droidloom-update -- host-build \
+  --work .work/arch/build --sysroot /path/to/arm64-root
 cargo run --locked -j 1 -p droidloom-update -- bundle-stage \
   --work .work/arch/build --product droidloom_arm64 \
-  --host /path/to/aarch64-unknown-linux-gnu/release --base /path/to/pinned-base/images \
-  --cell-spec /path/to/target-cell.json --user target-user --destination /path/to/new-bundle
+  --host .work/arch/build/cargo-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/release \
+  --base /path/to/pinned-base/images --device aston --destination /path/to/new-bundle
 ```
+
+`host-build` cross-compiles the Linux programs:
+- It uses `aarch64-linux-gnu-gcc`, and takes native libraries and pkg-config
+  files from `--sysroot`, an ARM64 root filesystem such as an Arch Linux ARM
+  root with the target's `-devel` dependencies.
+- Its Cargo output is kept in `cargo-aarch64-unknown-linux-gnu` below the work
+  directory.
+
+`bundle-stage --device NAME` makes the cell from two tracked files:
+- `packaging/cell-spec-arm64.json` is the recipe: images, init and the Android
+  file mappings to the release.
+- `packaging/devices/NAME.json` sets the device fields: desktop user and UID,
+  subordinate ID ranges, data directory, render node, graphics backend, GApps
+  add-on and shared storage.
+
+A profile cannot change runtime mappings, so every device gets the same release.
+To add a device, add a profile; a release never needs hand-edited overrides.
+`--cell-spec FILE --user USER` remains available for one-off cells.
 
 `bundle-stage` verifies pinned base-image hashes and the complete compiled ABI
 pairing without reading the workstation's device configuration or activating
-either machine. The ARM64 vendor includes Freedreno and Panfrost GLES; native
+either machine. Compatibility declarations are image contents, not device
+configuration:
+- the vendor image carries the touchscreen and orientation features,
+  `ro.opengles.version` and `dalvik.vm.dex2oat64.enabled` (the 64-bit-only base
+  has no `dex2oat32`);
+- `android.hardware.droidloom_app_compatibility.xml` declares the features Play
+  infers from ordinary permissions: Bluetooth, location, Wi-Fi, camera,
+  microphone, the common sensors and the standard phone software features.
+  The XML explains why telephony, USB, NFC and biometrics are left out.
+- the SettingsProvider overlay keeps Bluetooth off on fresh data. Data created
+  before that overlay needs `settings put global bluetooth_on 0` once;
+- the pinned base disables `android.hardware.location.network` at compile time;
+  Play implies it only for apps targeting API 20 or older;
+- the compiled `services.jar` reports the detected Vulkan level and version.
+
+Check them in a staged bundle with `debugfs -R 'cat /build.prop'` on
+`var/lib/droidloom/images/images/vendor.raw.img`.
+
+On the target, copy the bundle with sparse-aware rsync, then run its verifier and
+installer as root:
+
+```console
+BUNDLE/usr/bin/droidloom-update verify BUNDLE
+BUNDLE/usr/bin/droidloom-update apply BUNDLE --uid UID --no-start
+```
+
+Root is needed because the release replaces files in `/usr`, `/etc` and the
+systemd unit directories. The verifier needs `unzip` on the target.
+Installation creates the profile's `data_dir` if it does not exist. That
+`data_dir` must be new or previously migrated direct storage (see
+`docs/INSTALL.md`). An optional GApps add-on must be installed at the profile's
+`gapps_dir`, root-owned, and its manifest must name the pinned base images.
+First GApps activation requires fresh Android data. Activation disables
+automatic startup. To start at boot again, link
+`/usr/lib/systemd/system/droidloomd.service` into
+`/etc/systemd/system/multi-user.target.wants/` and the user unit into
+`~/.config/systemd/user/graphical-session.target.wants/`. Do not use
+`systemctl enable`: those unit paths are symlinks into the active release, so
+enable would pin the current release's units.
+After a capability change, clear the Play Store cache, as described in
+`AGENTS.md`. The ARM64 vendor includes Freedreno and Panfrost GLES; native
 ARM execution omits the x86 ISA translator. `graphics_backend=drm_dma_heap`
 selects linear DMA-heap images for DRM drivers without a native minigbm backend,
 while retaining Mesa's native render-node selection. Transfer bundles with

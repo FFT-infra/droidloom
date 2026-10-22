@@ -48,12 +48,23 @@ enum Action {
         base: PathBuf,
         #[arg(long, value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
         product: String,
-        #[arg(long)]
-        cell_spec: PathBuf,
-        #[arg(long)]
-        user: String,
+        /// Tracked profile in packaging/devices; supplies the cell and user.
+        #[arg(long, conflicts_with_all = ["cell_spec", "user"], required_unless_present_all = ["cell_spec", "user"])]
+        device: Option<String>,
+        #[arg(long, requires = "user")]
+        cell_spec: Option<PathBuf>,
+        #[arg(long, requires = "cell_spec")]
+        user: Option<String>,
         #[arg(long)]
         destination: PathBuf,
+    },
+    /// Cross-compile the Linux host programs for an ARM64 device.
+    HostBuild {
+        #[arg(long)]
+        work: PathBuf,
+        /// ARM64 root filesystem providing the target's native libraries.
+        #[arg(long)]
+        sysroot: PathBuf,
     },
     /// Cross-build the complete Android userspace closure, including the vendor image.
     AndroidBuild {
@@ -177,22 +188,39 @@ fn execute(args: Args) -> Result<()> {
             host,
             base,
             product,
+            device,
             cell_spec,
             user,
             destination,
         }) => {
+            let repo = repository(args.source.clone())?;
+            let (cell, user) = match (device, cell_spec, user) {
+                (Some(device), _, _) => assemble::device_cell(&repo, product, device)?,
+                (None, Some(spec), Some(user)) => {
+                    (serde_json::from_slice(&fs::read(spec)?)?, user.clone())
+                }
+                _ => return fail("bundle-stage needs --device, or --cell-spec with --user"),
+            };
             return assemble::stage_cross(
-                &repository(args.source.clone())?,
+                &repo,
                 work,
                 host,
                 base,
                 assemble::CrossTarget {
                     product,
-                    cell_spec,
-                    user,
+                    cell: &cell,
+                    user: &user,
                 },
                 destination,
             );
+        }
+        Some(Action::HostBuild { work, sysroot }) => {
+            let capacity = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(1);
+            let jobs = args.jobs.unwrap_or(capacity).min(capacity);
+            assemble::host_build(&repository(args.source.clone())?, work, sysroot, jobs)?;
+            return Ok(());
         }
         Some(Action::NativeBridgeImage {
             image,
