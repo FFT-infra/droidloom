@@ -1,22 +1,28 @@
 diff --git a/server/Controllers.cpp b/server/Controllers.cpp
-index 43ea13d..0000000 100644
+index 8a2c3be..0000000 100644
 --- a/server/Controllers.cpp
 +++ b/server/Controllers.cpp
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
   * limitations under the License.
   */
  
 +#include <cstdlib>
++#include <unistd.h>
  #include <cinttypes>
  #include <regex>
  #include <set>
-@@ -322,22 +323,31 @@ int Controllers::initIptablesRules() {
+@@ -322,22 +324,36 @@ int Controllers::initIptablesRules() {
  }
  
  void Controllers::init() {
 -    if (initIptablesRules()) {
 +    const bool cellOwnsPacketPolicy = std::getenv("DROIDLOOM_CELL") != nullptr;
-+    const bool iptablesReady = initIptablesRules() == 0;
++    // The cell cannot load the legacy tables. Without them each of the ruleset's
++    // iptables-restore calls fails on its own, seconds in all.
++    const bool legacyTablesLoaded = access("/proc/net/ip_tables_names", F_OK) == 0 &&
++                                    access("/proc/net/ip6_tables_names", F_OK) == 0;
++    const bool iptablesReady =
++            (!cellOwnsPacketPolicy || legacyTablesLoaded) && initIptablesRules() == 0;
 +    if (!iptablesReady && !cellOwnsPacketPolicy) {
          gLog.error("Failed to initialize iptables rules");
          exit(1);
@@ -52,7 +58,7 @@ index 43ea13d..0000000 100644
  
      if (int ret = RouteController::Init(NetworkController::LOCAL_NET_ID)) {
          gLog.error("Failed to initialize RouteController (%s)", strerror(-ret));
-@@ -343,7 +353,13 @@ void Controllers::init() {
+@@ -347,7 +363,13 @@ void Controllers::init() {
  
      netdutils::Status xStatus = XfrmController::Init();
      if (!isOk(xStatus)) {
@@ -79,7 +85,7 @@ index 775bbbb..0000000 100644
  #include <arpa/inet.h>
  #include <errno.h>
  #include <fcntl.h>
-@@ -480,6 +481,11 @@ int modifyIpRoute(uint16_t action, uint16_t flags, uint32_t table,
+@@ -480,6 +481,11 @@ int modifyIpRoute(uint16_t action, uint16_t flags, uint32_t table, const char* i
  //   same interface.
  int modifyIncomingPacketMark(unsigned netId, const char* interface, Permission permission,
                               bool add) {
@@ -91,3 +97,22 @@ index 775bbbb..0000000 100644
      Fwmark fwmark;
  
      fwmark.netId = netId;
+diff --git a/server/main.cpp b/server/main.cpp
+index be9a1d0..0000000 100644
+--- a/server/main.cpp
++++ b/server/main.cpp
+@@ -167,7 +167,13 @@ int main(const int argc, const char* argv[]) {
+     }
+ 
+     std::unique_ptr<NFLogListener> logListener;
+-    {
++    if (getenv("DROIDLOOM_CELL") != nullptr) {
++        // The host owns packet policy and installs no NFLOG rules; the cell's
++        // kernel also rejects nfnetlink_log setup. Its error replies arrive on
++        // the listener thread while the resolver below replaces the process
++        // logger, which aborts netd.
++        gLog.info("Droidloom cell: no wakeup packet logging; the host owns packet policy");
++    } else {
+         auto result = makeNFLogListener();
+         if (!isOk(result)) {
+             ALOGE("Unable to create NFLogListener: %s", toString(result).c_str());

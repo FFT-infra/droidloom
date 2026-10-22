@@ -15,6 +15,9 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const STATE: &str = ".droidloom-gapps.json";
+/// The images the last successful verification covered. Hashing them takes
+/// seconds on every start, and Android cannot boot before they are checked.
+const VERIFIED: &str = "/var/cache/droidloom/gapps-verified.json";
 
 /// Choose only product/`system_ext` from the add-on; system always uses the base.
 pub(crate) fn partition_image(spec: &CellSpec, role: &str) -> PathBuf {
@@ -59,7 +62,102 @@ pub fn validate(spec: &CellSpec) -> Result<()> {
         trusted_file(&partition_image(spec, role))?;
     }
     let manifest = Manifest::load(&directory.join("manifest.json"))?;
-    manifest.verify_images(&spec.image_dir, directory, TARGET_ARCHITECTURE)
+    // Taken before hashing, so an image rewritten meanwhile no longer matches.
+    let checked = Verified::now(spec, directory, &manifest)?;
+    let record = Path::new(VERIFIED);
+    if trusted_file(record).is_ok() && Verified::read(record).ok().as_ref() == Some(&checked) {
+        return Ok(());
+    }
+    manifest.verify_images(&spec.image_dir, directory, TARGET_ARCHITECTURE)?;
+    if let Err(error) = checked.write(record) {
+        eprintln!("droidloom-supervisor: GApps verification not recorded: {error}");
+    }
+    Ok(())
+}
+
+/// The manifest and the image files a verification covered, as the kernel
+/// identifies them: rewriting a file changes its ctime, which no caller sets.
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Verified {
+    manifest: FileDigest,
+    images: Vec<FileIdentity>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> Result<Self> {
+        let meta = fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            size: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+impl Verified {
+    /// The same image paths `Manifest::verify_images` hashes.
+    fn now(spec: &CellSpec, addon: &Path, manifest: &Manifest) -> Result<Self> {
+        let mut images = Vec::new();
+        for (directory, roles) in [
+            (spec.image_dir.as_path(), &manifest.base_images),
+            (addon, &manifest.images),
+        ] {
+            for role in roles.keys() {
+                images.push(FileIdentity::of(
+                    &directory.join("images").join(format!("{role}.img")),
+                )?);
+            }
+        }
+        Ok(Self {
+            manifest: FileDigest::read(&addon.join("manifest.json"))?,
+            images,
+        })
+    }
+
+    fn read(path: &Path) -> Result<Self> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)?.take(65_537).read_to_end(&mut bytes)?;
+        if bytes.len() > 65_536 {
+            return Err("GApps verification record exceeds limit".into());
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let directory = path.parent().ok_or("record without a directory")?;
+        fs::create_dir_all(directory)?;
+        let temporary = directory.join(format!(".gapps-verified-{}.tmp", std::process::id()));
+        let result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&temporary)?;
+            file.write_all(&serde_json::to_vec(self)?)?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -251,5 +349,23 @@ mod tests {
         reconcile_data(redirected.path(), Some(state('a'))).unwrap();
         symlink(outside.path(), redirected.path().join("system")).unwrap();
         assert!(reconcile_data(redirected.path(), Some(state('b'))).is_err());
+    }
+
+    #[test]
+    fn verification_record_matches_only_unchanged_images() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("system.img");
+        fs::write(&image, "image").unwrap();
+        let record = root.path().join("cache/verified.json");
+        let verified = || Verified {
+            manifest: state('a').manifest,
+            images: vec![FileIdentity::of(&image).unwrap()],
+        };
+        verified().write(&record).unwrap();
+        assert_eq!(Verified::read(&record).unwrap(), verified());
+        // Same size and contents, written again: a new ctime.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&image, "image").unwrap();
+        assert_ne!(Verified::read(&record).unwrap(), verified());
     }
 }

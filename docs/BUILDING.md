@@ -738,7 +738,9 @@ package with pacman only when ready; administrator access is needed to write
 the package-owned directory and update the package database. While Droidloom is
 stopped, add `"gapps_dir": "/usr/lib/droidloom/addons/gapps"` to its root-owned
 cell specification. Package installation alone does not activate Google apps.
-The supervisor verifies root ownership and every base/output hash before boot.
+The supervisor verifies root ownership and every base/output hash before boot,
+hashing an image again only after it changed since it last matched
+(`/var/cache/droidloom/gapps-verified.json`).
 An incompatible or missing selected add-on fails startup without falling back.
 
 **First activation requires fresh Android data.** Configure a separately

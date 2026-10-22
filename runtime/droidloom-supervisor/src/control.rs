@@ -250,7 +250,7 @@ impl ActiveCell {
         if let Some(pid) = self.ready_init.get() {
             return Ok(pid);
         }
-        let pid = wait_for_android_init(&self.spec, progress)?;
+        let pid = wait_for_android_init(&self.spec, self.cell.host_pid(), progress)?;
         self.ready_init.set(Some(pid));
         Ok(pid)
     }
@@ -1178,7 +1178,11 @@ fn validate_application_catalog(applications: &[AndroidApplication]) -> Result<(
     Ok(())
 }
 
-fn wait_for_android_init(spec: &CellSpec, progress: &Reporter) -> Result<u32, ControlError> {
+fn wait_for_android_init(
+    spec: &CellSpec,
+    owner: u32,
+    progress: &Reporter,
+) -> Result<u32, ControlError> {
     wait_for_boot(
         ANDROID_READY_TIMEOUT,
         Duration::from_millis(100),
@@ -1186,10 +1190,24 @@ fn wait_for_android_init(spec: &CellSpec, progress: &Reporter) -> Result<u32, Co
             progress
                 .check_cancelled()
                 .map_err(|e| io_error("cancel Android readiness wait", e))?;
+            if owner_exited(owner) {
+                return Err(ControlError::Invalid(format!(
+                    "Android stopped before it was ready.\n{LOG_HINT}"
+                )));
+            }
             android_boot_snapshot(spec)
         },
         |message| progress.report(message),
     )
+}
+
+/// Whether the cell's owner has exited. The daemon reaps it only between
+/// requests, so during a wait it stays a zombie and its PID is not reused.
+fn owner_exited(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| Some(stat.rsplit_once(") ")?.1.starts_with(['Z', 'X'])))
+        .unwrap_or(true)
 }
 
 fn wait_for_boot(

@@ -12,6 +12,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
+use droidloom_supervisor::boot_notice::BootNotice;
 use droidloom_supervisor::control::{
     ControlRequest, DEFAULT_CELL_SPEC, DEFAULT_CONTROL_SOCKET, request, request_with_progress,
 };
@@ -250,6 +251,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(droidloom_supervisor::control::supervise_cell(
                     &cli.socket,
                     &spec,
+                    BootNotice::current(),
                 )?);
             }
             Command::Status => ControlRequest::Status,
@@ -333,7 +335,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         if cli.cell {
-            request(&cli.socket, &control_request)?
+            // The session's start shows the boot notice; recovery closes it.
+            let notice = matches!(control_request, ControlRequest::Start { .. })
+                .then(BootNotice::starting);
+            let response = request(&cli.socket, &control_request);
+            if let Some(notice) = notice {
+                match &response {
+                    Ok(response) if response.ok => {}
+                    Ok(response) => notice.failed(&response.message),
+                    Err(error) => notice.failed(&error.to_string()),
+                }
+            }
+            response?
         } else {
             request_with_progress(&cli.socket, &control_request, &mut report)?
         }

@@ -47,6 +47,11 @@ final class DroidloomApplicationCatalog {
             "com.android.launcher3",
             "com.android.systemui"
     ));
+    // Until the user is unlocked, Android matches only direct-boot-aware
+    // activities. The catalog lists every installed launcher, so a query made
+    // during boot must not read as the other applications' removal.
+    private static final int INSTALLED = PackageManager.MATCH_DIRECT_BOOT_AWARE
+            | PackageManager.MATCH_DIRECT_BOOT_UNAWARE;
 
     private DroidloomApplicationCatalog() {}
 
@@ -121,7 +126,7 @@ final class DroidloomApplicationCatalog {
     private static String iconKey(PackageManager packageManager, ComponentName component)
             throws PackageManager.NameNotFoundException {
         PackageInfo packageInfo = packageManager.getPackageInfo(component.getPackageName(), 0);
-        ActivityInfo activityInfo = packageManager.getActivityInfo(component, 0);
+        ActivityInfo activityInfo = packageManager.getActivityInfo(component, INSTALLED);
         return Long.toUnsignedString(packageInfo.getLongVersionCode()) + ":"
                 + Long.toUnsignedString(packageInfo.lastUpdateTime) + ":"
                 + Integer.toUnsignedString(activityInfo.getIconResource());
@@ -161,12 +166,12 @@ final class DroidloomApplicationCatalog {
         // Keep that hot path entirely on the public SDK; the reflected system
         // API is reserved for future explicitly requested secondary users.
         if (userId == 0) {
-            return packageManager.queryIntentActivities(launcher, 0);
+            return packageManager.queryIntentActivities(launcher, INSTALLED);
         }
         Method query = packageManager.getClass().getMethod(
                 "queryIntentActivitiesAsUser", Intent.class, int.class, int.class);
         query.setAccessible(true);
-        return (List<ResolveInfo>) query.invoke(packageManager, launcher, 0, userId);
+        return (List<ResolveInfo>) query.invoke(packageManager, launcher, INSTALLED, userId);
     }
 
 }

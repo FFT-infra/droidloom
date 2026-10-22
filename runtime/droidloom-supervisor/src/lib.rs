@@ -7,6 +7,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod adb;
+pub mod boot_notice;
 pub mod control;
 mod cpu_placement;
 pub mod development;

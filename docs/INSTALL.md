@@ -120,6 +120,10 @@ a crash loop. Inspect `journalctl --user -u droidloom-recovery.service`, then us
 application state. This watches process exits; a live but hung Android process
 still needs diagnosis.
 
+Each start shows a “Droidloom is starting” notification. Recovery follows
+Android's boot and closes it once Android is ready; if Android does not start,
+the notification says why and stays until dismissed.
+
 ## 4. Try a built-in app
 
 ```console

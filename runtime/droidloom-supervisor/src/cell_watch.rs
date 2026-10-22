@@ -6,8 +6,10 @@ use std::{
 };
 
 use super::{CellState, ControlError, ControlRequest, ControlResponse, io_error, request};
+use crate::boot_notice::BootNotice;
 
-/// Start or attach to the authorized cell and wait for its exact owner to exit.
+/// Start or attach to the authorized cell, follow its boot to readiness for
+/// the boot notice, and wait for its exact owner to exit.
 ///
 /// The user service stops this companion before intentionally stopping Android.
 /// An unexpected exit is an error so systemd restarts the companion with a delay.
@@ -15,7 +17,7 @@ use super::{CellState, ControlError, ControlRequest, ControlResponse, io_error, 
 ///
 /// # Errors
 /// Returns authorization/start failures, inability to watch the owner, and cell exit.
-pub fn supervise_cell(socket: &Path, spec: &Path) -> Result<(), ControlError> {
+pub fn supervise_cell(socket: &Path, spec: &Path, notice: BootNotice) -> Result<(), ControlError> {
     let start = ControlRequest::Start { spec: spec.into() };
     let pid = running_pid(request(socket, &start)?)?;
     let owner = open_owner(pid).map_err(|e| io_error("watch Android cell owner", e))?;
@@ -25,6 +27,12 @@ pub fn supervise_cell(socket: &Path, spec: &Path) -> Result<(), ControlError> {
         return Err(ControlError::Invalid(
             "Android cell changed while attaching recovery".into(),
         ));
+    }
+    // The daemon answers once Android is ready, or as soon as it cannot be.
+    match request(socket, &ControlRequest::WaitReady) {
+        Ok(response) if response.ok => notice.ready(),
+        Ok(response) => notice.failed(&response.message),
+        Err(error) => notice.failed(&error.to_string()),
     }
     eprintln!("watching Android cell owner {pid}; recovery is event-driven");
     wait_for_exit(&owner).map_err(|e| io_error("wait for Android cell exit", e))?;
@@ -112,14 +120,15 @@ mod tests {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
         let server = thread::spawn(move || {
-            for _ in 0..2 {
+            for expected in ["start", "start", "wait"] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut bytes = Vec::new();
                 stream.read_to_end(&mut bytes).unwrap();
-                assert!(matches!(
-                    serde_json::from_slice::<ControlRequest>(&bytes).unwrap(),
-                    ControlRequest::Start { .. }
-                ));
+                let request = serde_json::from_slice::<ControlRequest>(&bytes).unwrap();
+                assert!(match expected {
+                    "start" => matches!(request, ControlRequest::Start { .. }),
+                    _ => matches!(request, ControlRequest::WaitReady),
+                });
                 let response = serde_json::json!({"ok":true,"state":"running","message":"running","host_pid":pid});
                 stream
                     .write_all(&serde_json::to_vec(&response).unwrap())
@@ -128,7 +137,12 @@ mod tests {
             child.kill().unwrap();
             child.wait().unwrap();
         });
-        let error = supervise_cell(&socket, Path::new("/etc/droidloom/cell.json")).unwrap_err();
+        let error = supervise_cell(
+            &socket,
+            Path::new("/etc/droidloom/cell.json"),
+            BootNotice::none(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("scheduling recovery"));
         server.join().unwrap();
     }
