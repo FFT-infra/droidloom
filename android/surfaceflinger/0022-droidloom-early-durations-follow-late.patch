@@ -1,0 +1,28 @@
+diff --git a/services/surfaceflinger/Scheduler/VsyncConfiguration.cpp b/services/surfaceflinger/Scheduler/VsyncConfiguration.cpp
+index 8cbb17c..47f957f 100644
+--- a/services/surfaceflinger/Scheduler/VsyncConfiguration.cpp
++++ b/services/surfaceflinger/Scheduler/VsyncConfiguration.cpp
+@@ -351,13 +351,19 @@ VsyncConfigSet WorkDuration::constructOffsets(nsecs_t vsyncDuration) const {
+     };
+ }
+ 
++// Unset early durations follow the late ones. The members are not initialized
++// while the delegated arguments are evaluated, so read the late properties again.
+ WorkDuration::WorkDuration(Fps currentRefreshRate)
+       : WorkDuration(currentRefreshRate, getProperty("debug.sf.late.sf.duration").value_or(-1),
+                      getProperty("debug.sf.late.app.duration").value_or(-1),
+-                     getProperty("debug.sf.early.sf.duration").value_or(mSfDuration),
+-                     getProperty("debug.sf.early.app.duration").value_or(mAppDuration),
+-                     getProperty("debug.sf.earlyGl.sf.duration").value_or(mSfDuration),
+-                     getProperty("debug.sf.earlyGl.app.duration").value_or(mAppDuration),
++                     getProperty("debug.sf.early.sf.duration")
++                             .value_or(getProperty("debug.sf.late.sf.duration").value_or(-1)),
++                     getProperty("debug.sf.early.app.duration")
++                             .value_or(getProperty("debug.sf.late.app.duration").value_or(-1)),
++                     getProperty("debug.sf.earlyGl.sf.duration")
++                             .value_or(getProperty("debug.sf.late.sf.duration").value_or(-1)),
++                     getProperty("debug.sf.earlyGl.app.duration")
++                             .value_or(getProperty("debug.sf.late.app.duration").value_or(-1)),
+                      getProperty("debug.sf.hwc.min.duration").value_or(0)) {
+     validateSysprops();
+ }

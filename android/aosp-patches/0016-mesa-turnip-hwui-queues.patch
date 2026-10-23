@@ -1,0 +1,45 @@
+Subject: [PATCH] turnip: two queues in the VM_BIND graphics family
+
+Android's HWUI Vulkan pipeline creates two queues in the first graphics
+family, one for rendering and one for texture uploads, and aborts when the
+family has fewer. Each Turnip queue is its own kernel submit queue. Only the
+VM_BIND family gets the second queue: the SET_IOVA path recycles freed
+addresses after queue 0's fence alone. With two queues, barriers between
+back-to-back acquire/release atomics are only removed up to workgroup scope.
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index be6f618..34bc2f3 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1587,11 +1587,16 @@ static const VkQueueFamilyProperties tu_gfx_queue_family_properties = {
+    .minImageTransferGranularity = { 1, 1, 1 },
+ };
+ 
++/* Android's HWUI Vulkan pipeline needs two queues in the graphics family, one
++ * for rendering and one for texture uploads. Only the VM_BIND family offers
++ * them: the kernel orders every queue's submissions after address changes,
++ * while the older SET_IOVA path recycles freed addresses after queue 0 alone.
++ */
+ static const VkQueueFamilyProperties tu_gfx_sparse_queue_family_properties = {
+    .queueFlags =
+       VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+       VK_QUEUE_SPARSE_BINDING_BIT,
+-   .queueCount = 1,
++   .queueCount = 2,
+    .timestampValidBits = 48,
+    .minImageTransferGranularity = { 1, 1, 1 },
+ };
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 53311f1..ffcf944 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2996,7 +2996,8 @@ tu_lower_nir(struct tu_device *dev,
+     * dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.image.guard_local.buffer.vert
+     */
+ 
+-   NIR_PASS(_, nir, nir_opt_acquire_release_barriers, SCOPE_QUEUE_FAMILY);
++   /* The VM_BIND graphics family has two queues; see tu_device.cc. */
++   NIR_PASS(_, nir, nir_opt_acquire_release_barriers, SCOPE_WORKGROUP);
+ 
+    /* This needs to happen before multiview lowering which rewrites store
+     * instructions of the position variable, so that we can just rewrite one

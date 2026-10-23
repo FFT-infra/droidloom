@@ -34,7 +34,7 @@ fn hardware_vulkan_capabilities_follow_the_active_android_loader() {
 
 #[test]
 #[ignore = "requires a host JDK"]
-fn java_vulkan_probe_boundary_fails_without_publishing_features() {
+fn java_vulkan_probe_boundary_and_hwui_default() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let policy = repo.join("android/framework/droidloom-window-policy");
     let temp = tempfile::tempdir().unwrap();
@@ -47,11 +47,22 @@ fn java_vulkan_probe_boundary_fails_without_publishing_features() {
          public static int w(String tag, String message, Throwable failure) { return 0; }\n}\n",
     )
     .unwrap();
+    let properties = temp.path().join("android/os/SystemProperties.java");
+    fs::create_dir_all(properties.parent().unwrap()).unwrap();
+    fs::write(
+        &properties,
+        "package android.os; public final class SystemProperties {\n\
+         private static final java.util.Map<String, String> values = new java.util.HashMap<>();\n\
+         public static String get(String key) { return values.getOrDefault(key, \"\"); }\n\
+         public static void set(String key, String value) { values.put(key, value); }\n}\n",
+    )
+    .unwrap();
     checked(
         Command::new("javac")
             .arg("-d")
             .arg(temp.path())
             .arg(&stub)
+            .arg(&properties)
             .arg(policy.join("java/com/android/server/DroidloomGraphicsCapabilities.java"))
             .arg(policy.join("tests/com/android/server/GraphicsCapabilitiesTest.java")),
     );

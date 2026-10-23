@@ -5,7 +5,7 @@
 #include <jni.h>
 
 extern "C" __attribute__((used, visibility("default")))
-const char DROIDLOOM_VULKAN_CAPABILITIES_ABI[] = "DROIDLOOM_VULKAN_CAPABILITIES_ABI=1;";
+const char DROIDLOOM_VULKAN_CAPABILITIES_ABI[] = "DROIDLOOM_VULKAN_CAPABILITIES_ABI=2;";
 
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_android_server_DroidloomGraphicsCapabilities_probeVulkan(JNIEnv* env, jclass) {
@@ -16,8 +16,9 @@ Java_com_android_server_DroidloomGraphicsCapabilities_probeVulkan(JNIEnv* env, j
     const auto capabilities = droidloom::detectVulkan(getProc);
     dlclose(loader);
     if (!capabilities.version) return nullptr;
-    const jint values[] = {static_cast<jint>(capabilities.version), capabilities.level};
-    jintArray result = env->NewIntArray(2);
-    if (result) env->SetIntArrayRegion(result, 0, 2, values);
+    const jint values[] = {static_cast<jint>(capabilities.version), capabilities.level,
+            capabilities.hwui ? 1 : 0};
+    jintArray result = env->NewIntArray(3);
+    if (result) env->SetIntArrayRegion(result, 0, 3, values);
     return result;
 }

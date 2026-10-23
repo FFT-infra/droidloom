@@ -11,6 +11,9 @@ namespace droidloom {
 struct VulkanCapabilities {
     uint32_t version = 0;
     int32_t level = -1;
+    // HWUI's Vulkan pipeline can run: the first physical device has Vulkan
+    // 1.1 with Android interop and two queues in its first graphics family.
+    bool hwui = false;
 };
 
 // Query the Android loader, not a host ICD or a product-name allowlist.

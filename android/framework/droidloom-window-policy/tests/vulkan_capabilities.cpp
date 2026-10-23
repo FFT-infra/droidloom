@@ -13,6 +13,7 @@ struct Device {
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceFeatures features{};
     bool graphics = true;
+    uint32_t graphicsQueues = 2;
     bool hardwareBuffer = true;
     bool semaphoreFd = true;
     bool fenceFd = true;
@@ -98,7 +99,7 @@ VKAPI_ATTR void VKAPI_CALL queues(VkPhysicalDevice handle, uint32_t* count,
     *count = 1;
     if (result) {
         result[0] = {};
-        result[0].queueCount = 1;
+        result[0].queueCount = device(handle).graphicsQueues;
         result[0].queueFlags = device(handle).graphics ? VK_QUEUE_GRAPHICS_BIT : VK_QUEUE_COMPUTE_BIT;
     }
 }
@@ -161,7 +162,7 @@ droidloom::VulkanCapabilities probe() {
 int main() {
     reset();
     auto result = probe();
-    assert(result.version == VK_API_VERSION_1_4 && result.level == 1);
+    assert(result.version == VK_API_VERSION_1_4 && result.level == 1 && result.hwui);
     reset({gpu(VK_API_VERSION_1_3, 0)});
     result = probe();
     assert(result.version == VK_API_VERSION_1_3 && result.level == 0);
@@ -195,8 +196,19 @@ int main() {
             &Device::ycbcr, &Device::semaphoreImport,
             &Device::semaphoreExport, &Device::fenceImport, &Device::fenceExport}) {
         reset(); devices[0].*flag = false;
-        assert(probe().version == VK_MAKE_API_VERSION(0, 1, 0, 3));
+        result = probe();
+        assert(result.version == VK_MAKE_API_VERSION(0, 1, 0, 3) && !result.hwui);
     }
+
+    // HWUI takes the first device and needs two queues in its graphics family.
+    reset(); devices[0].graphicsQueues = 1;
+    result = probe();
+    assert(result.version == VK_API_VERSION_1_4 && !result.hwui);
+    reset({gpu(VK_API_VERSION_1_0), gpu()});
+    result = probe();
+    assert(result.version == VK_API_VERSION_1_4 && !result.hwui);
+    reset({cpu, gpu()});
+    assert(!probe().hwui);
     reset(); missingFunction = "vkGetPhysicalDeviceFeatures2";
     assert(probe().version == VK_MAKE_API_VERSION(0, 1, 0, 3));
     reset(); loaderVersion = VK_API_VERSION_1_1;
@@ -215,5 +227,5 @@ int main() {
     reset(); missingFunction = "vkGetPhysicalDeviceProperties";
     assert(probe().version == 0);
     assert(droidloom::detectVulkan(nullptr).version == 0);
-    std::cout << "PASS: hardware-only Vulkan detection, levels, coherent versions, Android interop and failures\n";
+    std::cout << "PASS: hardware-only Vulkan detection, levels, coherent versions, Android interop, HWUI and failures\n";
 }

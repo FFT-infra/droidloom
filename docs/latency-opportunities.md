@@ -14,13 +14,14 @@ than native Android.
 
 SF's vsync now comes from Denial's grants and wakes SF 2 ms before Denial's
 latch ([architecture](architecture.md#vsync)), which removes the free-running
-phase and the drift. App work durations are still SF's defaults (an app wakes
-two periods minus 1 ms before SF).
+phase and the drift. SF schedules by work durations: apps wake 9.33 ms before
+SF (`debug.sf.late.app.duration`), 15.67 ms during early scheduling. Unset early
+durations follow the late ones (SurfaceFlinger patch 0022).
 
 Options, smallest first:
 
-1. Size the app duration (`debug.sf.late.app.duration`) once frame misses are
-   measured against it.
+1. Size the app duration (done). On aston, HWUI's vsync-to-GPU-done time was
+   p50 5 ms, p99 7.6 ms; the old 15.67 ms budget only queued more buffers.
 2. For direct-layer tasks, send the scene when the app's transaction arrives,
    without waiting for SF vsync. SF renders nothing on that path; Denial paces.
    This removes the extra stage instead of shrinking it.

@@ -52,6 +52,10 @@ Runtime patches under `android/aosp-patches/`:
   the pinned libdrm otherwise passes its NULL kernel pointer to `strdup` and
   crashes SurfaceFlinger during EGL initialization. This applies to libdrm,
   retaining the real driver name and version without changing the kernel.
+- `0016-mesa-turnip-hwui-queues.patch`: two queues in Turnip's VM_BIND graphics
+  family, which HWUI's Vulkan pipeline requires (render and upload queues).
+  The SET_IOVA family keeps one queue: it recycles freed addresses after queue
+  0's fence alone. Shader barrier removal stops at workgroup scope.
 
 Validate a new host using real Android allocations, raw DMA-BUF and native
 Android EGL imports, GPU rendering/readback, native fences and synchronized CPU

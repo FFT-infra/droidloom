@@ -155,11 +155,11 @@ VulkanCapabilities detectVulkan(PFN_vkGetInstanceProcAddr getProc) {
         if (queueCount == 0 || queueCount > 256) continue;
         std::vector<VkQueueFamilyProperties> families(queueCount);
         queues(devices[i], &queueCount, families.data());
-        bool graphics = false;
-        for (uint32_t q = 0; q < queueCount; ++q) {
-            graphics |= families[q].queueCount > 0 && (families[q].queueFlags & VK_QUEUE_GRAPHICS_BIT);
-        }
-        if (!graphics) continue;
+        // HWUI renders and uploads on two queues of the first graphics family.
+        const auto graphics = std::find_if(families.begin(), families.end(), [](const auto& f) {
+            return f.queueCount > 0 && (f.queueFlags & VK_QUEUE_GRAPHICS_BIT);
+        });
+        if (graphics == families.end()) continue;
         VkPhysicalDeviceFeatures f{};
         features(devices[i], &f);
         const int32_t level = hardwareLevel(f);
@@ -171,9 +171,12 @@ VulkanCapabilities detectVulkan(PFN_vkGetInstanceProcAddr getProc) {
                 !androidInterop(getProc, handle, devices[i], extensions))) {
             version = VK_MAKE_API_VERSION(0, 1, 0, 3);
         }
+        // HWUI always takes the first physical device.
+        if (i == 0) result.hwui = version >= VK_API_VERSION_1_1 && graphics->queueCount >= 2;
         // Version must come from a device that supports the advertised level.
         if (level > result.level || (level == result.level && version > result.version)) {
-            result = {version, level};
+            result.version = version;
+            result.level = level;
         }
     }
     return result;

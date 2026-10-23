@@ -83,8 +83,15 @@ PRODUCT_COPY_FILES += \
 # installation and background optimization, as core_64_bit_only.mk does.
 # HWUI reports each frame's work to a hint session, which Droidloom's power
 # service turns into utilization floors for the UI thread and RenderThread.
+# SurfaceFlinger schedules by work durations. Its own stays one period minus
+# 1 ms, which Composer's vsync relies on; apps wake 9.33 ms before SF instead
+# of 15.67 ms, and 15.67 ms during early (transition) scheduling.
 PRODUCT_VENDOR_PROPERTIES += \
     debug.hwui.use_hint_manager=true \
+    debug.sf.use_phase_offsets_as_durations=1 \
+    debug.sf.late.app.duration=9333333 \
+    debug.sf.early.app.duration=15666666 \
+    debug.sf.earlyGl.app.duration=15666666 \
     persist.audio.normal_playback_period_ms=5 \
     ro.zygote=zygote64 \
     dalvik.vm.dex2oat64.enabled=true \

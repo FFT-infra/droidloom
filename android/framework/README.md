@@ -78,6 +78,11 @@ rules still apply after detection. No dEQP, compute or Vulkan profile certificat
 is inferred. The Java adapter and native probe ship as a matched services/InputFlinger
 pair, checked by the bundle's Vulkan capability ABI marker.
 
+The same probe sets `ro.hwui.use_vulkan=true` when HWUI's Vulkan pipeline can
+run: the first physical device (the one HWUI takes) has Vulkan 1.1 with that
+interop and two queues in its first graphics family. Apps read it when they
+start; `debug.hwui.renderer` still overrides it and a product value is kept.
+
 Run the driver-independent native fixtures and Java failure-boundary checks with
 `cargo test --locked -j 1 -p droidloom-update --test vulkan_capabilities -- --ignored`.
 These checks require the prepared AOSP Vulkan headers and a host JDK/C++ compiler.

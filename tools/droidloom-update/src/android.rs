@@ -226,6 +226,10 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "frameworks/native",
+        "android/surfaceflinger/0022-droidloom-early-durations-follow-late.patch",
+    ),
+    (
+        "frameworks/native",
         "android/inputflinger/0001-application-token-targeted-injection.patch",
     ),
     (
@@ -767,6 +771,11 @@ pub fn build_targets(
         source,
         "vendor/droidloom/mesa3d",
         &repo.join("android/aosp-patches/0014-mesa-background-cpu-placement.patch"),
+    )?;
+    p.patch(
+        source,
+        "vendor/droidloom/mesa3d",
+        &repo.join("android/aosp-patches/0016-mesa-turnip-hwui-queues.patch"),
     )?;
     let cross = mesa.join("android/mesa3d_cross.mk");
     let cross_text = fs::read_to_string(&cross)?;

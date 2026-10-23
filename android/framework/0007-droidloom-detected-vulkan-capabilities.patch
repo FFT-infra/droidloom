@@ -1,6 +1,6 @@
 --- a/services/core/java/com/android/server/SystemConfig.java
 +++ b/services/core/java/com/android/server/SystemConfig.java
-@@ -2105,6 +2105,19 @@
+@@ -2105,6 +2105,20 @@
      // This only needs to be called once after all features have been parsed
      // from various partition/apex sources.
      private void readAllPermissionsFromEnvironment() {
@@ -15,6 +15,7 @@
 +                addFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, vulkan[0]);
 +                addFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL, vulkan[1]);
 +            }
++            DroidloomGraphicsCapabilities.selectHwuiRenderer(vulkan);
 +        }
 +
          // Some devices can be field-converted to FBE, so offer to splice in
