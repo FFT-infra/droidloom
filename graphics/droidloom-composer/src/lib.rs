@@ -177,14 +177,6 @@ pub enum ComposerError {
     /// Version one deliberately omits Android-controlled doze.
     #[error("power mode {0:?} is unsupported")]
     UnsupportedPowerMode(PowerMode),
-    /// A presentation timestamp moved backwards.
-    #[error("presentation timestamp {actual} precedes {previous}")]
-    NonMonotonicPresentation {
-        /// Last accepted timestamp.
-        previous: u64,
-        /// Rejected timestamp.
-        actual: u64,
-    },
     /// Denial did not provide a usable refresh period.
     #[error("display configure has no refresh rate")]
     MissingRefreshRate,
@@ -655,24 +647,20 @@ impl Composer {
     ///
     /// # Errors
     ///
-    /// Rejects timestamps that move backwards and an enabled stream with no
-    /// refresh rate from the latest configure. Multiple commits may be
-    /// co-presented on one host refresh; an equal timestamp is therefore a
-    /// valid duplicate sample and produces no additional callback.
+    /// Rejects an enabled stream with no refresh rate from the latest
+    /// configure. Every task surface on the display reports its own
+    /// presentations, and Denial stamps one refresh either with the kernel's
+    /// vblank time or with the time it saw it, so a sample at or before the
+    /// latest one repeats a refresh already reported and produces no callback.
     pub fn presentation_sample(
         &mut self,
         timestamp_nanos: u64,
     ) -> Result<Option<VsyncSample>, ComposerError> {
-        if let Some(previous) = self.last_presentation_nanos {
-            if timestamp_nanos < previous {
-                return Err(ComposerError::NonMonotonicPresentation {
-                    previous,
-                    actual: timestamp_nanos,
-                });
-            }
-            if timestamp_nanos == previous {
-                return Ok(None);
-            }
+        if self
+            .last_presentation_nanos
+            .is_some_and(|previous| timestamp_nanos <= previous)
+        {
+            return Ok(None);
         }
         self.last_presentation_nanos = Some(timestamp_nanos);
         if self.power_mode != PowerMode::On || !self.vsync_enabled {
@@ -1156,13 +1144,7 @@ mod tests {
             })
         );
         assert_eq!(composer.presentation_sample(1_000_000_000).unwrap(), None);
-        assert_eq!(
-            composer.presentation_sample(999_999_999),
-            Err(ComposerError::NonMonotonicPresentation {
-                previous: 1_000_000_000,
-                actual: 999_999_999,
-            })
-        );
+        assert_eq!(composer.presentation_sample(999_879_894).unwrap(), None);
         composer.set_power_mode(DISPLAY, PowerMode::Off).unwrap();
         assert_eq!(composer.presentation_sample(2_000_000_000).unwrap(), None);
         assert_eq!(

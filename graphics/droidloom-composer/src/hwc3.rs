@@ -422,7 +422,6 @@ fn map_composer_error(error: &ComposerError) -> ErrorCode {
         ) => ErrorCode::NoResources,
         ComposerError::MissingClientTarget
         | ComposerError::DisplayOff
-        | ComposerError::NonMonotonicPresentation { .. }
         | ComposerError::MissingRefreshRate
         | ComposerError::Transport(_) => ErrorCode::BadParameter,
     }

@@ -7,6 +7,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.ApplicationInfo;
 import android.graphics.Rect;
 import android.os.PowerManager;
 import android.os.SystemClock;
@@ -70,6 +71,22 @@ public final class DroidloomFrameworkControl {
         if (!name.isEmpty()) Settings.Global.putString(context.getContentResolver(), Settings.Global.DEVICE_NAME, name);
         service.mWindowManager.setWindowingMode(0, android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM);
     }
+    /**
+     * Some apps read the density and font scale once per process and ignore later changes.
+     * Visible app activities restart their process with saved state, as Android does for size
+     * compat, and cached processes die so the next open starts fresh. Foreground services stay.
+     */
+    private void restartForSize() {
+        synchronized (service.mGlobalLock) {
+            service.mRootWindowContainer.forAllActivities(activity -> {
+                if (activity.app == null || activity.app.isPersistent() || !activity.isVisibleRequested()
+                        || activity.isActivityTypeHome()
+                        || (activity.info.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) return;
+                activity.restartProcessIfVisible();
+            });
+        }
+        service.mAmInternal.killAllBackgroundProcessesExcept(-1, ActivityManager.PROCESS_STATE_HOME);
+    }
     private void serve() {
         while (true) {
             byte[] bytes = DroidloomFrameworkNative.next();
@@ -125,7 +142,19 @@ public final class DroidloomFrameworkControl {
             case 2: {
                 int dpi = request.getInt("dpi");
                 if (dpi < 72) throw new IllegalArgumentException("Invalid display density");
-                service.mWindowManager.setForcedDisplayDensityForUser(0, dpi, 0);
+                // The size is the density alone: a font scale left from Android's settings goes.
+                boolean changed = Settings.System.getFloatForUser(
+                        service.mContext.getContentResolver(), Settings.System.FONT_SCALE, 1f, 0) != 1f;
+                if (changed) {
+                    Settings.System.putFloatForUser(
+                            service.mContext.getContentResolver(), Settings.System.FONT_SCALE, 1f, 0);
+                    service.updateFontScaleIfNeeded(0);
+                }
+                if (service.mWindowManager.getBaseDisplayDensity(0) != dpi) {
+                    service.mWindowManager.setForcedDisplayDensityForUser(0, dpi, 0);
+                    changed = true;
+                }
+                if (changed) restartForSize();
                 return "dpi=" + dpi;
             }
             case 3: return DroidloomApplicationCatalog.listApplications(service.mContext, 0).toString();
