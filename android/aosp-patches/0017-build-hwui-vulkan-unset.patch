@@ -1,0 +1,25 @@
+Subject: [PATCH] build: leave ro.hwui.use_vulkan unset when the board does not choose
+
+Droidloom sets it at boot from the Vulkan probe when HWUI's Vulkan
+requirements are met. An empty build.prop value would make it read-only.
+
+diff --git a/core/sysprop_config.mk b/core/sysprop_config.mk
+index b1baf5e..0d3abc7 100644
+--- a/core/sysprop_config.mk
++++ b/core/sysprop_config.mk
+@@ -118,8 +118,14 @@ endif
+ ADDITIONAL_VENDOR_PROPERTIES += \
+     ro.vendor.build.security_patch=$(VENDOR_SECURITY_PATCH) \
+     ro.product.board=$(TARGET_BOOTLOADER_BOARD_NAME) \
+-    ro.board.platform=$(TARGET_BOARD_PLATFORM) \
++    ro.board.platform=$(TARGET_BOARD_PLATFORM)
++
++# An empty value still sets the read-only property, so a board that does not
++# choose leaves it unset for a runtime decision.
++ifneq ($(TARGET_USES_VULKAN),)
++ADDITIONAL_VENDOR_PROPERTIES += \
+     ro.hwui.use_vulkan=$(TARGET_USES_VULKAN)
++endif
+ 
+ ifdef TARGET_SCREEN_DENSITY
+ ADDITIONAL_VENDOR_PROPERTIES += \

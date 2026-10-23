@@ -93,6 +93,10 @@ pub fn apex_output_for_product(name: &str, product: &str) -> Option<PathBuf> {
 }
 const PATCHES: &[(&str, &str)] = &[
     (
+        "build/make",
+        "android/aosp-patches/0017-build-hwui-vulkan-unset.patch",
+    ),
+    (
         "external/libdrm",
         "android/aosp-patches/0015-libdrm-empty-version-strings.patch",
     ),
