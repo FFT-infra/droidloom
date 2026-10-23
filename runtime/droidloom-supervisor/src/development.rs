@@ -177,7 +177,7 @@ pub fn validate_development_inputs(spec: &CellSpec) -> Result<(), DevelopmentErr
     for directory in &spec.android_runtime_directories {
         validate_android_runtime_directory(&directory.source)?;
     }
-    for directory in &spec.shared_storage_directories {
+    for directory in &spec.shared_storage() {
         validate_shared_storage_directory(&directory.source, (spec.host_uid, directory.host_gid))?;
     }
     crate::host_storage::validate(&spec.data_dir)
@@ -221,11 +221,15 @@ fn validate_android_init_override(path: &Path) -> Result<(), DevelopmentError> {
 }
 
 fn validate_android_file_override_source(path: &Path) -> Result<(), DevelopmentError> {
-    let metadata =
-        fs::metadata(path).map_err(|source| io_error("stat Android file override", source))?;
-    if !metadata.is_file() {
+    let metadata = fs::metadata(path).map_err(|source| {
+        io_error(
+            &format!("stat Android file override {}", path.display()),
+            source,
+        )
+    })?;
+    if !metadata.is_file() && !metadata.is_dir() {
         return Err(DevelopmentError::InvalidInput(format!(
-            "{} is not a regular file",
+            "{} is neither a regular file nor a directory",
             path.display()
         )));
     }
@@ -438,6 +442,8 @@ pub fn start_development_cell(
     spec: &CellSpec,
     entry_executable: &Path,
 ) -> Result<DevelopmentCell, DevelopmentError> {
+    crate::user_folders::prepare(spec)
+        .map_err(|source| io_error("prepare the user's folders for Android", source))?;
     validate_development_inputs(spec)?;
     prepare_host_directories(spec)?;
     let mut network = match DevelopmentNetwork::create(spec) {
@@ -448,7 +454,7 @@ pub fn start_development_cell(
         }
     };
     let adb_client = match AdbConnection::prepare(spec) {
-        Ok(client) => Some(client),
+        Ok(client) => client,
         Err(error) => {
             eprintln!("droidloom-supervisor: automatic ADB unavailable: {error}");
             None
@@ -556,10 +562,11 @@ fn signal_process(pid: u32, signal: libc::c_int) -> Result<(), DevelopmentError>
 
 fn start_idmap_namespace(
     spec: &CellSpec,
+    shared: &[crate::SharedStorageDirectory],
     android_uid: u32,
     proc_root: &Path,
 ) -> Result<Option<Child>, DevelopmentError> {
-    let Some(first) = spec.shared_storage_directories.first() else {
+    let Some(first) = shared.first() else {
         return Ok(None);
     };
     let uid_mapping = format!("{}:{android_uid}:1", spec.host_uid);
@@ -691,12 +698,8 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
             "remove Android development bootconfig",
         ),
         (
-            spec.runtime_dir.join("android-cgroups.json"),
-            "remove Android development cgroup configuration",
-        ),
-        (
-            spec.runtime_dir.join("android-tracing.prop"),
-            "remove Android container tracing properties",
+            spec.runtime_dir.join("android-product.prop"),
+            "remove Android product properties",
         ),
     ] {
         match fs::remove_file(path) {
@@ -705,16 +708,16 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
             Err(source) => return Err(io_error(context, source)),
         }
     }
-    let cpu_policy = spec.runtime_dir.join("cpu-policy");
-    if cpu_policy.exists() {
+    let cgroup_policy = spec.runtime_dir.join("cgroup-policy");
+    if cgroup_policy.exists() {
         for entry in
-            fs::read_dir(&cpu_policy).map_err(|e| io_error("read CPU policy directory", e))?
+            fs::read_dir(&cgroup_policy).map_err(|e| io_error("read cgroup policy directory", e))?
         {
-            let entry = entry.map_err(|e| io_error("read CPU policy entry", e))?;
+            let entry = entry.map_err(|e| io_error("read cgroup policy entry", e))?;
             fs::remove_file(entry.path())
-                .map_err(|e| io_error("remove generated CPU policy", e))?;
+                .map_err(|e| io_error("remove generated cgroup policy", e))?;
         }
-        fs::remove_dir(cpu_policy).map_err(|e| io_error("remove CPU policy directory", e))?;
+        fs::remove_dir(cgroup_policy).map_err(|e| io_error("remove cgroup policy directory", e))?;
     }
     let private_sysctls = spec.runtime_dir.join(PRIVATE_SYSCTL_DIRECTORY);
     let private_net_core = private_sysctls.join(PRIVATE_NET_CORE_DIRECTORY);
@@ -845,10 +848,26 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
                 source,
             )
         })?;
-        if !metadata.is_file() {
+        let directory = fs::metadata(&file_override.source)
+            .map_err(|source| {
+                io_error(
+                    &format!(
+                        "stat Android file override {}",
+                        file_override.source.display()
+                    ),
+                    source,
+                )
+            })?
+            .is_dir();
+        if directory != metadata.is_dir() || !(metadata.is_file() || metadata.is_dir()) {
             return Err(DevelopmentError::InvalidInput(format!(
-                "{} is not an existing regular Android partition file",
-                file_override.target.display()
+                "{} is not an existing Android partition {}",
+                file_override.target.display(),
+                if directory {
+                    "directory"
+                } else {
+                    "regular file"
+                }
             )));
         }
         bind_mount_read_only_executable(&file_override.source, &target)?;
@@ -878,14 +897,14 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     create_private_dev(spec, &root)?;
     mount_first_stage_runtime_filesystems(&root)?;
     bind_boot_parameters(spec, &root)?;
-    let cpu_policy = crate::cpu_placement::prepare(&root, spec.id().as_str())
+    let controllers = crate::cpu_placement::prepare(&root, spec.id().as_str())
         .map_err(|source| io_error("prepare private Android CPU placement hierarchy", source))?;
-    bind_development_cgroups(spec, &root, cpu_policy.is_some())?;
-    if let Some(policy) = cpu_policy {
-        bind_cpu_policy(spec, &root, &policy)?;
+    bind_development_cgroups(spec, &root, &controllers)?;
+    if let Some(policy) = &controllers.cpu_policy {
+        bind_cpu_policy(spec, &root, policy)?;
     }
     bind_adb_configuration(spec, &root)?;
-    bind_tracing_configuration(spec, &root)?;
+    bind_product_properties(spec, &root)?;
 
     // The reusable base is a system-as-root image, but Droidloom has already
     // supplied the mounts that Android first-stage init normally constructs.
@@ -1006,7 +1025,7 @@ fn prepare_host_directories(spec: &CellSpec) -> Result<(), DevelopmentError> {
 }
 
 fn make_mounts_private() -> Result<(), DevelopmentError> {
-    run("mount", ["--make-rprivate", "/"])
+    mount_syscall(None, Path::new("/"), None, "rprivate")
 }
 
 fn mount_image(
@@ -1040,14 +1059,7 @@ fn mount_read_only_image(image: &Path, target: &Path) -> Result<(), DevelopmentE
 
 fn mount_host_storage(source: &Path, target: &Path) -> Result<(), DevelopmentError> {
     bind_mount(source, target, false)?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-o"),
-            OsString::from("remount,bind,rw,nodev,nosuid"),
-            target.as_os_str().to_owned(),
-        ],
-    )
+    remount(target, "bind,rw,nodev,nosuid")
 }
 
 fn mount_synthetic_system_root(lower: &Path, target: &Path) -> Result<(), DevelopmentError> {
@@ -1124,41 +1136,109 @@ fn detect_read_only_filesystem(path: &Path) -> Result<ReadOnlyFilesystem, Develo
 }
 
 fn bind_mount(source: &Path, target: &Path, read_only: bool) -> Result<(), DevelopmentError> {
-    run_os(
-        "mount",
-        [
-            OsString::from("--bind"),
-            source.as_os_str().to_owned(),
-            target.as_os_str().to_owned(),
-        ],
-    )?;
+    mount_syscall(Some(source.as_os_str()), target, None, "bind")?;
     if read_only {
-        run_os(
-            "mount",
-            [
-                OsString::from("-o"),
-                OsString::from("remount,bind,ro,nosuid,nodev,noexec"),
-                target.as_os_str().to_owned(),
-            ],
-        )?;
+        remount(target, "bind,ro,nosuid,nodev,noexec")?;
     }
     Ok(())
 }
 
 fn bind_mount_read_only_executable(source: &Path, target: &Path) -> Result<(), DevelopmentError> {
     bind_mount(source, target, false)?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-o"),
-            OsString::from("remount,bind,ro,nosuid,nodev"),
-            target.as_os_str().to_owned(),
-        ],
+    remount(target, "bind,ro,nosuid,nodev")
+}
+
+// A cell start makes a few hundred mounts and device nodes. Spawning mount(8)
+// or mknod(1) for each cost about 2 ms, over a second before Android started,
+// so these call the kernel directly with mount(8)-style option strings. Loop
+// images and idmapped binds still use mount(8), which sets those up.
+fn mount_syscall(
+    source: Option<&OsStr>,
+    target: &Path,
+    filesystem: Option<&str>,
+    options: &str,
+) -> Result<(), DevelopmentError> {
+    let mut flags: libc::c_ulong = 0;
+    let mut data = Vec::new();
+    for option in options.split(',').filter(|option| !option.is_empty()) {
+        match option {
+            "ro" => flags |= libc::MS_RDONLY,
+            "rw" => {}
+            "nosuid" => flags |= libc::MS_NOSUID,
+            "nodev" => flags |= libc::MS_NODEV,
+            "noexec" => flags |= libc::MS_NOEXEC,
+            "bind" => flags |= libc::MS_BIND,
+            "remount" => flags |= libc::MS_REMOUNT,
+            "rprivate" => flags |= libc::MS_REC | libc::MS_PRIVATE,
+            _ => data.push(option),
+        }
+    }
+    let source = source
+        .map(|source| c_string(source.as_bytes()))
+        .transpose()?;
+    let target_c = c_string(target.as_os_str().as_bytes())?;
+    let filesystem = filesystem
+        .map(|name| c_string(name.as_bytes()))
+        .transpose()?;
+    let data = (!data.is_empty())
+        .then(|| c_string(data.join(",").as_bytes()))
+        .transpose()?;
+    // SAFETY: every pointer is null or a NUL-terminated string that outlives
+    // the call; the kernel copies them.
+    let result = unsafe {
+        libc::mount(
+            source
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            target_c.as_ptr(),
+            filesystem
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            flags,
+            data.as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr().cast()),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(
+            &format!("mount {} ({options})", target.display()),
+            io::Error::last_os_error(),
+        ))
+    }
+}
+
+fn mount_filesystem(
+    filesystem: &str,
+    target: &Path,
+    options: &str,
+) -> Result<(), DevelopmentError> {
+    mount_syscall(
+        Some(OsStr::new(filesystem)),
+        target,
+        Some(filesystem),
+        options,
     )
 }
 
+fn remount(target: &Path, options: &str) -> Result<(), DevelopmentError> {
+    mount_syscall(None, target, None, &format!("remount,{options}"))
+}
+
+fn c_string(bytes: &[u8]) -> Result<CString, DevelopmentError> {
+    CString::new(bytes).map_err(|_| {
+        DevelopmentError::InvalidInput(format!(
+            "{} contains a NUL byte",
+            String::from_utf8_lossy(bytes)
+        ))
+    })
+}
+
 fn mount_shared_storage_directories(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
-    if spec.shared_storage_directories.is_empty() {
+    // Resolved once: the user's folders are found again at each start.
+    let shared = spec.shared_storage();
+    if shared.is_empty() {
         return Ok(());
     }
 
@@ -1171,10 +1251,10 @@ fn mount_shared_storage_directories(spec: &CellSpec, root: &Path) -> Result<(), 
         })?;
     let android_uid = media_provider_uid(&packages)?;
     let proc_root = root.join("proc");
-    let mut namespace = start_idmap_namespace(spec, android_uid, &proc_root)?
+    let mut namespace = start_idmap_namespace(spec, &shared, android_uid, &proc_root)?
         .expect("shared-storage list was checked above");
     let userns = proc_root.join(namespace.id().to_string()).join("ns/user");
-    let result = mount_shared_storage_with_idmap(spec, root, &userns);
+    let result = mount_shared_storage_with_idmap(&shared, root, &userns);
     let cleanup = stop_idmap_namespace(&mut namespace);
     result?;
     cleanup
@@ -1199,7 +1279,7 @@ fn media_provider_uid(packages: &str) -> Result<u32, DevelopmentError> {
 }
 
 fn mount_shared_storage_with_idmap(
-    spec: &CellSpec,
+    shared: &[crate::SharedStorageDirectory],
     root: &Path,
     userns: &Path,
 ) -> Result<(), DevelopmentError> {
@@ -1212,7 +1292,7 @@ fn mount_shared_storage_with_idmap(
         set_owner(&directory, ANDROID_MEDIA_RW_ID, ANDROID_MEDIA_RW_ID)?;
     }
 
-    for directory in &spec.shared_storage_directories {
+    for directory in shared {
         let target = media_root.join(&directory.android_name);
         fs::create_dir_all(&target)
             .map_err(|source| io_error("create shared-storage mountpoint", source))?;
@@ -1229,59 +1309,28 @@ fn mount_shared_storage_with_idmap(
                 target.as_os_str().to_owned(),
             ],
         )?;
-        run_os(
-            "mount",
-            [
-                OsString::from("-o"),
-                OsString::from("remount,bind,rw,nosuid,nodev,noexec"),
-                target.as_os_str().to_owned(),
-            ],
-        )?;
+        remount(&target, "bind,rw,nosuid,nodev,noexec")?;
     }
     Ok(())
 }
 
 fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
     let proc = root.join("proc");
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("proc"),
-            OsString::from("-o"),
-            OsString::from("nosuid,nodev,noexec"),
-            OsString::from("proc"),
-            proc.as_os_str().to_owned(),
-        ],
-    )?;
+    mount_filesystem("proc", &proc, "nosuid,nodev,noexec")?;
     // Keep procfs itself writable, but make the root view read-only with bind
     // mount flags. A plain `remount,ro` would make the proc superblock
     // read-only, preventing any writable child view from accepting sysctl
     // writes. Android's IpClient must tune the network-namespace-local
     // controls before it provisions an address.
     bind_mount(&proc, &proc, false)?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-o"),
-            OsString::from("remount,bind,ro,nosuid,nodev,noexec"),
-            proc.as_os_str().to_owned(),
-        ],
-    )?;
+    remount(&proc, "bind,ro,nosuid,nodev,noexec")?;
 
     // Linux isolates /proc/sys/net through the cell's network namespace, so
     // expose just that subtree as writable. Global controls and sysrq-trigger
     // remain behind the read-only parent proc mount.
     let network_sysctls = proc.join("sys/net");
     bind_mount(&network_sysctls, &network_sysctls, false)?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-o"),
-            OsString::from("remount,bind,rw,nosuid,nodev,noexec"),
-            network_sysctls.into_os_string(),
-        ],
-    )?;
+    remount(&network_sysctls, "bind,rw,nosuid,nodev,noexec")?;
     project_private_bpf_sysctls(spec, root)?;
 
     // Do not expose the host sysfs device tree. ueventd coldboot would
@@ -1291,17 +1340,7 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     // namespace lets Android mount a namespaced cgroup2 view below this
     // synthetic tree without access to ancestor host cgroups.
     let sys = root.join("sys");
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("tmpfs"),
-            OsString::from("-o"),
-            OsString::from("mode=0755,nosuid,nodev,noexec"),
-            OsString::from("tmpfs"),
-            sys.as_os_str().to_owned(),
-        ],
-    )?;
+    mount_tmpfs(&sys, "mode=0755,nosuid,nodev,noexec")?;
     fs::create_dir_all(sys.join("fs/cgroup"))
         .map_err(|source| io_error("create private cgroup mount point", source))?;
     // Android normally inherits this mount point from the real sysfs tree and
@@ -1321,14 +1360,7 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     project_cpu_sysfs(&sys)?;
     let render_metadata = read_render_node_sysfs_metadata(&spec.render_node)?;
     publish_render_node_sysfs_metadata(&sys, &render_metadata)?;
-    run_os(
-        "mount",
-        [
-            OsString::from("-o"),
-            OsString::from("remount,ro,nosuid,nodev,noexec"),
-            sys.into_os_string(),
-        ],
-    )
+    remount(&sys, "ro,nosuid,nodev,noexec")
 }
 
 // Bionic reads the CPU masks for get_nprocs()/sysconf; Unity also classifies
@@ -1684,17 +1716,7 @@ fn mount_first_stage_runtime_filesystems(root: &Path) -> Result<(), DevelopmentE
 }
 
 fn mount_tmpfs(target: &Path, options: &str) -> Result<(), DevelopmentError> {
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("tmpfs"),
-            OsString::from("-o"),
-            OsString::from(options),
-            OsString::from("tmpfs"),
-            target.as_os_str().to_owned(),
-        ],
-    )
+    mount_filesystem("tmpfs", target, options)
 }
 
 // Linux reserves a power-of-two minor-number range for every loop device
@@ -1731,17 +1753,7 @@ fn mount_private_input(dev: &Path) -> Result<(), DevelopmentError> {
 #[allow(clippy::too_many_lines)]
 fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
     let dev = root.join("dev");
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("tmpfs"),
-            OsString::from("-o"),
-            OsString::from("mode=0755,nosuid"),
-            OsString::from("tmpfs"),
-            dev.as_os_str().to_owned(),
-        ],
-    )?;
+    mount_tmpfs(&dev, "mode=0755,nosuid")?;
     mount_private_input(&dev)?;
     for directory in ["pts", "binderfs", "block", "dri", "socket/droidloom"] {
         fs::create_dir_all(dev.join(directory))
@@ -1785,16 +1797,10 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             "600",
         )?;
     }
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("devpts"),
-            OsString::from("-o"),
-            OsString::from("newinstance,ptmxmode=0666,mode=0620,nosuid,noexec"),
-            OsString::from("devpts"),
-            dev.join("pts").into_os_string(),
-        ],
+    mount_filesystem(
+        "devpts",
+        &dev.join("pts"),
+        "newinstance,ptmxmode=0666,mode=0620,nosuid,noexec",
     )?;
     symlink("pts/ptmx", dev.join("ptmx")).map_err(|source| io_error("create ptmx link", source))?;
     for (link, target) in [
@@ -1807,15 +1813,7 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
             .map_err(|source| io_error("create standard device link", source))?;
     }
 
-    run_os(
-        "mount",
-        [
-            OsString::from("-t"),
-            OsString::from("binder"),
-            OsString::from("binder"),
-            dev.join("binderfs").into_os_string(),
-        ],
-    )?;
+    mount_filesystem("binder", &dev.join("binderfs"), "")?;
     let control = dev.join("binderfs/binder-control");
     for name in ["binder", "hwbinder", "vndbinder"] {
         let binder = dev.join("binderfs").join(name);
@@ -1992,28 +1990,70 @@ fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentE
 fn bind_development_cgroups(
     spec: &CellSpec,
     root: &Path,
-    cpuset: bool,
+    controllers: &crate::cpu_placement::Controllers,
 ) -> Result<(), DevelopmentError> {
-    // The target host is unified cgroup v2. Keep Android's legacy controller
-    // descriptors optional so their unavailable v1 mounts cannot prevent the
-    // private v2 hierarchy (and its /system subtree) from being created.
-    let source = spec.runtime_dir.join("android-cgroups.json");
+    // Android mounts or activates every controller it is told about, and each
+    // one it cannot use fails again at every profile application. Describe
+    // only the controllers the cell provides, and fit the profiles to them.
+    let directory = spec.runtime_dir.join("cgroup-policy");
+    fs::create_dir(&directory).map_err(|e| io_error("create cgroup policy directory", e))?;
     let mut config: serde_json::Value =
         serde_json::from_str(DEVELOPMENT_CGROUPS).expect("embedded cgroup configuration is valid");
-    if cpuset {
-        // CPU placement uses cpuset. Do not advertise an unusable legacy CPU
-        // controller: get_sched_policy() must read the real cpuset hierarchy.
-        config["Cgroups"]
-            .as_array_mut()
-            .expect("controller list")
-            .retain(|controller| controller["Controller"] != "cpu");
-    }
+    config["Cgroups"]
+        .as_array_mut()
+        .expect("controller list")
+        .retain(|controller| {
+            controller["Controller"]
+                .as_str()
+                .is_some_and(|name| controllers.provides(name))
+        });
+    let source = directory.join("cgroups.json");
     fs::write(
         &source,
         serde_json::to_vec_pretty(&config).expect("JSON value serializes"),
     )
     .map_err(|source| io_error("write Android development cgroup configuration", source))?;
-    bind_mount(&source, &root.join(ANDROID_CGROUPS_TARGET), true)
+    bind_mount(&source, &root.join(ANDROID_CGROUPS_TARGET), true)?;
+
+    let mut targets = vec![root.join("system/etc/task_profiles.json")];
+    // API-specific profiles load between system and vendor.
+    let api_directory = root.join("system/etc/task_profiles");
+    if api_directory.is_dir() {
+        for entry in
+            fs::read_dir(api_directory).map_err(|e| io_error("read API task profiles", e))?
+        {
+            let entry = entry.map_err(|e| io_error("read API task profile entry", e))?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with("task_profiles_") && s.ends_with(".json"))
+            {
+                targets.push(entry.path());
+            }
+        }
+    }
+    for relative in [
+        "vendor/etc/task_profiles.json",
+        "system_ext/etc/task_profiles.json",
+    ] {
+        let target = root.join(relative);
+        if target.exists() {
+            targets.push(target);
+        }
+    }
+    let sources = targets
+        .iter()
+        .map(fs::read_to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io_error("read Android task profiles", e))?;
+    let fitted = crate::cpu_placement::task_profiles(&sources, controllers)
+        .map_err(|e| io_error("fit Android task profiles to the cell", e))?;
+    for (index, (target, profiles)) in targets.iter().zip(fitted).enumerate() {
+        let source = directory.join(format!("profiles-{index}.json"));
+        fs::write(&source, profiles).map_err(|e| io_error("write Android task profiles", e))?;
+        bind_mount(&source, target, true)?;
+    }
+    Ok(())
 }
 
 fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
@@ -2072,8 +2112,9 @@ fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), Developmen
     bind_mount(&source, &target, true)
 }
 
-// Tracing is independent of whether host ADB and its authentication keys exist.
-fn bind_tracing_configuration(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
+// Tracing and the host's identity are independent of whether host ADB and its
+// authentication keys exist.
+fn bind_product_properties(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
     let target = ["product/etc/build.prop", "product/build.prop"]
         .into_iter()
         .map(|path| root.join(path))
@@ -2082,17 +2123,18 @@ fn bind_tracing_configuration(spec: &CellSpec, root: &Path) -> Result<(), Develo
             DevelopmentError::InvalidInput("Android product build properties are missing".into())
         })?;
     let original = fs::read_to_string(&target)
-        .map_err(|source| io_error("read Android tracing properties", source))?;
-    let source = spec.runtime_dir.join("android-tracing.prop");
-    fs::write(&source, crate::tracing::container_properties(&original))
-        .map_err(|source| io_error("write Android container tracing properties", source))?;
+        .map_err(|source| io_error("read Android product properties", source))?;
+    let properties = crate::tracing::container_properties(&original);
+    let properties = crate::identity::product_properties(&properties, &crate::identity::host());
+    let source = spec.runtime_dir.join("android-product.prop");
+    fs::write(&source, properties)
+        .map_err(|source| io_error("write Android product properties", source))?;
     set_mode(&source, 0o644)?;
     bind_mount(&source, &target, true)
 }
 
 fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), DevelopmentError> {
-    let directory = spec.runtime_dir.join("cpu-policy");
-    fs::create_dir(&directory).map_err(|e| io_error("create CPU policy directory", e))?;
+    let directory = spec.runtime_dir.join("cgroup-policy");
     // Preserve the already projected init file, including the classpath and
     // shared-kernel adaptations. The appended on-init action follows AOSP's
     // cpuset defaults and completes before services are started.
@@ -2113,42 +2155,6 @@ fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), Dev
     fs::write(&source, service).map_err(|e| io_error("write SurfaceFlinger CPU policy", e))?;
     bind_mount(&source, &target, true)?;
 
-    let mut targets = vec![root.join("system/etc/task_profiles.json")];
-    for relative in [
-        "vendor/etc/task_profiles.json",
-        "system_ext/etc/task_profiles.json",
-    ] {
-        let target = root.join(relative);
-        if target.exists() {
-            targets.push(target);
-        }
-    }
-    // API-specific profiles load between system and vendor; translate them
-    // too, so an older image cannot silently replace a working CPU backend.
-    let api_directory = root.join("system/etc/task_profiles");
-    if api_directory.is_dir() {
-        for entry in
-            fs::read_dir(api_directory).map_err(|e| io_error("read API task profiles", e))?
-        {
-            let entry = entry.map_err(|e| io_error("read API task profile entry", e))?;
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|s| s.starts_with("task_profiles_") && s.ends_with(".json"))
-            {
-                targets.push(entry.path());
-            }
-        }
-    }
-    for (index, target) in targets.iter().enumerate() {
-        let original =
-            fs::read_to_string(target).map_err(|e| io_error("read Android task profiles", e))?;
-        let translated = crate::cpu_placement::task_profiles(&original)
-            .map_err(|e| io_error("translate Android CPU task profiles", e))?;
-        let source = directory.join(format!("profiles-{index}.json"));
-        fs::write(&source, translated).map_err(|e| io_error("write Android task profiles", e))?;
-        bind_mount(&source, target, true)?;
-    }
     Ok(())
 }
 
@@ -2168,17 +2174,27 @@ fn make_device_node(
     minor: u32,
     mode: &str,
 ) -> Result<(), DevelopmentError> {
-    run_os(
-        "mknod",
-        [
-            OsString::from("-m"),
-            OsString::from(mode),
-            path.as_os_str().to_owned(),
-            OsString::from(kind),
-            OsString::from(major.to_string()),
-            OsString::from(minor.to_string()),
-        ],
-    )
+    let kind = match kind {
+        "c" => libc::S_IFCHR,
+        "b" => libc::S_IFBLK,
+        _ => {
+            return Err(DevelopmentError::InvalidInput(format!(
+                "unknown device node kind {kind:?}"
+            )));
+        }
+    };
+    let mode = u32::from_str_radix(mode, 8)
+        .map_err(|_| DevelopmentError::InvalidInput(format!("invalid device mode {mode:?}")))?;
+    let path_c = c_string(path.as_os_str().as_bytes())?;
+    // SAFETY: the path is NUL terminated and outlives the call.
+    if unsafe { libc::mknod(path_c.as_ptr(), kind | 0o600, libc::makedev(major, minor)) } != 0 {
+        return Err(io_error(
+            &format!("create device node {}", path.display()),
+            io::Error::last_os_error(),
+        ));
+    }
+    // mknod applies the umask; set the exact mode as mknod -m did.
+    set_mode(path, mode)
 }
 
 #[repr(C)]
@@ -2291,10 +2307,6 @@ fn set_owner(path: &Path, uid: u32, gid: u32) -> Result<(), DevelopmentError> {
     } else {
         Err(io_error("set path owner", io::Error::last_os_error()))
     }
-}
-
-fn run<const N: usize>(program: &str, args: [&str; N]) -> Result<(), DevelopmentError> {
-    run_os(program, args.map(OsString::from))
 }
 
 fn run_os<I>(program: &str, args: I) -> Result<(), DevelopmentError>
@@ -2481,13 +2493,21 @@ mod tests {
     }
 
     #[test]
-    fn android_file_override_source_must_be_a_regular_file() {
+    fn android_file_override_source_is_a_regular_file_or_directory() {
         let file = tempfile::NamedTempFile::new().unwrap();
         validate_android_file_override_source(file.path()).unwrap();
 
         let directory = tempfile::tempdir().unwrap();
-        let error = validate_android_file_override_source(directory.path()).unwrap_err();
-        assert!(error.to_string().contains("is not a regular file"));
+        validate_android_file_override_source(directory.path()).unwrap();
+
+        let socket = directory.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let error = validate_android_file_override_source(&socket).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("neither a regular file nor a directory")
+        );
     }
 
     #[test]

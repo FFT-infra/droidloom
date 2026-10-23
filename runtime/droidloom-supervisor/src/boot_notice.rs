@@ -4,12 +4,7 @@
 //! recovery companion follows the boot and closes it once Android is ready.
 //! Either replaces it with the reason Android did not start. The notice's ID
 //! lives in the session's runtime directory, so a restart reuses the notice.
-use std::{
-    env, fs,
-    os::unix::fs::DirBuilderExt,
-    path::PathBuf,
-    process::Stdio,
-};
+use std::{env, fs, os::unix::fs::DirBuilderExt, path::PathBuf, process::Stdio};
 
 const SERVICE: &str = "org.freedesktop.Notifications";
 const OBJECT: &str = "/org/freedesktop/Notifications";
@@ -27,7 +22,10 @@ impl BootNotice {
     /// No notice: boot is followed without telling the desktop.
     #[must_use]
     pub fn none() -> Self {
-        Self { id: 0, record: None }
+        Self {
+            id: 0,
+            record: None,
+        }
     }
 
     /// The notice a start showed, if it is still up.

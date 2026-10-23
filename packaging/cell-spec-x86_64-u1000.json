@@ -11,6 +11,7 @@
   "image_dir": "/var/lib/droidloom/images/current",
   "vendor_image": "/var/lib/droidloom/images/current/images/vendor.raw.img",
   "android_init": "/usr/lib/droidloom/current/bin/droidloom-android-init",
+  "share_user_folders": true,
   "android_file_overrides": [
     {
       "source": "/usr/lib/droidloom/current/lib64/libaudiobase.so",
@@ -23,6 +24,10 @@
     {
       "source": "/usr/lib/droidloom/current/framework/services.jar",
       "target": "/system/framework/services.jar"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/framework/oat/x86_64",
+      "target": "/system/framework/oat/x86_64"
     },
     {
       "source": "/usr/lib/droidloom/current/ime/droidloom-framework.rc",
@@ -151,6 +156,50 @@
     {
       "source": "/usr/lib/droidloom/current/lib64/libdrm_amdgpu.so",
       "target": "/vendor/lib64/libdrm_amdgpu.so"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/Browser2"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/Calendar"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/Camera2"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/priv-app/Contacts"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/DeskClock"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/priv-app/Dialer"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/Gallery2"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/messaging"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/product/app/QuickSearchBox"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/system/priv-app/PrivateSpace"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/compat/removed-app",
+      "target": "/system_ext/priv-app/ThreadNetworkDemoApp"
     }
   ],
   "android_runtime_directories": [

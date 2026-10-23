@@ -221,6 +221,7 @@ rust_binary {
     crate_root: "android/runtime/droidloom-classpath-wrapper/src/main.rs",
     edition: "2021",
     vendor: true,
+    rustlibs: ["liblibc"],
 }
 
 // Versioned Denial-native SOCK_SEQPACKET codec. The socket/SCM_RIGHTS adapter

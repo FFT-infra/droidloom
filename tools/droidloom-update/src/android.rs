@@ -43,6 +43,7 @@ pub const TARGETS: &[&str] = &[
     "libnetd_updatable",
     "services",
     "vendorimage",
+    "dex2oat",
 ];
 pub const AUDIO_TARGETS: &[&str] = &["com.android.hardware.audio.droidloom", "libaudiobase"];
 pub const TASK_BACKEND_TARGETS: &[&str] = &[
@@ -78,6 +79,16 @@ pub fn apex_output(name: &str) -> Option<&'static str> {
         "libnetd_updatable" => Some(
             "soong/.intermediates/packages/modules/Connectivity/bpf/netd/libnetd_updatable/android_x86_64_shared_cfi/libnetd_updatable.so",
         ),
+        _ => None,
+    }
+}
+// The boot profile of services.jar. The system-server compile in bundle staging
+// reads it beside the jar, so a jar is never staged with a stale profile.
+const SERVICES_PROFILE: &str = "soong/.intermediates/frameworks/base/services/services/android_common/dexpreopt/services/profile.prof";
+// The host compiler of the system-server jars, from the base image's source.
+pub fn host_output(name: &str) -> Option<&'static str> {
+    match name {
+        "dex2oat" => Some("host/linux-x86/bin/dex2oat64"),
         _ => None,
     }
 }
@@ -231,6 +242,10 @@ const PATCHES: &[(&str, &str)] = &[
     (
         "frameworks/native",
         "android/surfaceflinger/0022-droidloom-early-durations-follow-late.patch",
+    ),
+    (
+        "frameworks/native",
+        "android/surfaceflinger/0023-droidloom-read-switches-once.patch",
     ),
     (
         "frameworks/native",
@@ -873,12 +888,22 @@ pub fn build_targets(
         .env("SOONG_INCREMENTAL_ANALYSIS", "false")
         .arg("--make-mode")
         .arg(format!("-j{jobs}"))
-        .args(targets.iter().map(|name| {
+        .args(targets.iter().flat_map(|name| {
             if framework_only {
-                out.join(framework_output(name, product).expect("known framework target"))
+                let mut outputs = vec![
+                    out.join(framework_output(name, product).expect("known framework target")),
+                ];
+                if *name == "services" {
+                    outputs.push(out.join(SERVICES_PROFILE));
+                }
+                outputs
             } else {
-                apex_output_for_product(name, product)
-                    .map_or_else(|| PathBuf::from(name), |path| out.join(path))
+                vec![
+                    host_output(name)
+                        .map(PathBuf::from)
+                        .or_else(|| apex_output_for_product(name, product))
+                        .map_or_else(|| PathBuf::from(name), |path| out.join(path)),
+                ]
             }
         }));
     if framework_only {
@@ -913,6 +938,14 @@ pub fn build_targets(
                 &out.join(framework_output(name, product).expect("known framework target")),
                 &out.join("target/product").join(product).join(destination),
             )?;
+            if *name == "services" {
+                copy(
+                    &out.join(SERVICES_PROFILE),
+                    &out.join("target/product")
+                        .join(product)
+                        .join("system/framework/services.jar.prof"),
+                )?;
+            }
         }
     }
     if let Some(native_bridge_source) = native_bridge_source {

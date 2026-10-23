@@ -1,7 +1,7 @@
 diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
 --- a/services/surfaceflinger/Android.bp
 +++ b/services/surfaceflinger/Android.bp
-@@ -33,6 +33,7 @@
+@@ -33,6 +33,7 @@ cc_aconfig_library {
  
  cc_defaults {
      name: "surfaceflinger_defaults",
@@ -12,7 +12,7 @@ diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Androi
 diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
 --- a/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
 +++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/CompositionRefreshArgs.h
-@@ -109,6 +109,8 @@
+@@ -109,6 +109,8 @@ struct CompositionRefreshArgs {
      // A null display leaves normal and screen-capture outputs unchanged.
      std::optional<PhysicalDisplayId> droidloomHeadlessDisplay;
      sp<Fence> droidloomHeadlessFence;
@@ -24,7 +24,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine
 diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
 --- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
 +++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
-@@ -202,6 +202,7 @@
+@@ -202,6 +202,7 @@ private:
  
      // Null disables the headless path; Fence::NO_FENCE is a valid empty frame.
      sp<Fence> mDroidloomHeadlessFence;
@@ -43,7 +43,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
  #include <compositionengine/impl/OutputCompositionState.h>
  #include <compositionengine/impl/OutputLayer.h>
  #include <compositionengine/impl/OutputLayerCompositionState.h>
-@@ -455,6 +456,10 @@
+@@ -455,6 +456,10 @@ ftl::Future<std::monostate> Output::present(
          *physicalId == *refreshArgs.droidloomHeadlessDisplay) {
          mDroidloomHeadlessFence = refreshArgs.droidloomHeadlessFence;
      }
@@ -54,7 +54,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
      std::optional<panopticon::ExclusiveToken> exclusive;
      if (auto displayId = getDisplayId(); displayId) {
          exclusive.emplace(panopticon::exclusive(std::to_string(displayId->value)));
-@@ -485,13 +490,20 @@
+@@ -485,13 +490,20 @@ ftl::Future<std::monostate> Output::present(
                         stringifyExpectedPresentTime().c_str());
      }
      ALOGV(__FUNCTION__);
@@ -75,7 +75,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
      if (isPowerHintSessionEnabled()) {
          // always reset the flag before the composition prediction
          setHintSessionRequiresRenderEngine(false);
-@@ -503,9 +515,12 @@
+@@ -503,9 +515,12 @@ ftl::Future<std::monostate> Output::present(
      } else {
          prepareFrame();
      }
@@ -88,7 +88,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
      ftl::Future<std::monostate> future;
      const bool flushEvenWhenDisabled = !refreshArgs.bufferIdsToUncache.empty();
      if (mOffloadPresent) {
-@@ -520,6 +535,7 @@
+@@ -520,6 +535,7 @@ ftl::Future<std::monostate> Output::present(
          presentFrameAndReleaseLayers(flushEvenWhenDisabled);
          future = ftl::yield<std::monostate>({});
      }
@@ -96,7 +96,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
      renderCachedSets(refreshArgs);
      return future;
  }
-@@ -1351,6 +1367,8 @@
+@@ -1351,6 +1367,8 @@ void Output::finishFrame(GpuCompositionResult&& result) {
                  std::make_unique<FenceTime>(sp<Fence>::make(dup(optReadyFence->get()))));
      }
      // swap buffers (presentation)
@@ -105,7 +105,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
      mRenderSurface->queueBuffer(std::move(*optReadyFence), getHdrSdrRatio(buffer));
  }
  
-@@ -1382,8 +1400,11 @@
+@@ -1382,8 +1400,11 @@ bool Output::dequeueRenderBuffer(base::unique_fd* bufferFence,
      // flipClientTarget request for this frame on this output, we still need to
      // dequeue a buffer.
      if (outputState.usesClientComposition || outputState.flipClientTarget) {
@@ -117,7 +117,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
              ALOGW("Dequeuing buffer for display [%s] failed, bailing out of "
                    "client composition for this frame",
                    mName.c_str());
-@@ -1419,6 +1440,9 @@
+@@ -1419,6 +1440,9 @@ std::optional<base::unique_fd> Output::composeSurfaces(
  
      ALOGV("hasClientComposition");
  
@@ -127,7 +127,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
      renderengine::DisplaySettings clientCompositionDisplay =
              generateClientCompositionDisplaySettings(tex);
  
-@@ -1431,6 +1455,7 @@
+@@ -1431,6 +1455,7 @@ std::optional<base::unique_fd> Output::composeSurfaces(
                                                clientCompositionDisplay.outputDataspace,
                                                clientCompositionLayersFE);
      appendRegionFlashRequests(debugRegion, clientCompositionLayers);
@@ -135,7 +135,7 @@ diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services
  
      if (mDroidloomHeadlessFence) {
          // The bootstrap target is discarded by the host. Preserve all normal
-@@ -1772,10 +1797,17 @@
+@@ -1772,10 +1797,17 @@ void Output::presentFrameAndReleaseLayers(bool flushEvenWhenDisabled) {
      auto& outputState = editState();
      outputState.dirtyRegion.clear();
  
@@ -157,7 +157,7 @@ diff --git a/services/surfaceflinger/DroidloomTiming.h b/services/surfaceflinger
 new file mode 100644
 --- /dev/null
 +++ b/services/surfaceflinger/DroidloomTiming.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,47 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <cstdint>
@@ -167,6 +167,13 @@ new file mode 100644
 +extern "C" DroidloomTimingStamp droidloom_timing_start(uint64_t frame);
 +extern "C" void droidloom_timing_finish(uint32_t stage, uint64_t object, uint64_t frame,
 +                                       uint64_t layers, uint64_t outcome, DroidloomTimingStamp start);
++extern "C" bool droidloom_traced(uint32_t diagnostic);
++// The `audit` diagnostic (persist.vendor.droidloom.trace), read once: a change
++// takes a SurfaceFlinger restart.
++inline bool droidloomAudit() {
++    static const bool audit = droidloom_traced(2);
++    return audit;
++}
 +// Numeric IDs are paired with runtime/droidloom-timing/src/lib.rs.
 +enum class DroidloomTimingStage : uint32_t {
 +    Composite, TaskScan, SnapshotCopy, DirectPrepare, DirectPublish,
@@ -209,7 +216,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
  #include "DisplayHardware/ComposerHal.h"
  #include "DisplayHardware/FramebufferSurface.h"
  #include "DisplayHardware/Hal.h"
-@@ -3333,6 +3334,9 @@
+@@ -3333,6 +3334,9 @@ std::future<void> SurfaceFlinger::offloadGpuCompositedDisplays(
  
  CompositeResultsPerDisplay SurfaceFlinger::composite(
          PhysicalDisplayId pacesetterId, const scheduler::FrameTargeters& frameTargeters) {
@@ -219,7 +226,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
      SFTRACE_ASYNC_FOR_TRACK_BEGIN(WorkloadTracer::TRACK_NAME, "Composition",
                                    WorkloadTracer::COMPOSITION_TRACE_COOKIE);
  
-@@ -3346,6 +3350,7 @@
+@@ -3346,6 +3350,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
      SFTRACE_NAME(ftl::Concat(__func__, ' ', ftl::to_underlying(vsyncId)).c_str());
  
      compositionengine::CompositionRefreshArgs refreshArgs;
@@ -227,7 +234,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
      // adpf load up hint
      refreshArgs.powerCallback = this;
      refreshArgs.outputs.reserve(displays.size());
-@@ -3395,6 +3400,7 @@
+@@ -3395,6 +3400,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
              ? copyMergedSnapshots(refreshArgs)
              : addLayerSnapshotsToCompositionArgs(refreshArgs, kCursorOnly);
      prepareLayersForComposition(refreshArgs, kCursorOnly, layers);
@@ -235,7 +242,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
  
      for (auto& [layer, layerFE] : layers) {
          validateForReadback(layerFE);
-@@ -3492,6 +3498,7 @@
+@@ -3492,6 +3498,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
          std::unordered_map<int32_t, DirectTaskFrame> taskFrames;
          std::unordered_map<int32_t, bool> liveTasks;
  
@@ -243,7 +250,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
          Rect displayBounds;
          for (const auto& output : refreshArgs.outputs) {
              if (output->getDisplayIdVariant().and_then(asPhysicalDisplayId) == pacesetterId) {
-@@ -3546,6 +3553,7 @@
+@@ -3546,6 +3553,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
              frame.layers.emplace_back(owner, sp<LayerFE>::fromExisting(layerFE));
          }
  
@@ -251,7 +258,16 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
          std::unordered_map<int32_t, sp<IBinder>> taskInputTokens;
          for (const auto& [task, frame] : taskFrames) {
              if (frame.applicationToken != nullptr) {
-@@ -3669,6 +3677,8 @@
+@@ -3661,14 +3669,15 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                     refreshArgs.colorTransformMatrix.has_value() ||
+                     refreshArgs.devOptFlashDirtyRegionsDelay.has_value();
+             const bool needsWork = taskOutput.work.needed(workRevision, dirty);
+-            if (base::GetBoolProperty("persist.vendor.droidloom.task_stats", false) &&
+-                taskNow - lastTaskStats >= 5'000'000'000) {
++            if (droidloomAudit() && taskNow - lastTaskStats >= 5'000'000'000) {
+                 ALOGI("Droidloom task work: skipped=%" PRIu64 " snapshots=%" PRIu64 " prepared=%" PRIu64,
+                       skippedTasks, copiedSnapshots, preparedTasks);
+                 lastTaskStats = taskNow;
              }
              if (!needsWork) { ++skippedTasks; continue; }
              ++preparedTasks;
@@ -260,7 +276,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
              std::vector<uint32_t> layerOrder;
              layerOrder.reserve(frame.layers.size());
              for (auto& [owner, layer] : frame.layers) {
-@@ -3684,6 +3694,7 @@
+@@ -3684,6 +3693,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
                  layer = copy;
                  ++copiedSnapshots;
              }
@@ -268,7 +284,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
              const bool layersChanged = layerOrder != taskOutput.layerOrder;
              if (layersChanged) {
                  taskOutput.layerOrder = std::move(layerOrder);
-@@ -3739,17 +3750,27 @@
+@@ -3739,17 +3749,27 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
                              forceGeometry || refreshArgs.updatingOutputGeometryThisFrame,
                      .updatingGeometryThisFrame =
                              forceGeometry || refreshArgs.updatingGeometryThisFrame,
@@ -297,7 +313,7 @@ diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinge
                      taskOutput.invalidated = false;
                      taskOutput.work.accept(workRevision);
                      continue;
-@@ -3789,7 +3810,10 @@
+@@ -3789,7 +3809,10 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
                          renderengine::impl::ExternalTexture::Usage::WRITEABLE);
              }
              output->setDroidloomTarget(texture);

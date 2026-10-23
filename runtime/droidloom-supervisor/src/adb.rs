@@ -433,15 +433,19 @@ pub(crate) struct AdbConnection {
 }
 
 impl AdbConnection {
-    /// Prepare the owner's key before Android init starts. Missing ADB or an
-    /// unusable home directory disables only ADB, not Android boot.
-    pub(crate) fn prepare(spec: &CellSpec) -> io::Result<AdbClient> {
+    /// Prepare the owner's key before Android init starts. Without the host's
+    /// ADB package there is nothing to prepare; an unusable home directory
+    /// disables only ADB, not Android boot.
+    pub(crate) fn prepare(spec: &CellSpec) -> io::Result<Option<AdbClient>> {
+        if !Path::new(ADB).is_file() {
+            return Ok(None);
+        }
         let client = AdbClient::for_uid(spec.host_uid)?;
         let key = client.public_key()?;
         let directory = spec.runtime_dir.join(DIRECTORY);
         fs::create_dir(&directory)?;
         fs::write(directory.join(KEYS_FILE), key)?;
-        Ok(client)
+        Ok(Some(client))
     }
 
     pub(crate) fn start(client: AdbClient) -> io::Result<Self> {
@@ -506,19 +510,17 @@ impl Drop for AdbConnection {
 pub(crate) fn authenticated_properties(original: &str) -> String {
     let mut properties = String::new();
     for line in original.lines() {
-        if line.split_once('=').is_some_and(|(name, _)| {
-            matches!(
-                name.trim(),
-                "ro.adb.secure" | "ro.product.device" | "ro.product.model"
-            )
-        }) {
+        if line
+            .split_once('=')
+            .is_some_and(|(name, _)| matches!(name.trim(), "ro.adb.secure" | "ro.product.device"))
+        {
             continue;
         }
         properties.push_str(line);
         properties.push('\n');
     }
     properties.push_str("ro.adb.secure=1\n");
-    properties.push_str("ro.product.device=droidloom\nro.product.model=Droidloom\n");
+    properties.push_str("ro.product.device=droidloom\n");
     properties
 }
 

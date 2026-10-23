@@ -9,14 +9,6 @@
       "Optional": true
     },
     {
-      "Controller": "cpu",
-      "Path": "/dev/cpuctl",
-      "Mode": "0755",
-      "UID": "system",
-      "GID": "system",
-      "Optional": true
-    },
-    {
       "Controller": "cpuset",
       "Path": "/dev/cpuset",
       "Mode": "0755",
@@ -34,13 +26,6 @@
       {
         "Controller": "freezer",
         "Path": "."
-      },
-      {
-        "Controller": "memory",
-        "Path": ".",
-        "NeedsActivation": true,
-        "MaxActivationDepth": 3,
-        "Optional": true
       }
     ]
   }

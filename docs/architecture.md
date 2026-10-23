@@ -168,14 +168,15 @@ processing. Prediction and
 already-dequeued targets retain buffer-backed completion. Ordinary displays and
 capture outputs do not select this path. Set
 `persist.vendor.droidloom.bootstrap_bufferless=false` to restore the bootstrap's
-buffer round trips without enabling its duplicate GPU draw; this switch is live
-and allows comparison in the same process. Fence handoff failure selects the
+buffer round trips without enabling its duplicate GPU draw. Fence handoff failure selects the
 buffer-backed path. The private bridge is version 4; SurfaceFlinger and Composer
 must be updated together.
 
 `persist.vendor.droidloom.direct_layers=false` selects composition fallback for
 all tasks. Missing host alpha-modifier support also selects fallback. Existing
 host targets remain subject to the original configure and release rules.
+SurfaceFlinger reads these switches once, at its first frame; a change takes a
+Droidloom restart.
 
 Opaque coverage belongs to each rendered frame, independently of its ARGB
 allocation format. SurfaceFlinger's normal task output now includes an opaque
@@ -245,13 +246,21 @@ backpressure waits for socket writability. These waits preserve frame and
 clipboard ordering without checking sockets and GPU timelines 250 times per
 second on a still screen.
 
-For diagnosis, `DROIDLOOM_PRESENT_AUDIT=1` enables aggregate commit-to-reported-
-presentation, feedback-delivery and buffer-release timings. These exclude
-Android's earlier input/render work, and buffer-release ages can include idle
-time while a compositor retains the current image. The diagnostic logs no
-input or application content and is disabled by default.
+Diagnostics are off by default. Each process reads them once, when it first
+checks: `DROIDLOOM_TRACE` in the host environment and
+`persist.vendor.droidloom.trace` inside Android, each a comma-separated list of
+`frames`, `audit` and `input`. A change takes a Droidloom restart. Without them
+a check costs one load of a constant, and no diagnostic state is kept.
 
-`DROIDLOOM_FRAME_TRACE=1` enables correlated per-frame records in both the
+`audit` logs aggregates at most once a second: the presenter's
+commit-to-reported-presentation, feedback-delivery and buffer-release timings,
+its clock audit, Composer's vsync audit, SurfaceFlinger's task work counters and
+release backlog reports. Presentation timings exclude Android's earlier
+input/render work, and buffer-release ages can include idle time while a
+compositor retains the current image. No input or application content is
+logged.
+
+`frames` enables correlated per-frame records in both the
 Android Composer service and `droidloom-wayland`. Every eighth task-local frame
 is sampled with its existing object/frame/buffer IDs; no wire protocol or
 release policy changes. The SurfaceFlinger broker additionally records its
@@ -357,10 +366,11 @@ Composer and SurfaceFlinger then get no wakeups, and SurfaceFlinger keeps its
 learned model. The next frame is committed untargeted at once and arms them
 again. Powering the Android display off also ends its vsync. Without the
 frame timeline global, Composer runs a timer seeded from presentation feedback.
-Each second with grants, Composer logs `Droidloom vsync audit` (grants
-delivered as `ticks`, delivery after Denial's tick as `wake_late`) and the
-presenter logs `Droidloom clock audit` (frames, untargeted frames, frames late
-for their grant, and how long before the latch targeted frames arrived).
+With the `audit` diagnostic, each second with grants, Composer logs
+`Droidloom vsync audit` (grants delivered as `ticks`, delivery after Denial's
+tick as `wake_late`) and the presenter logs `Droidloom clock audit` (frames,
+untargeted frames, frames late for their grant, and how long before the latch
+targeted frames arrived).
 
 ActivityTaskManager now owns task publication inside system_server. Its task
 callbacks enqueue a coalesced worker; the worker copies attached task identities
@@ -535,8 +545,8 @@ or rejected commits and fallback recovery advance an asynchronous work revision
 before scheduling composition. Successful direct or fallback work accepts only
 the revision captured before preparation, preserving racing wakeups. Static
 fallback tasks skip dequeue/render/queue as well. Global lifecycle and release
-processing still runs. Optional `persist.vendor.droidloom.task_stats` counters
-report skipped tasks, copied snapshots and prepared tasks without an idle timer.
+processing still runs. With the `audit` diagnostic, counters report skipped
+tasks, copied snapshots and prepared tasks without an idle timer.
 
 Private-socket wire tests observe zero requests for two static children across
 100 updates to an animated sibling, while the changed child and root each
@@ -659,11 +669,10 @@ service definitions remain available for rollback. Local deployment evidence is
 under `.work/moto-fastpath-deploy/`; this readiness check does not establish
 touch-to-display latency or visual acceptance.
 
-Input logs are off by default. `DROIDLOOM_INPUT_TRACE=1` logs every input
-record the presenter sends, with its event time and its age at receipt, in each
-presenter process where the environment is set. Composer no longer forwards
-input records; the native receiver replaces the Java bridge's per-key path.
-The flag is read once per process, not from the environment on every event.
+Input logs are off by default. The `input` diagnostic logs every input record
+the presenter sends, with its event time and its age at receipt, and the text
+input editor's state changes. Composer no longer forwards input records; the
+native receiver replaces the Java bridge's per-key path.
 
 Host regression tests cover reusable record boundaries, truncated-FD cleanup,
 geometry stability across buffer rotation, and resize/opacity/solid transitions.
@@ -725,8 +734,15 @@ joins it, and retains only that subtree at a private holding path. The temporary
 full-hierarchy discovery mount is detached before Android starts. Declared
 `/dev/cpuset` and `/dev/blkio` mount points remain unmounted until Android's
 `CgroupSetup` runs: an already-mounted v1 descriptor otherwise makes AOSP return
-early and skip its v2 subtrees. Android mounts its own group root normally. The separate v2 memory/freezer domain is retained. Cleanup removes only
+early and skip its v2 subtrees. Android mounts its own group root normally. The separate v2 freezer domain is retained. Cleanup removes only
 empty, cell-owned legacy groups.
+
+Android is told only about controllers the cell provides: blkio and cpuset when
+their subtrees are ready, and the v2 freezer. The legacy cpu hierarchy cannot be
+created from the cell's cgroup namespace, and v2 memory cannot be delegated below
+the namespace root, which holds Android init. The supervisor removes profile
+actions and attributes on any other controller. Otherwise each would fail, and
+log, at every process start and state change.
 
 Android retains its native task-profile API. Generated init policy assigns
 top-app to graphics, foreground to normal, and background/system-background/

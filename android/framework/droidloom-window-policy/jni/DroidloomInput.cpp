@@ -5,6 +5,7 @@
 #include <binder/IPCThreadState.h>
 #include <input/Input.h>
 #include <private/android_filesystem_config.h>
+#include <processgroup/processgroup.h>
 #include <utils/Log.h>
 #include <array>
 #include <map>
@@ -114,6 +115,9 @@ bool DroidloomInput::workerLifecycle(uintptr_t context, bool starting) {
     JavaVMAttachArgs args{JNI_VERSION_1_6, const_cast<char*>("DroidloomInput"), nullptr};
     const bool attached = input.mVm->AttachCurrentThreadAsDaemon(&env, &args) == JNI_OK;
     if (!attached) ALOGE("Droidloom input worker could not attach to the VM");
+    // Every event passes through this thread on its way to InputDispatcher, so
+    // it gets the dispatcher's own scheduling (InputThread.cpp).
+    if (!SetTaskProfiles(0, {"InputPolicy"})) ALOGW("Droidloom input worker kept normal scheduling");
     return attached;
 }
 

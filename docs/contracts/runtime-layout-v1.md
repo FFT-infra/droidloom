@@ -54,7 +54,13 @@ The Droidloom system-server policy is a paired file override:
 and `/system/lib64/libinputflinger.so` includes its in-process Rust engine alongside
 the existing Droidloom native input integration.
 Both replace existing regular partition files through the normal override
-mechanism. No new file is created in the immutable system image. The package
+mechanism. No new file is created in the immutable system image.
+Each base odex records the checksums of the jars loaded before it, so ART would
+reject the base's precompiled code for services.jar and every system-server jar
+after it. Bundle staging compiles those jars again with a host `dex2oat` built
+from the base's own source, against the base boot image and with the context,
+compiler filter, profile and app image the base used for each. The result, with
+the base's other oat files unchanged, replaces `/system/framework/oat/<isa>`. The package
 must contain window-policy ABI 1 metadata in both compiled artifacts; native
 architecture must match the cell, and JNI checks the ABI again before WMS starts.
 The framework task backend additionally requires task-backend ABI 2 metadata
@@ -144,7 +150,13 @@ links.
   explicit wipe; the containing host filesystem is never exposed to Android.
 - per-user shared storage: an explicit allowlist of host-owned directories,
   each mapped to one top-level collection below `/storage/emulated/0`; an
-  omitted list exposes no host directory.
+  omitted list exposes no host directory. With `share_user_folders`, which the
+  recipes set, the desktop user's Downloads, Pictures, Documents, Music and
+  Videos (as `~/.config/user-dirs.dirs` names them, else those names below the
+  home) become Android's Download, Pictures, Documents, Music and Movies. They
+  are found at each start; a folder is shared while it is a real directory
+  owned by the user and the user's primary group, and gets the setgid bit
+  before the cell starts. Android keeps its own folder for the others.
 - per-user application integration: managed `.desktop` files below
   `$XDG_DATA_HOME/applications` with `droidloom-` names, rendered icons below the user's
   hicolor icon tree, and reconciliation state below `$XDG_STATE_HOME/droidloom`.
@@ -160,9 +172,10 @@ When selected, `android_init` must be a normalized absolute path to a regular,
 executable package-owned file. The supervisor bind-mounts it read-only over the
 immutable base's `/system/bin/init`; omitting it retains the base init.
 Each `android_file_overrides` entry names a normalized absolute package-owned
-regular file and a unique normalized target below `/system`, `/system_ext`,
-`/product`, or `/vendor`. Targets must already be regular files in the mounted
-partition and are bind-mounted read-only with executable mappings allowed.
+regular file or directory and a unique normalized target below `/system`,
+`/system_ext`, `/product`, or `/vendor`. Targets must already exist in the
+mounted partition as the same kind, and are bind-mounted read-only with
+executable mappings allowed.
 `/system/bin/init` remains reserved for the separately validated
 `android_init` field.
 Each `android_runtime_directories` entry names a normalized, package-owned host
@@ -224,7 +237,7 @@ an existing server without replacing it, derives the public key without reading
 user-selected paths as root, and projects the public key read-only at
 `/adb_keys`. The private key stays in the user's `~/.android/adbkey`.
 Runtime-generated read-only product properties enforce `ro.adb.secure=1` and
-the `Droidloom` model / `droidloom` device identity. Boot parameters supply
+the `droidloom` device identity. Boot parameters supply
 `ro.serialno=droidloom`. The generated init policy starts the existing AOSP
 adbd service independently of USB configuration and retains the previously
 projected classpath and CPU policy. Persistent Android data is preserved.
@@ -233,6 +246,11 @@ The product-property projection also clears `traced.relay_producer_port`: the
 cell uses Android’s local Perfetto producer and consumer Unix sockets, without
 an incoming VM relay listener. This avoids a `traced` restart loop on hosts
 without AF_VSOCK while preserving normal tracing and its enable setting.
+
+It names Android after the host as well. `ro.product.model` is the host's
+device-tree model, or `Droidloom` without one. `ro.droidloom.device_name` is
+the host's pretty hostname from `/etc/machine-info`, else its hostname, and
+system_server writes it to `Settings.Global.DEVICE_NAME` at every start.
 
 A connection worker uses bounded requests to the standard ADB host protocol
 to retry registration with the user's server, including after server restarts.
@@ -275,6 +293,22 @@ The daemon sends newline-delimited `{"progress": "..."}` frames followed by the
 normal response object. APK file descriptors still accompany the first request
 byte and are accepted only for installation. UID authorization is unchanged;
 boot observations are emitted only after authorizing the cell owner.
+
+`stats` answers from files only, without entering the cell: whether the
+framework and task-control sockets exist, time since start, the cell control
+group's memory without its file cache (`memory.current` less `file`, plus
+`shmem`), its swap, its `cpu.stat` usage, its processes and threads
+(droidloomd left out) and those under Android's `apps` group, the time from
+the cell's start until both sockets existed, Android's release version from
+`system/build.prop`, and the model and device name from `product/etc/build.prop`.
+A stopped cell answers with why it last ended, when it did not end on request.
+Settings asks for it every few seconds.
+`display` answers the built-in display's density (`dpi`) and the one it started
+with (`initial_dpi`) from the framework RPC endpoint; `set_dpi` changes it.
+`application_details` and `application_action` go to the framework RPC
+endpoint: a package's version, install dates and storage, and stop, uninstall
+(not for system packages), clear cache, clear data, or opening Android's App
+info for it in a window.
 
 Boot waiting is bounded at 120 seconds, with short timeouts on readiness probes.
 Native framework replies have a 120-second deadline. Package-manager commands

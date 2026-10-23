@@ -143,10 +143,12 @@ impl TextInput {
             show_request: Some(editor.show_request),
             ..Edit::default()
         });
-        eprintln!(
-            "Droidloom host panel dismissed session={} serial={serial}",
-            editor.session
-        );
+        if droidloom_timing::traced(droidloom_timing::Diagnostic::Input) {
+            eprintln!(
+                "Droidloom host panel dismissed session={} serial={serial}",
+                editor.session
+            );
+        }
     }
 
     pub fn fds(&self) -> impl Iterator<Item = (RawFd, i16)> + '_ {
@@ -260,11 +262,13 @@ impl TextInput {
         }
         resource.commit();
         self.serial = self.serial.wrapping_add(1);
-        eprintln!(
-            "Droidloom text-input editor={desired:?} focused_task={focused_task:?} serial={} touch_age_ms={:?}",
-            self.serial,
-            self.last_touch.map(|touch| touch.elapsed().as_millis())
-        );
+        if droidloom_timing::traced(droidloom_timing::Diagnostic::Input) {
+            eprintln!(
+                "Droidloom text-input editor={desired:?} focused_task={focused_task:?} serial={} touch_age_ms={:?}",
+                self.serial,
+                self.last_touch.map(|touch| touch.elapsed().as_millis())
+            );
+        }
     }
 
     fn done(&mut self, serial: u32) {

@@ -65,6 +65,7 @@ PRODUCT_COPY_FILES += \
     vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_input.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_input.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.activities_on_secondary_displays.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.activities_on_secondary_displays.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.software.app_widgets.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.app_widgets.xml \
+    frameworks/native/data/etc/android.software.freeform_window_management.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.freeform_window_management.xml \
     vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_app_compatibility.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_app_compatibility.xml \
     vendor/droidloom/android/device/droidloom_arm64/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
     vendor/droidloom/android/device/droidloom_arm64/droidloom_primary_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/droidloom_primary_audio_policy_configuration.xml \
@@ -74,9 +75,14 @@ PRODUCT_COPY_FILES += \
 
 # HWUI reports each frame's work to a hint session, which Droidloom's power
 # service turns into utilization floors for the UI thread and RenderThread.
+# Android's stream volumes start at full scale; the host mixer owns loudness.
 PRODUCT_VENDOR_PROPERTIES += \
     debug.hwui.use_hint_manager=true \
     persist.audio.normal_playback_period_ms=5 \
+    ro.config.media_vol_default=15 \
+    ro.config.vc_call_vol_default=15 \
+    ro.config.alarm_vol_default=7 \
+    ro.config.system_vol_default=7 \
     ro.zygote=zygote64 \
     ro.vendor.droidloom.surfaceflinger_direct=true \
     ro.vendor.droidloom.surfaceflinger_tasks=true \

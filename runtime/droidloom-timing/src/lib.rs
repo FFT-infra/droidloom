@@ -1,5 +1,11 @@
-//! Opt-in frame correlation. The render thread never waits for the log writer.
+//! Opt-in diagnostics. The render thread never waits for the log writer.
 //! Times are CLOCK_MONOTONIC nanoseconds shared by host and Android, not wall time.
+//!
+//! A process reads its diagnostics once, at the first query, so changing them
+//! takes a restart: `DROIDLOOM_TRACE` on the host and
+//! `persist.vendor.droidloom.trace` in Android, each a comma-separated list of
+//! `frames` (sampled per-frame records), `audit` (aggregates once a second) and
+//! `input` (every input event). Without them a check is one load of a constant.
 
 use std::io;
 mod clock;
@@ -33,11 +39,41 @@ struct Trace {
     written: AtomicU64,
 }
 
+/// A diagnostic a process may be started with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Diagnostic {
+    /// Sampled per-frame correlation records.
+    Frames = 1,
+    /// Aggregate timing, logged at most once a second.
+    Audit = 2,
+    /// One record per input event.
+    Input = 4,
+}
+
+static DIAGNOSTICS: OnceLock<u32> = OnceLock::new();
+
+/// Whether this process was started with `diagnostic`.
+pub fn traced(diagnostic: Diagnostic) -> bool {
+    *DIAGNOSTICS.get_or_init(|| parse(&requested())) & diagnostic as u32 != 0
+}
+
+fn parse(list: &str) -> u32 {
+    list.split([',', ' '])
+        .map(|name| match name.trim() {
+            "frames" => Diagnostic::Frames as u32,
+            "audit" => Diagnostic::Audit as u32,
+            "input" => Diagnostic::Input as u32,
+            _ => 0,
+        })
+        .fold(0, |all, one| all | one)
+}
+
 static TRACE: OnceLock<Option<Trace>> = OnceLock::new();
 
 fn trace() -> Option<&'static Trace> {
     TRACE.get_or_init(|| {
-        if !requested() {
+        if !traced(Diagnostic::Frames) {
             return None;
         }
         let (sender, receiver) = mpsc::sync_channel::<Record>(256);
@@ -93,7 +129,7 @@ fn write_record(line: &str) -> io::Result<()> {
     }
 }
 
-/// Whether tracing was explicitly enabled for this process at startup.
+/// Whether per-frame records were enabled for this process at startup.
 pub fn enabled() -> bool {
     trace().is_some()
 }
@@ -128,9 +164,10 @@ fn clock_ns(clock: clock::ClockId) -> u64 {
         .unwrap_or(0)
 }
 
-fn requested() -> bool {
-    if std::env::var_os("DROIDLOOM_FRAME_TRACE").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        return true;
+fn requested() -> String {
+    #[cfg(not(target_os = "android"))]
+    {
+        std::env::var("DROIDLOOM_TRACE").unwrap_or_default()
     }
     #[cfg(target_os = "android")]
     {
@@ -142,17 +179,15 @@ fn requested() -> bool {
         }
         let mut value = [0 as core::ffi::c_char; 92];
         // SAFETY: Android's property API writes at most PROP_VALUE_MAX (92)
-        // bytes; the name is NUL terminated and no pointer is retained.
-        return unsafe {
-            __system_property_get(
-                c"persist.vendor.droidloom.frame_timing".as_ptr(),
-                value.as_mut_ptr(),
-            ) == 1
-                && value[0] == b'1' as core::ffi::c_char
-        };
+        // bytes, NUL terminated; the name is NUL terminated and no pointer is
+        // retained.
+        unsafe {
+            __system_property_get(c"persist.vendor.droidloom.trace".as_ptr(), value.as_mut_ptr());
+            core::ffi::CStr::from_ptr(value.as_ptr())
+        }
+        .to_string_lossy()
+        .into_owned()
     }
-    #[cfg(not(target_os = "android"))]
-    false
 }
 
 /// Clock pair for one thread; zero means disabled, unsampled or unavailable.
@@ -257,6 +292,13 @@ impl Drop for Span {
     }
 }
 
+/// C ABI diagnostic query for SurfaceFlinger, which keeps the answer in a
+/// constant. `diagnostic` is a `Diagnostic` value.
+#[unsafe(no_mangle)]
+pub extern "C" fn droidloom_traced(diagnostic: u32) -> bool {
+    DIAGNOSTICS.get_or_init(|| parse(&requested())) & diagnostic != 0
+}
+
 /// C ABI clock entry point used by SurfaceFlinger's RAII adapter.
 #[unsafe(no_mangle)]
 pub extern "C" fn droidloom_timing_start(frame: u64) -> Stamp {
@@ -330,6 +372,15 @@ mod tests {
         assert_eq!(Stamp::default().elapsed(start), None);
     }
     #[test]
+    fn diagnostics_parse_from_a_list_and_ignore_unknown_names() {
+        assert_eq!(parse(""), 0);
+        assert_eq!(parse("input"), Diagnostic::Input as u32);
+        assert_eq!(
+            parse("frames, audit,bogus"),
+            Diagnostic::Frames as u32 | Diagnostic::Audit as u32
+        );
+    }
+    #[test]
     fn monotonic_and_thread_cpu_clocks_are_available() {
         assert!(now_ns() > 0);
         assert!(clock_ns(clock::CLOCK_THREAD_CPUTIME_ID) > 0);
@@ -378,9 +429,9 @@ mod tests {
             command
                 .args(["--exact", "tests::capture_child", "--nocapture"])
                 .env("DROIDLOOM_TIMING_TEST_CHILD", mode)
-                .env_remove("DROIDLOOM_FRAME_TRACE");
+                .env_remove("DROIDLOOM_TRACE");
             if mode == "enabled" {
-                command.env("DROIDLOOM_FRAME_TRACE", "1");
+                command.env("DROIDLOOM_TRACE", "audit,frames");
             }
             let result = command.output().unwrap();
             assert!(

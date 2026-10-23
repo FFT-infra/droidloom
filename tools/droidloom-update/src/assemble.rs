@@ -372,6 +372,16 @@ pub fn assemble_artifacts(
     ] {
         copy(&product.join(src), &runtime.join(dst))?;
     }
+    let scratch = tempfile::Builder::new()
+        .prefix("system-server-")
+        .tempdir_in(work)?;
+    crate::system_server::stage(
+        base,
+        &product.join("system/framework/services.jar"),
+        &work.join("android-out/host/linux-x86/bin"),
+        scratch.path(),
+        &runtime.join("framework/oat"),
+    )?;
     for (name, destination) in [
         ("netbpfload", "compat/classpath-compat/bin/netbpfload"),
         (
@@ -467,6 +477,13 @@ pub fn assemble_artifacts(
     copy(
         &work.join("init.rc"),
         &runtime.join("compat/init-classpath-first-pixels.rc"),
+    )?;
+    // Mounted over the base image's apps that Denial replaces or the cell
+    // cannot use (no camera): Android finds no APK there and drops them.
+    // Releases install files, so the folder holds one that is not an APK.
+    write(
+        &runtime.join("compat/removed-app/README"),
+        "Droidloom leaves this app out of Android.\n",
     )?;
     // Preserve both Java classpaths advertised by the base APEX manifest.
     for name in [
@@ -572,7 +589,7 @@ fn configure_target(repo: &Path, payload: &Path, spec: &Value, user: &str) -> Re
         } else {
             payload.join(src.trim_start_matches('/'))
         };
-        if !actual.is_file() {
+        if !actual.is_file() && !actual.is_dir() {
             return fail(format!("missing runtime override: {src}"));
         }
     }

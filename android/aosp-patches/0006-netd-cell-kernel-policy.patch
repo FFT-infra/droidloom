@@ -2,27 +2,21 @@ diff --git a/server/Controllers.cpp b/server/Controllers.cpp
 index 8a2c3be..0000000 100644
 --- a/server/Controllers.cpp
 +++ b/server/Controllers.cpp
-@@ -14,6 +14,8 @@
+@@ -14,6 +14,7 @@
   * limitations under the License.
   */
  
 +#include <cstdlib>
-+#include <unistd.h>
  #include <cinttypes>
  #include <regex>
  #include <set>
-@@ -322,22 +324,36 @@ int Controllers::initIptablesRules() {
+@@ -322,22 +323,31 @@ int Controllers::initIptablesRules() {
  }
  
  void Controllers::init() {
 -    if (initIptablesRules()) {
 +    const bool cellOwnsPacketPolicy = std::getenv("DROIDLOOM_CELL") != nullptr;
-+    // The cell cannot load the legacy tables. Without them each of the ruleset's
-+    // iptables-restore calls fails on its own, seconds in all.
-+    const bool legacyTablesLoaded = access("/proc/net/ip_tables_names", F_OK) == 0 &&
-+                                    access("/proc/net/ip6_tables_names", F_OK) == 0;
-+    const bool iptablesReady =
-+            (!cellOwnsPacketPolicy || legacyTablesLoaded) && initIptablesRules() == 0;
++    const bool iptablesReady = iptablesRestoreCtrl.available() && initIptablesRules() == 0;
 +    if (!iptablesReady && !cellOwnsPacketPolicy) {
          gLog.error("Failed to initialize iptables rules");
          exit(1);
@@ -58,7 +52,7 @@ index 8a2c3be..0000000 100644
  
      if (int ret = RouteController::Init(NetworkController::LOCAL_NET_ID)) {
          gLog.error("Failed to initialize RouteController (%s)", strerror(-ret));
-@@ -347,7 +363,13 @@ void Controllers::init() {
+@@ -347,7 +357,13 @@ void Controllers::init() {
  
      netdutils::Status xStatus = XfrmController::Init();
      if (!isOk(xStatus)) {
@@ -73,6 +67,81 @@ index 8a2c3be..0000000 100644
          exit(4);
      };
      gLog.info("Initializing XfrmController: %" PRId64 "us", s.getTimeAndResetUs());
+diff --git a/server/IptablesRestoreController.cpp b/server/IptablesRestoreController.cpp
+index 49b48d3..0000000 100644
+--- a/server/IptablesRestoreController.cpp
++++ b/server/IptablesRestoreController.cpp
+@@ -22,6 +22,8 @@
+ #include <sys/wait.h>
+ #include <unistd.h>
+ 
++#include <cstdlib>
++
+ #include <android-base/file.h>
+ #include <android-base/logging.h>
+ #include <android-base/properties.h>
+@@ -99,7 +101,19 @@ public:
+     static constexpr size_t STDERR_IDX = 1;
+ };
+ 
+-IptablesRestoreController::IptablesRestoreController() {
++namespace {
++
++// Without the legacy tables every iptables-restore exits on its first command,
++// and stopProcess() then sleeps 100 ms per process before reaping it.
++bool legacyTablesUsable() {
++    return std::getenv("DROIDLOOM_CELL") == nullptr ||
++           (access("/proc/net/ip_tables_names", F_OK) == 0 &&
++            access("/proc/net/ip6_tables_names", F_OK) == 0);
++}
++
++}  // namespace
++
++IptablesRestoreController::IptablesRestoreController() : mAvailable(legacyTablesUsable()) {
+     Init();
+ }
+ 
+@@ -107,6 +121,8 @@ IptablesRestoreController::~IptablesRestoreController() {
+ }
+ 
+ void IptablesRestoreController::Init() {
++    if (!mAvailable) return;
++
+     // We cannot fork these in parallel or a child process could inherit the pipe fds intended for
+     // use by the other child process. see https://android-review.googlesource.com/469559 for what
+     // breaks. This does not cause a latency hit, because the parent only has to wait for
+@@ -341,6 +357,7 @@ int IptablesRestoreController::execute(const IptablesTarget target, const std::s
+     } else {
+         output->clear();
+     }
++    if (!mAvailable) return -1;
+ 
+     int res = 0;
+     if (target == V4 || target == V4V6) {
+diff --git a/server/IptablesRestoreController.h b/server/IptablesRestoreController.h
+index b1c8dcd..0000000 100644
+--- a/server/IptablesRestoreController.h
++++ b/server/IptablesRestoreController.h
+@@ -45,6 +45,10 @@ class IptablesRestoreController final : public IptablesRestoreInterface {
+     int execute(const IptablesTarget target, const std::string& commands,
+                 std::string* output) override;
+ 
++    // False in a Droidloom cell whose kernel has no legacy tables. The host owns
++    // packet policy there, and execute() fails without starting iptables-restore.
++    bool available() const { return mAvailable; }
++
+     enum IptablesProcessType {
+         IPTABLES_PROCESS,
+         IP6TABLES_PROCESS,
+@@ -83,6 +87,8 @@ private:
+     static void maybeLogStderr(const std::unique_ptr<IptablesProcess> &process,
+                                const std::string& command);
+ 
++    const bool mAvailable;
++
+     // Guards calls to execute().
+     std::mutex mLock;
+ 
 diff --git a/server/RouteController.cpp b/server/RouteController.cpp
 index 775bbbb..0000000 100644
 --- a/server/RouteController.cpp
@@ -97,6 +166,31 @@ index 775bbbb..0000000 100644
      Fwmark fwmark;
  
      fwmark.netId = netId;
+diff --git a/server/TetherController.cpp b/server/TetherController.cpp
+index b159d95..0000000 100644
+--- a/server/TetherController.cpp
++++ b/server/TetherController.cpp
+@@ -25,6 +25,7 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
++#include <unistd.h>
+ 
+ #include <netinet/in.h>
+ #include <arpa/inet.h>
+@@ -905,6 +906,12 @@ StatusOr<TetherController::TetherStatsList> TetherController::getTetherStats() {
+     TetherStatsList statsList;
+     std::string parsedIptablesOutput;
+ 
++    // A Droidloom cell without the legacy tables never tethers. NetworkStats
++    // polls this at boot and on every app state change.
++    if (!gCtls->iptablesRestoreCtrl.available()) {
++        return statsList;
++    }
++
+     for (const IptablesTarget target : {V4, V6}) {
+         std::string statsString;
+         if (int ret = iptablesRestoreFunction(target, GET_TETHER_STATS_COMMAND, &statsString)) {
 diff --git a/server/main.cpp b/server/main.cpp
 index be9a1d0..0000000 100644
 --- a/server/main.cpp

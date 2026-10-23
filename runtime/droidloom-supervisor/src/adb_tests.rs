@@ -187,7 +187,7 @@ fn authentication_overrides_insecure_defaults_and_preserves_other_properties() {
     assert!(properties.contains("ro.build.version.sdk=37\n"));
     assert!(properties.contains("ro.adb.secure=1\n"));
     assert!(properties.contains("ro.product.device=droidloom\n"));
-    assert!(properties.contains("ro.product.model=Droidloom\n"));
+    assert!(properties.contains("ro.product.model=Cuttlefish\n"));
     assert!(!properties.contains("ro.adb.secure=0"));
     assert_eq!(authenticated_properties(&properties), properties);
 }

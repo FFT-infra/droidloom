@@ -1,15 +1,16 @@
 //! Mount package-owned APEX compatibility inputs before Android derives its
 //! boot class path.
 
-#![forbid(unsafe_code)]
-
 use std::env;
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Command, ExitCode};
+use std::time::SystemTime;
 
 const DERIVE_CLASSPATH: &str = "/apex/com.android.sdkext/bin/derive_classpath";
-const TOYBOX: &str = "/system/bin/toybox";
 
 fn main() -> ExitCode {
     match arguments().and_then(|config| run(&config)) {
@@ -141,45 +142,54 @@ fn run(config: &Config) -> Result<(), String> {
     let mut targets = versioned_targets(Path::new("/apex"), &config.module)?;
     targets.push(target);
     for target in targets {
-        checked(
-            Command::new(TOYBOX)
-                .args(["mount", "--bind"])
-                .arg(&source)
-                .arg(&target)
-                .status(),
-            "bind classpath projection",
-        )?;
+        bind(&source, &target).map_err(|error| format!("bind classpath projection: {error}"))?;
     }
 
     for file_override in file_overrides {
-        checked(
-            Command::new(TOYBOX)
-                .args(["mount", "--bind"])
-                .arg(&file_override.source)
-                .arg(&file_override.target)
-                .status(),
-            "bind APEX file override",
-        )?;
+        bind(&file_override.source, &file_override.target)
+            .map_err(|error| format!("bind APEX file override: {error}"))?;
     }
     // libvintf may have cached the original APEX manifest before this oneshot.
     // Its cache key is the APEX info-list mtime. The projection changes what
     // that list resolves to, so refresh the key without changing its contents.
     let apex_info = Path::new("/apex/apex-info-list.xml");
     if apex_info.exists() {
-        checked(
-            Command::new(TOYBOX).arg("touch").arg(apex_info).status(),
-            "invalidate projected APEX manifest cache",
-        )?;
+        fs::File::options()
+            .append(true)
+            .open(apex_info)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .map_err(|error| format!("invalidate projected APEX manifest cache: {error}"))?;
     }
 
     // The supervisor has already made the source projection read-only,
     // nosuid, and nodev. A bind of that mount preserves the restrictions.
-    // Remounting through Android toybox would resolve the backing host block
-    // device and fail with EBUSY even though the target is already read-only.
-    checked(
-        Command::new(DERIVE_CLASSPATH).status(),
-        "derive Android class paths",
-    )
+    // Init waits for this process, so derive_classpath takes its place.
+    Err(format!(
+        "derive Android class paths: {}",
+        Command::new(DERIVE_CLASSPATH).exec()
+    ))
+}
+
+/// Bind `source` onto `target` directly: each process spawn here delays the
+/// whole boot, which waits for this oneshot.
+fn bind(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: both strings outlive the call; mount retains no pointers.
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 // Match exact module version aliases only, never another APEX or a symlink.
@@ -255,15 +265,6 @@ fn resolve_file_override(file_override: &FileOverride) -> Result<ResolvedFileOve
         source,
         target: file_override.target.clone(),
     })
-}
-
-fn checked(result: std::io::Result<ExitStatus>, operation: &str) -> Result<(), String> {
-    let status = result.map_err(|error| format!("{operation}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{operation} failed ({status})"))
-    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,12 @@ pub const DENSITY: u16 = 2;
 pub const CATALOG: u16 = 3;
 /// Render one or more explicitly selected launcher icons.
 pub const ICONS: u16 = 4;
+/// Read one installed package's version and storage.
+pub const PACKAGE: u16 = 5;
+/// Stop, uninstall, clear or open the Android settings of one package.
+pub const PACKAGE_ACTION: u16 = 6;
+/// Read the built-in display's density and the one it started with.
+pub const DISPLAY: u16 = 7;
 /// Error bit in a response opcode.
 pub const ERROR: u16 = 0x8000;
 

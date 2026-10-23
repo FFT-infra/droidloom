@@ -15,10 +15,12 @@ mod development_network;
 mod filesystem_guard;
 pub mod gapps;
 pub mod host_storage;
+mod identity;
 pub mod linux_plan;
 mod package_cache;
 pub mod storage_migration;
 mod tracing;
+mod user_folders;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
@@ -61,13 +63,15 @@ pub struct IdRange {
     pub count: u32,
 }
 
-/// One package-owned file mounted over an immutable Android partition file.
+/// One package-owned file or directory mounted over its counterpart in an
+/// immutable Android partition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AndroidFileOverride {
     /// Normalized absolute host path to the package-owned replacement.
     pub source: PathBuf,
-    /// Normalized absolute file path inside an immutable Android partition.
+    /// Normalized absolute path inside an immutable Android partition, of the
+    /// same kind as `source`.
     pub target: PathBuf,
 }
 
@@ -161,8 +165,8 @@ pub struct CellSpec {
     /// base image's `/system/bin/init`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub android_init: Option<PathBuf>,
-    /// Package-owned compatibility files mounted read-only over immutable
-    /// Android partition files.
+    /// Package-owned compatibility files and directories mounted read-only
+    /// over their immutable Android partition counterparts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub android_file_overrides: Vec<AndroidFileOverride>,
     /// Package-owned compatibility trees projected read-only below the
@@ -173,6 +177,10 @@ pub struct CellSpec {
     /// storage. Omission keeps every host directory private.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_storage_directories: Vec<SharedStorageDirectory>,
+    /// Also share the desktop user's Downloads, Pictures, Documents, Music
+    /// and Videos as Android's own folders, found at each start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub share_user_folders: bool,
     /// Private host parent containing direct `data` and `metadata` directories.
     /// Android shares their host filesystem capacity; no writable disk images.
     pub data_dir: PathBuf,
@@ -191,6 +199,14 @@ impl CellSpec {
     /// Return the stable v1 identifier for this specification.
     pub fn id(&self) -> CellId {
         CellId::for_host_uid(self.host_uid)
+    }
+
+    /// The host directories Android shows in its shared storage: the explicit
+    /// ones, then the user's own folders that can be shared now.
+    pub fn shared_storage(&self) -> Vec<SharedStorageDirectory> {
+        let mut directories = self.shared_storage_directories.clone();
+        directories.extend(user_folders::resolve(self));
+        directories
     }
 
     /// Validate paths, ID mappings, and render-node policy before mutation.
@@ -260,7 +276,7 @@ impl CellSpec {
             }
             if !is_android_file_override_target(&file_override.target) {
                 problems.push(format!(
-                    "android_file_overrides[{index}].target must be a normalized file path below /system, /system_ext, /product, or /vendor"
+                    "android_file_overrides[{index}].target must be a normalized path below /system, /system_ext, /product, or /vendor"
                 ));
             }
             if file_override.target == Path::new("/system/bin/init") {
@@ -695,6 +711,7 @@ mod tests {
             android_file_overrides: Vec::new(),
             android_runtime_directories: Vec::new(),
             shared_storage_directories: Vec::new(),
+            share_user_folders: false,
             data_dir: "/var/lib/droidloom/users/1000/data".into(),
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),

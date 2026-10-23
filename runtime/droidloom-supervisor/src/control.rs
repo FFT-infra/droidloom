@@ -146,6 +146,26 @@ pub enum ControlRequest {
         /// Square output extent in pixels.
         size: u32,
     },
+    /// Report cheap runtime figures without spawning anything in the cell.
+    Stats,
+    /// Read one installed package's version and storage.
+    ApplicationDetails {
+        /// Android package name.
+        package: String,
+        /// Android user identifier.
+        user: u32,
+    },
+    /// Act on one installed package.
+    ApplicationAction {
+        /// Android package name.
+        package: String,
+        /// Android user identifier.
+        user: u32,
+        /// What to do.
+        action: ApplicationAction,
+    },
+    /// Read the density of Android's built-in display, while it runs.
+    Display,
     /// Persist the density of Android's single built-in display.
     SetDpi {
         /// Cell specification used when the runtime is cold.
@@ -179,6 +199,108 @@ pub struct AndroidApplication {
     pub icon_key: String,
 }
 
+/// What `ApplicationAction` does to a package.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationAction {
+    /// Stop all of its processes, as Android's Force stop does.
+    Stop,
+    /// Remove it. System packages cannot be removed.
+    Uninstall,
+    /// Delete its cache.
+    ClearCache,
+    /// Delete all of its data, as if newly installed.
+    ClearData,
+    /// Open Android's own settings screen for it.
+    Settings,
+}
+
+impl ApplicationAction {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Uninstall => "uninstall",
+            Self::ClearCache => "clear_cache",
+            Self::ClearData => "clear_data",
+            Self::Settings => "settings",
+        }
+    }
+}
+
+/// Cheap figures about the running cell.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellStats {
+    /// Droidloom's framework endpoints answer: apps can be opened.
+    pub ready: bool,
+    /// Time since the cell started.
+    pub uptime_ms: u64,
+    /// Memory charged to the cell's control group, without the file cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// Processor time used by the cell's control group since it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usec: Option<u64>,
+    /// Android's release version, such as "17".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android_version: Option<String>,
+    /// Time from the cell's start until apps could be opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_ms: Option<u64>,
+    /// Memory swapped out of the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_bytes: Option<u64>,
+    /// Processes in the cell's control group, droidloomd left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<u32>,
+    /// Their threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
+    /// The processes Android runs for apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_processes: Option<u32>,
+    /// The model Android reports to apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The device name Android shows, as on Bluetooth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+/// The density of Android's built-in display.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayDensity {
+    /// What Android draws at now, in dots per inch.
+    pub dpi: u32,
+    /// What it started with, before any change.
+    pub initial_dpi: u32,
+}
+
+/// One installed Android package.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationDetails {
+    /// Localized Android label.
+    pub name: String,
+    /// Android package name.
+    pub package: String,
+    /// The version name the package declares.
+    pub version: String,
+    /// Part of the system image: it can be stopped and cleared, not removed.
+    pub system: bool,
+    /// First install, in milliseconds since the epoch.
+    pub installed_ms: i64,
+    /// Last update, in milliseconds since the epoch.
+    pub updated_ms: i64,
+    /// Bytes of code.
+    pub app_bytes: u64,
+    /// Bytes of data, without the cache.
+    pub data_bytes: u64,
+    /// Bytes of cache.
+    pub cache_bytes: u64,
+}
+
 /// One bounded control response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +329,15 @@ pub struct ControlResponse {
     /// Android log snapshot or crash report, when requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<String>,
+    /// Runtime figures, when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<CellStats>,
+    /// One package's details, when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<ApplicationDetails>,
+    /// The display's density, when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayDensity>,
 }
 
 /// Daemon filesystem and executable configuration.
@@ -244,6 +375,7 @@ struct ActiveCell {
     spec: CellSpec,
     cell: DevelopmentCell,
     ready_init: std::cell::Cell<Option<u32>>,
+    started: Instant,
 }
 impl ActiveCell {
     fn ready_init(&self, progress: &Reporter) -> Result<u32, ControlError> {
@@ -349,7 +481,17 @@ impl Daemon {
                 user,
                 size,
             } => self.application_icon(peer_uid, &component, user, size),
+            ControlRequest::Display => self.display(peer_uid),
             ControlRequest::SetDpi { spec, dpi } => self.set_dpi(peer_uid, &spec, dpi),
+            ControlRequest::Stats => self.stats(peer_uid),
+            ControlRequest::ApplicationDetails { package, user } => {
+                self.application_details(peer_uid, &package, user)
+            }
+            ControlRequest::ApplicationAction {
+                package,
+                user,
+                action,
+            } => self.application_action(peer_uid, &package, user, action),
         };
         result.unwrap_or_else(|error| self.failure(error.to_string()))
     }
@@ -376,6 +518,7 @@ impl Daemon {
             spec: spec.clone(),
             cell,
             ready_init: std::cell::Cell::new(None),
+            started: Instant::now(),
         });
         self.last_exit = None;
         Ok(ControlResponse {
@@ -388,6 +531,9 @@ impl Daemon {
             application_icon: None,
             application_icons: None,
             diagnostics: None,
+            stats: None,
+            application: None,
+            display: None,
         })
     }
 
@@ -485,6 +631,9 @@ impl Daemon {
             application_icon: None,
             application_icons: None,
             diagnostics: None,
+            stats: None,
+            application: None,
+            display: None,
         })
     }
 
@@ -517,6 +666,9 @@ impl Daemon {
             application_icon: None,
             application_icons: None,
             diagnostics: None,
+            stats: None,
+            application: None,
+            display: None,
         })
     }
 
@@ -588,6 +740,9 @@ impl Daemon {
             application_icon: Some(icon),
             application_icons: None,
             diagnostics: None,
+            stats: None,
+            application: None,
+            display: None,
         })
     }
 
@@ -641,6 +796,86 @@ impl Daemon {
         framework_control::connect(init, "catalog-events")
     }
 
+    fn stats(&self, peer_uid: u32) -> Result<ControlResponse, ControlError> {
+        let Some(active) = &self.active else {
+            return Ok(self.success(self.last_exit.as_deref().unwrap_or("cell is stopped")));
+        };
+        authorize_uid(peer_uid, active.spec.host_uid)?;
+        let init = match active.ready_init.get() {
+            Some(pid) => Some(pid),
+            None => android_init_pid(&active.spec)?,
+        };
+        let mut response = self.success(format!("cell {} is running", active.spec.id()));
+        response.stats = Some(cell_stats(active.cell.host_pid(), init, active.started));
+        Ok(response)
+    }
+
+    fn application_details(
+        &self,
+        peer_uid: u32,
+        package: &str,
+        user: u32,
+    ) -> Result<ControlResponse, ControlError> {
+        validate_package(package)?;
+        validate_android_user(user)?;
+        let active = self.require_active_cell(peer_uid, None)?;
+        let init = active.ready_init(&self.progress)?;
+        let output = framework_request(
+            init,
+            framework_wire::PACKAGE,
+            &self.progress,
+            &serde_json::json!({"user":user,"package":package}),
+        )?;
+        let details: ApplicationDetails = serde_json::from_str(&output).map_err(|error| {
+            ControlError::Invalid(format!("Android package details are invalid: {error}"))
+        })?;
+        if details.package != package {
+            return Err(ControlError::Invalid(
+                "Android described a different package".into(),
+            ));
+        }
+        let mut response = self.success(format!("read {package}"));
+        response.application = Some(details);
+        Ok(response)
+    }
+
+    fn application_action(
+        &self,
+        peer_uid: u32,
+        package: &str,
+        user: u32,
+        action: ApplicationAction,
+    ) -> Result<ControlResponse, ControlError> {
+        validate_package(package)?;
+        validate_android_user(user)?;
+        let active = self.require_active_cell(peer_uid, None)?;
+        let init = active.ready_init(&self.progress)?;
+        let output = framework_request(
+            init,
+            framework_wire::PACKAGE_ACTION,
+            &self.progress,
+            &serde_json::json!({"user":user,"package":package,"action":action.wire()}),
+        )?;
+        Ok(self.success(output))
+    }
+
+    fn display(&self, peer_uid: u32) -> Result<ControlResponse, ControlError> {
+        let active = self.require_active_cell(peer_uid, None)?;
+        let init = active.ready_init(&self.progress)?;
+        let output = framework_request(
+            init,
+            framework_wire::DISPLAY,
+            &self.progress,
+            &serde_json::json!({"user": 0}),
+        )?;
+        let display: DisplayDensity = serde_json::from_str(&output).map_err(|error| {
+            ControlError::Invalid(format!("Android display density is invalid: {error}"))
+        })?;
+        let mut response = self.success(format!("display density is {} dpi", display.dpi));
+        response.display = Some(display);
+        Ok(response)
+    }
+
     fn set_dpi(
         &mut self,
         peer_uid: u32,
@@ -667,6 +902,9 @@ impl Daemon {
             application_icon: None,
             application_icons: None,
             diagnostics: None,
+            stats: None,
+            application: None,
+            display: None,
         })
     }
 
@@ -756,6 +994,9 @@ impl Daemon {
             application_icon: None,
             application_icons: None,
             diagnostics: None,
+            stats: None,
+            application: None,
+            display: None,
         }
     }
 
@@ -1322,6 +1563,121 @@ fn android_boot_phase(properties: &[u8], launcher: bool, task_control: bool) -> 
     }
 }
 
+/// Reads files only: Settings asks for these every few seconds.
+fn cell_stats(host_pid: u32, init: Option<u32>, started: Instant) -> CellStats {
+    let socket = |init: u32, path: &str| {
+        fs::symlink_metadata(format!("/proc/{init}/root/dev/socket/{path}"))
+            .ok()
+            .filter(|metadata| metadata.file_type().is_socket())
+    };
+    let group = fs::read_to_string(format!("/proc/{host_pid}/cgroup"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+        })
+        .map(|path| PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')));
+    let read = |name: &str| {
+        group
+            .as_ref()
+            .and_then(|group| fs::read_to_string(group.join(name)).ok())
+    };
+    let number = |name: &str| read(name).and_then(|text| text.trim().parse::<u64>().ok());
+    // Apps can be opened once both endpoints exist; the later one's
+    // creation is when that happened.
+    let endpoints = init.and_then(|init| {
+        let framework = socket(init, "droidloom-framework/control")?;
+        let tasks = socket(init, "droidloom-task-control")?;
+        Some(framework.ctime().max(tasks.ctime()))
+    });
+    let uptime = started.elapsed();
+    let started_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|now| now.saturating_sub(uptime).as_secs_f64());
+    let (own, own_threads) = (std::process::id(), own_threads());
+    let processes = group.as_deref().map(|group| count_processes(group, own));
+    let property = |file: &str, key: &str| {
+        let properties = fs::read_to_string(format!("/proc/{}/root{file}", init?)).ok()?;
+        properties.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .strip_prefix('=')
+                .map(|value| value.trim().to_owned())
+        })
+    };
+    CellStats {
+        ready: endpoints.is_some(),
+        uptime_ms: uptime.as_millis() as u64,
+        // The page cache of Android's images is the kernel's to drop;
+        // shared memory is counted in it but is not.
+        memory_bytes: number("memory.current").map(|current| {
+            let stat = read("memory.stat").unwrap_or_default();
+            let field = |name: &str| {
+                stat.lines()
+                    .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+                    .unwrap_or(0u64)
+            };
+            current.saturating_sub(field("file")) + field("shmem")
+        }),
+        cpu_usec: read("cpu.stat").and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("usage_usec ")?.trim().parse().ok())
+        }),
+        android_version: property("/system/build.prop", "ro.build.version.release"),
+        ready_ms: endpoints.zip(started_s).map(|(ready, started)| {
+            ((ready as f64 - started).max(0.0) * 1000.0) as u64
+        }),
+        swap_bytes: number("memory.swap.current"),
+        processes: processes.map(|(all, _)| all),
+        threads: number("pids.current")
+            .map(|threads| threads.saturating_sub(u64::from(own_threads)) as u32),
+        app_processes: processes.map(|(_, apps)| apps),
+        model: property("/product/etc/build.prop", "ro.product.model"),
+        device_name: property("/product/etc/build.prop", "ro.droidloom.device_name"),
+    }
+}
+
+/// The processes in `group` and the groups under it, but `own`; and those
+/// under Android's `apps` group.
+fn count_processes(group: &Path, own: u32) -> (u32, u32) {
+    let mut all = 0;
+    let mut apps = 0;
+    let mut pending = vec![(group.to_path_buf(), false)];
+    while let Some((group, in_apps)) = pending.pop() {
+        if let Ok(procs) = fs::read_to_string(group.join("cgroup.procs")) {
+            let count = procs
+                .lines()
+                .filter(|pid| pid.trim().parse::<u32>().is_ok_and(|pid| pid != own))
+                .count() as u32;
+            all += count;
+            if in_apps {
+                apps += count;
+            }
+        }
+        let Ok(entries) = fs::read_dir(&group) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let in_apps = in_apps || entry.file_name() == "apps";
+                pending.push((entry.path(), in_apps));
+            }
+        }
+    }
+    (all, apps)
+}
+
+fn own_threads() -> u32 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:")?.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn android_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
     for pid in android_namespace_pids(spec)? {
         let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
@@ -1448,6 +1804,9 @@ mod tests {
                         application_icon: None,
                         application_icons: None,
                         diagnostics: None,
+                        stats: None,
+                        application: None,
+            display: None,
                     },
                 )
                 .unwrap();
@@ -1499,6 +1858,66 @@ mod tests {
             serde_json::from_slice::<ControlRequest>(&encoded).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn settings_requests_parse() {
+        let parse = |text: &str| serde_json::from_str::<ControlRequest>(text).unwrap();
+        assert_eq!(parse(r#"{"command":"stats"}"#), ControlRequest::Stats);
+        assert_eq!(
+            parse(r#"{"command":"application_details","package":"org.example","user":0}"#),
+            ControlRequest::ApplicationDetails {
+                package: "org.example".into(),
+                user: 0
+            }
+        );
+        assert_eq!(
+            parse(
+                r#"{"command":"application_action","package":"org.example","user":0,"action":"clear_cache"}"#
+            ),
+            ControlRequest::ApplicationAction {
+                package: "org.example".into(),
+                user: 0,
+                action: ApplicationAction::ClearCache,
+            }
+        );
+        assert_eq!(parse(r#"{"command":"display"}"#), ControlRequest::Display);
+        let display = DisplayDensity {
+            dpi: 360,
+            initial_dpi: 408,
+        };
+        assert_eq!(
+            serde_json::to_value(display).unwrap(),
+            serde_json::json!({"dpi":360,"initial_dpi":408})
+        );
+        let stats = CellStats {
+            ready: true,
+            uptime_ms: 5,
+            memory_bytes: Some(1),
+            cpu_usec: None,
+            android_version: Some("17".into()),
+            processes: Some(3),
+            ..CellStats::default()
+        };
+        let encoded = serde_json::to_value(&stats).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"ready":true,"uptime_ms":5,"memory_bytes":1,"android_version":"17","processes":3})
+        );
+    }
+
+    #[test]
+    fn cell_processes_are_counted_through_android_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let app = root.join("apps/uid_10050");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(root.join("system")).unwrap();
+        fs::write(root.join("cgroup.procs"), "7\n8\n").unwrap();
+        fs::write(root.join("system/cgroup.procs"), "9\n").unwrap();
+        fs::write(root.join("apps/cgroup.procs"), "").unwrap();
+        fs::write(app.join("cgroup.procs"), "10\n11\n").unwrap();
+        assert_eq!(count_processes(root, 7), (4, 2));
     }
 
     #[test]

@@ -86,22 +86,41 @@ fn layer_pipeline_supports_bounded_async_imports_commits_and_legacy_replies() {
 }
 
 #[test]
-fn host_fences_do_not_block_other_apps_or_commit_callbacks() {
+fn host_fences_do_not_block_other_surfaces_or_commit_callbacks() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let patch =
-        fs::read_to_string(repo.join("android/surfaceflinger/0008-droidloom-release-fences.patch"))
-            .unwrap();
-    let section = patch
-        .split("diff --git ")
-        .find(|section| section.starts_with("a/services/surfaceflinger/DroidloomReleaseQueue.h "))
-        .expect("release scheduler is part of the Android patch");
-    let header: String = section
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .map(|line| format!("{}\n", &line[1..]))
-        .collect();
     let temp = tempfile::tempdir().unwrap();
-    fs::write(temp.path().join("DroidloomReleaseQueue.h"), header).unwrap();
+    // The scheduler as SurfaceFlinger builds it: 0008 adds it, 0021 changes it.
+    for patch in [
+        "0008-droidloom-release-fences.patch",
+        "0021-droidloom-release-backlog-diagnostics.patch",
+    ] {
+        let output = Command::new("git")
+            .current_dir(temp.path())
+            .args([
+                "apply",
+                "--include=services/surfaceflinger/DroidloomReleaseQueue.h",
+            ])
+            .arg(repo.join("android/surfaceflinger").join(patch))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::copy(
+        temp.path()
+            .join("services/surfaceflinger/DroidloomReleaseQueue.h"),
+        temp.path().join("DroidloomReleaseQueue.h"),
+    )
+    .unwrap();
+    fs::create_dir(temp.path().join("log")).unwrap();
+    fs::write(
+        temp.path().join("log/log.h"),
+        "#include <cstdio>\n#define ALOGW(...) std::fprintf(stderr, __VA_ARGS__)\n",
+    )
+    .unwrap();
     let binary = temp.path().join("release-queue-test");
     let output = Command::new("c++")
         .args([

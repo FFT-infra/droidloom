@@ -96,6 +96,14 @@ configuration:
 Check them in a staged bundle with `debugfs -R 'cat /build.prop'` on
 `var/lib/droidloom/images/images/vendor.raw.img`.
 
+`bundle-stage` also compiles the system-server jars that depend on Droidloom's
+`services.jar`, using the host `dex2oat64` that `android-build` produces from the
+base's own source. It reads each base odex for the boot
+image, class-loader context, compiler filter, profile and app image to use,
+then checks that the new odex records the same boot image checksums and
+context. The release's `framework/oat/<isa>` replaces the base directory in the
+cell; see the [runtime layout](../../docs/contracts/runtime-layout-v1.md).
+
 On the target, copy the bundle with sparse-aware rsync, then run its verifier and
 installer as root:
 

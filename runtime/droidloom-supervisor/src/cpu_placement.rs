@@ -35,10 +35,31 @@ fn mount(
     Ok(())
 }
 
+/// The cgroup controllers the cell gives Android.
+pub(crate) struct Controllers {
+    pub(crate) blkio: bool,
+    /// The cpuset init policy, present when the cell cpuset is ready.
+    pub(crate) cpu_policy: Option<String>,
+}
+
+impl Controllers {
+    /// Whether Android may use `controller`. The legacy cpu hierarchy cannot
+    /// be created from the cell's cgroup namespace, and v2 memory cannot be
+    /// delegated below the namespace root, which holds Android init.
+    pub(crate) fn provides(&self, controller: &str) -> bool {
+        match controller {
+            "blkio" => self.blkio,
+            "cpuset" => self.cpu_policy.is_some(),
+            "cgroup2" | "freezer" => true,
+            _ => false,
+        }
+    }
+}
+
 /// Create the hierarchy in the initial cgroup namespace, enter only our subtree,
 /// then seal the namespace. A missing/busy legacy controller is explicitly
-/// reported; Android may still boot using its original optional descriptors.
-pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
+/// reported, and Android is not told about it.
+pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Controllers> {
     let normal = CpuSet::current()?;
     let groups = match Groups::detect() {
         Ok(groups) => groups,
@@ -51,7 +72,7 @@ pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
     };
     // Android's scheduling aggregates also contain I/O actions. Without a real
     // blkio hierarchy they report failure even after applying CPU placement.
-    prepare_legacy(root, "blkio", "blkio", cell, |_| Ok(()))?;
+    let blkio = prepare_legacy(root, "blkio", "blkio", cell, |_| Ok(()))?;
     let cpuset = prepare_legacy(
         root,
         "cpuset",
@@ -73,7 +94,7 @@ pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
     if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if cpuset {
+    let cpu_policy = cpuset.then(|| {
         eprintln!(
             "Droidloom Android cpuset: cell={cell} normal={} big={} little={}",
             normal.list(),
@@ -84,10 +105,9 @@ pub(crate) fn prepare(root: &Path, cell: &str) -> io::Result<Option<String>> {
                 .as_ref()
                 .map_or_else(|| normal.list(), |g| g.background.list())
         );
-        Ok(Some(init_policy(&normal, groups.as_ref())))
-    } else {
-        Ok(None)
-    }
+        init_policy(&normal, groups.as_ref())
+    });
+    Ok(Controllers { blkio, cpu_policy })
 }
 
 fn prepare_legacy(
@@ -199,25 +219,56 @@ fn init_policy(normal: &CpuSet, groups: Option<&Groups>) -> String {
     rc
 }
 
-/// Translate CPU placement profiles onto the actual cell controller. Other
-/// actions (I/O, memory, freezer, scheduler priority, timer slack) are preserved.
-/// Frequency/utilization-clamp attributes deliberately retain their own backend.
-pub(crate) fn task_profiles(source: &str) -> io::Result<String> {
-    let mut json: serde_json::Value = serde_json::from_str(source)?;
-    let Some(profiles) = json
-        .get_mut("Profiles")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return Ok(source.into());
-    };
-    for profile in profiles {
-        let graphics = matches!(
-            profile["Name"].as_str(),
-            Some("SFMainPolicy" | "SFRenderEnginePolicy")
-        );
-        if let Some(actions) = profile["Actions"].as_array_mut() {
-            for action in actions {
-                if action["Name"] == "JoinCgroup" && action["Params"]["Controller"] == "cpu" {
+/// Fit Android's task profiles to the cell's controllers. CPU placement moves
+/// onto the cell cpuset; actions on a controller the cell lacks are removed,
+/// since each would fail, and log, at every application. Other actions (timer
+/// slack, scheduler policy, freezer) are preserved.
+pub(crate) fn task_profiles(
+    sources: &[String],
+    controllers: &Controllers,
+) -> io::Result<Vec<String>> {
+    use serde_json::Value;
+    let mut documents = sources
+        .iter()
+        .map(|source| serde_json::from_str::<Value>(source))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Profiles may name attributes another file declares.
+    let missing: std::collections::HashSet<String> = documents
+        .iter()
+        .filter_map(|document| document["Attributes"].as_array())
+        .flatten()
+        .filter(|attribute| {
+            !attribute["Controller"]
+                .as_str()
+                .is_some_and(|controller| controllers.provides(controller))
+        })
+        .filter_map(|attribute| attribute["Name"].as_str().map(str::to_owned))
+        .collect();
+    let cpuset = controllers.provides("cpuset");
+    for document in &mut documents {
+        if let Some(attributes) = document.get_mut("Attributes").and_then(Value::as_array_mut) {
+            attributes.retain(|attribute| {
+                !attribute["Name"]
+                    .as_str()
+                    .is_some_and(|name| missing.contains(name))
+            });
+        }
+        let Some(profiles) = document.get_mut("Profiles").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for profile in profiles {
+            let graphics = matches!(
+                profile["Name"].as_str(),
+                Some("SFMainPolicy" | "SFRenderEnginePolicy")
+            );
+            let Some(actions) = profile["Actions"].as_array_mut() else {
+                continue;
+            };
+            for action in actions
+                .iter_mut()
+                .filter(|action| cpuset && action["Name"] == "JoinCgroup")
+            {
+                if action["Params"]["Controller"] == "cpu" {
                     let path = match action["Params"]["Path"].as_str() {
                         Some("" | "system" | "camera-daemon" | "nnapi-hal") => "foreground",
                         Some("rt" | "top-app") => "top-app",
@@ -234,16 +285,25 @@ pub(crate) fn task_profiles(source: &str) -> io::Result<String> {
                     action["Params"]["Controller"] = "cpuset".into();
                     action["Params"]["Path"] = path.into();
                 }
-                if graphics
-                    && action["Name"] == "JoinCgroup"
-                    && action["Params"]["Controller"] == "cpuset"
-                {
+                if graphics && action["Params"]["Controller"] == "cpuset" {
                     action["Params"]["Path"] = "top-app".into();
                 }
             }
+            actions.retain(|action| match action["Name"].as_str() {
+                Some("JoinCgroup") => action["Params"]["Controller"]
+                    .as_str()
+                    .is_some_and(|controller| controllers.provides(controller)),
+                Some("SetAttribute") => !action["Params"]["Name"]
+                    .as_str()
+                    .is_some_and(|name| missing.contains(name)),
+                _ => true,
+            });
         }
     }
-    serde_json::to_string_pretty(&json).map_err(Into::into)
+    documents
+        .iter()
+        .map(|document| serde_json::to_string_pretty(document).map_err(Into::into))
+        .collect()
 }
 
 #[cfg(test)]
@@ -276,8 +336,12 @@ mod tests {
           {"Name":"Frozen","Actions":[{"Name":"SetAttribute","Params":{"Name":"FreezerState","Value":"1"}}]}],
           "AggregateProfiles":[{"Name":"Custom","Profiles":["HighPerformance","Frozen"]}]}"#;
         let before: serde_json::Value = serde_json::from_str(source).unwrap();
-        let after: serde_json::Value =
-            serde_json::from_str(&task_profiles(source).unwrap()).unwrap();
+        let controllers = Controllers {
+            blkio: true,
+            cpu_policy: Some(String::new()),
+        };
+        let after = task_profiles(&[source.into()], &controllers).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&after[0]).unwrap();
         assert_eq!(
             after["Profiles"][0]["Actions"][0]["Params"]["Controller"],
             "cpuset"
@@ -288,6 +352,45 @@ mod tests {
         );
         assert_eq!(after["Profiles"][2], before["Profiles"][2]);
         assert_eq!(after["AggregateProfiles"], before["AggregateProfiles"]);
+    }
+    #[test]
+    fn removes_actions_on_controllers_the_cell_lacks() {
+        let system = r#"{"Attributes":[
+          {"Name":"MemSoftLimit","Controller":"memory","File":"memory.soft_limit_in_bytes"},
+          {"Name":"FreezerState","Controller":"freezer","File":"cgroup.freeze"}],
+          "Profiles":[
+          {"Name":"HighPerformance","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"cpu","Path":"foreground"}},{"Name":"SetTimerSlack","Params":{"Slack":"50000"}}]},
+          {"Name":"ProcessCapacityHigh","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"cpuset","Path":"foreground"}}]},
+          {"Name":"HighIoPriority","Actions":[{"Name":"JoinCgroup","Params":{"Controller":"blkio","Path":""}}]},
+          {"Name":"Frozen","Actions":[{"Name":"SetAttribute","Params":{"Name":"FreezerState","Value":"1"}}]}]}"#;
+        let vendor = r#"{"Profiles":[
+          {"Name":"LowMemoryUsage","Actions":[{"Name":"SetAttribute","Params":{"Name":"MemSoftLimit","Value":"16MB"}}]}]}"#;
+        let controllers = Controllers {
+            blkio: true,
+            cpu_policy: None,
+        };
+        let after = task_profiles(&[system.into(), vendor.into()], &controllers).unwrap();
+        let system: serde_json::Value = serde_json::from_str(&after[0]).unwrap();
+        let vendor: serde_json::Value = serde_json::from_str(&after[1]).unwrap();
+        assert_eq!(system["Attributes"].as_array().unwrap().len(), 1);
+        assert_eq!(system["Attributes"][0]["Name"], "FreezerState");
+        let actions = |profile: usize| {
+            system["Profiles"][profile]["Actions"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            [actions(0), actions(1), actions(2), actions(3)],
+            [1, 0, 1, 1]
+        );
+        assert_eq!(system["Profiles"][0]["Actions"][0]["Name"], "SetTimerSlack");
+        assert!(
+            vendor["Profiles"][0]["Actions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

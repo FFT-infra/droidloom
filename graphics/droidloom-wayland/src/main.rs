@@ -700,8 +700,9 @@ impl App {
                 content_opaque: false,
                 applied_opaque: None,
                 composed_root: false,
-                presentation_audit: (env::var_os("DROIDLOOM_PRESENT_AUDIT").as_deref()
-                    == Some(std::ffi::OsStr::new("1")))
+                presentation_audit: droidloom_timing::traced(
+                    droidloom_timing::Diagnostic::Audit,
+                )
                 .then(presentation_audit::Audit::default),
                 focused: false,
                 unmap_requested: false,
@@ -1827,7 +1828,6 @@ impl App {
         event: InputEvent,
         timestamp: u64,
     ) -> Result<bool, PresenterError> {
-        static INPUT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !matches!(
             event,
             InputEvent::Touch {
@@ -1844,9 +1844,7 @@ impl App {
             .next_input_serial
             .checked_add(1)
             .ok_or(PresenterError::Configuration("input serial exhausted"))?;
-        if *INPUT_TRACE.get_or_init(|| {
-            env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        }) {
+        if droidloom_timing::traced(droidloom_timing::Diagnostic::Input) {
             let receipt = monotonic_timestamp_nanos()?;
             eprintln!(
                 "Droidloom input trace: stage=wayland serial={} object={} event={event:?} time_ns={timestamp} receipt_ns={receipt} age_us={}",
@@ -3158,7 +3156,7 @@ fn run() -> Result<(), PresenterError> {
         xdg_shell,
         insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
         frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
-        clock: clock::Clock::default(),
+        clock: clock::Clock::new(),
         viewporter,
         fractional_scale_manager,
         sync_manager,

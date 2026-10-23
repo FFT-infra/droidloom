@@ -28,16 +28,25 @@ pub(super) struct Clock {
     subscription: Option<Subscription>,
     armed: bool,
     last_frame_nanos: u64,
-    audit: Audit,
+    /// Only with the `audit` diagnostic.
+    audit: Option<Audit>,
 }
 
 impl Clock {
+    pub fn new() -> Self {
+        Self {
+            audit: droidloom_timing::traced(droidloom_timing::Diagnostic::Audit)
+                .then(Audit::default),
+            ..Self::default()
+        }
+    }
+
     pub fn armed(&self) -> bool {
         self.armed
     }
 }
 
-// Once a second while armed: grants forwarded, frames, frames shown untargeted
+// With the `audit` diagnostic, once a second while armed: grants forwarded, frames, frames shown untargeted
 // after idle, frames late for their grant, and how long before the latch
 // targeted frames arrived.
 #[derive(Default)]
@@ -113,16 +122,18 @@ impl App {
     /// An Android frame is being shown; `target` is its grant, if any.
     pub(super) fn android_frame(&mut self, now: u64, target: Option<&Target>) {
         self.clock.last_frame_nanos = now;
-        if self.clock.armed {
-            self.clock.audit.frame(now, target);
-        } else {
-            self.clock.audit = Audit {
-                started_nanos: now,
-                late_seen: self.late_frames(),
-                ..Audit::default()
-            };
-            self.clock.audit.frame(now, target);
+        if !self.clock.armed {
+            if self.clock.audit.is_some() {
+                self.clock.audit = Some(Audit {
+                    started_nanos: now,
+                    late_seen: self.late_frames(),
+                    ..Audit::default()
+                });
+            }
             self.arm_timelines(true);
+        }
+        if let Some(audit) = self.clock.audit.as_mut() {
+            audit.frame(now, target);
         }
     }
 
@@ -132,8 +143,12 @@ impl App {
             return;
         }
         let idle = now.saturating_sub(self.clock.last_frame_nanos) >= IDLE_NANOS;
-        let late = self.late_frames();
-        self.clock.audit.log(now, late, idle);
+        if self.clock.audit.is_some() {
+            let late = self.late_frames();
+            if let Some(audit) = self.clock.audit.as_mut() {
+                audit.log(now, late, idle);
+            }
+        }
         if idle {
             self.arm_timelines(false);
         }
@@ -210,7 +225,9 @@ impl Dispatch<OutputTimeline, ClockTimeline> for App {
                     _ => {}
                 }
             }
-            state.clock.audit.grants += 1;
+            if let Some(audit) = state.clock.audit.as_mut() {
+                audit.grants += 1;
+            }
             state.clock_idle_check(monotonic_timestamp_nanos()?);
             Ok::<(), super::PresenterError>(())
         })();

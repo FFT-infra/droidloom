@@ -589,6 +589,24 @@
       "purpose": "Pinned compression library required by host VINTF assembly"
     },
     {
+      "path": "external/cpu_features",
+      "name": "platform/external/cpu_features",
+      "commit": "76df2471cbea083fd15823ef051bbd85a7cddabb",
+      "purpose": "CPU feature detection linked into the host dex2oat runtime"
+    },
+    {
+      "path": "external/dlmalloc",
+      "name": "platform/external/dlmalloc",
+      "commit": "01a95ac67e502c00c9d546c3ccee2a00313f90ee",
+      "purpose": "Allocator headers of the host dex2oat runtime"
+    },
+    {
+      "path": "external/vixl",
+      "name": "platform/external/vixl",
+      "commit": "ce11d32c9cc395fd0fd961e30b1ab56e06fd30dc",
+      "purpose": "ARM code generator of the host dex2oat that precompiles system-server jars"
+    },
+    {
       "path": "external/zopfli",
       "name": "platform/external/zopfli",
       "commit": "eef2dd4266802ab1b7f26cb72cb1fc9b8ed3f55b",

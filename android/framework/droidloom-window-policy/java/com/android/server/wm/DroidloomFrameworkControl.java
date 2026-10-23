@@ -24,7 +24,7 @@ public final class DroidloomFrameworkControl {
     private static final DroidloomFrameworkStartup STARTUP = new DroidloomFrameworkStartup();
     private final ActivityTaskManagerService service;
     private final DroidloomTaskBackend backend;
-    private boolean started, configured;
+    private boolean started;
     DroidloomFrameworkControl(ActivityTaskManagerService service, DroidloomTaskBackend backend) {
         this.service = service; this.backend = backend;
         STARTUP.attach(this::startInstance);
@@ -35,6 +35,7 @@ public final class DroidloomFrameworkControl {
     private synchronized void startInstance() {
         if (started) return;
         if (!DroidloomFrameworkNative.start()) throw new IllegalStateException("Framework native listener unavailable");
+        configure();
         BroadcastReceiver changes = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) { DroidloomFrameworkNative.catalogChanged(); }
         };
@@ -53,16 +54,21 @@ public final class DroidloomFrameworkControl {
         SystemProperties.set("sys.droidloom.framework_ready", "1");
         Slog.i("DroidloomRPC", BUILD_ABI + " launch/catalog ready");
     }
+    /**
+     * Before any task exists: a task created on a fullscreen display stays fullscreen until the
+     * display turns freeform, which then gives it Android's default freeform bounds.
+     */
     private void configure() {
-        if (configured) return;
         Context context = service.mContext;
         Settings.Global.putInt(context.getContentResolver(), "force_resizable_activities", 1);
         new LockPatternUtils(context).setLockScreenDisabled(true, 0);
         Settings.System.putIntForUser(context.getContentResolver(), "screen_off_timeout", Integer.MAX_VALUE, 0);
         for (String setting : new String[] {"peak_refresh_rate", "min_refresh_rate"})
             Settings.System.putFloatForUser(context.getContentResolver(), setting, Float.POSITIVE_INFINITY, 0);
+        // The host's name, given by the supervisor at each start (identity.rs).
+        String name = SystemProperties.get("ro.droidloom.device_name");
+        if (!name.isEmpty()) Settings.Global.putString(context.getContentResolver(), Settings.Global.DEVICE_NAME, name);
         service.mWindowManager.setWindowingMode(0, android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM);
-        configured = true;
     }
     private void serve() {
         while (true) {
@@ -84,6 +90,11 @@ public final class DroidloomFrameworkControl {
             DroidloomFrameworkNative.reply(result.getBytes(StandardCharsets.UTF_8), success);
         }
     }
+    private static String packageOf(JSONObject request) throws Exception {
+        String name = request.getString("package");
+        if (!name.matches("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")) throw new IllegalArgumentException("Invalid package");
+        return name;
+    }
     private String dispatch(int op, JSONObject request) throws Exception {
         switch (op) {
             case 1: {
@@ -103,7 +114,6 @@ public final class DroidloomFrameworkControl {
                         throw new IllegalArgumentException("Invalid launch bounds");
                     bounds = new Rect(0, 0, width, height);
                 }
-                configure();
                 service.mContext.getSystemService(PowerManager.class).wakeUp(
                         SystemClock.uptimeMillis(), 1, "droidloom:launch");
                 service.mWindowManager.dismissKeyguard(null, null);
@@ -135,6 +145,15 @@ public final class DroidloomFrameworkControl {
                     catch (Exception error) { /* Package removal can race a batch; retry after its event. */ }
                 }
                 return icons.toString();
+            }
+            case 5: return DroidloomPackageControl.details(service.mContext, packageOf(request)).toString();
+            case 6: return DroidloomPackageControl.act(
+                    service.mContext, backend, packageOf(request), request.getString("action"));
+            case 7: {
+                JSONObject display = new JSONObject();
+                display.put("dpi", service.mWindowManager.getBaseDisplayDensity(0));
+                display.put("initial_dpi", service.mWindowManager.getInitialDisplayDensity(0));
+                return display.toString();
             }
             default: throw new IllegalArgumentException("Unknown framework operation");
         }

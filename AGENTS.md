@@ -44,6 +44,53 @@ Use Rust for new tooling; shell is reserved for required upstream interfaces and
 PKGBUILD functions. Explain why administrator access is needed before requesting
 it. Package builds use rootless Podman and need no host sudo.
 
+## Phone release loop
+
+ARM64 phones (aston, roadstr, iceland) get a release built on this workstation.
+Run each step under the workspace's `tools/buildwatch`; caches make repeats
+incremental. `.work` is the main checkout's: from a worktree, give its absolute
+path (`/mnt/development/denial-os/droidloom/.work`).
+
+```console
+cargo run --locked -j 1 -p droidloom-update -- --jobs $(($(nproc) - 2)) android-build --work .work/arch/build --product droidloom_arm64
+cargo run --locked -j 1 -p droidloom-update -- host-build --work .work/arch/build --sysroot ~/.cache/denial/tablet-arm64-20261009/sysroot
+cargo run --locked -j 1 -p droidloom-update -- bundle-stage --work .work/arch/build --product droidloom_arm64 --host .work/arch/build/cargo-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/release --base .work/arm64-base-15885347/images --device DEVICE --destination STAGE
+```
+
+`bundle-stage` ends with `Verified cross-built bundle ID: STAGE`. Send it to
+`/var/lib/droidloom/stage/release-ID` on the phone with
+`rsync -a --sparse --compress --compress-choice=zstd`, passing the phone's
+previous stage as `--copy-dest` so only changed files travel. Copy to `ID.tmp`
+and rename it when complete.
+
+Activate on the phone as root:
+1. Stop `droidloom.service` and `droidloom-applications.service` in the desktop
+   user's manager, then `droidloomd.service`. Wait until neither
+   `droidloom-andro` nor `droidloomd` runs.
+2. `STAGE/usr/bin/droidloom-update apply STAGE --uid UID --no-start`, with the
+   UID from `packaging/devices/DEVICE.json`.
+3. Activation disables autostart. Link `/usr/lib/systemd/user/droidloom.service`
+   into the user's `~/.config/systemd/user/graphical-session.target.wants/`,
+   then reload both managers.
+4. Start `droidloomd.service`, then the user's `droidloom.service`, and wait for
+   `sys.boot_completed`.
+
+Keep the previous stage on the phone: it is the rollback and the next
+`--copy-dest`. The user's manager is reached as root with
+`sudo -u USER XDG_RUNTIME_DIR=/run/user/UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/UID/bus systemctl --user`.
+Android tools run with
+`nsenter -t $(pgrep -o -f '^/init second_stage') -a /system/bin/TOOL`.
+
+## AOSP patches
+
+The folders under `android/` hold patches applied in the order of `PATCHES` in
+`tools/droidloom-update/src/android.rs`, each to one project pinned in
+`android/manifest/m2-sparse-source-lock.json`. `.work/arch/build/aosp-source/PROJECT`
+is the unpatched checkout. To change a patch, add a detached worktree of that
+checkout, apply the patch there and commit it, make the change and amend, then
+write `git diff HEAD~1 HEAD` back over the patch. Check it with `git apply --check`
+on a clean worktree, and remove both worktrees.
+
 ## Translation benchmarks
 
 “Translation benchmarks” means `droidloom-translation-bench` for Digitalis/Berberis

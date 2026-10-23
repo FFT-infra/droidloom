@@ -1432,7 +1432,7 @@ impl App {
         }
         root.commit();
         self.activation.mapped(object, &root);
-        if !stream.active {
+        if !stream.active && droidloom_timing::traced(droidloom_timing::Diagnostic::Audit) {
             eprintln!(
                 "Droidloom task {}: direct Wayland composition, {} layers, backing={}",
                 object.0,

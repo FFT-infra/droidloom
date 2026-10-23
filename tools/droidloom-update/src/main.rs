@@ -9,6 +9,7 @@ mod licenses;
 mod native_bridge;
 mod package;
 mod python;
+mod system_server;
 mod util;
 use clap::{Parser, Subcommand};
 use std::{fs, path::PathBuf, process::Command};

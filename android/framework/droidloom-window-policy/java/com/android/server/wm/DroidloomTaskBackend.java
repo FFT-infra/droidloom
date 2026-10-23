@@ -239,18 +239,23 @@ final class DroidloomTaskBackend {
 
     /** Launch through the real ActivityStarter; retain the exact completed record. */
     String launch(String owner, ComponentName component, int user, Rect bounds) throws Exception {
+        if (user != 0 || owner == null || !owner.matches("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
+                || (component != null && !owner.equals(component.getPackageName()))) {
+            throw new IllegalArgumentException("Invalid Droidloom launcher identity");
+        }
+        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        if (component != null) intent.setComponent(component); else intent.setPackage(owner);
+        return launch(intent, owner, user, bounds);
+    }
+
+    /** Starts `intent` as a new freeform task of `owner` and publishes its window. */
+    String launch(Intent intent, String owner, int user, Rect bounds) throws Exception {
         int uid = Binder.getCallingUid();
         int pid = Binder.getCallingPid();
         if (uid != Process.ROOT_UID && uid != Process.SHELL_UID && uid != Process.SYSTEM_UID) {
             throw new SecurityException("Droidloom launch requires root, system or shell");
         }
-        if (user != 0 || owner == null || !owner.matches("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
-                || (component != null && !owner.equals(component.getPackageName()))) {
-            throw new IllegalArgumentException("Invalid Droidloom launcher identity");
-        }
-        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        if (component != null) intent.setComponent(component); else intent.setPackage(owner);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         ActivityOptions options = ActivityOptions.makeBasic();
         options.setLaunchDisplayId(0);
         options.setLaunchWindowingMode(android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM);

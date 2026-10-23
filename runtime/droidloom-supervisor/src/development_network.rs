@@ -3,10 +3,11 @@
 //! Linux remains the network implementation. This module only creates a veth
 //! pair, assigns the host gateway, and installs narrowly named nftables rules
 //! for outbound forwarding/NAT. Android owns `eth0` and its normal networking
-//! services inside the private namespace.
+//! services inside the private namespace. Each side is one `ip -batch` and the
+//! rules are one `nft` transaction, so a cell start spawns three helpers.
 
-use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -17,12 +18,13 @@ const HOST_IPV4_CIDR: &str = "10.177.0.1/30";
 const CELL_IPV4_CIDR: &str = "10.177.0.2/32";
 const IPV4_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 const IPV4_FORWARD_STATE_FILE: &str = "host-ipv4-forward.before";
+const NETNS_DIR: &str = "/run/netns";
+const NET_CLASS_DIR: &str = "/sys/class/net";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NetworkNames {
     namespace: String,
     host_interface: String,
-    temporary_cell_interface: String,
     filter_table: String,
     nat_table: String,
 }
@@ -33,7 +35,6 @@ impl NetworkNames {
         Self {
             namespace: format!("droidloom-u{uid}"),
             host_interface: format!("dlh{uid}"),
-            temporary_cell_interface: format!("dlc{uid}"),
             filter_table: format!("droidloom_u{uid}"),
             nat_table: format!("droidloom_u{uid}_nat"),
         }
@@ -85,8 +86,7 @@ impl DevelopmentNetwork {
     fn setup(&mut self) -> Result<(), DevelopmentError> {
         self.setup_links()?;
         self.enable_forwarding()?;
-        self.setup_filter()?;
-        self.setup_nat()?;
+        self.setup_rules()?;
         self.setup_ufw_forwarding()
     }
 
@@ -102,57 +102,36 @@ impl DevelopmentNetwork {
     }
 
     fn setup_links(&mut self) -> Result<(), DevelopmentError> {
-        run("ip", ["netns", "add", &self.names.namespace])?;
-        self.resources.push(NetworkResource::Namespace);
-
-        run(
+        let NetworkNames {
+            namespace,
+            host_interface,
+            ..
+        } = &self.names;
+        // The peer is created inside the namespace as eth0, so it never
+        // appears on the host under a temporary name.
+        let host = run_script(
             "ip",
-            [
-                "link",
-                "add",
-                &self.names.host_interface,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                &self.names.temporary_cell_interface,
-            ],
-        )?;
-        self.resources.push(NetworkResource::HostInterface);
-        run(
+            ["-batch", "-"],
+            &format!(
+                "netns add {namespace}\n\
+                 link add {host_interface} type veth peer name eth0 netns {namespace}\n\
+                 address add {HOST_IPV4_CIDR} dev {host_interface}\n\
+                 link set {host_interface} up\n"
+            ),
+        );
+        // A batch stops at its first failing line; own whatever it created.
+        if namespace_exists(namespace) {
+            self.resources.push(NetworkResource::Namespace);
+        }
+        if link_exists(host_interface) {
+            self.resources.push(NetworkResource::HostInterface);
+        }
+        host?;
+        run_script(
             "ip",
-            [
-                "link",
-                "set",
-                &self.names.temporary_cell_interface,
-                "netns",
-                &self.names.namespace,
-            ],
-        )?;
-        run(
-            "ip",
-            [
-                "address",
-                "add",
-                HOST_IPV4_CIDR,
-                "dev",
-                &self.names.host_interface,
-            ],
-        )?;
-        run("ip", ["link", "set", &self.names.host_interface, "up"])?;
-        run_in_namespace(&self.names.namespace, ["link", "set", "lo", "up"])?;
-        run_in_namespace(
-            &self.names.namespace,
-            [
-                "link",
-                "set",
-                &self.names.temporary_cell_interface,
-                "name",
-                "eth0",
-            ],
-        )?;
-        run_in_namespace(&self.names.namespace, ["link", "set", "eth0", "up"])?;
-        Ok(())
+            ["-n", namespace, "-batch", "-"],
+            "link set lo up\nlink set eth0 up\n",
+        )
     }
 
     fn enable_forwarding(&mut self) -> Result<(), DevelopmentError> {
@@ -168,202 +147,44 @@ impl DevelopmentNetwork {
         Ok(())
     }
 
-    fn setup_filter(&mut self) -> Result<(), DevelopmentError> {
-        run("nft", ["add", "table", "inet", &self.names.filter_table])?;
+    /// Install both tables in one nftables transaction: all of it or nothing.
+    fn setup_rules(&mut self) -> Result<(), DevelopmentError> {
+        let NetworkNames {
+            host_interface: host,
+            filter_table,
+            nat_table,
+            ..
+        } = &self.names;
+        run_script(
+            "nft",
+            ["-f", "-"],
+            &format!(
+                r#"table inet {filter_table} {{
+	chain input {{
+		type filter hook input priority filter; policy accept;
+		iifname "{host}" ip saddr {CELL_IPV4_CIDR} tcp sport 5555 ct state established accept
+		iifname "{host}" drop
+	}}
+	chain forward {{
+		type filter hook forward priority filter; policy accept;
+		iifname "{host}" ip saddr != {CELL_IPV4_CIDR} drop
+		iifname "{host}" ip saddr {CELL_IPV4_CIDR} accept
+		oifname "{host}" ip daddr {CELL_IPV4_CIDR} ct state established,related accept
+		oifname "{host}" drop
+	}}
+}}
+table ip {nat_table} {{
+	chain postrouting {{
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr {CELL_IPV4_CIDR} masquerade
+	}}
+}}
+"#
+            ),
+        )?;
         self.resources.push(NetworkResource::FilterTable);
-        self.setup_input_filter()?;
-        self.setup_forward_filter()
-    }
-
-    fn setup_input_filter(&self) -> Result<(), DevelopmentError> {
-        run(
-            "nft",
-            [
-                "add",
-                "chain",
-                "inet",
-                &self.names.filter_table,
-                "input",
-                "{",
-                "type",
-                "filter",
-                "hook",
-                "input",
-                "priority",
-                "filter",
-                ";",
-                "policy",
-                "accept",
-                ";",
-                "}",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "inet",
-                &self.names.filter_table,
-                "input",
-                "iifname",
-                &self.names.host_interface,
-                "ip",
-                "saddr",
-                CELL_IPV4_CIDR,
-                "tcp",
-                "sport",
-                "5555",
-                "ct",
-                "state",
-                "established",
-                "accept",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "inet",
-                &self.names.filter_table,
-                "input",
-                "iifname",
-                &self.names.host_interface,
-                "drop",
-            ],
-        )
-    }
-
-    fn setup_forward_filter(&self) -> Result<(), DevelopmentError> {
-        run(
-            "nft",
-            [
-                "add",
-                "chain",
-                "inet",
-                &self.names.filter_table,
-                "forward",
-                "{",
-                "type",
-                "filter",
-                "hook",
-                "forward",
-                "priority",
-                "filter",
-                ";",
-                "policy",
-                "accept",
-                ";",
-                "}",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "inet",
-                &self.names.filter_table,
-                "forward",
-                "iifname",
-                &self.names.host_interface,
-                "ip",
-                "saddr",
-                "!=",
-                CELL_IPV4_CIDR,
-                "drop",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "inet",
-                &self.names.filter_table,
-                "forward",
-                "iifname",
-                &self.names.host_interface,
-                "ip",
-                "saddr",
-                CELL_IPV4_CIDR,
-                "accept",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "inet",
-                &self.names.filter_table,
-                "forward",
-                "oifname",
-                &self.names.host_interface,
-                "ip",
-                "daddr",
-                CELL_IPV4_CIDR,
-                "ct",
-                "state",
-                "established,related",
-                "accept",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "inet",
-                &self.names.filter_table,
-                "forward",
-                "oifname",
-                &self.names.host_interface,
-                "drop",
-            ],
-        )
-    }
-
-    fn setup_nat(&mut self) -> Result<(), DevelopmentError> {
-        run("nft", ["add", "table", "ip", &self.names.nat_table])?;
         self.resources.push(NetworkResource::NatTable);
-        run(
-            "nft",
-            [
-                "add",
-                "chain",
-                "ip",
-                &self.names.nat_table,
-                "postrouting",
-                "{",
-                "type",
-                "nat",
-                "hook",
-                "postrouting",
-                "priority",
-                "srcnat",
-                ";",
-                "policy",
-                "accept",
-                ";",
-                "}",
-            ],
-        )?;
-        run(
-            "nft",
-            [
-                "add",
-                "rule",
-                "ip",
-                &self.names.nat_table,
-                "postrouting",
-                "ip",
-                "saddr",
-                CELL_IPV4_CIDR,
-                "masquerade",
-            ],
-        )
+        Ok(())
     }
 
     /// Remove every object created by this instance in reverse ownership order.
@@ -413,25 +234,24 @@ impl DevelopmentNetwork {
         let mut first_error = None;
 
         record_error(&mut first_error, remove_ufw_rule(&names));
-        if nft_table_exists("ip", &names.nat_table)? {
-            record_error(
-                &mut first_error,
-                run("nft", ["delete", "table", "ip", &names.nat_table]),
-            );
-        }
-        if nft_table_exists("inet", &names.filter_table)? {
-            record_error(
-                &mut first_error,
-                run("nft", ["delete", "table", "inet", &names.filter_table]),
-            );
-        }
-        if link_exists(&names.host_interface)? {
+        record_error(
+            &mut first_error,
+            run_script(
+                "nft",
+                ["-f", "-"],
+                &format!(
+                    "destroy table ip {}\ndestroy table inet {}\n",
+                    names.nat_table, names.filter_table
+                ),
+            ),
+        );
+        if link_exists(&names.host_interface) {
             record_error(
                 &mut first_error,
                 run("ip", ["link", "delete", &names.host_interface]),
             );
         }
-        if namespace_exists(&names.namespace)? {
+        if namespace_exists(&names.namespace) {
             record_error(
                 &mut first_error,
                 run("ip", ["netns", "delete", &names.namespace]),
@@ -525,29 +345,12 @@ fn command_succeeds<const N: usize>(
         .map_err(|source| io_error(&format!("execute {program}"), source))
 }
 
-fn namespace_exists(namespace: &str) -> Result<bool, DevelopmentError> {
-    let output = droidloom_cpu_placement::command("ip")
-        .args(["netns", "list"])
-        .output()
-        .map_err(|source| io_error("execute ip", source))?;
-    if !output.status.success() {
-        return Err(DevelopmentError::Command {
-            program: "ip".into(),
-            status: output.status,
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .any(|name| name == namespace))
+fn namespace_exists(namespace: &str) -> bool {
+    Path::new(NETNS_DIR).join(namespace).exists()
 }
 
-fn link_exists(interface: &str) -> Result<bool, DevelopmentError> {
-    command_succeeds("ip", ["link", "show", "dev", interface])
-}
-
-fn nft_table_exists(family: &str, table: &str) -> Result<bool, DevelopmentError> {
-    command_succeeds("nft", ["list", "table", family, table])
+fn link_exists(interface: &str) -> bool {
+    Path::new(NET_CLASS_DIR).join(interface).exists()
 }
 
 fn remove_file_if_present(path: &Path, context: &str) -> Result<(), DevelopmentError> {
@@ -558,32 +361,37 @@ fn remove_file_if_present(path: &Path, context: &str) -> Result<(), DevelopmentE
     }
 }
 
-fn run_in_namespace<const N: usize>(
-    namespace: &str,
-    ip_arguments: [&str; N],
-) -> Result<(), DevelopmentError> {
-    let mut arguments = vec![
-        OsString::from("netns"),
-        OsString::from("exec"),
-        OsString::from(namespace),
-        OsString::from("ip"),
-    ];
-    arguments.extend(ip_arguments.into_iter().map(OsString::from));
-    run_os("ip", arguments)
-}
-
 fn run<const N: usize>(program: &str, args: [&str; N]) -> Result<(), DevelopmentError> {
-    run_os(program, args.into_iter().map(OsString::from))
-}
-
-fn run_os<I>(program: &str, args: I) -> Result<(), DevelopmentError>
-where
-    I: IntoIterator<Item = OsString>,
-{
     let status = droidloom_cpu_placement::command(program)
         .args(args)
         .status()
         .map_err(|source| io_error(&format!("execute {program}"), source))?;
+    command_status(program, status)
+}
+
+/// Run `program` once with `script` on its standard input.
+fn run_script<const N: usize>(
+    program: &str,
+    args: [&str; N],
+    script: &str,
+) -> Result<(), DevelopmentError> {
+    let mut child = droidloom_cpu_placement::command(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|source| io_error(&format!("execute {program}"), source))?;
+    let written = child
+        .stdin
+        .take()
+        .map_or(Ok(()), |mut stdin| stdin.write_all(script.as_bytes()));
+    let status = child
+        .wait()
+        .map_err(|source| io_error(&format!("wait for {program}"), source))?;
+    written.map_err(|source| io_error(&format!("write {program} script"), source))?;
+    command_status(program, status)
+}
+
+fn command_status(program: &str, status: std::process::ExitStatus) -> Result<(), DevelopmentError> {
     if status.success() {
         Ok(())
     } else {
@@ -633,6 +441,7 @@ mod tests {
             android_file_overrides: Vec::new(),
             android_runtime_directories: Vec::new(),
             shared_storage_directories: Vec::new(),
+            share_user_folders: false,
             data_dir: PathBuf::from("/data"),
             runtime_dir: PathBuf::from("/run/droidloom/cells/test"),
             render_node: PathBuf::from("/dev/dri/renderD128"),
@@ -646,9 +455,7 @@ mod tests {
         let names = NetworkNames::for_spec(&spec(1001));
         assert_eq!(names.namespace, "droidloom-u1001");
         assert_eq!(names.host_interface, "dlh1001");
-        assert_eq!(names.temporary_cell_interface, "dlc1001");
         assert!(names.host_interface.len() < libc::IF_NAMESIZE);
-        assert!(names.temporary_cell_interface.len() < libc::IF_NAMESIZE);
     }
 
     #[test]

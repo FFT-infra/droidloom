@@ -110,15 +110,15 @@ before collecting a baseline. Source builds and the commands below for reporting
 do not install or restart anything. Enabling tracing for an installed cell needs
 the ordinary Droidloom-only restart; it closes Android application windows.
 
-Enable the presenter's `DROIDLOOM_FRAME_TRACE=1` environment for that run, for
-example with `systemctl --user set-environment DROIDLOOM_FRAME_TRACE=1` on the
-packaged user-service setup. Inside Android, set
-`persist.vendor.droidloom.frame_timing=1` before restarting Droidloom. That
-persistent property survives a cell restart. Both settings are read on the first
-trace check and remain fixed for that process. After measuring, set the Android
-property to `0`, run
-`systemctl --user unset-environment DROIDLOOM_FRAME_TRACE`, and restart Droidloom
-normally to return to the disabled path. Do not restart the desktop session.
+Enable the presenter's `frames` diagnostic for that run, for example with
+`systemctl --user set-environment DROIDLOOM_TRACE=frames` on the packaged
+user-service setup. Inside Android, set `persist.vendor.droidloom.trace=frames`
+before restarting Droidloom. That persistent property survives a cell restart.
+Both are read on the first check and remain fixed for that process; `audit` and
+`input` can be added to either list. After measuring, set the Android property
+to an empty value, run `systemctl --user unset-environment DROIDLOOM_TRACE`, and
+restart Droidloom normally to return to the disabled path. Do not restart the
+desktop session.
 
 Capture Android `logcat -v raw -s DroidloomTiming:I` and the presenter's user
 journal as separate text files under ignored `.work/frame-timing/`. Android
@@ -159,8 +159,8 @@ Composer request and `bootstrap_queue` measures display-surface advancement;
 no `bootstrap_dequeue` occurs.
 HWC preparation, presentation and release timers remain. Set
 `persist.vendor.droidloom.bootstrap_bufferless=false`
-inside Android to restore the buffer-backed path live, then restore `true` after
-comparison. Keep each switch outside the measured interval and allow the workload
+inside Android and restart Droidloom to restore the buffer-backed path, then
+restore `true` after comparison. Keep each switch outside the measured interval and allow the workload
 to settle; retain the full trace for loss checks. The focused regression test is
 `cargo test --locked -j 1 -p droidloom-update --test bufferless_bootstrap`; it
 compiles the patch's real completion methods with isolated framework substitutes
@@ -267,6 +267,41 @@ several clients, and deprecated `drm-memory-*` aliases are not added again.
 This accounting does not depend on the frame logger or its per-process cap.
 Keep app sizes, refresh rate and workload fixed, record unrelated GPU load and
 repeat active and idle scenarios before claiming a GPU improvement.
+
+## Startup timing
+
+A start is measured from `systemctl --user start droidloom.service` until
+Android's `sys.boot_completed` is 1. Stop Droidloom fully and let the device
+settle for a few seconds before each run. Runs vary by about half a second, so
+compare three of each. Use `CLOCK_MONOTONIC` for every source so that they line
+up: `logcat -v monotonic`, `perf record -k CLOCK_MONOTONIC` and the host's
+`/proc/uptime` on a device that has not suspended since boot.
+
+Where the time goes, from coarse to fine:
+- `getprop | grep ro.boottime.` gives when init started each Android service.
+  The events buffer has `boot_progress_*`, and logcat has `SystemServerTiming`
+  spans.
+- `SystemServiceManager: Service NAME took N ms in onBootPhase` names slow
+  system services. A slow service with little CPU time is usually waiting on a
+  binder call.
+- `perf record -a -k CLOCK_MONOTONIC -e binder:binder_transaction,binder:binder_transaction_received`
+  shows that call: the destination process and the transaction `code`. A method's
+  code is 1 plus its index in the frozen `aidl_api/INTERFACE/current` file of its
+  AIDL interface. `INetd` code `0x31` is `bandwidthSetGlobalAlert`, for example.
+- `sched:sched_switch` in the same recording shows what a waiting thread was
+  blocked on.
+- For the host part before Android `/init`, record
+  `sched:sched_process_exec,sched:sched_process_exit,sched:sched_process_fork`
+  system-wide. `perf` takes about a second to start recording, so start it two
+  seconds early and run `/usr/bin/true` just before the unit start; that exec
+  is time zero.
+- The busy fraction of `/proc/stat` over the start tells whether startup is
+  CPU-bound or a chain of waits.
+
+On aston, the start is a chain of waits; the CPU is about a third busy. In
+order: the user unit and droidloomd, host network setup, Android init's early
+services (aconfigd, apexd, odsign, bpfloader), zygote preload, system_server's
+services, then persistent apps and home.
 
 ## 1. Prepare an x86_64 build machine
 

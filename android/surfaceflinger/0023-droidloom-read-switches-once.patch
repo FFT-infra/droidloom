@@ -1,0 +1,72 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 54d4d32..708cd6b 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -238,6 +238,22 @@ namespace hal = android::hardware::graphics::composer::hal;
+ 
+ namespace {
+ 
++// Droidloom's composition switches, read once: composite() runs every frame,
++// and a change takes a SurfaceFlinger restart.
++struct DroidloomSwitches {
++    bool tasks = base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false);
++    bool direct = base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_direct", false);
++    bool directLayers = base::GetBoolProperty("persist.vendor.droidloom.direct_layers", true);
++    bool elideBootstrap = base::GetBoolProperty("persist.vendor.droidloom.elide_bootstrap", true);
++    bool bootstrapBufferless =
++            base::GetBoolProperty("persist.vendor.droidloom.bootstrap_bufferless", true);
++};
++
++const DroidloomSwitches& droidloomSwitches() {
++    static const DroidloomSwitches switches;
++    return switches;
++}
++
+ static constexpr int FOUR_K_WIDTH = 3840;
+ static constexpr int FOUR_K_HEIGHT = 2160;
+ 
+@@ -2848,7 +2864,7 @@ bool SurfaceFlinger::updateLayerSnapshots(VsyncId vsyncId, nsecs_t frameTimeNs,
+                          ? frontend::LayerSnapshotBuilder::ForceUpdateFlags::ALL
+                          : frontend::LayerSnapshotBuilder::ForceUpdateFlags::NONE,
+                  .includeMetadata =
+-                         base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false) ||
++                         droidloomSwitches().tasks ||
+                          mCompositionEngine->getFeatureFlags().test(
+                                  compositionengine::Feature::kSnapshotLayerMetadata),
+                  .displays = mFrontEndDisplayInfos,
+@@ -3460,7 +3476,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+     // Render each such subtree into its own Denial-owned target. The physical
+     // output remains active during bring-up so Android keeps its ordinary
+     // scheduling and release-fence path while this split is validated.
+-    if (base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_tasks", false)) {
++    if (droidloomSwitches().tasks) {
+         // Retain outstanding reads across idle/visibility transitions too:
+         // a frame with no task draw must not release the preceding GPU work.
+         static sp<Fence> taskCompletion = Fence::NO_FENCE;
+@@ -3691,7 +3707,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             // Capture before preparation. Asynchronous completions/configures
+             // increment this before scheduling composition, avoiding lost work.
+             const uint64_t workRevision = taskOutput.window->getWorkRevision();
+-            const bool directLayers = base::GetBoolProperty("persist.vendor.droidloom.direct_layers", true);
++            const bool directLayers = droidloomSwitches().directLayers;
+             taskOutput.work.add(directLayers);
+             taskOutput.work.add(static_cast<uint64_t>(refreshArgs.outputColorSetting));
+             taskOutput.work.add(static_cast<uint64_t>(refreshArgs.forceOutputColorMode));
+@@ -3897,14 +3913,11 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // The direct bootstrap native window has no visible Wayland surface.
+         // Retain its normal HWC scheduling and release-fence path, using the
+         // actual task reads instead of another full-canvas GPU composition.
+-        // This switch is live so the same process supports controlled A/B tests.
+-        if (taskFencesValid &&
+-            base::GetBoolProperty("ro.vendor.droidloom.surfaceflinger_direct", false) &&
+-            base::GetBoolProperty("persist.vendor.droidloom.elide_bootstrap", true)) {
++        // An A/B test of this switch restarts SurfaceFlinger.
++        if (taskFencesValid && droidloomSwitches().direct && droidloomSwitches().elideBootstrap) {
+             refreshArgs.droidloomHeadlessDisplay = pacesetterId;
+             refreshArgs.droidloomHeadlessFence = taskCompletion;
+-            refreshArgs.droidloomSkipBootstrapTarget = base::GetBoolProperty(
+-                    "persist.vendor.droidloom.bootstrap_bufferless", true);
++            refreshArgs.droidloomSkipBootstrapTarget = droidloomSwitches().bootstrapBufferless;
+         }
+     }
+ 

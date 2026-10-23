@@ -4,7 +4,9 @@
 with an opaque static background and hardware acceleration disabled. It has no
 launcher entry, permissions, services, timers, or wake locks. Its task stays alive
 under Android's ordinary lifecycle and is never registered for native export.
-This lets Settings' `FallbackHome` finish instead of polling and animating forever.
+The activity is direct-boot aware, so once installed it is HOME from the start of
+boot: Android draws it to end the boot animation and never starts Settings for
+its `FallbackHome`. Before the first install, `FallbackHome` finishes into it.
 
 The independent `droidloom-home-setup` init oneshot installs the signed APK and
 selects it as user 0's default HOME after boot. The APK and script use the existing

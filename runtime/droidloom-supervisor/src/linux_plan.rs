@@ -539,7 +539,7 @@ fn mount_operations(spec: &CellSpec) -> Vec<LinuxOperation> {
         )
     }));
     operations.extend(private_filesystem_mounts(spec));
-    operations.extend(spec.shared_storage_directories.iter().map(|directory| {
+    operations.extend(spec.shared_storage().iter().map(|directory| {
         LinuxOperation::MountSharedStorage {
             source: directory.source.clone(),
             target: directory.android_backing_path(),
@@ -816,7 +816,7 @@ fn teardown_operations(spec: &CellSpec, step: LifecycleStep) -> Vec<LinuxOperati
             }
             targets.extend([PathBuf::from("/dev/socket/droidloom/denial")]);
             targets.extend(
-                spec.shared_storage_directories
+                spec.shared_storage()
                     .iter()
                     .rev()
                     .map(crate::SharedStorageDirectory::android_backing_path),
@@ -900,6 +900,7 @@ mod tests {
                 target: "/droidloom/runtime".into(),
             }],
             shared_storage_directories: Vec::new(),
+            share_user_folders: false,
             data_dir: "/var/lib/droidloom/users/1000/data".into(),
             runtime_dir: "/run/droidloom/cells/u1000".into(),
             render_node: "/dev/dri/renderD128".into(),

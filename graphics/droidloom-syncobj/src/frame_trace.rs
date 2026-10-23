@@ -1,6 +1,6 @@
 //! Opt-in frame correlation and nonblocking GPU fence diagnostics.
 
-pub use droidloom_timing::{enabled, event, now_ns, sampled};
+pub use droidloom_timing::{Diagnostic, enabled, event, now_ns, sampled, traced};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, BorrowedFd};

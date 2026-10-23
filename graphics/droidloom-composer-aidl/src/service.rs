@@ -59,6 +59,7 @@ use droidloom_composer::{
     hwc3::{ErrorCode, Session, MAX_BUFFER_SLOTS},
     DisplayId, LayerId, PowerMode, ReservedTaskWindowSpec, TaskId, TaskWindowSpec,
 };
+use droidloom_syncobj::frame_trace;
 use droidloom_syncobj::monotonic_deadline_after;
 use droidloom_transport::Configure;
 
@@ -94,13 +95,16 @@ struct VsyncSchedulerShared {
     callback: SharedCallback,
     schedule: Mutex<VsyncSchedule>,
     wake: Condvar,
+    /// The `audit` diagnostic, read once at startup.
+    audit: bool,
 }
 
 #[derive(Default)]
 struct VsyncSchedule {
     displays: BTreeMap<DisplayId, ScheduledVsync>,
     presentation_phase: Option<(u64, u64)>,
-    audit: VsyncAudit,
+    /// Only with the `audit` diagnostic.
+    audit: Option<VsyncAudit>,
 }
 
 #[derive(Clone, Copy)]
@@ -161,10 +165,15 @@ struct VsyncAudit {
 
 impl VsyncScheduler {
     fn new(callback: SharedCallback, host_clock: bool) -> Self {
+        let audit = frame_trace::traced(frame_trace::Diagnostic::Audit);
         let shared = Arc::new(VsyncSchedulerShared {
             callback,
-            schedule: Mutex::new(VsyncSchedule::default()),
+            schedule: Mutex::new(VsyncSchedule {
+                audit: audit.then(VsyncAudit::default),
+                ..VsyncSchedule::default()
+            }),
             wake: Condvar::new(),
+            audit,
         });
         if !host_clock {
             let worker = Arc::clone(&shared);
@@ -190,9 +199,6 @@ impl VsyncScheduler {
         else {
             return;
         };
-        let Ok(now) = monotonic_timestamp_nanos() else {
-            return;
-        };
         let Ok(mut schedule) = self.shared.schedule.lock() else {
             return;
         };
@@ -207,16 +213,17 @@ impl VsyncScheduler {
         }
         // In host-clock mode the wake columns time grant delivery from the
         // host tick that issued it.
-        let audit = &mut schedule.audit;
-        if audit.window_started_nanos == 0 {
-            audit.window_started_nanos = now;
+        if let (Some(audit), Ok(now)) = (schedule.audit.as_mut(), monotonic_timestamp_nanos()) {
+            if audit.window_started_nanos == 0 {
+                audit.window_started_nanos = now;
+            }
+            let delivery = now.saturating_sub(latch_nanos.saturating_sub(period_nanos));
+            audit.scheduler_ticks = audit.scheduler_ticks.saturating_add(1);
+            audit.wake_late_total_nanos = audit
+                .wake_late_total_nanos
+                .saturating_add(u128::from(delivery));
+            audit.wake_late_max_nanos = audit.wake_late_max_nanos.max(delivery);
         }
-        let delivery = now.saturating_sub(latch_nanos.saturating_sub(period_nanos));
-        audit.scheduler_ticks = audit.scheduler_ticks.saturating_add(1);
-        audit.wake_late_total_nanos = audit
-            .wake_late_total_nanos
-            .saturating_add(u128::from(delivery));
-        audit.wake_late_max_nanos = audit.wake_late_max_nanos.max(delivery);
         drop(schedule);
         deliver_vsyncs(&self.shared, due);
     }
@@ -286,64 +293,11 @@ impl VsyncScheduler {
         let Ok(mut schedule) = self.shared.schedule.lock() else {
             return;
         };
-        if schedule.audit.window_started_nanos == 0 {
-            schedule.audit.window_started_nanos = now;
+        let state = &mut *schedule;
+        if let Some(audit) = state.audit.as_mut() {
+            audit_presentation(audit, &state.displays, now, timestamp_nanos, period_nanos);
         }
-        schedule.audit.presentations = schedule.audit.presentations.saturating_add(1);
-        let delivery_late = now.saturating_sub(timestamp_nanos);
-        schedule.audit.delivery_late_total_nanos = schedule
-            .audit
-            .delivery_late_total_nanos
-            .saturating_add(u128::from(delivery_late));
-        schedule.audit.delivery_late_max_nanos =
-            schedule.audit.delivery_late_max_nanos.max(delivery_late);
-        if let Some(previous) = schedule.audit.last_presentation_nanos {
-            if timestamp_nanos == previous {
-                schedule.audit.duplicate_presentations =
-                    schedule.audit.duplicate_presentations.saturating_add(1);
-            } else if timestamp_nanos > previous {
-                let interval = timestamp_nanos - previous;
-                schedule.audit.presentation_interval_count =
-                    schedule.audit.presentation_interval_count.saturating_add(1);
-                schedule.audit.presentation_interval_total_nanos = schedule
-                    .audit
-                    .presentation_interval_total_nanos
-                    .saturating_add(u128::from(interval));
-                schedule.audit.presentation_interval_max_nanos =
-                    schedule.audit.presentation_interval_max_nanos.max(interval);
-            }
-        }
-        schedule.audit.last_presentation_nanos = Some(timestamp_nanos);
         schedule.presentation_phase = Some((timestamp_nanos, period_nanos));
-        let mut phase_observations = 0_u64;
-        let mut phase_error_total_nanos = 0_u128;
-        let mut phase_error_max_nanos = 0_u64;
-        for scheduled in schedule.displays.values() {
-            if periods_compatible(scheduled.period_nanos, period_nanos) {
-                let host_next = next_vsync_after(now, timestamp_nanos, scheduled.period_nanos);
-                let phase_error = phase_distance(
-                    host_next,
-                    scheduled.next_nanos,
-                    scheduled.period_nanos,
-                );
-                phase_observations = phase_observations.saturating_add(1);
-                phase_error_total_nanos =
-                    phase_error_total_nanos.saturating_add(u128::from(phase_error));
-                phase_error_max_nanos = phase_error_max_nanos.max(phase_error);
-            }
-        }
-        schedule.audit.phase_observations = schedule
-            .audit
-            .phase_observations
-            .saturating_add(phase_observations);
-        schedule.audit.phase_error_total_nanos = schedule
-            .audit
-            .phase_error_total_nanos
-            .saturating_add(phase_error_total_nanos);
-        schedule.audit.phase_error_max_nanos = schedule
-            .audit
-            .phase_error_max_nanos
-            .max(phase_error_max_nanos);
 
         // Presentation feedback is delivered well after the physical vblank.
         // Moving a phased clock here could delete its imminent tick, so only
@@ -354,6 +308,57 @@ impl VsyncScheduler {
         drop(schedule);
         self.shared.wake.notify_one();
     }
+}
+
+fn audit_presentation(
+    audit: &mut VsyncAudit,
+    displays: &BTreeMap<DisplayId, ScheduledVsync>,
+    now: u64,
+    timestamp_nanos: u64,
+    period_nanos: u64,
+) {
+    if audit.window_started_nanos == 0 {
+        audit.window_started_nanos = now;
+    }
+    audit.presentations = audit.presentations.saturating_add(1);
+    let delivery_late = now.saturating_sub(timestamp_nanos);
+    audit.delivery_late_total_nanos = audit
+        .delivery_late_total_nanos
+        .saturating_add(u128::from(delivery_late));
+    audit.delivery_late_max_nanos = audit.delivery_late_max_nanos.max(delivery_late);
+    if let Some(previous) = audit.last_presentation_nanos {
+        if timestamp_nanos == previous {
+            audit.duplicate_presentations = audit.duplicate_presentations.saturating_add(1);
+        } else if timestamp_nanos > previous {
+            let interval = timestamp_nanos - previous;
+            audit.presentation_interval_count = audit.presentation_interval_count.saturating_add(1);
+            audit.presentation_interval_total_nanos = audit
+                .presentation_interval_total_nanos
+                .saturating_add(u128::from(interval));
+            audit.presentation_interval_max_nanos =
+                audit.presentation_interval_max_nanos.max(interval);
+        }
+    }
+    audit.last_presentation_nanos = Some(timestamp_nanos);
+    let mut phase_observations = 0_u64;
+    let mut phase_error_total_nanos = 0_u128;
+    let mut phase_error_max_nanos = 0_u64;
+    for scheduled in displays.values() {
+        if periods_compatible(scheduled.period_nanos, period_nanos) {
+            let host_next = next_vsync_after(now, timestamp_nanos, scheduled.period_nanos);
+            let phase_error =
+                phase_distance(host_next, scheduled.next_nanos, scheduled.period_nanos);
+            phase_observations = phase_observations.saturating_add(1);
+            phase_error_total_nanos =
+                phase_error_total_nanos.saturating_add(u128::from(phase_error));
+            phase_error_max_nanos = phase_error_max_nanos.max(phase_error);
+        }
+    }
+    audit.phase_observations = audit.phase_observations.saturating_add(phase_observations);
+    audit.phase_error_total_nanos = audit
+        .phase_error_total_nanos
+        .saturating_add(phase_error_total_nanos);
+    audit.phase_error_max_nanos = audit.phase_error_max_nanos.max(phase_error_max_nanos);
 }
 
 fn run_vsync_scheduler(shared: &VsyncSchedulerShared) {
@@ -394,9 +399,6 @@ fn run_vsync_scheduler(shared: &VsyncSchedulerShared) {
         }
 
         let mut due = Vec::new();
-        if schedule.audit.window_started_nanos == 0 {
-            schedule.audit.window_started_nanos = now;
-        }
         let mut scheduler_ticks = 0_u64;
         let mut skipped_periods = 0_u64;
         let mut wake_late_total_nanos = 0_u128;
@@ -411,27 +413,21 @@ fn run_vsync_scheduler(shared: &VsyncSchedulerShared) {
                 due.push((*display, timestamp_nanos, scheduled.period_nanos));
                 scheduler_ticks = scheduler_ticks.saturating_add(1);
                 skipped_periods = skipped_periods.saturating_add(skipped);
-                wake_late_total_nanos =
-                    wake_late_total_nanos.saturating_add(u128::from(wake_late));
+                wake_late_total_nanos = wake_late_total_nanos.saturating_add(u128::from(wake_late));
                 wake_late_max_nanos = wake_late_max_nanos.max(wake_late);
             }
         }
-        schedule.audit.scheduler_ticks = schedule
-            .audit
-            .scheduler_ticks
-            .saturating_add(scheduler_ticks);
-        schedule.audit.skipped_periods = schedule
-            .audit
-            .skipped_periods
-            .saturating_add(skipped_periods);
-        schedule.audit.wake_late_total_nanos = schedule
-            .audit
-            .wake_late_total_nanos
-            .saturating_add(wake_late_total_nanos);
-        schedule.audit.wake_late_max_nanos = schedule
-            .audit
-            .wake_late_max_nanos
-            .max(wake_late_max_nanos);
+        if let Some(audit) = schedule.audit.as_mut() {
+            if audit.window_started_nanos == 0 {
+                audit.window_started_nanos = now;
+            }
+            audit.scheduler_ticks = audit.scheduler_ticks.saturating_add(scheduler_ticks);
+            audit.skipped_periods = audit.skipped_periods.saturating_add(skipped_periods);
+            audit.wake_late_total_nanos = audit
+                .wake_late_total_nanos
+                .saturating_add(wake_late_total_nanos);
+            audit.wake_late_max_nanos = audit.wake_late_max_nanos.max(wake_late_max_nanos);
+        }
         drop(schedule);
         deliver_vsyncs(shared, due);
     }
@@ -462,9 +458,15 @@ fn deliver_vsyncs(shared: &VsyncSchedulerShared, due: Vec<(DisplayId, u64, u64)>
             failed.push(display);
             continue;
         };
-        let callback_started = monotonic_timestamp_nanos().ok();
+        let callback_started = shared
+            .audit
+            .then(monotonic_timestamp_nanos)
+            .and_then(Result::ok);
         let result = callback.onVsync(display_value, timestamp_value, period_value);
-        if let (Some(started), Ok(finished)) = (callback_started, monotonic_timestamp_nanos()) {
+        if let (Some(started), Ok(finished)) = (
+            callback_started,
+            callback_started.map_or(Ok(0), |_| monotonic_timestamp_nanos()),
+        ) {
             let elapsed = finished.saturating_sub(started);
             callback_total_nanos = callback_total_nanos.saturating_add(u128::from(elapsed));
             callback_max_nanos = callback_max_nanos.max(elapsed);
@@ -474,20 +476,21 @@ fn deliver_vsyncs(shared: &VsyncSchedulerShared, due: Vec<(DisplayId, u64, u64)>
             failed.push(display);
         }
     }
+    if !shared.audit && failed.is_empty() {
+        return;
+    }
     if let Ok(mut schedule) = shared.schedule.lock() {
-        schedule.audit.callback_total_nanos = schedule
-            .audit
-            .callback_total_nanos
-            .saturating_add(callback_total_nanos);
-        schedule.audit.callback_max_nanos =
-            schedule.audit.callback_max_nanos.max(callback_max_nanos);
-        if !failed.is_empty() {
-            for display in failed {
-                schedule.displays.remove(&display);
-            }
+        for display in failed {
+            schedule.displays.remove(&display);
         }
-        if let Ok(now) = monotonic_timestamp_nanos() {
-            maybe_log_vsync_audit(&mut schedule.audit, now);
+        if let Some(audit) = schedule.audit.as_mut() {
+            audit.callback_total_nanos = audit
+                .callback_total_nanos
+                .saturating_add(callback_total_nanos);
+            audit.callback_max_nanos = audit.callback_max_nanos.max(callback_max_nanos);
+            if let Ok(now) = monotonic_timestamp_nanos() {
+                maybe_log_vsync_audit(audit, now);
+            }
         }
     }
 }
