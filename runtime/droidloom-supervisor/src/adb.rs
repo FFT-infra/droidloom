@@ -25,7 +25,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTPUT: u64 = 8192;
 
-/// Android init owns adbd, including restarts requested by `adb root`.
+/// Android init owns the non-root adbd service and its restarts.
 /// Framework USB state changes must not disable the private TCP transport.
 pub(crate) const INIT_POLICY: &str = "
 # Droidloom's authenticated, private-network ADB transport.

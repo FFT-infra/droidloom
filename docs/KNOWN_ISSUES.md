@@ -6,6 +6,20 @@ commands are in [INSTALL.md](INSTALL.md); source builds are in
 
 ## Application compatibility
 
+- **Root detection from development-image properties.** The supervisor projects
+  release-style build metadata over the base partitions before Android init
+  starts, including direct `build.prop` reads. It clears `ro.debuggable` and
+  the boot debug flag, enables secure ADB defaults, and replaces `userdebug`,
+  `eng`, `test-keys` and `dev-keys` in standard build metadata. This also disables
+  `adb root`; host administration and Android system-service UIDs remain
+  available. The policy applies with or without host ADB keys and preserves
+  device identity, build version and security-patch dates. It does not change
+  image signing, SELinux enforcement or hardware attestation, and cannot
+  guarantee acceptance by every app or Play Integrity. All 107 supervisor
+  tests pass. On the Pad 4, the deployed ARM64 supervisor reports the expected
+  properties through `getprop` and direct partition-file reads from an app UID;
+  Android boot, framework readiness and user storage unlock also pass. App
+  acceptance remains for the user to validate.
 - **Monitor removal restarted Android on the OnePlus Pad 4.** Disconnecting
   DisplayPort made the compositor send `zwlr_output_power_v1.failed` for the
   removed output. The presenter incorrectly treated that per-output notification

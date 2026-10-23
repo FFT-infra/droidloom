@@ -686,6 +686,8 @@ fn stop_idmap_namespace(child: &mut Child) -> Result<(), DevelopmentError> {
 }
 
 fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
+    crate::app_properties::cleanup(&spec.runtime_dir)
+        .map_err(|source| io_error("remove Android application properties", source))?;
     crate::adb::cleanup(&spec.runtime_dir)
         .map_err(|source| io_error("remove private ADB configuration", source))?;
     for (path, context) in [
@@ -902,6 +904,11 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     bind_development_cgroups(spec, &root, &controllers)?;
     if let Some(policy) = &controllers.cpu_policy {
         bind_cpu_policy(spec, &root, policy)?;
+    }
+    for (source, target) in crate::app_properties::prepare(&root, &spec.runtime_dir)
+        .map_err(|source| io_error("prepare Android application properties", source))?
+    {
+        bind_mount(&source, &target, true)?;
     }
     bind_adb_configuration(spec, &root)?;
     bind_product_properties(spec, &root)?;
@@ -1964,7 +1971,7 @@ fn bind_boot_parameters(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentE
             "androidboot.hardware=droidloom ",
             "androidboot.serialno=droidloom ",
             "androidboot.selinux=permissive ",
-            "androidboot.debuggable=1 ",
+            "androidboot.debuggable=0 ",
             "androidboot.veritymode=enforcing ",
             "androidboot.verifiedbootstate=green\n"
         ),
@@ -2112,8 +2119,8 @@ fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), Developmen
     bind_mount(&source, &target, true)
 }
 
-// Tracing and the host's identity are independent of whether host ADB and its
-// authentication keys exist.
+// Application properties, tracing and host identity apply even without ADB
+// authentication keys. Product defaults load after all other partitions.
 fn bind_product_properties(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
     let target = ["product/etc/build.prop", "product/build.prop"]
         .into_iter()
@@ -2126,6 +2133,7 @@ fn bind_product_properties(spec: &CellSpec, root: &Path) -> Result<(), Developme
         .map_err(|source| io_error("read Android product properties", source))?;
     let properties = crate::tracing::container_properties(&original);
     let properties = crate::identity::product_properties(&properties, &crate::identity::host());
+    let properties = crate::app_properties::product_properties(&properties);
     let source = spec.runtime_dir.join("android-product.prop");
     fs::write(&source, properties)
         .map_err(|source| io_error("write Android product properties", source))?;
