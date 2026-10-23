@@ -29,13 +29,13 @@ Options, smallest first:
 
 ## Input
 
-1. **Delivery-time stamps** (confirmed). Denial puts libinput's hardware time in
-   `wl_touch`; the presenter discards it and stamps each event with
-   `clock_gettime` on receipt (`send_input` in
-   [main.rs](../graphics/droidloom-wayland/src/main.rs)). Android resamples at
-   vsync and computes fling velocity from event times, so delivery jitter
-   becomes wobbly scrolling and wrong fling speed. Carry the hardware time;
-   `zwp_input_timestamps_v1` in Denial would give nanosecond precision.
+1. **Hardware event times** (done). The presenter stamps each record with the
+   libinput time from `zwp_input_timestamps_v1`, falling back to the 32-bit
+   millisecond time of `wl_touch`, `wl_pointer` and `wl_keyboard`
+   ([input_time.rs](../graphics/droidloom-wayland/src/input_time.rs)). Android
+   resamples at vsync and computes fling velocity from event times. On aston
+   the receipt stamps it replaced were 0.1–0.6 ms late with 0.3 ms interval
+   jitter; touch reports every 8 ms.
 2. **Clipboard gate holds all input** (confirmed). Every
    `wl_data_device.selection`, which is re-sent on keyboard focus, blocks touches
    until the clipboard is read and imported into Android, up to 10 s

@@ -338,6 +338,7 @@ struct App {
     // Touch and mouse share Android's injected pointer device; keys are separate.
     motion_times: input_time::Stream,
     key_times: input_time::Stream,
+    input_timestamps: input_time::Timestamps,
     next_buffer_id: u64,
     next_input_serial: u64,
     direct_input: input::DirectInput,
@@ -1787,7 +1788,7 @@ impl App {
             contacts.sort_by_key(|contact| contact.object);
             contacts.dedup_by_key(|contact| contact.object);
             for contact in contacts {
-                let result = self.motion_time(None).and_then(|time| {
+                let result = self.synthesized_time().and_then(|time| {
                     self.send_input(contact.object, contact.event(TouchAction::Cancel), time)
                 });
                 if let Err(error) = result {
@@ -1798,19 +1799,25 @@ impl App {
         self.clear_contacts();
     }
 
-    /// Nanoseconds for a touch or mouse event with the compositor's `millis`,
-    /// or the receipt time for an event the compositor did not time.
-    fn motion_time(&mut self, millis: Option<u32>) -> Result<u64, PresenterError> {
+    /// Nanoseconds for an event of `device` with the compositor's `millis`,
+    /// at full precision when the compositor sent the full time.
+    fn input_time(
+        &mut self,
+        device: input_time::Device,
+        millis: u32,
+    ) -> Result<u64, PresenterError> {
         let now = monotonic_timestamp_nanos()?;
-        Ok(match millis {
-            Some(millis) => self.motion_times.event(millis, now),
-            None => self.motion_times.received(now),
-        })
+        let precise = self.input_timestamps.take(device, millis);
+        let stream = match device {
+            input_time::Device::Keyboard => &mut self.key_times,
+            input_time::Device::Pointer | input_time::Device::Touch => &mut self.motion_times,
+        };
+        Ok(stream.event(millis, precise, now))
     }
 
-    /// Nanoseconds for a key event with the compositor's `millis`.
-    fn key_time(&mut self, millis: u32) -> Result<u64, PresenterError> {
-        Ok(self.key_times.event(millis, monotonic_timestamp_nanos()?))
+    /// Nanoseconds for a touch or mouse event the presenter makes itself.
+    fn synthesized_time(&mut self) -> Result<u64, PresenterError> {
+        Ok(self.motion_times.received(monotonic_timestamp_nanos()?))
     }
 
     /// Send one event stamped with its hardware time on the shared monotonic clock.
@@ -2543,17 +2550,26 @@ impl SeatHandler for App {
             Capability::Keyboard if self.keyboard.is_none() => self
                 .seat_state
                 .get_keyboard(qh, &seat, None)
-                .map(|keyboard| self.keyboard = Some(keyboard))
+                .map(|keyboard| {
+                    self.input_timestamps.keyboard(&keyboard, qh);
+                    self.keyboard = Some(keyboard);
+                })
                 .map_err(|error| error.to_string()),
             Capability::Pointer if self.pointer.is_none() => self
                 .seat_state
                 .get_pointer(qh, &seat)
-                .map(|pointer| self.pointer = Some(pointer))
+                .map(|pointer| {
+                    self.input_timestamps.pointer(&pointer, qh);
+                    self.pointer = Some(pointer);
+                })
                 .map_err(|error| error.to_string()),
             Capability::Touch if self.touch.is_none() => self
                 .seat_state
                 .get_touch(qh, &seat)
-                .map(|touch| self.touch = Some(touch))
+                .map(|touch| {
+                    self.input_timestamps.touch(&touch, qh);
+                    self.touch = Some(touch);
+                })
                 .map_err(|error| error.to_string()),
             _ => Ok(()),
         };
@@ -2579,6 +2595,7 @@ impl SeatHandler for App {
                     })
                     .is_some_and(|data| data.seat() == &seat) =>
             {
+                self.input_timestamps.remove(input_time::Device::Keyboard);
                 self.keyboard = None;
                 self.text_input.remove_resource();
             }
@@ -2592,6 +2609,7 @@ impl SeatHandler for App {
                     .is_some_and(|data| data.seat() == &seat) =>
             {
                 self.retire_contacts(None);
+                self.input_timestamps.remove(input_time::Device::Pointer);
                 self.pointer = None;
             }
             Capability::Touch
@@ -2604,6 +2622,7 @@ impl SeatHandler for App {
                     .is_some_and(|data| data.seat() == &seat) =>
             {
                 self.retire_contacts(None);
+                self.input_timestamps.remove(input_time::Device::Touch);
                 self.touch = None;
             }
             _ => {}
@@ -2671,17 +2690,19 @@ impl KeyboardHandler for App {
             self.activation.input(serial, data.seat(), surface);
         }
         if let Some(object) = self.focused
-            && let Err(error) = self.key_time(event.time).and_then(|time| {
-                self.send_input(
-                    object,
-                    InputEvent::Key {
-                        action: KeyAction::Down,
-                        keycode: event.raw_code,
-                        repeat: 0,
-                    },
-                    time,
-                )
-            })
+            && let Err(error) = self
+                .input_time(input_time::Device::Keyboard, event.time)
+                .and_then(|time| {
+                    self.send_input(
+                        object,
+                        InputEvent::Key {
+                            action: KeyAction::Down,
+                            keycode: event.raw_code,
+                            repeat: 0,
+                        },
+                        time,
+                    )
+                })
         {
             self.fail(&error);
         }
@@ -2697,17 +2718,19 @@ impl KeyboardHandler for App {
     ) {
         self.clipboard.serial(serial);
         if let Some(object) = self.focused
-            && let Err(error) = self.key_time(event.time).and_then(|time| {
-                self.send_input(
-                    object,
-                    InputEvent::Key {
-                        action: KeyAction::Down,
-                        keycode: event.raw_code,
-                        repeat: 1,
-                    },
-                    time,
-                )
-            })
+            && let Err(error) = self
+                .input_time(input_time::Device::Keyboard, event.time)
+                .and_then(|time| {
+                    self.send_input(
+                        object,
+                        InputEvent::Key {
+                            action: KeyAction::Down,
+                            keycode: event.raw_code,
+                            repeat: 1,
+                        },
+                        time,
+                    )
+                })
         {
             self.fail(&error);
         }
@@ -2723,17 +2746,19 @@ impl KeyboardHandler for App {
     ) {
         self.clipboard.serial(serial);
         if let Some(object) = self.focused
-            && let Err(error) = self.key_time(event.time).and_then(|time| {
-                self.send_input(
-                    object,
-                    InputEvent::Key {
-                        action: KeyAction::Up,
-                        keycode: event.raw_code,
-                        repeat: 0,
-                    },
-                    time,
-                )
-            })
+            && let Err(error) = self
+                .input_time(input_time::Device::Keyboard, event.time)
+                .and_then(|time| {
+                    self.send_input(
+                        object,
+                        InputEvent::Key {
+                            action: KeyAction::Up,
+                            keycode: event.raw_code,
+                            repeat: 0,
+                        },
+                        time,
+                    )
+                })
         {
             self.fail(&error);
         }
@@ -2797,9 +2822,11 @@ impl PointerHandler for App {
                         pointer_id: u32::MAX,
                         position_fixed: (x_fixed, y_fixed),
                     };
-                    let sent = self.motion_time(Some(time)).and_then(|time| {
-                        self.send_input(object, contact.event(TouchAction::Down), time)
-                    });
+                    let sent =
+                        self.input_time(input_time::Device::Pointer, time)
+                            .and_then(|time| {
+                                self.send_input(object, contact.event(TouchAction::Down), time)
+                            });
                     match sent {
                         Err(error) => self.fail(&error),
                         Ok(true) => self.pointer_contact = Some(contact),
@@ -2815,9 +2842,15 @@ impl PointerHandler for App {
                         contact.position_fixed =
                             self.fixed_position(contact.object, event.position);
                     }
-                    let sent = self.motion_time(Some(time)).and_then(|time| {
-                        self.send_input(contact.object, contact.event(TouchAction::Motion), time)
-                    });
+                    let sent =
+                        self.input_time(input_time::Device::Pointer, time)
+                            .and_then(|time| {
+                                self.send_input(
+                                    contact.object,
+                                    contact.event(TouchAction::Motion),
+                                    time,
+                                )
+                            });
                     match sent {
                         Err(error) => self.fail(&error),
                         Ok(true) => self.pointer_contact = Some(contact),
@@ -2832,9 +2865,16 @@ impl PointerHandler for App {
                         contact.position_fixed =
                             self.fixed_position(contact.object, event.position);
                     }
-                    if let Err(error) = self.motion_time(Some(time)).and_then(|time| {
-                        self.send_input(contact.object, contact.event(TouchAction::Up), time)
-                    }) {
+                    if let Err(error) =
+                        self.input_time(input_time::Device::Pointer, time)
+                            .and_then(|time| {
+                                self.send_input(
+                                    contact.object,
+                                    contact.event(TouchAction::Up),
+                                    time,
+                                )
+                            })
+                    {
                         self.fail(&error);
                     }
                 }
@@ -2879,7 +2919,7 @@ impl TouchHandler for App {
             position_fixed: (x_fixed, y_fixed),
         };
         let sent = self
-            .motion_time(Some(time))
+            .input_time(input_time::Device::Touch, time)
             .and_then(|time| self.send_input(object, contact.event(TouchAction::Down), time));
         match sent {
             Err(error) => self.fail(&error),
@@ -2908,7 +2948,7 @@ impl TouchHandler for App {
         // wl_touch.up carries no coordinates. Android still needs the last
         // position; substituting (0, 0) turns a button tap into a release outside it.
         if let Err(error) = self
-            .motion_time(Some(time))
+            .input_time(input_time::Device::Touch, time)
             .and_then(|time| self.send_input(contact.object, contact.event(TouchAction::Up), time))
         {
             self.fail(&error);
@@ -2931,9 +2971,11 @@ impl TouchHandler for App {
             return;
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
-        let sent = self.motion_time(Some(time)).and_then(|time| {
-            self.send_input(contact.object, contact.event(TouchAction::Motion), time)
-        });
+        let sent = self
+            .input_time(input_time::Device::Touch, time)
+            .and_then(|time| {
+                self.send_input(contact.object, contact.event(TouchAction::Motion), time)
+            });
         match sent {
             Err(error) => self.fail(&error),
             Ok(true) => {
@@ -3135,6 +3177,7 @@ fn run() -> Result<(), PresenterError> {
         touch_contacts: BTreeMap::new(),
         motion_times: input_time::Stream::default(),
         key_times: input_time::Stream::default(),
+        input_timestamps: input_time::Timestamps::new(globals.bind(&qh, 1..=1, ()).ok()),
         next_buffer_id: 0,
         next_input_serial: 0,
         direct_input: input::DirectInput::default(),

@@ -659,7 +659,8 @@ service definitions remain available for rollback. Local deployment evidence is
 under `.work/moto-fastpath-deploy/`; this readiness check does not establish
 touch-to-display latency or visual acceptance.
 
-Key-event logs are off by default. `DROIDLOOM_INPUT_TRACE=1` enables them in each
+Input logs are off by default. `DROIDLOOM_INPUT_TRACE=1` logs every input
+record the presenter sends, with its event time and its age at receipt, in each
 presenter process where the environment is set. Composer no longer forwards
 input records; the native receiver replaces the Java bridge's per-key path.
 The flag is read once per process, not from the environment on every event.
