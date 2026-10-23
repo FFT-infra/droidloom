@@ -328,6 +328,7 @@ pub struct DenialEndpoint {
     direct_input: bool,
     lazy_render_targets: bool,
     scene_presentation: bool,
+    host_clock: bool,
     tasks: BTreeMap<TaskObjectId, TaskEndpoint>,
 }
 
@@ -350,6 +351,7 @@ impl DenialEndpoint {
             direct_input: false,
             lazy_render_targets: false,
             scene_presentation: false,
+            host_clock: false,
             tasks: BTreeMap::new(),
         }
     }
@@ -841,6 +843,39 @@ impl DenialEndpoint {
         self.ready && self.scene_presentation
     }
 
+    /// Opt into forwarding the host's frame grants as Android's vsync.
+    pub fn with_host_clock(mut self) -> Self {
+        self.host_clock = true;
+        self
+    }
+
+    /// Whether Android takes its vsync from forwarded host frame grants.
+    pub fn host_clock(&self) -> bool {
+        self.ready && self.host_clock
+    }
+
+    /// Forward one host frame grant. Without a negotiated host clock this is
+    /// a no-op; Android then runs its own timer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates codec or socket failure.
+    pub fn send_frame_grant(
+        &self,
+        latch_nanos: u64,
+        target_nanos: u64,
+        period_nanos: u64,
+    ) -> Result<(), EndpointError> {
+        if self.host_clock() {
+            self.socket.send_denial(&DenialMessage::FrameGrant {
+                latch_nanos,
+                target_nanos,
+                period_nanos,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Forward display timing for a committed direct scene. This never accesses
     /// composed-frame ownership or signals any release timeline.
     pub fn send_scene_presented(
@@ -965,10 +1000,13 @@ impl DenialEndpoint {
         self.direct_input &= capabilities & capability::DIRECT_INPUT != 0;
         self.lazy_render_targets &= capabilities & capability::LAZY_RENDER_TARGETS != 0;
         self.scene_presentation &= capabilities & capability::SCENE_PRESENTATION != 0;
+        self.host_clock &= capabilities & capability::HOST_CLOCK != 0;
         self.socket.send_denial(&DenialMessage::ServerHello {
             major: PROTOCOL_MAJOR,
-            minor: if self.scene_presentation {
+            minor: if self.host_clock {
                 PROTOCOL_MINOR
+            } else if self.scene_presentation {
+                8
             } else if self.lazy_render_targets {
                 7
             } else {
@@ -987,6 +1025,11 @@ impl DenialEndpoint {
                 }
                 | if self.scene_presentation {
                     capability::SCENE_PRESENTATION
+                } else {
+                    0
+                }
+                | if self.host_clock {
+                    capability::HOST_CLOCK
                 } else {
                     0
                 }
@@ -1702,6 +1745,56 @@ mod tests {
             denial.receive_action(),
             Err(EndpointError::HandshakeRequired)
         ));
+    }
+
+    #[test]
+    fn frame_grants_flow_only_with_a_negotiated_host_clock() {
+        for host in [false, true] {
+            for client in [false, true] {
+                let (android, mut endpoint) = pair();
+                if host {
+                    endpoint = endpoint.with_host_clock();
+                }
+                android
+                    .send_android(
+                        &AndroidMessage::ClientHello {
+                            min_major: 1,
+                            max_major: 1,
+                            capabilities: capability::REQUIRED_V1
+                                | if client { capability::HOST_CLOCK } else { 0 },
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                endpoint.receive_action().unwrap();
+                let DenialMessage::ServerHello {
+                    minor,
+                    capabilities,
+                    ..
+                } = android.receive_denial().unwrap().message
+                else {
+                    panic!("hello");
+                };
+                assert_eq!(endpoint.host_clock(), host && client);
+                assert_eq!(capabilities & capability::HOST_CLOCK != 0, host && client);
+                assert_eq!(minor, if host && client { 9 } else { 6 });
+                endpoint.send_frame_grant(10, 20, 10).unwrap();
+                endpoint.send_display_power(true).unwrap();
+                let first = android.receive_denial().unwrap().message;
+                if host && client {
+                    assert_eq!(
+                        first,
+                        DenialMessage::FrameGrant {
+                            latch_nanos: 10,
+                            target_nanos: 20,
+                            period_nanos: 10,
+                        }
+                    );
+                } else {
+                    assert_eq!(first, DenialMessage::DisplayPower { powered: true });
+                }
+            }
+        }
     }
 
     #[test]

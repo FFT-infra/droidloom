@@ -74,9 +74,20 @@ pub type SharedSession = Arc<Mutex<Session>>;
 type SharedCallback = Arc<Mutex<Option<Strong<dyn IComposerCallback>>>>;
 type ConnectedDisplays = Arc<Mutex<BTreeSet<DisplayId>>>;
 
+/// SurfaceFlinger wakes one period minus its default 1 ms phase offset
+/// before the vsync it composes for.
+const SF_PHASE_OFFSET_NANOS: u64 = 1_000_000;
+/// Time SurfaceFlinger gets to compose and hand a frame to the presenter
+/// before the host's latch.
+const SF_LATCH_BUDGET_NANOS: u64 = 2_000_000;
+
+// With a host clock, vsync follows the host's frame grants and there is no
+// timer thread. Without one, a free-running timer seeded from presentation
+// feedback stands in.
 #[derive(Clone)]
 struct VsyncScheduler {
     shared: Arc<VsyncSchedulerShared>,
+    host_clock: bool,
 }
 
 struct VsyncSchedulerShared {
@@ -149,18 +160,65 @@ struct VsyncAudit {
 }
 
 impl VsyncScheduler {
-    fn new(callback: SharedCallback) -> Self {
+    fn new(callback: SharedCallback, host_clock: bool) -> Self {
         let shared = Arc::new(VsyncSchedulerShared {
             callback,
             schedule: Mutex::new(VsyncSchedule::default()),
             wake: Condvar::new(),
         });
-        let worker = Arc::clone(&shared);
-        std::thread::Builder::new()
-            .name("droidloom-vsync".to_owned())
-            .spawn(move || run_vsync_scheduler(&worker))
-            .expect("create Droidloom vsync scheduler");
-        Self { shared }
+        if !host_clock {
+            let worker = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("droidloom-vsync".to_owned())
+                .spawn(move || run_vsync_scheduler(&worker))
+                .expect("create Droidloom vsync scheduler");
+        }
+        Self { shared, host_clock }
+    }
+
+    /// Deliver one host frame grant as a vsync to every enabled display at
+    /// its period. The sample is the vblank before the grant's latch, moved
+    /// early by SurfaceFlinger's phase offset and latch budget, so SF wakes
+    /// that budget before the host latches. The host sends no grants while
+    /// Android is idle or the display is off; SF keeps its model meanwhile.
+    fn frame_grant(&self, latch_nanos: u64, period_nanos: u64) {
+        if !self.host_clock {
+            return;
+        }
+        let Some(timestamp_nanos) = latch_nanos
+            .checked_sub(period_nanos + SF_PHASE_OFFSET_NANOS + SF_LATCH_BUDGET_NANOS)
+        else {
+            return;
+        };
+        let Ok(now) = monotonic_timestamp_nanos() else {
+            return;
+        };
+        let Ok(mut schedule) = self.shared.schedule.lock() else {
+            return;
+        };
+        let due = schedule
+            .displays
+            .iter()
+            .filter(|(_, scheduled)| periods_compatible(scheduled.period_nanos, period_nanos))
+            .map(|(display, scheduled)| (*display, timestamp_nanos, scheduled.period_nanos))
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            return;
+        }
+        // In host-clock mode the wake columns time grant delivery from the
+        // host tick that issued it.
+        let audit = &mut schedule.audit;
+        if audit.window_started_nanos == 0 {
+            audit.window_started_nanos = now;
+        }
+        let delivery = now.saturating_sub(latch_nanos.saturating_sub(period_nanos));
+        audit.scheduler_ticks = audit.scheduler_ticks.saturating_add(1);
+        audit.wake_late_total_nanos = audit
+            .wake_late_total_nanos
+            .saturating_add(u128::from(delivery));
+        audit.wake_late_max_nanos = audit.wake_late_max_nanos.max(delivery);
+        drop(schedule);
+        deliver_vsyncs(&self.shared, due);
     }
 
     fn set_enabled(
@@ -219,7 +277,7 @@ impl VsyncScheduler {
     }
 
     fn observe_presentation(&self, timestamp_nanos: u64, period_nanos: u64) {
-        if period_nanos == 0 {
+        if period_nanos == 0 || self.host_clock {
             return;
         }
         let Ok(now) = monotonic_timestamp_nanos() else {
@@ -375,63 +433,66 @@ fn run_vsync_scheduler(shared: &VsyncSchedulerShared) {
             .wake_late_max_nanos
             .max(wake_late_max_nanos);
         drop(schedule);
+        deliver_vsyncs(shared, due);
+    }
+}
 
-        let callback = shared
-            .callback
-            .lock()
-            .ok()
-            .and_then(|callback| callback.clone());
-        let Some(callback) = callback else {
+fn deliver_vsyncs(shared: &VsyncSchedulerShared, due: Vec<(DisplayId, u64, u64)>) {
+    let callback = shared
+        .callback
+        .lock()
+        .ok()
+        .and_then(|callback| callback.clone());
+    let Some(callback) = callback else {
+        return;
+    };
+    let mut failed = Vec::new();
+    let mut callback_total_nanos = 0_u128;
+    let mut callback_max_nanos = 0_u64;
+    for (display, timestamp_nanos, period_nanos) in due {
+        let Ok(display_value) = i64::try_from(display.0) else {
+            failed.push(display);
             continue;
         };
-        let mut failed = Vec::new();
-        let mut callback_total_nanos = 0_u128;
-        let mut callback_max_nanos = 0_u64;
-        for (display, timestamp_nanos, period_nanos) in due {
-            let Ok(display_value) = i64::try_from(display.0) else {
-                failed.push(display);
-                continue;
-            };
-            let Ok(timestamp_value) = i64::try_from(timestamp_nanos) else {
-                failed.push(display);
-                continue;
-            };
-            let Ok(period_value) = i32::try_from(period_nanos) else {
-                failed.push(display);
-                continue;
-            };
-            let callback_started = monotonic_timestamp_nanos().ok();
-            let result = callback.onVsync(display_value, timestamp_value, period_value);
-            if let (Some(started), Ok(finished)) =
-                (callback_started, monotonic_timestamp_nanos())
-            {
-                let elapsed = finished.saturating_sub(started);
-                callback_total_nanos =
-                    callback_total_nanos.saturating_add(u128::from(elapsed));
-                callback_max_nanos = callback_max_nanos.max(elapsed);
-            }
-            if let Err(error) = result {
-                eprintln!("Droidloom vsync callback failed for {display:?}: {error:?}");
-                failed.push(display);
+        let Ok(timestamp_value) = i64::try_from(timestamp_nanos) else {
+            failed.push(display);
+            continue;
+        };
+        let Ok(period_value) = i32::try_from(period_nanos) else {
+            failed.push(display);
+            continue;
+        };
+        let callback_started = monotonic_timestamp_nanos().ok();
+        let result = callback.onVsync(display_value, timestamp_value, period_value);
+        if let (Some(started), Ok(finished)) =
+            (callback_started, monotonic_timestamp_nanos())
+        {
+            let elapsed = finished.saturating_sub(started);
+            callback_total_nanos =
+                callback_total_nanos.saturating_add(u128::from(elapsed));
+            callback_max_nanos = callback_max_nanos.max(elapsed);
+        }
+        if let Err(error) = result {
+            eprintln!("Droidloom vsync callback failed for {display:?}: {error:?}");
+            failed.push(display);
+        }
+    }
+    if let Ok(mut schedule) = shared.schedule.lock() {
+        schedule.audit.callback_total_nanos = schedule
+            .audit
+            .callback_total_nanos
+            .saturating_add(callback_total_nanos);
+        schedule.audit.callback_max_nanos = schedule
+            .audit
+            .callback_max_nanos
+            .max(callback_max_nanos);
+        if !failed.is_empty() {
+            for display in failed {
+                schedule.displays.remove(&display);
             }
         }
-        if let Ok(mut schedule) = shared.schedule.lock() {
-            schedule.audit.callback_total_nanos = schedule
-                .audit
-                .callback_total_nanos
-                .saturating_add(callback_total_nanos);
-            schedule.audit.callback_max_nanos = schedule
-                .audit
-                .callback_max_nanos
-                .max(callback_max_nanos);
-            if !failed.is_empty() {
-                for display in failed {
-                    schedule.displays.remove(&display);
-                }
-            }
-            if let Ok(now) = monotonic_timestamp_nanos() {
-                maybe_log_vsync_audit(&mut schedule.audit, now);
-            }
+        if let Ok(now) = monotonic_timestamp_nanos() {
+            maybe_log_vsync_audit(&mut schedule.audit, now);
         }
     }
 }
@@ -667,9 +728,15 @@ impl ComposerLifecycle {
     }
 
     /// Phase-lock synthetic HWC vsync to a real host presentation sample.
+    /// Ignored when the host clock drives vsync.
     pub fn observe_presentation(&self, timestamp_nanos: u64, period_nanos: u64) {
         self.vsync
             .observe_presentation(timestamp_nanos, period_nanos);
+    }
+
+    /// Deliver one host frame grant as SurfaceFlinger's vsync.
+    pub fn frame_grant(&self, latch_nanos: u64, period_nanos: u64) {
+        self.vsync.frame_grant(latch_nanos, period_nanos);
     }
 }
 
@@ -696,9 +763,10 @@ where
     F: Fn() -> A + Send + Sync + 'static,
 {
     /// Create an unregistered service around the per-task Composer session.
-    pub fn new(session: SharedSession, buffer_factory: F) -> Self {
+    /// With `host_clock`, vsync comes only from forwarded host frame grants.
+    pub fn new(session: SharedSession, buffer_factory: F, host_clock: bool) -> Self {
         let callback = Arc::new(Mutex::new(None));
-        let vsync = VsyncScheduler::new(Arc::clone(&callback));
+        let vsync = VsyncScheduler::new(Arc::clone(&callback), host_clock);
         Self {
             session,
             buffer_factory,
@@ -1134,9 +1202,15 @@ where
             AidlPowerMode::DOZE_SUSPEND => PowerMode::DozeSuspend,
             _ => return Err(service_error(ErrorCode::Unsupported)),
         };
+        let display = display_id(display)?;
         lock(&self.session)?
-            .set_power_mode(display_id(display)?, mode)
-            .map_err(service_error)
+            .set_power_mode(display, mode)
+            .map_err(service_error)?;
+        // Powering off also ends vsync; SF enables it again after power-on.
+        if mode == PowerMode::Off {
+            self.vsync.disable(display);
+        }
+        Ok(())
     }
 
     fn setReadbackBuffer(

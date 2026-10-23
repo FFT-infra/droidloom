@@ -497,6 +497,7 @@ impl DenialTaskBinding {
             | DenialMessage::DisplayPower { .. }
             | DenialMessage::Error { .. }
             | DenialMessage::Ping { .. }
+            | DenialMessage::FrameGrant { .. }
             | DenialMessage::RegisterRenderTarget { .. }
             | DenialMessage::UnregisterRenderTarget { .. } => {
                 Err(DenialBridgeError::UnexpectedMessage)
@@ -522,7 +523,8 @@ fn message_object(message: &DenialMessage) -> Option<TaskObjectId> {
         DenialMessage::ServerHello { .. }
         | DenialMessage::RequestInputChannel { .. }
         | DenialMessage::DisplayPower { .. }
-        | DenialMessage::Ping { .. } => None,
+        | DenialMessage::Ping { .. }
+        | DenialMessage::FrameGrant { .. } => None,
     }
 }
 

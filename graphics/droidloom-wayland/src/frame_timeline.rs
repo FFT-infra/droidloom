@@ -34,7 +34,7 @@ mod protocol {
     wayland_scanner::generate_client_code!("../../protocol/denial-frame-timeline-v1.xml");
 }
 pub(super) use protocol::denial_frame_timeline_manager_v1::DenialFrameTimelineManagerV1 as Manager;
-use protocol::denial_output_frame_timeline_v1::{
+pub(super) use protocol::denial_output_frame_timeline_v1::{
     self as output_timeline, DenialOutputFrameTimelineV1 as OutputTimeline,
 };
 use protocol::denial_surface_frame_timeline_v1::DenialSurfaceFrameTimelineV1;
@@ -46,11 +46,11 @@ pub(super) struct Identity {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Grant {
+pub(super) struct Grant {
     identity: Identity,
-    latch_deadline_ns: u64,
-    presentation_target_ns: u64,
-    refresh_period_ns: u64,
+    pub latch_deadline_ns: u64,
+    pub presentation_target_ns: u64,
+    pub refresh_period_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,19 +155,45 @@ impl Drop for Surface {
 pub(super) struct Target {
     timeline: OutputTimeline,
     pub identity: Identity,
+    pub latch_ns: u64,
 }
 
 pub(super) struct Reservation {
     pub target: Option<Target>,
 }
 
-struct Subscription {
-    output: wl_output::WlOutput,
+// Armed only while Android draws; see clock.rs.
+pub(super) struct Subscription {
+    pub output: wl_output::WlOutput,
     proxy: OutputTimeline,
+    armed: bool,
+}
+impl Subscription {
+    pub fn new(output: wl_output::WlOutput, proxy: OutputTimeline, armed: bool) -> Self {
+        if armed {
+            proxy.set_active(1);
+        }
+        Self {
+            output,
+            proxy,
+            armed,
+        }
+    }
+    pub fn arm(&mut self, armed: bool) {
+        if self.armed != armed {
+            self.proxy.set_active(u32::from(armed));
+            self.armed = armed;
+        }
+    }
+    pub fn is(&self, proxy: &OutputTimeline) -> bool {
+        self.proxy == *proxy
+    }
 }
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.proxy.set_active(0);
+        if self.armed {
+            self.proxy.set_active(0);
+        }
         self.proxy.destroy();
     }
 }
@@ -184,6 +210,8 @@ pub(super) struct Timeline {
     subscription: Option<Subscription>,
     schedule: Schedule,
     pub queued: Option<QueuedFrame>,
+    // Frames that reached an offered grant after its latch.
+    pub late: u64,
 }
 impl Timeline {
     pub fn new<D: Dispatch<DenialSurfaceFrameTimelineV1, ()> + 'static>(
@@ -207,13 +235,35 @@ impl Timeline {
             return Some(Reservation { target: None });
         }
         let subscription = self.subscription.as_ref()?;
-        let grant = self.schedule.consume(now)?;
+        // Disarmed means Android was idle: show this frame at once, untargeted,
+        // while the caller arms grants for the frames after it.
+        if !subscription.armed {
+            return Some(Reservation { target: None });
+        }
+        let late = self
+            .schedule
+            .offered
+            .is_some_and(|grant| now >= grant.latch_deadline_ns);
+        let Some(grant) = self.schedule.consume(now) else {
+            self.late += u64::from(late);
+            return None;
+        };
         Some(Reservation {
             target: Some(Target {
                 timeline: subscription.proxy.clone(),
                 identity: grant.identity,
+                latch_ns: grant.latch_deadline_ns,
             }),
         })
+    }
+    /// Arm or disarm grant delivery. A grant offered but not taken is dropped.
+    pub fn arm(&mut self, armed: bool) {
+        if let Some(subscription) = self.subscription.as_mut() {
+            subscription.arm(armed);
+        }
+        if !armed && self.schedule.offered.take().is_some() {
+            self.schedule.count(Terminal::Skipped);
+        }
     }
     pub fn stop(&mut self) {
         self.subscription = None;
@@ -347,10 +397,11 @@ impl App {
             task.timeline.schedule.last_sequence = 0;
             if let (Some(manager), Some(output)) = (&self.frame_timeline_manager, output) {
                 let proxy = manager.get_timeline(&output, qh, object);
-                proxy.set_active(1);
-                task.timeline.subscription = Some(Subscription { output, proxy });
+                task.timeline.subscription =
+                    Some(Subscription::new(output, proxy, self.clock.armed()));
             }
         }
+        self.refresh_clock(qh);
         Ok(())
     }
 
@@ -365,10 +416,12 @@ impl App {
             if task.timeline.queued.is_none() || task.presentation_feedback.len() >= 64 {
                 continue;
             }
-            let Some(target) = task.timeline.reserve(monotonic_timestamp_nanos()?) else {
+            let now = monotonic_timestamp_nanos()?;
+            let Some(target) = task.timeline.reserve(now) else {
                 continue;
             };
             let queued = task.timeline.queued.take().unwrap();
+            self.android_frame(now, target.target.as_ref());
             self.present(qh, &queued.frame, &queued.fence, target.target)?;
         }
         Ok(())
@@ -407,7 +460,7 @@ impl Dispatch<OutputTimeline, TaskObjectId> for App {
             .timeline
             .subscription
             .as_ref()
-            .is_some_and(|s| s.proxy == *proxy)
+            .is_some_and(|s| s.is(proxy))
         {
             return;
         }
@@ -427,45 +480,20 @@ impl Dispatch<OutputTimeline, TaskObjectId> for App {
                         .schedule
                         .epoch(epoch);
                 }
-                output_timeline::Event::Grant {
-                    epoch_hi,
-                    epoch_lo,
-                    sequence_hi,
-                    sequence_lo,
-                    latch_sec_hi,
-                    latch_sec_lo,
-                    latch_nsec,
-                    target_sec_hi,
-                    target_sec_lo,
-                    target_nsec,
-                    period_ns_hi,
-                    period_ns_lo,
-                } => {
-                    let grant = Grant {
-                        identity: Identity {
-                            epoch: join(epoch_hi, epoch_lo),
-                            sequence: join(sequence_hi, sequence_lo),
-                        },
-                        latch_deadline_ns: presentation_timestamp_nanos(
-                            join(latch_sec_hi, latch_sec_lo),
-                            latch_nsec,
-                        )?,
-                        presentation_target_ns: presentation_timestamp_nanos(
-                            join(target_sec_hi, target_sec_lo),
-                            target_nsec,
-                        )?,
-                        refresh_period_ns: join(period_ns_hi, period_ns_lo),
-                    };
+                event @ output_timeline::Event::Grant { .. } => {
+                    let grant = wire_grant(event)?;
+                    let now = monotonic_timestamp_nanos()?;
                     state
                         .tasks
                         .get_mut(object)
                         .unwrap()
                         .timeline
                         .schedule
-                        .offer(grant, monotonic_timestamp_nanos()?);
+                        .offer(grant, now);
                     state
                         .task_work
                         .mark(*object, readiness::TIMELINE | readiness::RELEASES);
+                    state.clock_idle_check(now);
                 }
             }
             Ok::<(), PresenterError>(())
@@ -492,6 +520,39 @@ impl Dispatch<WpPresentation, GlobalData> for App {
             state, proxy, event, data, conn, qh,
         );
     }
+}
+
+/// Decode a grant event.
+pub(super) fn wire_grant(event: output_timeline::Event) -> Result<Grant, PresenterError> {
+    let output_timeline::Event::Grant {
+        epoch_hi,
+        epoch_lo,
+        sequence_hi,
+        sequence_lo,
+        latch_sec_hi,
+        latch_sec_lo,
+        latch_nsec,
+        target_sec_hi,
+        target_sec_lo,
+        target_nsec,
+        period_ns_hi,
+        period_ns_lo,
+    } = event
+    else {
+        return Err(PresenterError::Configuration("expected a frame grant"));
+    };
+    Ok(Grant {
+        identity: Identity {
+            epoch: join(epoch_hi, epoch_lo),
+            sequence: join(sequence_hi, sequence_lo),
+        },
+        latch_deadline_ns: presentation_timestamp_nanos(join(latch_sec_hi, latch_sec_lo), latch_nsec)?,
+        presentation_target_ns: presentation_timestamp_nanos(
+            join(target_sec_hi, target_sec_lo),
+            target_nsec,
+        )?,
+        refresh_period_ns: join(period_ns_hi, period_ns_lo),
+    })
 }
 
 fn join(hi: u32, lo: u32) -> u64 {

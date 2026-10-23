@@ -75,9 +75,11 @@ fn run() -> Result<(), String> {
         .with_lazy_render_targets(capabilities & capability::LAZY_RENDER_TARGETS != 0);
     let session: SharedSession = Arc::new(Mutex::new(Session::default()));
     let factory_sink = sink.clone();
-    let service = ComposerService::new(Arc::clone(&session), move || {
-        MinigbmBufferAdapter::new(factory_sink.clone())
-    });
+    let service = ComposerService::new(
+        Arc::clone(&session),
+        move || MinigbmBufferAdapter::new(factory_sink.clone()),
+        capabilities & capability::HOST_CLOCK != 0,
+    );
     let lifecycle = service.lifecycle();
     let coordinator = TaskCoordinator::new(sink.clone(), lifecycle.clone());
     let input = InputHandoff::new(sink.clone(), INPUT_SOCKET);
@@ -183,7 +185,8 @@ fn handshake(socket: &ProtocolSocket) -> Result<u64, String> {
                     | capability::TASK_ACTIVATION
                     | capability::DIRECT_INPUT
                     | capability::LAZY_RENDER_TARGETS
-                    | capability::SCENE_PRESENTATION,
+                    | capability::SCENE_PRESENTATION
+                    | capability::HOST_CLOCK,
             },
             &[],
         )
@@ -230,6 +233,11 @@ fn event_loop(
                 .socket()
                 .send_android(&AndroidMessage::Pong { cookie }, &[])
                 .map_err(|error| error.to_string())?,
+            DenialMessage::FrameGrant {
+                latch_nanos,
+                period_nanos,
+                ..
+            } => lifecycle.frame_grant(latch_nanos, period_nanos),
             DenialMessage::Error { message, .. } => {
                 return Err(format!("Denial protocol error: {message}"));
             }
@@ -427,6 +435,7 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         DenialMessage::ServerHello { .. }
         | DenialMessage::RequestInputChannel { .. }
         | DenialMessage::DisplayPower { .. }
-        | DenialMessage::Ping { .. } => None,
+        | DenialMessage::Ping { .. }
+        | DenialMessage::FrameGrant { .. } => None,
     }
 }

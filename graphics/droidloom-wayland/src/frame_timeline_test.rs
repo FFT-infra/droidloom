@@ -170,8 +170,7 @@ impl Fixture {
         let mut timeline = Timeline::new(manager.as_ref(), Some(&surface), &qh);
         if let Some(manager) = manager {
             let proxy = manager.get_timeline(&output, &qh, ());
-            proxy.set_active(1);
-            timeline.subscription = Some(Subscription { output, proxy });
+            timeline.subscription = Some(Subscription::new(output, proxy, true));
         }
         let presentation = registry.bind::<WpPresentation, _, _>(4, 1, &qh, ());
         let feedback = [
@@ -327,4 +326,39 @@ fn scene_and_composed_feedback_share_idempotent_teardown_accounting() {
     assert!(scenes.is_empty() && frames.is_empty());
     assert_eq!(forgotten, vec![FrameId(88)]);
     assert_eq!(fixture.timeline.schedule.terminal, [0, 0, 0, 2, 0]);
+}
+
+#[test]
+fn a_disarmed_timeline_shows_frames_at_once_and_drops_its_offer() {
+    let mut fixture = Fixture::new(true);
+    fixture.requests();
+    let output = fixture
+        .timeline
+        .subscription
+        .as_ref()
+        .unwrap()
+        .proxy
+        .id()
+        .protocol_id();
+    fixture.timeline.schedule.epoch(1);
+    fixture.timeline.schedule.offer(grant(1, 1, 100), 0);
+    fixture.timeline.arm(false);
+    fixture.timeline.arm(false);
+    assert!(matches!(
+        fixture.timeline.reserve(1),
+        Some(Reservation { target: None })
+    ));
+    fixture.timeline.arm(true);
+    assert!(fixture.timeline.reserve(1).is_none());
+    fixture.timeline.schedule.offer(grant(1, 2, 200), 0);
+    assert!(fixture.timeline.reserve(200).is_none());
+    assert_eq!(fixture.timeline.late, 1);
+    fixture.timeline.schedule.offer(grant(1, 3, 300), 200);
+    let target = fixture.timeline.reserve(250).unwrap().target.unwrap();
+    assert_eq!(target.latch_ns, 300);
+    assert_eq!(
+        fixture.requests(),
+        vec![(output, 0, vec![0]), (output, 0, vec![1])]
+    );
+    assert_eq!(fixture.timeline.schedule.terminal, [0, 1, 1, 0, 0]);
 }

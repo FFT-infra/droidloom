@@ -4,6 +4,7 @@
 
 mod activation;
 mod clipboard;
+mod clock;
 mod fence_wakeup;
 mod frame_timeline;
 mod imports;
@@ -316,6 +317,7 @@ struct App {
     xdg_shell: XdgShell,
     insets_manager: Option<insets::DenialInsetsManagerV1>,
     frame_timeline_manager: Option<frame_timeline::Manager>,
+    clock: clock::Clock,
     viewporter: WpViewporter,
     fractional_scale_manager: WpFractionalScaleManagerV1,
     sync_manager: WpLinuxDrmSyncobjManagerV1,
@@ -462,15 +464,17 @@ impl App {
         select_surface_refresh(
             &task.entered_outputs,
             task.presentation_output.as_ref(),
-            |output| {
-                self.output_state.info(output).and_then(|info| {
-                    info.modes
-                        .iter()
-                        .find(|mode| mode.current && mode.refresh_rate > 0)
-                        .and_then(|mode| u32::try_from(mode.refresh_rate).ok())
-                })
-            },
+            |output| self.output_refresh_millihz(output),
         )
+    }
+
+    fn output_refresh_millihz(&self, output: &wl_output::WlOutput) -> Option<u32> {
+        self.output_state.info(output).and_then(|info| {
+            info.modes
+                .iter()
+                .find(|mode| mode.current && mode.refresh_rate > 0)
+                .and_then(|mode| u32::try_from(mode.refresh_rate).ok())
+        })
     }
 
     fn update_task_refresh(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
@@ -3060,6 +3064,7 @@ fn run() -> Result<(), PresenterError> {
         xdg_shell,
         insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
         frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        clock: clock::Clock::default(),
         viewporter,
         fractional_scale_manager,
         sync_manager,
@@ -3560,11 +3565,21 @@ fn select_surface_refresh<T: PartialEq>(
     presented: Option<&T>,
     mut refresh: impl FnMut(&T) -> Option<u32>,
 ) -> u32 {
-    presented
-        .filter(|output| entered.contains(output))
-        .and_then(&mut refresh)
-        .or_else(|| entered.iter().rev().find_map(refresh))
+    select_surface_output(entered, presented, &mut refresh)
+        .and_then(refresh)
         .unwrap_or(60_000)
+}
+
+/// The output whose refresh a surface takes: where it is presented, else the
+/// most recently entered output with a known refresh.
+fn select_surface_output<'a, T: PartialEq>(
+    entered: &'a [T],
+    presented: Option<&'a T>,
+    mut refresh: impl FnMut(&T) -> Option<u32>,
+) -> Option<&'a T> {
+    presented
+        .filter(|output| entered.contains(output) && refresh(output).is_some())
+        .or_else(|| entered.iter().rev().find(|output| refresh(output).is_some()))
 }
 
 fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {

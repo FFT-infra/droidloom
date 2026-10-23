@@ -1055,7 +1055,8 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         DenialMessage::ServerHello { .. }
         | DenialMessage::RequestInputChannel { .. }
         | DenialMessage::DisplayPower { .. }
-        | DenialMessage::Ping { .. } => None,
+        | DenialMessage::Ping { .. }
+        | DenialMessage::FrameGrant { .. } => None,
     }
 }
 

@@ -20,7 +20,7 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 8;
+pub const PROTOCOL_MINOR: u16 = 9;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
 /// Wire version introducing task activation.
@@ -72,6 +72,8 @@ pub mod capability {
     pub const LAZY_RENDER_TARGETS: u64 = 1 << 11;
     /// Real presentation observations for direct layer scenes, independent of targets.
     pub const SCENE_PRESENTATION: u64 = 1 << 12;
+    /// The host forwards its compositor frame grants as Android's vsync.
+    pub const HOST_CLOCK: u64 = 1 << 13;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -437,6 +439,15 @@ pub enum DenialMessage {
     Ping {
         /// Opaque cookie the client must return unchanged.
         cookie: u64,
+    },
+    /// One presentation opportunity granted by the host compositor.
+    FrameGrant {
+        /// CLOCK_MONOTONIC time by which content must be ready; a host vblank.
+        latch_nanos: u64,
+        /// Predicted CLOCK_MONOTONIC presentation, one period after the latch.
+        target_nanos: u64,
+        /// Nominal refresh period of the granting output.
+        period_nanos: u64,
     },
 }
 
@@ -1216,6 +1227,7 @@ const OP_UNREGISTER_RENDER_TARGET: u16 = 0x800d;
 const OP_DISPLAY_POWER: u16 = 0x800e;
 const OP_REQUEST_INPUT_CHANNEL: u16 = 0x800f;
 const OP_SCENE_PRESENTED: u16 = 0x8010;
+const OP_FRAME_GRANT: u16 = 0x8011;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1864,6 +1876,17 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
             payload.u64(*cookie);
             (OP_PING, 0)
         }
+        DenialMessage::FrameGrant {
+            latch_nanos,
+            target_nanos,
+            period_nanos,
+        } => {
+            frame_grant(*latch_nanos, *target_nanos, *period_nanos)?;
+            payload.u64(*latch_nanos);
+            payload.u64(*target_nanos);
+            payload.u64(*period_nanos);
+            (OP_FRAME_GRANT, 0)
+        }
     };
     let descriptors = match message {
         DenialMessage::RegisterRenderTarget { buffer, .. } => {
@@ -2109,6 +2132,18 @@ pub fn decode_denial(
                 cookie: payload.u64()?,
             }
         }
+        OP_FRAME_GRANT => {
+            require_connection(header.object)?;
+            let latch_nanos = payload.u64()?;
+            let target_nanos = payload.u64()?;
+            let period_nanos = payload.u64()?;
+            frame_grant(latch_nanos, target_nanos, period_nanos)?;
+            DenialMessage::FrameGrant {
+                latch_nanos,
+                target_nanos,
+                period_nanos,
+            }
+        }
         opcode => return Err(WireError::UnknownOpcode(opcode)),
     };
     payload.finish()?;
@@ -2253,6 +2288,7 @@ fn finish_packet(
         OP_BIND_INPUT_CHANNEL | OP_BIND_INPUT_ROUTE | OP_REQUEST_INPUT_CHANNEL => 6,
         OP_REQUEST_RENDER_TARGETS => 7,
         OP_SCENE_PRESENTED => 8,
+        OP_FRAME_GRANT => 9,
         _ => BASE_PROTOCOL_MINOR,
     };
     bytes.extend_from_slice(&minor.to_le_bytes());
@@ -2448,6 +2484,18 @@ fn require_connection(object: u64) -> Result<(), WireError> {
     } else {
         Err(WireError::InvalidObject)
     }
+}
+
+fn frame_grant(latch: u64, target: u64, period: u64) -> Result<(), WireError> {
+    nonzero("grant latch", latch)?;
+    nonzero("grant period", period)?;
+    if target <= latch {
+        return Err(WireError::InvalidEnum {
+            field: "grant target",
+            value: target,
+        });
+    }
+    Ok(())
 }
 
 fn nonzero(field: &'static str, value: u64) -> Result<(), WireError> {
@@ -3209,6 +3257,33 @@ mod tests {
                     timestamp_nanos: timestamp,
                     refresh_period_nanos: period,
                     sequence: 0
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn frame_grant_is_connection_scoped_and_ordered() {
+        let message = DenialMessage::FrameGrant {
+            latch_nanos: 1_000_000,
+            target_nanos: 9_333_333,
+            period_nanos: 8_333_333,
+        };
+        let packet = encode_denial(&message).unwrap();
+        assert!(packet.descriptors.is_empty());
+        assert_eq!(
+            u16::from_le_bytes(packet.bytes[6..8].try_into().unwrap()),
+            9
+        );
+        assert_eq!(decode_denial(&packet.bytes, 0).unwrap().message, message);
+        assert!(decode_denial(&packet.bytes, 1).is_err());
+        for (latch, target, period) in [(0, 1, 1), (2, 2, 1), (1, 2, 0)] {
+            assert!(
+                encode_denial(&DenialMessage::FrameGrant {
+                    latch_nanos: latch,
+                    target_nanos: target,
+                    period_nanos: period,
                 })
                 .is_err()
             );

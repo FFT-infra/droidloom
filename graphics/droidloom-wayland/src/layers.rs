@@ -1094,10 +1094,12 @@ impl App {
             stream.park(object, commit, "presentation feedback limit");
             return Ok(());
         }
-        let Some(target) = task.timeline.reserve(monotonic_timestamp_nanos()?) else {
+        let now = monotonic_timestamp_nanos()?;
+        let Some(target) = task.timeline.reserve(now) else {
             stream.park(object, commit, "no frame grant");
             return Ok(());
         };
+        self.android_frame(now, target.target.as_ref());
         self.commit_layers(
             qh,
             object,
