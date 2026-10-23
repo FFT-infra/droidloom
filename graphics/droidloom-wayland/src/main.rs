@@ -1671,6 +1671,15 @@ impl App {
                     .with_direct_input()
                     .with_lazy_render_targets()
                     .with_scene_presentation();
+                // Android takes Denial's grants as its vsync only when they
+                // can be compared with the private protocol's clock.
+                let endpoint = if self.frame_timeline_manager.is_some()
+                    && self.presentation_clock == Some(libc::CLOCK_MONOTONIC as u32)
+                {
+                    endpoint.with_host_clock()
+                } else {
+                    endpoint
+                };
                 endpoint.socket().socket().set_nonblocking(true)?;
                 self.endpoint = Some(endpoint);
             }
