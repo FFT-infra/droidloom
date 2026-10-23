@@ -9,6 +9,7 @@ mod fence_wakeup;
 mod frame_timeline;
 mod imports;
 mod input;
+mod input_time;
 mod insets;
 mod layers;
 mod notifications;
@@ -289,18 +290,18 @@ impl Contact {
 fn clear_contact_state(
     pointer: &mut Option<Contact>,
     touches: &mut BTreeMap<i32, Contact>,
-    deferred: &mut VecDeque<(TaskObjectId, InputEvent)>,
+    deferred: &mut VecDeque<(TaskObjectId, InputEvent, u64)>,
 ) {
     *pointer = None;
     touches.clear();
-    deferred.retain(|(_, event)| !matches!(event, InputEvent::Touch { .. }));
+    deferred.retain(|(_, event, _)| !matches!(event, InputEvent::Touch { .. }));
 }
 
 struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
     clipboard: clipboard::Clipboard,
-    clipboard_inputs: VecDeque<(TaskObjectId, InputEvent)>,
+    clipboard_inputs: VecDeque<(TaskObjectId, InputEvent, u64)>,
     text_input: text_input::TextInput,
     registry_state: RegistryState,
     output_state: OutputState,
@@ -334,6 +335,9 @@ struct App {
     focused: Option<TaskObjectId>,
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
+    // Touch and mouse share Android's injected pointer device; keys are separate.
+    motion_times: input_time::Stream,
+    key_times: input_time::Stream,
     next_buffer_id: u64,
     next_input_serial: u64,
     direct_input: input::DirectInput,
@@ -1753,7 +1757,7 @@ impl App {
                     .touch_contacts
                     .values()
                     .any(|contact| contact.object == object)
-                && !self.clipboard_inputs.iter().any(|(owner, event)| {
+                && !self.clipboard_inputs.iter().any(|(owner, event, _)| {
                     *owner == object && matches!(event, InputEvent::Touch { .. })
                 })
             {
@@ -1783,9 +1787,10 @@ impl App {
             contacts.sort_by_key(|contact| contact.object);
             contacts.dedup_by_key(|contact| contact.object);
             for contact in contacts {
-                if let Err(error) =
-                    self.send_input(contact.object, contact.event(TouchAction::Cancel))
-                {
+                let result = self.motion_time(None).and_then(|time| {
+                    self.send_input(contact.object, contact.event(TouchAction::Cancel), time)
+                });
+                if let Err(error) = result {
                     eprintln!("Droidloom input retirement: {error}");
                 }
             }
@@ -1793,12 +1798,29 @@ impl App {
         self.clear_contacts();
     }
 
+    /// Nanoseconds for a touch or mouse event with the compositor's `millis`,
+    /// or the receipt time for an event the compositor did not time.
+    fn motion_time(&mut self, millis: Option<u32>) -> Result<u64, PresenterError> {
+        let now = monotonic_timestamp_nanos()?;
+        Ok(match millis {
+            Some(millis) => self.motion_times.event(millis, now),
+            None => self.motion_times.received(now),
+        })
+    }
+
+    /// Nanoseconds for a key event with the compositor's `millis`.
+    fn key_time(&mut self, millis: u32) -> Result<u64, PresenterError> {
+        Ok(self.key_times.event(millis, monotonic_timestamp_nanos()?))
+    }
+
+    /// Send one event stamped with its hardware time on the shared monotonic clock.
     fn send_input(
         &mut self,
         object: TaskObjectId,
         event: InputEvent,
+        timestamp: u64,
     ) -> Result<bool, PresenterError> {
-        static KEY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static INPUT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !matches!(
             event,
             InputEvent::Touch {
@@ -1808,25 +1830,22 @@ impl App {
         ) && self.clipboard.blocked()
             && self.clipboard_inputs.len() < 512
         {
-            self.clipboard_inputs.push_back((object, event));
+            self.clipboard_inputs.push_back((object, event, timestamp));
             return Ok(true);
         }
         self.next_input_serial = self
             .next_input_serial
             .checked_add(1)
             .ok_or(PresenterError::Configuration("input serial exhausted"))?;
-        let timestamp = monotonic_timestamp_nanos()?;
-        if *KEY_TRACE.get_or_init(|| {
+        if *INPUT_TRACE.get_or_init(|| {
             env::var_os("DROIDLOOM_INPUT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        }) && let InputEvent::Key {
-            action,
-            keycode,
-            repeat,
-        } = &event
-        {
+        }) {
+            let receipt = monotonic_timestamp_nanos()?;
             eprintln!(
-                "Droidloom key trace: stage=wayland serial={} object={} action={action:?} scan_code={keycode} repeat={repeat}",
-                self.next_input_serial, object.0
+                "Droidloom input trace: stage=wayland serial={} object={} event={event:?} time_ns={timestamp} receipt_ns={receipt} age_us={}",
+                self.next_input_serial,
+                object.0,
+                receipt.saturating_sub(timestamp) / 1_000
             );
         }
         if self
@@ -2652,14 +2671,17 @@ impl KeyboardHandler for App {
             self.activation.input(serial, data.seat(), surface);
         }
         if let Some(object) = self.focused
-            && let Err(error) = self.send_input(
-                object,
-                InputEvent::Key {
-                    action: KeyAction::Down,
-                    keycode: event.raw_code,
-                    repeat: 0,
-                },
-            )
+            && let Err(error) = self.key_time(event.time).and_then(|time| {
+                self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Down,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                    time,
+                )
+            })
         {
             self.fail(&error);
         }
@@ -2675,14 +2697,17 @@ impl KeyboardHandler for App {
     ) {
         self.clipboard.serial(serial);
         if let Some(object) = self.focused
-            && let Err(error) = self.send_input(
-                object,
-                InputEvent::Key {
-                    action: KeyAction::Down,
-                    keycode: event.raw_code,
-                    repeat: 1,
-                },
-            )
+            && let Err(error) = self.key_time(event.time).and_then(|time| {
+                self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Down,
+                        keycode: event.raw_code,
+                        repeat: 1,
+                    },
+                    time,
+                )
+            })
         {
             self.fail(&error);
         }
@@ -2698,14 +2723,17 @@ impl KeyboardHandler for App {
     ) {
         self.clipboard.serial(serial);
         if let Some(object) = self.focused
-            && let Err(error) = self.send_input(
-                object,
-                InputEvent::Key {
-                    action: KeyAction::Up,
-                    keycode: event.raw_code,
-                    repeat: 0,
-                },
-            )
+            && let Err(error) = self.key_time(event.time).and_then(|time| {
+                self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                    time,
+                )
+            })
         {
             self.fail(&error);
         }
@@ -2758,7 +2786,7 @@ impl PointerHandler for App {
             }
             let object = self.task_for_surface(&event.surface);
             match event.kind {
-                PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
+                PointerEventKind::Press { button, time, .. } if button == LEFT_BUTTON => {
                     if self.pointer_contact.is_some() {
                         self.retire_contacts(None);
                     }
@@ -2769,13 +2797,16 @@ impl PointerHandler for App {
                         pointer_id: u32::MAX,
                         position_fixed: (x_fixed, y_fixed),
                     };
-                    match self.send_input(object, contact.event(TouchAction::Down)) {
+                    let sent = self.motion_time(Some(time)).and_then(|time| {
+                        self.send_input(object, contact.event(TouchAction::Down), time)
+                    });
+                    match sent {
                         Err(error) => self.fail(&error),
                         Ok(true) => self.pointer_contact = Some(contact),
                         Ok(false) => {}
                     }
                 }
-                PointerEventKind::Motion { .. } => {
+                PointerEventKind::Motion { time } => {
                     let Some(mut contact) = self.pointer_contact else {
                         continue;
                     };
@@ -2784,13 +2815,16 @@ impl PointerHandler for App {
                         contact.position_fixed =
                             self.fixed_position(contact.object, event.position);
                     }
-                    match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+                    let sent = self.motion_time(Some(time)).and_then(|time| {
+                        self.send_input(contact.object, contact.event(TouchAction::Motion), time)
+                    });
+                    match sent {
                         Err(error) => self.fail(&error),
                         Ok(true) => self.pointer_contact = Some(contact),
                         Ok(false) => {}
                     }
                 }
-                PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
+                PointerEventKind::Release { button, time, .. } if button == LEFT_BUTTON => {
                     let Some(mut contact) = self.pointer_contact.take() else {
                         continue;
                     };
@@ -2798,9 +2832,9 @@ impl PointerHandler for App {
                         contact.position_fixed =
                             self.fixed_position(contact.object, event.position);
                     }
-                    if let Err(error) =
-                        self.send_input(contact.object, contact.event(TouchAction::Up))
-                    {
+                    if let Err(error) = self.motion_time(Some(time)).and_then(|time| {
+                        self.send_input(contact.object, contact.event(TouchAction::Up), time)
+                    }) {
                         self.fail(&error);
                     }
                 }
@@ -2817,7 +2851,7 @@ impl TouchHandler for App {
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
         _serial: u32,
-        _time: u32,
+        time: u32,
         surface: wl_surface::WlSurface,
         id: i32,
         position: (f64, f64),
@@ -2844,7 +2878,10 @@ impl TouchHandler for App {
             pointer_id,
             position_fixed: (x_fixed, y_fixed),
         };
-        match self.send_input(object, contact.event(TouchAction::Down)) {
+        let sent = self
+            .motion_time(Some(time))
+            .and_then(|time| self.send_input(object, contact.event(TouchAction::Down), time));
+        match sent {
             Err(error) => self.fail(&error),
             Ok(true) => {
                 self.touch_contacts.insert(id, contact);
@@ -2859,7 +2896,7 @@ impl TouchHandler for App {
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
         _serial: u32,
-        _time: u32,
+        time: u32,
         id: i32,
     ) {
         if self.touch.as_ref() != Some(_touch) {
@@ -2870,7 +2907,10 @@ impl TouchHandler for App {
         };
         // wl_touch.up carries no coordinates. Android still needs the last
         // position; substituting (0, 0) turns a button tap into a release outside it.
-        if let Err(error) = self.send_input(contact.object, contact.event(TouchAction::Up)) {
+        if let Err(error) = self
+            .motion_time(Some(time))
+            .and_then(|time| self.send_input(contact.object, contact.event(TouchAction::Up), time))
+        {
             self.fail(&error);
         }
     }
@@ -2880,7 +2920,7 @@ impl TouchHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
-        _time: u32,
+        time: u32,
         id: i32,
         position: (f64, f64),
     ) {
@@ -2891,7 +2931,10 @@ impl TouchHandler for App {
             return;
         };
         contact.position_fixed = self.fixed_position(contact.object, position);
-        match self.send_input(contact.object, contact.event(TouchAction::Motion)) {
+        let sent = self.motion_time(Some(time)).and_then(|time| {
+            self.send_input(contact.object, contact.event(TouchAction::Motion), time)
+        });
+        match sent {
             Err(error) => self.fail(&error),
             Ok(true) => {
                 self.touch_contacts.insert(id, contact);
@@ -3090,6 +3133,8 @@ fn run() -> Result<(), PresenterError> {
         focused: None,
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
+        motion_times: input_time::Stream::default(),
+        key_times: input_time::Stream::default(),
         next_buffer_id: 0,
         next_input_serial: 0,
         direct_input: input::DirectInput::default(),
@@ -3132,9 +3177,9 @@ fn run_presenter_loop(
         app.pump_text_input();
         app.clipboard.pump(&qh);
         if !app.clipboard.blocked() {
-            while let Some((object, input)) = app.clipboard_inputs.pop_front() {
+            while let Some((object, input, timestamp)) = app.clipboard_inputs.pop_front() {
                 if app.tasks.contains_key(&object) {
-                    if let Err(error) = app.send_input(object, input) {
+                    if let Err(error) = app.send_input(object, input, timestamp) {
                         eprintln!("Droidloom queued input: {error}");
                     }
                 }
@@ -3644,14 +3689,14 @@ mod tests {
             repeat: 0,
         };
         let mut deferred = VecDeque::from([
-            (first.object, first.event(TouchAction::Down)),
-            (second.object, second.event(TouchAction::Motion)),
-            (mouse.object, mouse.event(TouchAction::Up)),
-            (first.object, key.clone()),
+            (first.object, first.event(TouchAction::Down), 1),
+            (second.object, second.event(TouchAction::Motion), 2),
+            (mouse.object, mouse.event(TouchAction::Up), 3),
+            (first.object, key.clone(), 4),
         ]);
         clear_contact_state(&mut pointer, &mut touches, &mut deferred);
         assert!(pointer.is_none() && touches.is_empty());
-        assert_eq!(deferred, VecDeque::from([(first.object, key)]));
+        assert_eq!(deferred, VecDeque::from([(first.object, key, 4)]));
         // Late UP/MOTION callbacks cannot find an old owner after reconnect,
         // surface removal or seat/capability retirement.
         assert!(touches.remove(&0).is_none());
