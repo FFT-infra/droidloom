@@ -3579,7 +3579,12 @@ fn select_surface_output<'a, T: PartialEq>(
 ) -> Option<&'a T> {
     presented
         .filter(|output| entered.contains(output) && refresh(output).is_some())
-        .or_else(|| entered.iter().rev().find(|output| refresh(output).is_some()))
+        .or_else(|| {
+            entered
+                .iter()
+                .rev()
+                .find(|output| refresh(output).is_some())
+        })
 }
 
 fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {

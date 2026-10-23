@@ -11,10 +11,10 @@
 //! SurfaceFlinger. They disarm together because a disarm can end Denial's
 //! epoch for every subscription; with all of them idle nothing is in flight.
 //! The first frame after idle is shown untargeted at once and arms them again.
-use super::frame_timeline::{output_timeline, wire_grant, OutputTimeline, Subscription, Target};
+use super::frame_timeline::{OutputTimeline, Subscription, Target, output_timeline, wire_grant};
 use super::{
-    monotonic_timestamp_nanos, select_surface_output, wl_output, App, Connection, Dispatch,
-    QueueHandle,
+    App, Connection, Dispatch, QueueHandle, endpoint_would_block, monotonic_timestamp_nanos,
+    select_surface_output, wl_output,
 };
 
 const IDLE_NANOS: u64 = 250_000_000;
@@ -189,18 +189,26 @@ impl Dispatch<OutputTimeline, ClockTimeline> for App {
         _: &QueueHandle<Self>,
     ) {
         if !matches!(event, output_timeline::Event::Grant { .. })
-            || !state.clock.subscription.as_ref().is_some_and(|s| s.is(proxy))
+            || !state
+                .clock
+                .subscription
+                .as_ref()
+                .is_some_and(|s| s.is(proxy))
         {
             return;
         }
         let result = (|| {
             let grant = wire_grant(event)?;
             if let Some(endpoint) = state.endpoint.as_ref() {
-                endpoint.send_frame_grant(
+                // A grant Composer cannot take now is worthless later.
+                match endpoint.send_frame_grant(
                     grant.latch_deadline_ns,
                     grant.presentation_target_ns,
                     grant.refresh_period_ns,
-                )?;
+                ) {
+                    Err(error) if !endpoint_would_block(&error) => return Err(error.into()),
+                    _ => {}
+                }
             }
             state.clock.audit.grants += 1;
             state.clock_idle_check(monotonic_timestamp_nanos()?);

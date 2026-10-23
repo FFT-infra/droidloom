@@ -185,8 +185,8 @@ impl VsyncScheduler {
         if !self.host_clock {
             return;
         }
-        let Some(timestamp_nanos) = latch_nanos
-            .checked_sub(period_nanos + SF_PHASE_OFFSET_NANOS + SF_LATCH_BUDGET_NANOS)
+        let Some(timestamp_nanos) =
+            latch_nanos.checked_sub(period_nanos + SF_PHASE_OFFSET_NANOS + SF_LATCH_BUDGET_NANOS)
         else {
             return;
         };
@@ -464,12 +464,9 @@ fn deliver_vsyncs(shared: &VsyncSchedulerShared, due: Vec<(DisplayId, u64, u64)>
         };
         let callback_started = monotonic_timestamp_nanos().ok();
         let result = callback.onVsync(display_value, timestamp_value, period_value);
-        if let (Some(started), Ok(finished)) =
-            (callback_started, monotonic_timestamp_nanos())
-        {
+        if let (Some(started), Ok(finished)) = (callback_started, monotonic_timestamp_nanos()) {
             let elapsed = finished.saturating_sub(started);
-            callback_total_nanos =
-                callback_total_nanos.saturating_add(u128::from(elapsed));
+            callback_total_nanos = callback_total_nanos.saturating_add(u128::from(elapsed));
             callback_max_nanos = callback_max_nanos.max(elapsed);
         }
         if let Err(error) = result {
@@ -482,10 +479,8 @@ fn deliver_vsyncs(shared: &VsyncSchedulerShared, due: Vec<(DisplayId, u64, u64)>
             .audit
             .callback_total_nanos
             .saturating_add(callback_total_nanos);
-        schedule.audit.callback_max_nanos = schedule
-            .audit
-            .callback_max_nanos
-            .max(callback_max_nanos);
+        schedule.audit.callback_max_nanos =
+            schedule.audit.callback_max_nanos.max(callback_max_nanos);
         if !failed.is_empty() {
             for display in failed {
                 schedule.displays.remove(&display);

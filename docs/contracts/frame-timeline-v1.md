@@ -83,7 +83,11 @@ presentation feedback continue unchanged. Exact mode verifies that
 records, before subscribing to an output.
 
 Each task subscribes to its presentation output, then its entered output, or
-an available output for the first mapping. It retains at most one composed
+an available output for the first mapping. All subscriptions are armed only
+while Android draws and disarm together after 250 ms without a frame; a frame
+arriving while disarmed is committed untargeted at once and re-arms them. One
+more subscription on the pacesetter output forwards grants to Composer as
+Android's vsync. It retains at most one composed
 frame awaiting a grant, or the layer stream's existing single pending scene.
 A newer submission can supersede work which has not consumed a grant. Once
 consumed, the identity is sent with `set_target` before the corresponding

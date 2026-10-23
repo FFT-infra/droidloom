@@ -336,9 +336,31 @@ unmapped tasks default to 60 Hz. Enter, leave, hotplug, and mode changes update
 cadence without replacing the configure's target allocation generation.
 Android's headless bootstrap uses the fastest active task's cadence to support
 the shared scheduler without selecting an unrelated faster monitor.
-The Composer refresh path also updates an enabled synthetic vsync timer and
+The Composer refresh path also updates the enabled vsync period and
 reannounces the existing Android display configuration, so SurfaceFlinger
 reloads its cached mode period. Disabled clocks remain disabled.
+
+### Vsync
+
+With Denial's frame timeline, Android has no clock of its own. The presenter
+subscribes to the pacesetter output, the one whose refresh the bootstrap
+display takes, and forwards each grant to Composer (`FrameGrant`, protocol
+1.9). Composer reports the vblank before the grant's latch to SurfaceFlinger
+as a vsync, moved early by SurfaceFlinger's 1 ms phase offset plus a 2 ms
+budget. SurfaceFlinger's predictor fits Denial's phase-locked grid, and its
+frame wakes 2 ms before Denial latches, so it is targeted at that latch.
+Grants for other periods are not delivered.
+
+Every timeline subscription is armed only while Android draws. After 250 ms
+without a frame the presenter disarms them all at once; Denial, the presenter,
+Composer and SurfaceFlinger then get no wakeups, and SurfaceFlinger keeps its
+learned model. The next frame is committed untargeted at once and arms them
+again. Powering the Android display off also ends its vsync. Without the
+frame timeline global, Composer runs a timer seeded from presentation feedback.
+Each second with grants, Composer logs `Droidloom vsync audit` (grants
+delivered as `ticks`, delivery after Denial's tick as `wake_late`) and the
+presenter logs `Droidloom clock audit` (frames, untargeted frames, frames late
+for their grant, and how long before the latch targeted frames arrived).
 
 ActivityTaskManager now owns task publication inside system_server. Its task
 callbacks enqueue a coalesced worker; the worker copies attached task identities

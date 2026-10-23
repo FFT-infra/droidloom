@@ -135,6 +135,14 @@ selects minor 8 with mutual scene-presentation support; peers without it keep
 their previously negotiated minor. Existing records retain their original
 headers so older decoders can complete negotiation.
 
+Protocol minor 9 adds optional bit 13 (`HOST_CLOCK`). Both peers must
+advertise it before the host sends `FrameGrant` (`0x8011`, connection object
+zero): three `u64` CLOCK_MONOTONIC values, the latch (a host vblank by which
+content must be ready), the predicted presentation (after the latch), and the
+granting output's nominal period. Composer then delivers vsync only from
+grants and runs no timer. The host sends grants only while Android draws.
+ServerHello selects minor 9 with mutual host-clock support.
+
 `BindTimelines` transfers exactly two DRM syncobj opaque descriptors. The first
 exports the acquire timeline; the second exports the release timeline. Both
 sides retain imported handles for the lifetime of the task. Rebinding is a

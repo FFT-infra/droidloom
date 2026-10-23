@@ -12,24 +12,20 @@ the presenter, and Denial then waits for its own vblank. Each clocked stage can
 cost up to a frame, so Droidloom likely pays one frame (8.3 ms at 120 Hz) more
 than native Android.
 
-- SF timing is untuned: the product files set no `debug.sf.*` durations or
-  offsets, so SF uses defaults that know nothing about Denial's latch.
-- The synthetic vsync free-runs. Its phase is seeded only when SF enables HWC
-  vsync ([service.rs](../graphics/droidloom-composer-aidl/src/service.rs),
-  end of `observe_presentation`), and SF disables vsync once its model is
-  learned, so drift against the real panel accumulates. The vsync audit's
-  `phase_error_max` shows how much.
+SF's vsync now comes from Denial's grants and wakes SF 2 ms before Denial's
+latch ([architecture](architecture.md#vsync)), which removes the free-running
+phase and the drift. App work durations are still SF's defaults (an app wakes
+two periods minus 1 ms before SF).
 
 Options, smallest first:
 
-1. Slew the running clock toward Denial's presentation timestamps instead of
-   jumping it.
-2. Set SF's duration so it wakes just before Denial's latch deadline.
-3. For direct-layer tasks, send the scene when the app's transaction arrives,
+1. Size the app duration (`debug.sf.late.app.duration`) once frame misses are
+   measured against it.
+2. For direct-layer tasks, send the scene when the app's transaction arrives,
    without waiting for SF vsync. SF renders nothing on that path; Denial paces.
    This removes the extra stage instead of shrinking it.
-4. Use the [frame timeline](contracts/frame-timeline-v1.md) both ways: Android's
-   expected present time to Denial, Denial's real deadlines back as vsync.
+3. Carry Android's expected present time to Denial, so a frame aimed further
+   ahead targets the matching grant.
 
 ## Input
 

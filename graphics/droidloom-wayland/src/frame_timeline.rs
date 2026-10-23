@@ -546,7 +546,10 @@ pub(super) fn wire_grant(event: output_timeline::Event) -> Result<Grant, Present
             epoch: join(epoch_hi, epoch_lo),
             sequence: join(sequence_hi, sequence_lo),
         },
-        latch_deadline_ns: presentation_timestamp_nanos(join(latch_sec_hi, latch_sec_lo), latch_nsec)?,
+        latch_deadline_ns: presentation_timestamp_nanos(
+            join(latch_sec_hi, latch_sec_lo),
+            latch_nsec,
+        )?,
         presentation_target_ns: presentation_timestamp_nanos(
             join(target_sec_hi, target_sec_lo),
             target_nsec,
