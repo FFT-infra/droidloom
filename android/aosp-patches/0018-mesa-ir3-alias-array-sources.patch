@@ -1,0 +1,26 @@
+ir3: keep array sources intact when alias.tex flattens a collect
+
+alias_srcs rebuilt SSA array sources with the flags only, so the copy named
+array 0 at element 0. Wuthering Waves crashed in DCE on the Pad 4 when
+array 0 had already been removed.
+
+--- a/src/freedreno/ir3/ir3_alias.c
++++ b/src/freedreno/ir3/ir3_alias.c
+@@ -121,6 +121,17 @@
+          if (collect_src->flags & IR3_REG_SSA) {
+             alias_src =
+                __ssa_src(instr, collect_src->def->instr, collect_src->flags);
++
++            /* An array element keeps its array, element and mask: without
++             * them it would name array 0, which may be another array or one
++             * DCE already removed.
++             */
++            if (collect_src->flags & IR3_REG_ARRAY) {
++               alias_src->def = collect_src->def;
++               alias_src->array = collect_src->array;
++               alias_src->size = collect_src->size;
++               alias_src->wrmask = collect_src->wrmask;
++            }
+          } else {
+             alias_src =
+                ir3_src_create(instr, collect_src->num, collect_src->flags);

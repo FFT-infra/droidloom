@@ -56,6 +56,10 @@ Runtime patches under `android/aosp-patches/`:
   family, which HWUI's Vulkan pipeline requires (render and upload queues).
   The SET_IOVA family keeps one queue: it recycles freed addresses after queue
   0's fence alone. Shader barrier removal stops at workgroup scope.
+- `0018-mesa-ir3-alias-array-sources.patch`: when alias.tex replaces a
+  collect with its sources, an array element keeps its array, element and
+  mask. The copy used to name array 0, element 0: a wrong read, or a crash in
+  DCE when array 0 was already gone (Wuthering Waves on the Pad 4).
 
 Validate a new host using real Android allocations, raw DMA-BUF and native
 Android EGL imports, GPU rendering/readback, native fences and synchronized CPU
