@@ -1,7 +1,7 @@
 //! Fixed-size, descriptor-free records for the Android framework bridge.
 //!
 //! The Wayland compositor remains the physical-input authority. This protocol
-//! carries touch, scroll and keyboard events already routed to one
+//! carries touch, scroll, stylus and keyboard events already routed to one
 //! authenticated Android task surface.
 
 #![no_std]
@@ -12,7 +12,7 @@ use core::fmt;
 /// Marker at the start of every input record.
 pub const MAGIC: [u8; 4] = *b"DLIN";
 /// Wire protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 8;
+pub const PROTOCOL_MAJOR: u16 = 9;
 
 /// Build metadata retained by the native sender for offline package verification.
 pub const BUILD_COMPATIBILITY: [u8; 26] = compatibility_marker(PROTOCOL_MAJOR);
@@ -47,6 +47,69 @@ pub const KIND_TASK_CLOSE: u8 = 5;
 pub const KIND_DISPLAY_POWER: u8 = 6;
 /// Record kind for one wheel or touchpad scroll at a task-local position.
 pub const KIND_SCROLL: u8 = 7;
+/// Routed stylus proximity, contact and barrel-button input.
+pub const KIND_STYLUS: u8 = 8;
+
+/// One native pen sample. Tilt uses signed degrees, matching Wayland tablet-v2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stylus {
+    /// Stable Wayland tool identity; zero is invalid.
+    pub tool: u32,
+    /// Enter, motion, leave, down, up, cancel, or barrel buttons (0 through 6).
+    pub action: u8,
+    /// Task-local signed 16.16 horizontal coordinate.
+    pub x_fixed: i32,
+    /// Task-local signed 16.16 vertical coordinate.
+    pub y_fixed: i32,
+    /// Normalized pressure over the full unsigned 16-bit range.
+    pub pressure: u16,
+    /// Horizontal tilt in degrees, from -90 to 90.
+    pub tilt_x: i8,
+    /// Vertical tilt in degrees, from -90 to 90.
+    pub tilt_y: i8,
+    /// Whether the tool is the eraser end of a pen.
+    pub eraser: bool,
+    /// Primary and secondary barrel buttons in bits zero and one.
+    pub buttons: u8,
+}
+
+/// Encode one native stylus record in the ABI 9 wire.
+///
+/// # Errors
+/// Rejects invalid routes, actions, tool identities, button masks, and tilt.
+pub fn encode_stylus(
+    display: u32,
+    task: u64,
+    timestamp: u64,
+    incarnation: u64,
+    pen: Stylus,
+) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if pen.tool == 0
+        || pen.action > 6
+        || pen.buttons > 3
+        || !(-90..=90).contains(&pen.tilt_x)
+        || !(-90..=90).contains(&pen.tilt_y)
+    {
+        return Err(InputProtocolError::Record);
+    }
+    let mut record = encode_touch(
+        display,
+        task,
+        timestamp,
+        0,
+        0,
+        pen.x_fixed,
+        pen.y_fixed,
+        pen.pressure,
+        incarnation,
+    )?;
+    record[6] = KIND_STYLUS;
+    record[7] = pen.action | (u8::from(pen.eraser) << 3) | (pen.buttons << 4);
+    record[12..16].copy_from_slice(&pen.tool.to_le_bytes());
+    record[34] = pen.tilt_x as u8;
+    record[35] = pen.tilt_y as u8;
+    Ok(record)
+}
 /// Highest pointer identity accepted by Android `MotionEvent`.
 pub const MAX_POINTER_ID: u32 = 31;
 /// Highest key identity defined by Linux's evdev input ABI.
@@ -384,6 +447,23 @@ pub struct Sample {
 /// Kind-specific input data.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Payload {
+    /// Task-local stylus coordinates, pressure and tool axes.
+    Stylus {
+        /// Horizontal physical pixel coordinate.
+        x: f32,
+        /// Vertical physical pixel coordinate.
+        y: f32,
+        /// Normalized contact pressure.
+        pressure: f32,
+        /// Horizontal tilt in degrees.
+        tilt_x: f32,
+        /// Vertical tilt in degrees.
+        tilt_y: f32,
+        /// Eraser rather than pen tool type.
+        eraser: bool,
+        /// Primary and secondary barrel button mask.
+        buttons: u8,
+    },
     /// Task-local physical pixel coordinates and normalized pressure.
     Touch {
         /// Horizontal task-local coordinate.
@@ -458,7 +538,11 @@ pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
     if timestamp == 0 || timestamp > i64::MAX as u64 {
         return Err(InputProtocolError::Record);
     }
-    let action = bytes[7];
+    let action = if bytes[6] == KIND_STYLUS {
+        bytes[7] & 7
+    } else {
+        bytes[7]
+    };
     let code = word(12);
     let fixed =
         |offset| i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as f32 / 65536.0;
@@ -482,6 +566,25 @@ pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
         }));
     }
     let payload = match bytes[6] {
+        KIND_STYLUS
+            if bytes[4..6] == PROTOCOL_MAJOR.to_le_bytes()
+                && action <= 6
+                && bytes[7] & 0xc0 == 0
+                && code != 0
+                && (-90..=90).contains(&(bytes[34] as i8))
+                && (-90..=90).contains(&(bytes[35] as i8)) =>
+        {
+            Payload::Stylus {
+                x: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as f32 / 65536.0,
+                y: i32::from_le_bytes(bytes[28..32].try_into().unwrap()) as f32 / 65536.0,
+                pressure: f32::from(u16::from_le_bytes(bytes[32..34].try_into().unwrap()))
+                    / 65535.0,
+                tilt_x: f32::from(bytes[34] as i8),
+                tilt_y: f32::from(bytes[35] as i8),
+                eraser: bytes[7] & 8 != 0,
+                buttons: (bytes[7] >> 4) & 3,
+            }
+        }
         KIND_TOUCH if action <= 3 && code <= MAX_POINTER_ID && bytes[34..36] == [0, 0] => {
             Payload::Touch {
                 x: fixed(24),
@@ -512,6 +615,61 @@ pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_stylus_wire_accepts_hover_and_retains_tool_axes() {
+        let mut record = encode_touch(0, 42, 100, 0, 2, 5 << 16, 3 << 16, 32768, 7).unwrap();
+        record[6] = 8; // Native stylus, rather than a touchscreen finger.
+        record[7] = 1 | 8 | 16; // Hover motion, eraser, primary barrel button.
+        record[34] = 30;
+        record[35] = (-45_i8) as u8;
+        assert!(
+            decode(&record).is_ok(),
+            "native pen record must reach the receiver"
+        );
+        record[34] = 91;
+        assert!(decode(&record).is_err(), "invalid tilt must be rejected");
+    }
+
+    #[test]
+    fn stylus_roundtrip_preserves_tool_axes_and_rejects_zero_tool() {
+        let record = encode_stylus(
+            0,
+            42,
+            100,
+            7,
+            Stylus {
+                tool: 9,
+                action: 1,
+                x_fixed: 5 << 16,
+                y_fixed: -(3 << 16),
+                pressure: 32768,
+                tilt_x: 30,
+                tilt_y: -45,
+                eraser: true,
+                buttons: 1,
+            },
+        )
+        .unwrap();
+        let Record::Input(sample) = decode(&record).unwrap() else {
+            panic!("stylus expected")
+        };
+        assert_eq!(
+            sample.payload,
+            Payload::Stylus {
+                x: 5.0,
+                y: -3.0,
+                pressure: 32768.0 / 65535.0,
+                tilt_x: 30.0,
+                tilt_y: -45.0,
+                eraser: true,
+                buttons: 1,
+            }
+        );
+        let mut zero_tool = record;
+        zero_tool[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(decode(&zero_tool).is_err());
+    }
 
     #[test]
     fn decoder_preserves_incarnation_and_rejects_malformed_packets() {
