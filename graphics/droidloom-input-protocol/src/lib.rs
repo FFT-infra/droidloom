@@ -1,7 +1,7 @@
 //! Fixed-size, descriptor-free records for the Android framework bridge.
 //!
 //! The Wayland compositor remains the physical-input authority. This protocol
-//! carries touch and keyboard events already routed to one authenticated
+//! carries touch, mouse, stylus and keyboard events routed to one authenticated
 //! Android task surface.
 
 #![no_std]
@@ -12,7 +12,9 @@ use core::fmt;
 /// Marker at the start of every input record.
 pub const MAGIC: [u8; 4] = *b"DLIN";
 /// Wire protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 7;
+pub const PROTOCOL_MAJOR: u16 = 8;
+/// Previous touch/keyboard-only wire, accepted during a staged host upgrade.
+pub const LEGACY_PROTOCOL_MAJOR: u16 = 7;
 
 /// Build metadata retained by the native sender for offline package verification.
 pub const BUILD_COMPATIBILITY: [u8; 26] = compatibility_marker(PROTOCOL_MAJOR);
@@ -45,6 +47,71 @@ pub const KIND_TASK_FOCUS: u8 = 4;
 pub const KIND_TASK_CLOSE: u8 = 5;
 /// Record kind for the aggregate host display-power state.
 pub const KIND_DISPLAY_POWER: u8 = 6;
+/// Routed mouse hover, buttons, and wheel input.
+pub const KIND_MOUSE: u8 = 7;
+/// Routed stylus proximity, contact and barrel-button input.
+pub const KIND_STYLUS: u8 = 8;
+
+/// One native pen sample. Tilt uses signed degrees, matching Wayland tablet-v2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stylus {
+    /// Stable Wayland tool identity; zero is invalid.
+    pub tool: u32,
+    /// Enter, motion, leave, down, up, cancel, or barrel buttons (0 through 6).
+    pub action: u8,
+    /// Task-local signed 16.16 horizontal coordinate.
+    pub x_fixed: i32,
+    /// Task-local signed 16.16 vertical coordinate.
+    pub y_fixed: i32,
+    /// Normalized pressure over the full unsigned 16-bit range.
+    pub pressure: u16,
+    /// Horizontal tilt in degrees, from -90 to 90.
+    pub tilt_x: i8,
+    /// Vertical tilt in degrees, from -90 to 90.
+    pub tilt_y: i8,
+    /// Whether the tool is the eraser end of a pen.
+    pub eraser: bool,
+    /// Primary and secondary barrel buttons in bits zero and one.
+    pub buttons: u8,
+}
+
+/// Encode one native stylus record in the pending ABI 8 wire.
+///
+/// # Errors
+/// Rejects invalid routes, actions, tool identities, button masks, and tilt.
+pub fn encode_stylus(
+    display: u32,
+    task: u64,
+    timestamp: u64,
+    incarnation: u64,
+    pen: Stylus,
+) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if pen.tool == 0
+        || pen.action > 6
+        || pen.buttons > 3
+        || !(-90..=90).contains(&pen.tilt_x)
+        || !(-90..=90).contains(&pen.tilt_y)
+    {
+        return Err(InputProtocolError::Record);
+    }
+    let mut record = encode_touch(
+        display,
+        task,
+        timestamp,
+        0,
+        0,
+        pen.x_fixed,
+        pen.y_fixed,
+        pen.pressure,
+        incarnation,
+    )?;
+    record[6] = KIND_STYLUS;
+    record[7] = pen.action | (u8::from(pen.eraser) << 3) | (pen.buttons << 4);
+    record[12..16].copy_from_slice(&pen.tool.to_le_bytes());
+    record[34] = pen.tilt_x as u8;
+    record[35] = pen.tilt_y as u8;
+    Ok(record)
+}
 /// Highest pointer identity accepted by Android `MotionEvent`.
 pub const MAX_POINTER_ID: u32 = 31;
 /// Highest key identity defined by Linux's evdev input ABI.
@@ -217,6 +284,52 @@ pub fn encode_key(
     Ok(record)
 }
 
+/// Encode mouse input without converting it to a touchscreen gesture.
+/// Wheel axes are signed 8.8 detents; coordinates remain signed 16.16 pixels.
+///
+/// # Errors
+/// Rejects invalid routes, actions and mouse button identities.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mouse(
+    display: u32,
+    task: u64,
+    timestamp: u64,
+    action: u8,
+    button: u32,
+    x: i32,
+    y: i32,
+    scroll_x: i16,
+    scroll_y: i16,
+    incarnation: u64,
+) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if action > 6
+        || (matches!(action, 3 | 4) && mouse_button(button).is_none())
+        || (!matches!(action, 3 | 4) && button != 0)
+        || (action != 5 && (scroll_x != 0 || scroll_y != 0))
+    {
+        return Err(InputProtocolError::Action);
+    }
+    let mut record = encode_touch(display, task, timestamp, 0, 0, x, y, 0, incarnation)?;
+    record[6] = KIND_MOUSE;
+    record[7] = action;
+    record[12..16].copy_from_slice(&button.to_le_bytes());
+    record[32..34].copy_from_slice(&scroll_x.to_le_bytes());
+    record[34..36].copy_from_slice(&scroll_y.to_le_bytes());
+    Ok(record)
+}
+
+/// Android button-state bit corresponding to a Linux mouse button.
+pub fn mouse_button(button: u32) -> Option<u32> {
+    Some(match button {
+        0x110 => 1,
+        0x111 => 2,
+        0x112 => 4,
+        0x113 | 0x116 => 8,
+        0x114 | 0x115 => 16,
+        _ => return None,
+    })
+}
+
 /// Encode a requested content size for one Android task.
 ///
 /// The Android task stays at a private origin because the Wayland compositor
@@ -337,6 +450,34 @@ pub struct Sample {
 /// Kind-specific input data.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Payload {
+    /// Task-local stylus coordinates, pressure and tool axes.
+    Stylus {
+        /// Horizontal physical pixel coordinate.
+        x: f32,
+        /// Vertical physical pixel coordinate.
+        y: f32,
+        /// Normalized contact pressure.
+        pressure: f32,
+        /// Horizontal tilt in degrees.
+        tilt_x: f32,
+        /// Vertical tilt in degrees.
+        tilt_y: f32,
+        /// Eraser rather than pen tool type.
+        eraser: bool,
+        /// Primary and secondary barrel button mask.
+        buttons: u8,
+    },
+    /// Task-local mouse coordinates and wheel detents.
+    Mouse {
+        /// Horizontal task-local physical pixel coordinate.
+        x: f32,
+        /// Vertical task-local physical pixel coordinate.
+        y: f32,
+        /// Horizontal wheel detents.
+        scroll_x: f32,
+        /// Vertical wheel detents.
+        scroll_y: f32,
+    },
     /// Task-local physical pixel coordinates and normalized pressure.
     Touch {
         /// Horizontal task-local coordinate.
@@ -374,7 +515,8 @@ pub enum Record {
 pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
     if bytes.len() != RECORD_BYTES
         || bytes[..4] != MAGIC
-        || bytes[4..6] != PROTOCOL_MAJOR.to_le_bytes()
+        || (bytes[4..6] != PROTOCOL_MAJOR.to_le_bytes()
+            && bytes[4..6] != LEGACY_PROTOCOL_MAJOR.to_le_bytes())
     {
         return Err(InputProtocolError::Record);
     }
@@ -399,9 +541,49 @@ pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
     if timestamp == 0 || timestamp > i64::MAX as u64 {
         return Err(InputProtocolError::Record);
     }
-    let action = bytes[7];
+    let action = if bytes[6] == KIND_STYLUS {
+        bytes[7] & 7
+    } else {
+        bytes[7]
+    };
     let code = word(12);
     let payload = match bytes[6] {
+        KIND_STYLUS
+            if bytes[4..6] == PROTOCOL_MAJOR.to_le_bytes()
+                && action <= 6
+                && bytes[7] & 0xc0 == 0
+                && code != 0
+                && (-90..=90).contains(&(bytes[34] as i8))
+                && (-90..=90).contains(&(bytes[35] as i8)) =>
+        {
+            Payload::Stylus {
+                x: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as f32 / 65536.0,
+                y: i32::from_le_bytes(bytes[28..32].try_into().unwrap()) as f32 / 65536.0,
+                pressure: f32::from(u16::from_le_bytes(bytes[32..34].try_into().unwrap()))
+                    / 65535.0,
+                tilt_x: f32::from(bytes[34] as i8),
+                tilt_y: f32::from(bytes[35] as i8),
+                eraser: bytes[7] & 8 != 0,
+                buttons: (bytes[7] >> 4) & 3,
+            }
+        }
+        KIND_MOUSE
+            if bytes[4..6] == PROTOCOL_MAJOR.to_le_bytes()
+                && action <= 6
+                && (if matches!(action, 3 | 4) {
+                    mouse_button(code).is_some()
+                } else {
+                    code == 0
+                })
+                && (action == 5 || bytes[32..36] == [0; 4]) =>
+        {
+            Payload::Mouse {
+                x: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as f32 / 65536.0,
+                y: i32::from_le_bytes(bytes[28..32].try_into().unwrap()) as f32 / 65536.0,
+                scroll_x: f32::from(i16::from_le_bytes(bytes[32..34].try_into().unwrap())) / 256.0,
+                scroll_y: f32::from(i16::from_le_bytes(bytes[34..36].try_into().unwrap())) / 256.0,
+            }
+        }
         KIND_TOUCH if action <= 3 && code <= MAX_POINTER_ID && bytes[34..36] == [0, 0] => {
             Payload::Touch {
                 x: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as f32 / 65536.0,
@@ -432,6 +614,52 @@ pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_stylus_wire_accepts_hover_and_retains_tool_axes() {
+        let mut record = encode_touch(0, 42, 100, 0, 2, 5 << 16, 3 << 16, 32768, 7).unwrap();
+        record[6] = 8; // Native stylus, rather than a touchscreen finger.
+        record[7] = 1 | 8 | 16; // Hover motion, eraser, primary barrel button.
+        record[34] = 30;
+        record[35] = (-45_i8) as u8;
+        assert!(
+            decode(&record).is_ok(),
+            "native pen record must reach the receiver"
+        );
+        record[34] = 91;
+        assert!(decode(&record).is_err(), "invalid tilt must be rejected");
+    }
+
+    #[test]
+    fn mouse_roundtrip_preserves_fractional_wheel_and_rejects_legacy_mouse() {
+        let record = encode_mouse(0, 42, 100, 5, 0, 2 << 16, -(3 << 16), 128, -256, 7).unwrap();
+        let Record::Input(sample) = decode(&record).unwrap() else {
+            panic!("mouse expected")
+        };
+        assert_eq!(
+            sample.payload,
+            Payload::Mouse {
+                x: 2.0,
+                y: -3.0,
+                scroll_x: 0.5,
+                scroll_y: -1.0
+            }
+        );
+        let mut old = record;
+        old[4..6].copy_from_slice(&LEGACY_PROTOCOL_MAJOR.to_le_bytes());
+        assert!(decode(&old).is_err());
+        assert!(encode_mouse(0, 42, 100, 3, 0, 0, 0, 0, 0, 7).is_err());
+        assert!(encode_mouse(0, 42, 100, 3, 0x110, 0, 0, 0, 1, 7).is_err());
+        for button in 0x110..=0x116 {
+            let press = encode_mouse(0, 42, 100, 3, button, 0, 0, 0, 0, 7).unwrap();
+            assert!(
+                matches!(decode(&press), Ok(Record::Input(Sample { code, action: 3, .. })) if code == button)
+            );
+        }
+        let mut key = encode_key(0, 42, 100, 0, 30, 0, 1, 7).unwrap();
+        key[4..6].copy_from_slice(&LEGACY_PROTOCOL_MAJOR.to_le_bytes());
+        assert!(decode(&key).is_ok());
+    }
 
     #[test]
     fn decoder_preserves_incarnation_and_rejects_malformed_packets() {
