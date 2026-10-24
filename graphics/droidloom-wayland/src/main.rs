@@ -753,19 +753,51 @@ impl App {
         Ok(())
     }
 
-    fn apply_pending_resizes(&mut self, qh: &QueueHandle<Self>) -> Result<(), PresenterError> {
-        // Wayland callbacks only replace pending geometry. Apply the final
-        // size/scale before draining Android frames or publishing layer config.
+    fn apply_pending_resizes(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        now: Instant,
+    ) -> Result<(), PresenterError> {
+        let actionable = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.accepts_present() && task.resize.action(now).is_some())
+            .map(|(object, _)| *object)
+            .collect::<Vec<_>>();
+        for object in actionable {
+            self.task_work.mark(object, readiness::RESIZE);
+        }
         while let Some(object) = self.task_work.pop(readiness::RESIZE) {
-            let Some(task) = self.tasks.get_mut(&object) else {
-                continue;
-            };
-            let Some(configure) = task.resize.take() else {
+            let Some(task) = self.tasks.get(&object) else {
                 continue;
             };
             if !task.accepts_present() {
                 continue;
             }
+            let Some(action) = self
+                .tasks
+                .get(&object)
+                .expect("checked above")
+                .resize
+                .action(now)
+            else {
+                continue;
+            };
+            let resize::Action::ApplyFinal(_) = action else {
+                let task = self.tasks.get_mut(&object).expect("checked above");
+                task.surface()
+                    .expect("accepts_present guarantees a mapped window")
+                    .commit();
+                task.resize.committed();
+                continue;
+            };
+            let configure = self
+                .tasks
+                .get_mut(&object)
+                .expect("checked above")
+                .resize
+                .take()
+                .expect("ApplyFinal guarantees queued geometry");
             self.configure_task(qh, object, configure)?;
             if configure.remember {
                 let package = &self
@@ -2180,7 +2212,7 @@ impl WindowHandler for App {
             .get_mut(&object)
             .expect("surface has a task")
             .resize
-            .configure(size, remember);
+            .configure(size, remember, configure.is_resizing());
         self.task_work.mark(object, readiness::RESIZE);
     }
 }
@@ -3339,7 +3371,7 @@ fn run_presenter_loop(
         if let Some(error) = app.fatal.take() {
             return Err(PresenterError::Wayland(error));
         }
-        app.apply_pending_resizes(&qh)?;
+        app.apply_pending_resizes(&qh, Instant::now())?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
         app.refresh_frame_timelines(&qh)?;
@@ -3503,6 +3535,11 @@ fn poll_sources(
         .into_iter()
         .chain(fallback_deadline)
         .chain(stall_deadline)
+        .chain(
+            app.tasks
+                .values()
+                .filter_map(|task| task.resize.deadline(now)),
+        )
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.
