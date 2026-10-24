@@ -365,6 +365,7 @@ struct App {
     focused: Option<TaskObjectId>,
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
+    pressed_keys: input::Keys,
     tablet_seat_id: u32,
     tablet_manager: Option<ZwpTabletManagerV2>,
     tablet_seats: Vec<(wl_seat::WlSeat, ZwpTabletSeatV2)>,
@@ -1590,6 +1591,18 @@ impl App {
     }
 
     fn destroy_task(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        for keycode in self.pressed_keys.take_task(object) {
+            let time = monotonic_timestamp_nanos().unwrap_or(0);
+            let _ = self.send_input(
+                object,
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode,
+                    repeat: 0,
+                },
+                time,
+            );
+        }
         let Some(task) = self.tasks.get_mut(&object) else {
             return Ok(());
         };
@@ -2755,7 +2768,7 @@ impl KeyboardHandler for App {
         _keyboard: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
         serial: u32,
-        _raw: &[u32],
+        raw: &[u32],
         _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
     ) {
         self.clipboard.focus(true);
@@ -2763,6 +2776,34 @@ impl KeyboardHandler for App {
         let object = self.task_for_surface(surface);
         if let Err(error) = self.set_focus(object) {
             self.fail(&error);
+        }
+        if let Some(object) = object {
+            let time = monotonic_timestamp_nanos().unwrap_or(0);
+            for keycode in raw
+                .iter()
+                .copied()
+                .filter(|key| matches!(key, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126))
+            {
+                if self.pressed_keys.owner(keycode) == Some(object) {
+                    continue;
+                }
+                self.pressed_keys.press(keycode, object);
+                match self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Down,
+                        keycode,
+                        repeat: 0,
+                    },
+                    time,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.pressed_keys.release(keycode);
+                    }
+                    Err(error) => self.fail(&error),
+                }
+            }
         }
     }
 
@@ -2775,6 +2816,20 @@ impl KeyboardHandler for App {
         _serial: u32,
     ) {
         self.clipboard.focus(false);
+        if let Some(object) = self.task_for_surface(surface) {
+            let time = monotonic_timestamp_nanos().unwrap_or(0);
+            for keycode in self.pressed_keys.take_task(object) {
+                let _ = self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode,
+                        repeat: 0,
+                    },
+                    time,
+                );
+            }
+        }
         if self.focused == self.task_for_surface(surface)
             && let Err(error) = self.set_focus(None)
         {
@@ -2800,22 +2855,36 @@ impl KeyboardHandler for App {
         {
             self.activation.input(serial, data.seat(), surface);
         }
-        if let Some(object) = self.focused
-            && let Err(error) = self
+        if let Some(object) = self.focused {
+            let time = self
                 .input_time(input_time::Device::Keyboard, event.time)
-                .and_then(|time| {
-                    self.send_input(
-                        object,
-                        InputEvent::Key {
-                            action: KeyAction::Down,
-                            keycode: event.raw_code,
-                            repeat: 0,
-                        },
-                        time,
-                    )
-                })
-        {
-            self.fail(&error);
+                .unwrap_or_else(|_| monotonic_timestamp_nanos().unwrap_or(0));
+            if let Some(previous) = self.pressed_keys.press(event.raw_code, object) {
+                let _ = self.send_input(
+                    previous,
+                    InputEvent::Key {
+                        action: KeyAction::Up,
+                        keycode: event.raw_code,
+                        repeat: 0,
+                    },
+                    time,
+                );
+            }
+            match self.send_input(
+                object,
+                InputEvent::Key {
+                    action: KeyAction::Down,
+                    keycode: event.raw_code,
+                    repeat: 0,
+                },
+                time,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.pressed_keys.release(event.raw_code);
+                }
+                Err(error) => self.fail(&error),
+            }
         }
     }
 
@@ -2828,7 +2897,11 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
+        if self.pressed_keys.is_consumed(event.raw_code) {
+            return;
+        }
         if let Some(object) = self.focused
+            && self.pressed_keys.owner(event.raw_code) == Some(object)
             && let Err(error) = self
                 .input_time(input_time::Device::Keyboard, event.time)
                 .and_then(|time| {
@@ -2856,8 +2929,9 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.clipboard.serial(serial);
-        if let Some(object) = self.focused
-            && let Err(error) = self
+        if let Some(object) = self.focused {
+            self.pressed_keys.release(event.raw_code);
+            if let Err(error) = self
                 .input_time(input_time::Device::Keyboard, event.time)
                 .and_then(|time| {
                     self.send_input(
@@ -2870,8 +2944,9 @@ impl KeyboardHandler for App {
                         time,
                     )
                 })
-        {
-            self.fail(&error);
+            {
+                self.fail(&error);
+            }
         }
     }
 
@@ -2881,10 +2956,33 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _modifiers: Modifiers,
+        modifiers: Modifiers,
         _raw_modifiers: RawModifiers,
         _layout: u32,
     ) {
+        if let Some(object) = self.focused {
+            let time = monotonic_timestamp_nanos().unwrap_or(0);
+            for (keycode, action) in self
+                .pressed_keys
+                .modifiers(object, modifiers.shift, modifiers.ctrl)
+            {
+                match self.send_input(
+                    object,
+                    InputEvent::Key {
+                        action,
+                        keycode,
+                        repeat: 0,
+                    },
+                    time,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.pressed_keys.release(keycode);
+                    }
+                    Err(error) => self.fail(&error),
+                }
+            }
+        }
     }
 
     fn update_repeat_info(
@@ -3311,6 +3409,7 @@ fn run() -> Result<(), PresenterError> {
         focused: None,
         pointer_contact: None,
         touch_contacts: BTreeMap::new(),
+        pressed_keys: input::Keys::default(),
         motion_times: input_time::Stream::default(),
         key_times: input_time::Stream::default(),
         input_timestamps: input_time::Timestamps::new(globals.bind(&qh, 1..=1, ()).ok()),
