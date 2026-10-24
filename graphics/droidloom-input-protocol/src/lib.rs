@@ -49,6 +49,8 @@ pub const KIND_DISPLAY_POWER: u8 = 6;
 pub const KIND_SCROLL: u8 = 7;
 /// Routed stylus proximity, contact and barrel-button input.
 pub const KIND_STYLUS: u8 = 8;
+/// Routed mouse hover, buttons and wheel input.
+pub const KIND_MOUSE: u8 = 9;
 
 /// One native pen sample. Tilt uses signed degrees, matching Wayland tablet-v2.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -327,6 +329,52 @@ pub fn encode_key(
     Ok(record)
 }
 
+/// Encode mouse input without converting it to a touchscreen gesture.
+/// Wheel axes are signed 8.8 detents; coordinates remain signed 16.16 pixels.
+///
+/// # Errors
+/// Rejects invalid routes, actions and mouse button identities.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mouse(
+    display: u32,
+    task: u64,
+    timestamp: u64,
+    action: u8,
+    button: u32,
+    x: i32,
+    y: i32,
+    scroll_x: i16,
+    scroll_y: i16,
+    incarnation: u64,
+) -> Result<[u8; RECORD_BYTES], InputProtocolError> {
+    if action > 6
+        || (matches!(action, 3 | 4) && mouse_button(button).is_none())
+        || (!matches!(action, 3 | 4) && button != 0)
+        || (action != 5 && (scroll_x != 0 || scroll_y != 0))
+    {
+        return Err(InputProtocolError::Action);
+    }
+    let mut record = encode_touch(display, task, timestamp, 0, 0, x, y, 0, incarnation)?;
+    record[6] = KIND_MOUSE;
+    record[7] = action;
+    record[12..16].copy_from_slice(&button.to_le_bytes());
+    record[32..34].copy_from_slice(&scroll_x.to_le_bytes());
+    record[34..36].copy_from_slice(&scroll_y.to_le_bytes());
+    Ok(record)
+}
+
+/// Android button-state bit corresponding to a Linux mouse button.
+pub fn mouse_button(button: u32) -> Option<u32> {
+    Some(match button {
+        0x110 => 1,
+        0x111 => 2,
+        0x112 => 4,
+        0x113 | 0x116 => 8,
+        0x114 | 0x115 => 16,
+        _ => return None,
+    })
+}
+
 /// Encode a requested content size for one Android task.
 ///
 /// The Android task stays at a private origin because the Wayland compositor
@@ -464,6 +512,17 @@ pub enum Payload {
         /// Primary and secondary barrel button mask.
         buttons: u8,
     },
+    /// Task-local mouse coordinates and wheel detents.
+    Mouse {
+        /// Horizontal task-local physical pixel coordinate.
+        x: f32,
+        /// Vertical task-local physical pixel coordinate.
+        y: f32,
+        /// Horizontal wheel detents.
+        scroll_x: f32,
+        /// Vertical wheel detents.
+        scroll_y: f32,
+    },
     /// Task-local physical pixel coordinates and normalized pressure.
     Touch {
         /// Horizontal task-local coordinate.
@@ -585,6 +644,23 @@ pub fn decode(bytes: &[u8]) -> Result<Record, InputProtocolError> {
                 buttons: (bytes[7] >> 4) & 3,
             }
         }
+        KIND_MOUSE
+            if bytes[4..6] == PROTOCOL_MAJOR.to_le_bytes()
+                && action <= 6
+                && (if matches!(action, 3 | 4) {
+                    mouse_button(code).is_some()
+                } else {
+                    code == 0
+                })
+                && (action == 5 || bytes[32..36] == [0; 4]) =>
+        {
+            Payload::Mouse {
+                x: i32::from_le_bytes(bytes[24..28].try_into().unwrap()) as f32 / 65536.0,
+                y: i32::from_le_bytes(bytes[28..32].try_into().unwrap()) as f32 / 65536.0,
+                scroll_x: f32::from(i16::from_le_bytes(bytes[32..34].try_into().unwrap())) / 256.0,
+                scroll_y: f32::from(i16::from_le_bytes(bytes[34..36].try_into().unwrap())) / 256.0,
+            }
+        }
         KIND_TOUCH if action <= 3 && code <= MAX_POINTER_ID && bytes[34..36] == [0, 0] => {
             Payload::Touch {
                 x: fixed(24),
@@ -629,6 +705,28 @@ mod tests {
         );
         record[34] = 91;
         assert!(decode(&record).is_err(), "invalid tilt must be rejected");
+    }
+
+    #[test]
+    fn mouse_roundtrip_preserves_fractional_wheel_and_buttons() {
+        let record = encode_mouse(0, 42, 100, 5, 0, 2 << 16, -(3 << 16), 128, -256, 7).unwrap();
+        let Record::Input(sample) = decode(&record).unwrap() else {
+            panic!("mouse expected")
+        };
+        assert_eq!(
+            sample.payload,
+            Payload::Mouse {
+                x: 2.0,
+                y: -3.0,
+                scroll_x: 0.5,
+                scroll_y: -1.0
+            }
+        );
+        for button in [0x110, 0x112, 0x116] {
+            let press = encode_mouse(0, 42, 100, 3, button, 0, 0, 0, 0, 7).unwrap();
+            assert!(matches!(decode(&press), Ok(Record::Input(_))));
+        }
+        assert!(encode_mouse(0, 42, 100, 3, 0, 0, 0, 0, 0, 7).is_err());
     }
 
     #[test]
