@@ -409,7 +409,7 @@ impl App {
         else {
             return false;
         };
-        let surface = if let Some(s) = surface {
+        let _surface = if let Some(s) = surface {
             s
         } else if let Some(s) = task_surface {
             self.tablet_tool_mut(tool_id).surface = Some(s.clone());
