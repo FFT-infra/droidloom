@@ -446,6 +446,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/droidloom/cells/test"),
             render_node: PathBuf::from("/dev/dri/renderD128"),
             graphics_backend: crate::GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: PathBuf::from("/run/user/1001/denial.sock"),
         }
     }
