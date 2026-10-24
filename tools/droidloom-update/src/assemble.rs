@@ -747,8 +747,9 @@ pub fn stage_cross(
     } = target;
     let _lock = Lock::acquire(&work.join("package-build.lock"))?;
     let _source_lock = Lock::acquire(&work.join("aosp-source-update.lock"))?;
-    if destination.exists() {
-        return fail("bundle destination already exists; retain it and choose a new destination");
+    // One stage per device: a previous bundle there is replaced once the new one verifies.
+    if destination.exists() && !destination.join("droidloom-update.json").is_file() {
+        return fail("bundle destination exists and is not a bundle");
     }
     let lock = match product {
         "droidloom_arm64" => "android/manifest/source-lock.json",
@@ -785,7 +786,14 @@ pub fn stage_cross(
     crate::licenses::rust(repo, &notices.join("rust"))?;
     let id = crate::bundle::seal(staging.path(), crate::bundle::source_identity(repo)?)?;
     crate::bundle::verify(staging.path())?;
+    let previous = tempfile::Builder::new()
+        .prefix("previous-bundle-")
+        .tempdir_in(parent)?;
+    if destination.exists() {
+        fs::rename(destination, previous.path().join("bundle"))?;
+    }
     fs::rename(staging.path(), destination)?;
+    drop(previous);
     println!(
         "Verified cross-built bundle {id}: {}",
         destination.display()

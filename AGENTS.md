@@ -54,14 +54,16 @@ path (`/mnt/development/denial-os/droidloom/.work`).
 ```console
 cargo run --locked -j 1 -p droidloom-update -- --jobs $(($(nproc) - 2)) android-build --work .work/arch/build --product droidloom_arm64
 cargo run --locked -j 1 -p droidloom-update -- host-build --work .work/arch/build --sysroot ~/.cache/denial/tablet-arm64-20261009/sysroot
-cargo run --locked -j 1 -p droidloom-update -- bundle-stage --work .work/arch/build --product droidloom_arm64 --host .work/arch/build/cargo-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/release --base .work/arm64-base-15885347/images --device DEVICE --destination STAGE
+cargo run --locked -j 1 -p droidloom-update -- bundle-stage --work .work/arch/build --product droidloom_arm64 --host .work/arch/build/cargo-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/release --base .work/arm64-base-15885347/images --device DEVICE --destination .work/stage/DEVICE
 ```
 
-`bundle-stage` ends with `Verified cross-built bundle ID: STAGE`. Send it to
-`/var/lib/droidloom/stage/release-ID` on the phone with
-`rsync -a --sparse --compress --compress-choice=zstd`, passing the phone's
-previous stage as `--copy-dest` so only changed files travel. Copy to `ID.tmp`
-and rename it when complete.
+Each device has one stage, `.work/stage/DEVICE`; `bundle-stage` replaces the
+previous bundle there once the new one verifies, and ends with `Verified
+cross-built bundle ID: STAGE`. Send it over the phone's one stage,
+`/var/lib/droidloom/stage/current`, with
+`rsync -a --sparse --delete --compress --compress-choice=zstd`: the previous
+content is the delta basis, so only changed files travel. Run
+`STAGE/usr/bin/droidloom-update verify STAGE` there before activating.
 
 Activate on the phone as root:
 1. Stop `droidloom.service` and `droidloom-applications.service` in the desktop
@@ -75,8 +77,8 @@ Activate on the phone as root:
 4. Start `droidloomd.service`, then the user's `droidloom.service`, and wait for
    `sys.boot_completed`.
 
-Keep the previous stage on the phone: it is the rollback and the next
-`--copy-dest`. The user's manager is reached as root with
+The installed releases under `/usr/lib/droidloom/releases` are the rollback;
+the stage is only the transfer copy. The user's manager is reached as root with
 `sudo -u USER XDG_RUNTIME_DIR=/run/user/UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/UID/bus systemctl --user`.
 Android tools run with
 `nsenter -t $(pgrep -o -f '^/init second_stage') -a /system/bin/TOOL`.
