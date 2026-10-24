@@ -16,6 +16,7 @@ mod notifications;
 mod presentation_audit;
 mod readiness;
 mod resize;
+mod tablet_input;
 mod text_input;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -92,6 +93,12 @@ use wayland_protocols::wp::viewporter::client::{
 use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
     zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
+};
+use wayland_protocols::wp::tablet::zv2::client::{
+    zwp_tablet_manager_v2::ZwpTabletManagerV2,
+    zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    zwp_tablet_tool_v2::ZwpTabletToolV2,
+    zwp_tablet_v2::ZwpTabletV2,
 };
 
 const BOOTSTRAP_PACKAGE: &str = "android.droidloom.bootstrap";
@@ -335,6 +342,14 @@ struct App {
     focused: Option<TaskObjectId>,
     pointer_contact: Option<Contact>,
     touch_contacts: BTreeMap<i32, Contact>,
+    tablet_seat_id: u32,
+    tablet_manager: Option<ZwpTabletManagerV2>,
+    tablet_seats: Vec<(wl_seat::WlSeat, ZwpTabletSeatV2)>,
+    tablet_tools: Vec<tablet_input::TabletToolState>,
+    tablet_tool_proxies: BTreeMap<u32, ZwpTabletToolV2>,
+    tablet_proxies: BTreeMap<u32, (u32, ZwpTabletV2)>,
+    tablet_pads: BTreeMap<u32, tablet_input::TabletPadState>,
+    tablet_pad_groups: BTreeMap<u32, u32>,
     // Touch and mouse share Android's injected pointer device; keys are separate.
     motion_times: input_time::Stream,
     key_times: input_time::Stream,
@@ -2517,7 +2532,9 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.bind_tablet_seat(seat, qh);
+    }
 
     fn new_capability(
         &mut self,
@@ -2617,6 +2634,7 @@ impl SeatHandler for App {
     }
 
     fn remove_seat(&mut self, conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.unbind_tablet_seat(&seat);
         for capability in [Capability::Keyboard, Capability::Pointer, Capability::Touch] {
             self.remove_capability(conn, qh, seat.clone(), capability);
         }
@@ -3113,6 +3131,16 @@ fn run() -> Result<(), PresenterError> {
     }
     let sync_manager: WpLinuxDrmSyncobjManagerV1 = globals.bind(&qh, 1..=1, ())?;
     let output_power_manager: Option<ZwlrOutputPowerManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let tablet_manager: Option<ZwpTabletManagerV2> = globals.bind(&qh, 1..=1, ()).ok();
+    let seat_state = SeatState::new(&globals, &qh);
+    let mut tablet_seats = Vec::new();
+    if let Some(manager) = &tablet_manager {
+        for seat in seat_state.seats() {
+            if !tablet_seats.iter().any(|(existing, _)| *existing == seat) {
+                tablet_seats.push((seat.clone(), manager.get_tablet_seat(&seat, &qh, ())));
+            }
+        }
+    }
     let mut app = App {
         activation: activation::Activation::new(&globals, &qh),
         layer_globals: layers::Globals {
@@ -3138,7 +3166,15 @@ fn run() -> Result<(), PresenterError> {
         published_display_power: None,
         presentation_time,
         presentation_clock: None,
-        seat_state: SeatState::new(&globals, &qh),
+        seat_state,
+        tablet_seat_id: 0,
+        tablet_manager,
+        tablet_seats,
+        tablet_tools: Vec::new(),
+        tablet_tool_proxies: BTreeMap::new(),
+        tablet_proxies: BTreeMap::new(),
+        tablet_pads: BTreeMap::new(),
+        tablet_pad_groups: BTreeMap::new(),
         dmabuf_state,
         feedback: None,
         compositor,
