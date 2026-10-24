@@ -314,6 +314,10 @@ struct Original {
     bytes: Option<Vec<u8>>,
     #[serde(default)]
     modified: Option<std::time::SystemTime>,
+    // A directory keeps only its timestamp: creating or renaming files in it
+    // changes that, and Mesa's Android build depends on its directories.
+    #[serde(default)]
+    directory: bool,
 }
 pub(crate) struct Projection {
     journal: PathBuf,
@@ -337,6 +341,16 @@ impl Projection {
         if self.originals.iter().any(|o| o.path == path) {
             return Ok(());
         }
+        if let Some(directory) = path.ancestors().skip(1).find(|a| a.is_dir()) {
+            if !self.originals.iter().any(|o| o.path == directory) {
+                self.originals.push(Original {
+                    modified: Some(fs::metadata(directory)?.modified()?),
+                    bytes: None,
+                    path: directory.to_owned(),
+                    directory: true,
+                });
+            }
+        }
         self.originals.push(Original {
             modified: fs::metadata(&path).ok().and_then(|m| m.modified().ok()),
             bytes: match fs::read(&path) {
@@ -345,6 +359,7 @@ impl Projection {
                 Err(e) => return Err(e.into()),
             },
             path,
+            directory: false,
         });
         durable_write(&self.journal, serde_json::to_vec(&self.originals)?)?;
         Ok(())
@@ -355,8 +370,16 @@ impl Projection {
     }
     fn stabilize_all(&self) -> Result<()> {
         // Wait until all patches are applied: several patches can touch one file.
-        for original in &self.originals {
+        for original in self.originals.iter().filter(|o| !o.directory) {
             self.stabilize(&original.path)?;
+        }
+        self.restore_directory_times()
+    }
+    fn restore_directory_times(&self) -> Result<()> {
+        for original in self.originals.iter().filter(|o| o.directory) {
+            if let (Some(modified), true) = (original.modified, original.path.is_dir()) {
+                fs::File::open(&original.path)?.set_modified(modified)?;
+            }
         }
         Ok(())
     }
@@ -411,7 +434,7 @@ impl Projection {
         Ok(())
     }
     fn restore(&mut self) -> Result<()> {
-        for o in self.originals.iter().rev() {
+        for o in self.originals.iter().rev().filter(|o| !o.directory) {
             if let Some(bytes) = &o.bytes {
                 write(&o.path, bytes)?;
                 if let Some(modified) = o.modified {
@@ -421,6 +444,7 @@ impl Projection {
                 fs::remove_file(&o.path)?;
             }
         }
+        self.restore_directory_times()?;
         self.originals.clear();
         if self.journal.exists() {
             fs::remove_file(&self.journal)?;
@@ -1212,6 +1236,31 @@ mod tests {
         p.stabilize_all().unwrap();
         assert!(!ninja().contains("no work to do"));
         assert_eq!(fs::read(d.path().join("result")).unwrap(), b"changed patch");
+    }
+    #[test]
+    fn patched_directories_keep_their_timestamps() {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        write(&source.join("input"), b"before\n").unwrap();
+        let patch = d.path().join("change.patch");
+        write(
+            &patch,
+            b"--- a/input\n+++ b/input\n@@ -1 +1 @@\n-before\n+after\n\
+              --- /dev/null\n+++ b/created\n@@ -0,0 +1 @@\n+new\n",
+        )
+        .unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::open(&source).unwrap().set_modified(old).unwrap();
+        let time = || fs::metadata(&source).unwrap().modified().unwrap();
+        let mut p = Projection::new(d.path().join("journal")).unwrap();
+        p.patch(&source, "", &patch).unwrap();
+        p.stabilize_all().unwrap();
+        assert_eq!(fs::read(source.join("created")).unwrap(), b"new\n");
+        assert_eq!(time(), old);
+        p.restore().unwrap();
+        assert!(!source.join("created").exists());
+        assert_eq!(time(), old);
     }
     #[test]
     fn restoration_preserves_original_and_removes_created_file() {
