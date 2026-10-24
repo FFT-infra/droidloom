@@ -447,6 +447,7 @@ mod tests {
             gpu: Default::default(),
             render_node: PathBuf::from("/dev/dri/renderD128"),
             graphics_backend: crate::GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: PathBuf::from("/run/user/1001/denial.sock"),
         }
     }

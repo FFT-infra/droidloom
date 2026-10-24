@@ -183,6 +183,14 @@ impl GraphicsBackend {
     }
 }
 
+/// Optional host video decoder exposed to Android through a private device node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoDecoderBackend {
+    /// Qualcomm Iris V4L2 decoder, identified dynamically through sysfs and QUERYCAP.
+    Iris,
+}
+
 /// Immutable inputs required to construct one cell.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +245,9 @@ pub struct CellSpec {
     /// Host-validated graphics pairing. Omission uses native DRM.
     #[serde(default)]
     pub graphics_backend: GraphicsBackend,
+    /// Optional host hardware decoder exposed through a private Android node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_decoder: Option<VideoDecoderBackend>,
     /// Authenticated Denial endpoint exposed at the fixed Android path.
     pub denial_socket: PathBuf,
 }
@@ -763,6 +774,7 @@ mod tests {
             gpu: Default::default(),
             render_node: "/dev/dri/renderD128".into(),
             graphics_backend: GraphicsBackend::default(),
+            video_decoder: None,
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
         }
     }
