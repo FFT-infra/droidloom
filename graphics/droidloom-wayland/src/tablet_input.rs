@@ -698,11 +698,40 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                         tool.surface = fallback_surface;
                     }
                     state.flush_tablet_tool(tool_id);
-                    return;
                 }
-                tablet_trace!(
-                    "Droidloom tablet: ignoring non-barrel tool button tool_id={tool_id}, button={button:#x}"
-                );
+                let action = match button_state {
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                        KeyAction::Down
+                    }
+                    WEnum::Value(tablet::zwp_tablet_tool_v2::ButtonState::Released) => {
+                        KeyAction::Up
+                    }
+                    _ => return,
+                };
+                let surface = state
+                    .tablet_tools
+                    .iter()
+                    .find(|t| t.tool_id == tool_id)
+                    .and_then(|t| t.surface.clone());
+                let target_object = surface
+                    .as_ref()
+                    .and_then(|s| state.task_for_surface(s))
+                    .or(state.focused);
+                if let Some(object) = target_object {
+                    tablet_trace!(
+                        "Droidloom tablet: Button tool_id={tool_id}, button={button:#x}, action={action:?}, target={object:?}"
+                    );
+                    let timestamp = monotonic_timestamp_nanos().unwrap_or(0);
+                    let _ = state.send_input(
+                        object,
+                        InputEvent::Key {
+                            action,
+                            keycode: button,
+                            repeat: 0,
+                        },
+                        timestamp,
+                    );
+                }
             }
             tablet::zwp_tablet_tool_v2::Event::Frame { .. } => {
                 state.flush_tablet_tool(tool_id);
