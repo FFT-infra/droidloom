@@ -11,7 +11,6 @@ pub(super) struct FrameTrace {
     gpu_logged: bool,
     gpu_known: bool,
     flushed: bool,
-    pub(super) release_observed: bool,
 }
 
 impl FrameTrace {
@@ -27,7 +26,6 @@ impl FrameTrace {
             gpu_logged: false,
             gpu_known: false,
             flushed: false,
-            release_observed: false,
         };
         trace.event("native_present_begin", &[]);
         trace.gpu();
@@ -72,7 +70,6 @@ impl FrameTrace {
             "release_observed",
             &[("feedback_pending", u64::from(feedback_pending))],
         );
-        self.release_observed = true;
     }
     pub(super) fn returned(&mut self) {
         self.gpu();

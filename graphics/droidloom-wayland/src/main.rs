@@ -1311,30 +1311,10 @@ impl App {
             let Some(task) = self.tasks.get_mut(&object) else {
                 continue;
             };
-            // Diagnostic observation only: retain the existing release policy.
-            // Inspect sampled frames independently so FIFO head blocking is visible.
-            for pending in &mut task.pending {
-                if let Some(trace) = pending.trace.as_mut() {
-                    if !trace.release_observed {
-                        if let Some(sync) = task
-                            .targets
-                            .get(&pending.buffer)
-                            .and_then(|t| t.sync.as_ref())
-                        {
-                            if let Ok(point) = sync.timeline.signalled_point() {
-                                if point >= pending.release_point {
-                                    trace.release_ready(
-                                        task.presentation_feedback
-                                            .iter()
-                                            .any(|feedback| feedback.frame == pending.frame),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            while let Some(pending) = task.pending.front() {
+            // Denial returns buffers in any order: a minimized window keeps its
+            // last shown frame while it releases the newer commits it replaced.
+            let mut index = 0;
+            while let Some(pending) = task.pending.get(index) {
                 let sync = task
                     .targets
                     .get(&pending.buffer)
@@ -1345,9 +1325,17 @@ impl App {
                 // Only the compositor's real release fence controls reuse.
                 // Presentation feedback retains its own bounded frame identity.
                 if pending.release_point > sync.timeline.signalled_point()? {
-                    break;
+                    index += 1;
+                    continue;
                 }
-                let pending = task.pending.pop_front().expect("front was present");
+                let mut pending = task.pending.remove(index).expect("index was present");
+                if let Some(trace) = pending.trace.as_mut() {
+                    trace.release_ready(
+                        task.presentation_feedback
+                            .iter()
+                            .any(|feedback| feedback.frame == pending.frame),
+                    );
+                }
                 if let Some(audit) = task.presentation_audit.as_mut() {
                     audit.released(pending.submitted_nanos, monotonic_timestamp_nanos()?);
                 }
