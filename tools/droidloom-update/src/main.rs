@@ -47,7 +47,7 @@ enum Action {
         host: PathBuf,
         #[arg(long)]
         base: PathBuf,
-        #[arg(long, value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        #[arg(long, value_parser = ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"])]
         product: String,
         /// Tracked profile in packaging/devices; supplies the cell and user.
         #[arg(long, conflicts_with_all = ["cell_spec", "user"], required_unless_present_all = ["cell_spec", "user"])]
@@ -71,14 +71,14 @@ enum Action {
     AndroidBuild {
         #[arg(long)]
         work: PathBuf,
-        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"])]
         product: String,
     },
     /// Compile system_server and its Rust policy in a prepared Android workspace.
     FrameworkBuild {
         #[arg(long)]
         work: Option<PathBuf>,
-        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"])]
         product: String,
         /// Rebuild task, graphics and input peers alongside the framework pair.
         #[arg(long, conflicts_with = "surfaceflinger_only")]
@@ -91,7 +91,7 @@ enum Action {
     AudioBuild {
         #[arg(long)]
         work: Option<PathBuf>,
-        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64"])]
+        #[arg(long, default_value = "droidloom_x86_64", value_parser = ["droidloom_x86_64", "droidloom_arm64", "droidloom_sheng"])]
         product: String,
     },
     #[command(hide = true)]
