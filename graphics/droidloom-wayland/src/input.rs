@@ -253,7 +253,17 @@ impl DirectInput {
         } else if let Some(original) = self.pens.get(&pen.tool) {
             route = *original;
         } else {
-            return Ok(());
+            self.pens.insert(pen.tool, route);
+            let enter_pen = droidloom_input_protocol::Stylus { action: 0, ..pen };
+            let enter_record = droidloom_input_protocol::encode_stylus(
+                route.display,
+                route.task,
+                timestamp,
+                route.incarnation,
+                enter_pen,
+            )
+            .map_err(|e| e.to_string())?;
+            self.enqueue(Some(route), enter_record)?;
         }
         pen.x_fixed = scale_fixed(pen.x_fixed, scale.0, scale.1).map_err(|e| e.to_string())?;
         pen.y_fixed = scale_fixed(pen.y_fixed, scale.0, scale.1).map_err(|e| e.to_string())?;
