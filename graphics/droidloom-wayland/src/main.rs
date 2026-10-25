@@ -3020,6 +3020,36 @@ impl PointerHandler for App {
                         self.fail(&error);
                     }
                 }
+                PointerEventKind::Press { button, time, .. } if matches!(button, 262..=265) => {
+                    if let Some(target) = object.or(self.focused) {
+                        let _ = self.input_time(input_time::Device::Pointer, time).and_then(|t| {
+                            self.send_input(
+                                target,
+                                InputEvent::Key {
+                                    action: KeyAction::Down,
+                                    keycode: button,
+                                    repeat: 0,
+                                },
+                                t,
+                            )
+                        });
+                    }
+                }
+                PointerEventKind::Release { button, time, .. } if matches!(button, 262..=265) => {
+                    if let Some(target) = object.or(self.focused) {
+                        let _ = self.input_time(input_time::Device::Pointer, time).and_then(|t| {
+                            self.send_input(
+                                target,
+                                InputEvent::Key {
+                                    action: KeyAction::Up,
+                                    keycode: button,
+                                    repeat: 0,
+                                },
+                                t,
+                            )
+                        });
+                    }
+                }
                 _ => {}
             }
         }
