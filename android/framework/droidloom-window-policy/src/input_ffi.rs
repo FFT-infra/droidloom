@@ -82,19 +82,17 @@ impl State {
         }
         false
     }
-    fn dispatch_routed(&self, event: &RoutedEvent) -> bool {
-        if let Some(token) = self.tokens.get(&event.target.task) {
-            return self.dispatch(&event.event, token.pointer);
-        }
-        false
-    }
     fn cancel(&mut self, events: Vec<RoutedEvent>) -> bool {
         let mut accepted = true;
         for event in events {
-            if self.dispatch_routed(&event) {
-                self.engine.acknowledge_cancel(&event);
+            if let Some(token) = self.tokens.get(&event.target.task) {
+                if self.dispatch(&event.event, token.pointer) {
+                    self.engine.acknowledge_cancel(&event);
+                } else {
+                    accepted = false;
+                }
             } else {
-                accepted = false;
+                self.engine.acknowledge_cancel(&event);
             }
         }
         self.recovering |= !accepted;
@@ -119,9 +117,18 @@ impl State {
         }
         let mut next = self.engine.clone();
         for event in next.process_batch(sample)? {
-            if !self.dispatch_routed(&event) {
-                self.recovering = true;
-                return Err("Android input dispatch rejected");
+            if let Some(token) = self.tokens.get(&event.target.task) {
+                if !self.dispatch(&event.event, token.pointer) {
+                    if event.event.kind != 8 {
+                        self.recovering = true;
+                        return Err("Android input dispatch rejected");
+                    } else {
+                        eprintln!(
+                            "Droidloom stylus dispatch dropped kind {} action {} for task {}",
+                            event.event.kind, event.event.action, event.target.task
+                        );
+                    }
+                }
             }
         }
         self.engine = next;
