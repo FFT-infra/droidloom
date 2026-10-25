@@ -304,7 +304,15 @@ public final class DroidloomWindowManagerPolicy implements WindowManagerPolicy {
         return routeKey(event.getKeyCode(), true, true, false) != PASS;
     }
     @Override public boolean interceptUnhandledKey(KeyEvent event, IBinder focusedToken) {
-        int route = routeKey(event.getKeyCode(), true, false, true);
+        int code = event.getKeyCode();
+        if ((code >= KeyEvent.KEYCODE_BUTTON_7 && code <= KeyEvent.KEYCODE_BUTTON_16)
+                || code == KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY
+                || code == KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY
+                || code == KeyEvent.KEYCODE_STYLUS_BUTTON_TERTIARY
+                || code == KeyEvent.KEYCODE_STYLUS_BUTTON_TAIL) {
+            return true;
+        }
+        int route = routeKey(code, true, false, true);
         if (route == MEDIA || route == VOLUME) {
             dispatchSystemKey(event, route);
             return true;
