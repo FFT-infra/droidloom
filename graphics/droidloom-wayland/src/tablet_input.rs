@@ -442,8 +442,6 @@ impl App {
             Ok(()) => true,
             Err(error) => {
                 eprintln!("Droidloom native pen: {error}");
-                self.direct_input.disconnect();
-                self.retire_contacts(None);
                 false
             }
         }
@@ -468,6 +466,9 @@ impl App {
         let buttons = std::mem::take(&mut tool.dirty_buttons);
         if !tool.native_entered {
             if self.send_native_pen(tool_id, 0) {
+                self.tablet_tool_mut(tool_id).native_entered = true;
+            } else if down {
+                // Explicit Enter failed, but pen is physically down: allow proceeding so send_stylus can self-heal.
                 self.tablet_tool_mut(tool_id).native_entered = true;
             } else {
                 if out {
