@@ -72,11 +72,33 @@ struct Key {
 }
 
 #[derive(Clone, Default)]
+struct Mouse {
+    buttons: u32,
+    x: f32,
+    y: f32,
+    down_time: u64,
+    last_time: u64,
+}
+
+#[derive(Clone)]
+struct Pen {
+    tool: u32,
+    down: bool,
+    hovering: bool,
+    buttons: u8,
+    down_time: u64,
+    last_time: u64,
+    event: Event,
+}
+
+#[derive(Clone, Default)]
 pub struct Engine {
     targets: BTreeMap<i32, Target>,
     gestures: BTreeMap<i32, Gesture>,
     keys: BTreeMap<(i32, u32), Key>,
     locks: BTreeMap<i32, i32>,
+    mice: BTreeMap<i32, Mouse>,
+    pens: BTreeMap<i32, Pen>,
     // Android resolves injected touchscreen input to one device per display,
     // not one device per task. Keep the first task's ownership until release;
     // contacts begun on another task must never become a new DOWN mid-contact.
@@ -129,16 +151,366 @@ impl Engine {
             return Ok(None);
         };
         let event = match sample.payload {
+            Payload::Mouse { .. } | Payload::Stylus { .. } => {
+                return Err("pointer requires batch dispatch");
+            }
             Payload::Touch { x, y, pressure } => {
                 if self.suppress_touch(sample) {
                     return Ok(None);
                 }
                 self.touch(sample, target, x, y, pressure)?
             }
-            Payload::Key { repeat, serial } => self.key(sample, repeat, serial)?,
+            Payload::Key { repeat, serial } => {
+                if android_keycode(sample.code).is_none() {
+                    return Ok(None);
+                }
+                self.key(sample, repeat, serial)?
+            }
         };
         Ok(Some(RoutedEvent { target, event }))
     }
+
+    pub fn process_batch(&mut self, sample: Sample) -> Result<Vec<RoutedEvent>, &'static str> {
+        if matches!(sample.payload, Payload::Stylus { .. }) {
+            return self.stylus(sample);
+        }
+        let Payload::Mouse {
+            x,
+            y,
+            scroll_x,
+            scroll_y,
+        } = sample.payload
+        else {
+            return self
+                .process(sample)
+                .map(|event| event.into_iter().collect());
+        };
+        let Some(target) = self.targets.get(&sample.task).copied().filter(|target| {
+            target.display == sample.display && target.incarnation == sample.incarnation
+        }) else {
+            return Ok(Vec::new());
+        };
+        let meta = self.meta(sample.task);
+        let had_mouse = self.mice.contains_key(&sample.task);
+        let mouse = self.mice.entry(sample.task).or_default();
+        let delta = if had_mouse && sample.action == 1 {
+            (x - mouse.x, y - mouse.y)
+        } else {
+            (0.0, 0.0)
+        };
+        mouse.x = x;
+        mouse.y = y;
+        mouse.last_time = sample.timestamp.max(mouse.last_time);
+        let button = droidloom_input_protocol::mouse_button(sample.code).unwrap_or(0);
+        let mut actions = Vec::with_capacity(2);
+        match sample.action {
+            0 => actions.push((9, 0)), // HOVER_ENTER
+            1 => actions.push((if mouse.buttons == 0 { 7 } else { 2 }, 0)),
+            2 => {
+                if mouse.buttons != 0 {
+                    mouse.buttons = 0;
+                    actions.push((3, 0));
+                }
+                actions.push((10, 0)); // HOVER_EXIT
+            }
+            3 => {
+                if button == 0 || mouse.buttons & button != 0 {
+                    return Err("invalid or duplicate mouse press");
+                }
+                let first = mouse.buttons == 0;
+                mouse.buttons |= button;
+                if first {
+                    mouse.down_time = mouse.last_time;
+                    actions.push((0, 0)); // DOWN
+                }
+                actions.push((11, button)); // BUTTON_PRESS
+            }
+            4 => {
+                if button == 0 || mouse.buttons & button == 0 {
+                    return Ok(Vec::new());
+                }
+                mouse.buttons &= !button;
+                actions.push((12, button)); // BUTTON_RELEASE
+                if mouse.buttons == 0 {
+                    actions.push((1, 0)); // UP
+                }
+            }
+            5 => actions.push((8, 0)), // SCROLL
+            6 => {
+                if mouse.buttons != 0 {
+                    mouse.buttons = 0;
+                    actions.push((3, 0)); // CANCEL
+                }
+            }
+            _ => return Err("mouse action"),
+        }
+        let mut result = Vec::with_capacity(actions.len());
+        for (action, action_button) in actions {
+            let mut event = Self::mouse_event(target, mouse, action, action_button, meta);
+            // The fixed C ABI reserves a second pointer slot for wheel axes;
+            // count stays one and this slot never becomes an Android pointer.
+            event.pointers[1].x = scroll_x;
+            event.pointers[1].y = scroll_y;
+            event.pointers[2].x = delta.0;
+            event.pointers[2].y = delta.1;
+            result.push(RoutedEvent { target, event });
+        }
+        if matches!(sample.action, 2 | 6) {
+            self.mice.remove(&sample.task);
+        }
+        // Match Android's CursorInputMapper: side buttons produce navigation
+        // keys as well as button MotionEvents, including balanced cancellation.
+        let navigation: Vec<_> = if matches!(sample.action, 2 | 6) {
+            self.keys
+                .keys()
+                .filter_map(|(task, scan)| {
+                    (*task == sample.task && matches!(scan, 0x113..=0x116)).then_some(*scan)
+                })
+                .collect()
+        } else if matches!(sample.action, 3 | 4) && matches!(sample.code, 0x113..=0x116) {
+            vec![sample.code]
+        } else {
+            Vec::new()
+        };
+        for scan in navigation {
+            let key = Sample {
+                code: scan,
+                action: u8::from(sample.action != 3),
+                payload: Payload::Key {
+                    repeat: 0,
+                    serial: 0,
+                },
+                ..sample
+            };
+            result.push(RoutedEvent {
+                target,
+                event: self.key(key, 0, 0)?,
+            });
+        }
+        Ok(result)
+    }
+
+    fn stylus(&mut self, sample: Sample) -> Result<Vec<RoutedEvent>, &'static str> {
+        let Some(target) = self.targets.get(&sample.task).copied().filter(|target| {
+            target.display == sample.display && target.incarnation == sample.incarnation
+        }) else {
+            return Ok(Vec::new());
+        };
+        let Payload::Stylus {
+            x,
+            y,
+            pressure,
+            tilt_x,
+            tilt_y,
+            eraser,
+            buttons,
+        } = sample.payload
+        else {
+            return Err("stylus payload");
+        };
+        let meta = self.meta(sample.task);
+        let mut result = Vec::new();
+        if matches!(sample.action, 2 | 5) {
+            return Ok(
+                if self
+                    .pens
+                    .get(&sample.task)
+                    .is_some_and(|pen| pen.tool == sample.code)
+                {
+                    self.cancel_pen(target, sample.timestamp)
+                } else {
+                    Vec::new()
+                },
+            );
+        }
+        // An enter replaces the old tool, cancelling any unfinished stroke.
+        if sample.action != 0
+            && self
+                .pens
+                .get(&sample.task)
+                .is_some_and(|pen| pen.tool != sample.code)
+        {
+            return Ok(Vec::new());
+        }
+        if sample.action == 0 {
+            result.extend(self.cancel_pen(target, sample.timestamp));
+        }
+        if !self.pens.contains_key(&sample.task) {
+            if matches!(sample.action, 2 | 4 | 5 | 6) {
+                return Ok(result);
+            }
+            let event = Event {
+                kind: 8,
+                display: target.display,
+                count: 1,
+                ..Event::default()
+            };
+            self.pens.insert(
+                sample.task,
+                Pen {
+                    tool: sample.code,
+                    down: false,
+                    hovering: false,
+                    buttons: 0,
+                    down_time: sample.timestamp,
+                    last_time: sample.timestamp,
+                    event,
+                },
+            );
+        }
+        let pen = self.pens.get_mut(&sample.task).unwrap();
+        pen.last_time = pen.last_time.max(sample.timestamp);
+        pen.event.key_code = if eraser { 4 } else { 2 }; // Android ToolType.
+        pen.event.meta = meta;
+        pen.event.event_time = pen.last_time;
+        pen.event.pointers[0] = Pointer {
+            id: 0,
+            x: x + target.left as f32,
+            y: y + target.top as f32,
+            pressure: if pen.down { pressure } else { 0.0 },
+        };
+        // Additional axes occupy an unused C ABI slot, never a second pointer.
+        let tx = tilt_x.clamp(-89.999, 89.999).to_radians().tan();
+        let ty = tilt_y.clamp(-89.999, 89.999).to_radians().tan();
+        pen.event.pointers[1].x = tx.hypot(ty).atan();
+        pen.event.pointers[1].y = if tx == 0.0 && ty == 0.0 {
+            0.0
+        } else {
+            (-tx).atan2(ty)
+        };
+        let mut actions = Vec::new();
+        match sample.action {
+            0 => {
+                pen.hovering = true;
+                actions.push((9, 0));
+            }
+            1 => {
+                if !pen.down && !pen.hovering {
+                    pen.hovering = true;
+                    actions.push((9, 0));
+                }
+                actions.push((if pen.down { 2 } else { 7 }, 0));
+            }
+            2 | 5 => {
+                if pen.down {
+                    actions.push((3, 0));
+                    pen.down = false;
+                }
+                if pen.hovering {
+                    actions.push((10, 0));
+                    pen.hovering = false;
+                }
+            }
+            3 => {
+                if pen.down {
+                    actions.push((3, 0));
+                }
+                if pen.hovering {
+                    actions.push((10, 0));
+                    pen.hovering = false;
+                }
+                pen.down = true;
+                pen.down_time = pen.last_time;
+                actions.push((0, 0));
+            }
+            4 => {
+                if pen.down {
+                    pen.down = false;
+                    actions.push((1, 0));
+                }
+                if !pen.hovering {
+                    pen.hovering = true;
+                    actions.push((9, 0));
+                }
+            }
+            6 => {
+                for bit in [1, 2] {
+                    if (pen.buttons ^ buttons) & bit != 0 {
+                        actions.push((
+                            if buttons & bit != 0 { 11 } else { 12 },
+                            i32::from(bit) << 5,
+                        ));
+                    }
+                }
+            }
+            _ => return Err("stylus action"),
+        }
+        if sample.action == 6 {
+            pen.buttons = buttons;
+        }
+        for (action, button) in actions {
+            let mut event = pen.event;
+            event.action = action;
+            event.scan_code = button;
+            event.flags = i32::from(buttons) << 5;
+            event.down_time = if matches!(action, 7 | 9 | 10) {
+                pen.last_time
+            } else {
+                pen.down_time
+            };
+            event.pointers[0].pressure = if matches!(action, 0 | 2 | 11 | 12) && pen.down {
+                pressure
+            } else {
+                0.0
+            };
+            result.push(RoutedEvent { target, event });
+        }
+        if matches!(sample.action, 2 | 5) {
+            self.pens.remove(&sample.task);
+        }
+        Ok(result)
+    }
+
+    fn cancel_pen(&mut self, target: Target, now: u64) -> Vec<RoutedEvent> {
+        let Some(pen) = self.pens.remove(&target.task) else {
+            return Vec::new();
+        };
+        let mut event = pen.event;
+        event.down_time = pen.down_time;
+        event.event_time = now.max(pen.last_time);
+        event.pointers[0].pressure = 0.0;
+        event.flags = 0;
+        event.scan_code = 0;
+        let mut result = Vec::new();
+        if pen.down {
+            event.action = 3;
+            result.push(RoutedEvent { target, event });
+        }
+        if pen.hovering {
+            event.action = 10;
+            result.push(RoutedEvent { target, event });
+        }
+        result
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn mouse_event(target: Target, mouse: &Mouse, action: i32, button: u32, meta: i32) -> Event {
+        let mut event = Event {
+            kind: 7,
+            display: target.display,
+            action,
+            key_code: button as i32, // Mouse actionButton, not a key identity.
+            flags: mouse.buttons as i32, // Mouse buttonState, not key flags.
+            meta,
+            count: 1,
+            down_time: if mouse.buttons == 0 && matches!(action, 7..=10) {
+                mouse.last_time
+            } else {
+                mouse.down_time
+            },
+            event_time: mouse.last_time,
+            ..Event::default()
+        };
+        event.pointers[0] = Pointer {
+            id: 0,
+            x: mouse.x + target.left as f32,
+            y: mouse.y + target.top as f32,
+            pressure: f32::from(mouse.buttons != 0),
+        };
+        event
+    }
+
+
 
     fn suppress_touch(&mut self, sample: Sample) -> bool {
         let identity = (sample.task, sample.code);
@@ -174,6 +546,10 @@ impl Engine {
             if let Ok(scan_code) = u32::try_from(event.event.scan_code) {
                 self.keys.remove(&(event.target.task, scan_code));
             }
+        } else if event.event.kind == 8 {
+            self.pens.remove(&event.target.task);
+        } else if event.event.kind == 7 {
+            self.mice.remove(&event.target.task);
         }
     }
 
@@ -375,6 +751,16 @@ impl Engine {
             });
         }
         self.locks.remove(&task);
+        cancelled.extend(self.cancel_pen(target, now));
+        if let Some(mut mouse) = self.mice.remove(&task) {
+            let action = if mouse.buttons == 0 { 10 } else { 3 };
+            mouse.buttons = 0;
+            mouse.last_time = now.max(mouse.last_time);
+            cancelled.push(RoutedEvent {
+                target,
+                event: Self::mouse_event(target, &mouse, action, 0, self.meta(task)),
+            });
+        }
         cancelled
     }
 }
@@ -414,6 +800,351 @@ mod tests {
             action,
             ..touch(0, 0)
         }
+    }
+    fn pen(action: u8, tool: u32, eraser: bool, buttons: u8) -> Sample {
+        let record = droidloom_input_protocol::encode_stylus(
+            0,
+            42,
+            100,
+            7,
+            droidloom_input_protocol::Stylus {
+                tool,
+                action,
+                x_fixed: 3 << 16,
+                y_fixed: 5 << 16,
+                pressure: 32768,
+                tilt_x: 30,
+                tilt_y: -45,
+                eraser,
+                buttons,
+            },
+        )
+        .unwrap();
+        let droidloom_input_protocol::Record::Input(sample) =
+            droidloom_input_protocol::decode(&record).unwrap()
+        else {
+            panic!("pen sample")
+        };
+        sample
+    }
+
+    #[test]
+    fn native_pen_preserves_hover_stroke_eraser_and_axes() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        let enter = engine.process_batch(pen(0, 9, true, 0)).unwrap();
+        assert_eq!(
+            (
+                enter[0].event.kind,
+                enter[0].event.action,
+                enter[0].event.key_code
+            ),
+            (8, 9, 4)
+        );
+        assert_eq!(enter[0].event.pointers[0].pressure, 0.0);
+        let hover = engine.process_batch(pen(1, 9, true, 0)).unwrap();
+        assert_eq!(hover[0].event.action, 7);
+        assert!(hover[0].event.pointers[1].x > 0.0);
+        let down = engine.process_batch(pen(3, 9, true, 0)).unwrap();
+        assert_eq!(
+            down.iter().map(|r| r.event.action).collect::<Vec<_>>(),
+            [10, 0]
+        );
+        assert!((down[1].event.pointers[0].pressure - 0.5).abs() < 0.001);
+        assert_eq!(
+            engine.process_batch(pen(1, 9, true, 0)).unwrap()[0]
+                .event
+                .action,
+            2
+        );
+        let up = engine.process_batch(pen(4, 9, true, 0)).unwrap();
+        assert_eq!(
+            up.iter().map(|r| r.event.action).collect::<Vec<_>>(),
+            [1, 9]
+        );
+        assert_eq!(
+            engine.process_batch(pen(2, 9, true, 0)).unwrap()[0]
+                .event
+                .action,
+            10
+        );
+        assert!(engine.reset(200).is_empty());
+    }
+
+    #[test]
+    fn pen_route_retirement_cancels_only_its_own_stroke() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.publish(
+            Target {
+                task: 43,
+                token: 11,
+                ..target()
+            },
+            1,
+        );
+        engine.process_batch(pen(0, 9, false, 0)).unwrap();
+        engine.process_batch(pen(3, 9, false, 0)).unwrap();
+        engine
+            .process(Sample {
+                task: 43,
+                ..key(29, 0, 0)
+            })
+            .unwrap();
+        let cancelled = engine.retire(42, 7, 200);
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(
+            (
+                cancelled[0].target.token,
+                cancelled[0].event.kind,
+                cancelled[0].event.action
+            ),
+            (9, 8, 3)
+        );
+        assert_eq!(engine.reset(300)[0].target.task, 43);
+        assert!(
+            engine
+                .process_batch(pen(1, 9, false, 0))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pen_buttons_and_replaced_tools_do_not_leave_a_stroke_held() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.process_batch(pen(0, 9, false, 0)).unwrap();
+        engine.process_batch(pen(3, 9, false, 1)).unwrap();
+        let button = engine.process_batch(pen(6, 9, false, 1)).unwrap();
+        assert_eq!(
+            (
+                button[0].event.action,
+                button[0].event.scan_code,
+                button[0].event.flags
+            ),
+            (11, 32, 32)
+        );
+        let release = engine.process_batch(pen(6, 9, false, 0)).unwrap();
+        assert_eq!(
+            (release[0].event.action, release[0].event.scan_code),
+            (12, 32)
+        );
+        let replace = engine.process_batch(pen(0, 10, false, 0)).unwrap();
+        assert_eq!(
+            replace.iter().map(|r| r.event.action).collect::<Vec<_>>(),
+            [3, 9]
+        );
+        // Late proximity-out from the first tool must not cancel its successor.
+        assert!(
+            engine
+                .process_batch(pen(2, 9, false, 0))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(engine.reset(200)[0].event.action, 10);
+    }
+
+    #[test]
+    fn remote_keyboard_preserves_keypad_and_numlock_semantics() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        let lock = engine.process(key(69, 0, 0)).unwrap().unwrap().event;
+        assert_eq!((lock.key_code, lock.meta & 0x20_0000), (143, 0x20_0000));
+        engine.process(key(69, 1, 0)).unwrap();
+        for (scan, android) in [
+            (55, 155),
+            (71, 151),
+            (78, 157),
+            (82, 144),
+            (83, 158),
+            (98, 154),
+            (117, 161),
+        ] {
+            let event = engine.process(key(scan, 0, 0)).unwrap().unwrap().event;
+            assert_eq!(event.key_code, android);
+            assert_ne!(event.meta & 0x20_0000, 0);
+            engine.process(key(scan, 1, 0)).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_unmapped_vendor_key_does_not_cancel_a_remote_control_modifier() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.process(key(29, 0, 0)).unwrap();
+        assert!(engine.process(key(0x2ff, 0, 0)).unwrap().is_none());
+        assert!(engine.process(key(0x2ff, 1, 0)).unwrap().is_none());
+        let a = engine.process(key(30, 0, 0)).unwrap().unwrap().event;
+        assert_ne!(a.meta & 0x1000, 0);
+        assert_eq!(
+            engine
+                .process(key(29, 1, 0))
+                .unwrap()
+                .unwrap()
+                .event
+                .key_code,
+            113
+        );
+    }
+
+    fn mouse(action: u8, button: u32) -> Sample {
+        Sample {
+            action,
+            code: button,
+            payload: Payload::Mouse {
+                x: 2.5,
+                y: 3.0,
+                scroll_x: 0.5,
+                scroll_y: -1.0,
+            },
+            ..touch(0, 0)
+        }
+    }
+
+    #[test]
+    fn mouse_buttons_hover_wheel_and_release_keep_native_semantics() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        let hover = engine.process_batch(mouse(0, 0)).unwrap();
+        assert_eq!((hover[0].event.kind, hover[0].event.action), (7, 9));
+        assert_eq!(hover[0].event.down_time, 100);
+        let press = engine.process_batch(mouse(3, 0x110)).unwrap();
+        assert_eq!(
+            press.iter().map(|e| e.event.action).collect::<Vec<_>>(),
+            [0, 11]
+        );
+        assert_eq!(press[1].event.key_code, 1);
+        assert_eq!(
+            (press[0].event.pointers[0].x, press[0].event.pointers[0].y),
+            (32.5, 43.0)
+        );
+        let right = engine.process_batch(mouse(3, 0x111)).unwrap();
+        assert_eq!(
+            (right.len(), right[0].event.action, right[0].event.flags),
+            (1, 11, 3)
+        );
+        let motion = engine.process_batch(mouse(1, 0)).unwrap();
+        assert_eq!(motion[0].event.action, 2);
+        let scroll = engine.process_batch(mouse(5, 0)).unwrap();
+        assert_eq!(
+            (
+                scroll[0].event.action,
+                scroll[0].event.pointers[1].x,
+                scroll[0].event.pointers[1].y
+            ),
+            (8, 0.5, -1.0)
+        );
+        let left_up = engine.process_batch(mouse(4, 0x110)).unwrap();
+        assert_eq!(
+            (
+                left_up.len(),
+                left_up[0].event.action,
+                left_up[0].event.flags
+            ),
+            (1, 12, 2)
+        );
+        let right_up = engine.process_batch(mouse(4, 0x111)).unwrap();
+        assert_eq!(
+            right_up.iter().map(|e| e.event.action).collect::<Vec<_>>(),
+            [12, 1]
+        );
+        assert_eq!(
+            engine.process_batch(mouse(1, 0)).unwrap()[0].event.action,
+            7
+        );
+        assert_eq!(
+            engine.process_batch(mouse(2, 0)).unwrap()[0].event.action,
+            10
+        );
+    }
+
+    #[test]
+    fn mouse_disconnect_and_rebinding_cancel_only_the_owning_task() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.process_batch(mouse(3, 0x112)).unwrap();
+        engine.publish(
+            Target {
+                task: 43,
+                token: 10,
+                ..target()
+            },
+            1,
+        );
+        engine
+            .process(Sample {
+                task: 43,
+                ..key(30, 0, 0)
+            })
+            .unwrap();
+        let cancelled = engine.publish(
+            Target {
+                incarnation: 8,
+                token: 11,
+                ..target()
+            },
+            200,
+        );
+        assert_eq!(
+            (
+                cancelled.len(),
+                cancelled[0].event.kind,
+                cancelled[0].event.action
+            ),
+            (1, 7, 3)
+        );
+        assert_eq!(cancelled[0].target.token, 9);
+        assert!(engine.process_batch(mouse(3, 0x110)).unwrap().is_empty());
+        let remaining = engine.reset(300);
+        assert_eq!(
+            (
+                remaining.len(),
+                remaining[0].target.task,
+                remaining[0].event.kind
+            ),
+            (1, 43, 2)
+        );
+    }
+
+    #[test]
+    fn mouse_relative_motion_and_side_navigation_balance_on_leave() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.process_batch(mouse(0, 0)).unwrap();
+        let moved = engine
+            .process_batch(Sample {
+                payload: Payload::Mouse {
+                    x: 5.0,
+                    y: 7.0,
+                    scroll_x: 0.0,
+                    scroll_y: 0.0,
+                },
+                ..mouse(1, 0)
+            })
+            .unwrap();
+        assert_eq!(
+            (moved[0].event.pointers[2].x, moved[0].event.pointers[2].y),
+            (2.5, 4.0)
+        );
+        let back = engine.process_batch(mouse(3, 0x113)).unwrap();
+        assert_eq!(
+            (
+                back[2].event.kind,
+                back[2].event.key_code,
+                back[2].event.action
+            ),
+            (2, 4, 0)
+        );
+        let leave = engine.process_batch(mouse(2, 0)).unwrap();
+        assert_eq!(
+            leave
+                .iter()
+                .map(|event| (event.event.kind, event.event.action))
+                .collect::<Vec<_>>(),
+            [(7, 3), (7, 10), (2, 1)]
+        );
+        assert!(engine.reset(200).is_empty());
     }
     #[test]
     fn multi_touch_indices_and_bounds_follow_the_same_live_task() {
