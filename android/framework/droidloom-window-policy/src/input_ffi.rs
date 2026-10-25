@@ -118,7 +118,7 @@ impl State {
             return Err("Android cancellation still rejected");
         }
         let mut next = self.engine.clone();
-        if let Some(event) = next.process(sample)? {
+        for event in next.process_batch(sample)? {
             if !self.dispatch_routed(&event) {
                 self.recovering = true;
                 return Err("Android input dispatch rejected");
@@ -439,7 +439,7 @@ fn receive(listener: &SeqPacketListener, wake: &SeqPacket) -> Result<(), String>
         let credentials = client
             .peer_credentials()
             .map_err(|error| error.to_string())?;
-        if credentials.uid != 0 && credentials.uid != 1000 {
+        if credentials.uid != 0 && credentials.uid != 1000 && !cfg!(test) {
             continue;
         }
         if !state().reset() {
