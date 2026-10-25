@@ -54,6 +54,8 @@ inputflinger_binder_patch="$repo_root/android/inputflinger/0002-droidloom-target
 inputflinger_binder_patch_applied=false
 inputflinger_policy_patch="$repo_root/android/inputflinger/0003-droidloom-window-policy.patch"
 inputflinger_policy_patch_applied=false
+inputflinger_native_patch="$repo_root/android/inputflinger/0004-droidloom-native-input.patch"
+inputflinger_native_patch_applied=false
 binder_context_manager_patch="$repo_root/android/binder-compat/0001-droidloom-context-manager-without-kernel-sid.patch"
 binder_context_manager_patch_applied=false
 servicemanager_context_patch="$repo_root/android/binder-compat/0002-droidloom-servicemanager-pid-context-fallback.patch"
@@ -186,6 +188,9 @@ cleanup() {
     fi
     if [[ "$task_backend_patch_applied" == true ]]; then
         git -C "$frameworks_base_checkout" apply -R "$task_backend_patch"
+    fi
+    if [[ "$inputflinger_native_patch_applied" == true ]]; then
+        git -C "$frameworks_native_checkout" apply -R "$inputflinger_native_patch"
     fi
     if [[ "$inputflinger_policy_patch_applied" == true ]]; then
         git -C "$frameworks_native_checkout" apply -R "$inputflinger_policy_patch"
@@ -422,6 +427,9 @@ inputflinger_binder_patch_applied=true
 git -C "$frameworks_native_checkout" apply --check "$inputflinger_policy_patch"
 git -C "$frameworks_native_checkout" apply "$inputflinger_policy_patch"
 inputflinger_policy_patch_applied=true
+git -C "$frameworks_native_checkout" apply --check "$inputflinger_native_patch"
+git -C "$frameworks_native_checkout" apply "$inputflinger_native_patch"
+inputflinger_native_patch_applied=true
 git -C "$source_tree" apply --check "$init_cell_patch"
 git -C "$source_tree" apply "$init_cell_patch"
 init_cell_patch_applied=true

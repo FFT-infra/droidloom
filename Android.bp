@@ -29,7 +29,11 @@ rust_ffi_static {
 
 filegroup {
     name: "droidloom-task-jni-sources",
-    srcs: ["android/framework/droidloom-window-policy/jni/*.cpp"],
+    srcs: [
+        "android/framework/droidloom-window-policy/jni/DroidloomFrameworkNative.cpp",
+        "android/framework/droidloom-window-policy/jni/DroidloomInput.cpp",
+        "android/framework/droidloom-window-policy/jni/DroidloomTaskNative.cpp",
+    ],
     visibility: ["//frameworks/native/services/inputflinger"],
 }
 
