@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "purpose": "Upstream Droidloom base and AOSP patch set this device layer is maintained against",
+  "upstream": {
+    "url": "https://github.com/denialwm/droidloom",
+    "commit": "a4fd422f65f27116c516c448f3a6e1df943478e7",
+    "committed_at": "2026-11-05T12:44:21+01:00"
+  },
+  "aosp": {
+    "tag": "android-17.0.0_r1",
+    "commit": "5bc9a7ce1cd78dd53613bbfd0ebf506e1e4adb0f",
+    "ci_build_id": "CP2A.260605.016",
+    "ci_build_number": "15885347",
+    "security_patch": "2026-06-05"
+  },
+  "patches": [
+    {
+      "path": "android/aosp-patches/0001-netbpfload-tolerate-shared-kernel-bpf-ids.patch",
+      "sha256": "eae002e9858dc976f494f9d29783b42f8cad8ed0fd3326a26d28d7906b7a9b78"
+    },
+    {
+      "path": "android/aosp-patches/0002-audio-default-only-service.patch",
+      "sha256": "b9308deaa6c92e71e474ab4a6fa7b51dc25ca80ba0943fccbad308804761d7f2"
+    },
+    {
+      "path": "android/aosp-patches/0003-connectivity-offline-rcu.patch",
+      "sha256": "3a09e7169467b08774495e36ba1775f76bbada5ddc1c2771ec8736cc75bc588b"
+    },
+    {
+      "path": "android/aosp-patches/0004-libmeminfo-offline-gpu-accounting.patch",
+      "sha256": "e0c39f6ab165a66e8bbbbbcbc88e29a22dda75046ec217c382978bdfa814c401"
+    },
+    {
+      "path": "android/aosp-patches/0005-frameworks-base-vendor-only-ext.patch",
+      "sha256": "b697a5a08dab7892b6616b6ba5c0340cf0fb864210fc53aeb605bb84024658a7"
+    },
+    {
+      "path": "android/aosp-patches/0006-netd-cell-kernel-policy.patch",
+      "sha256": "022fd1fdff7a7afab6cc21226a37a314e44681a255d12f344ce2893c8b063ec7"
+    },
+    {
+      "path": "android/aosp-patches/0007-minigbm-amdgpu-platform.patch",
+      "sha256": "e7afa3f6bc1d7057b838c6d095769c95e3661afbc7524e09ae59bfb804bd8b77"
+    },
+    {
+      "path": "android/aosp-patches/0008-vold-preserve-shared-storage-submounts.patch",
+      "sha256": "5dba63d68cf5fc48d5512bd1e65753f46323e635b3847f44c4e124a7843575ba"
+    },
+    {
+      "path": "android/aosp-patches/0009-netd-bpf-pid-namespace.patch",
+      "sha256": "6dfab46afc470ae8636cda323f63e1cbfdedd47ed083090b038b70ef187f1c05"
+    },
+    {
+      "path": "android/aosp-patches/0010-minigbm-dma-heap-images.patch",
+      "sha256": "0eb4b7e523e9cb92f95ea73567b82ce8969651a79e269188a4a8b6bc245d7f8d"
+    },
+    {
+      "path": "android/aosp-patches/0011-mesa-zink-kgsl.patch",
+      "sha256": "3d3e064080640b21e9852210c57c62201677530f32647c0b85e22b5be33d4b02"
+    },
+    {
+      "path": "android/aosp-patches/0012-mesa-adreno722.patch",
+      "sha256": "e29a0ad3a534e8458ac15f6ca0d5c88e640daa819287ee02d105e410844d478e"
+    },
+    {
+      "path": "android/aosp-patches/0013-mesa-texture-upload-span.patch",
+      "sha256": "ae8376e56f8d380f37634b1b87a263f2627db157024c50e3066488d55d194ea1"
+    },
+    {
+      "path": "android/aosp-patches/0014-mesa-background-cpu-placement.patch",
+      "sha256": "3434b82569b1bfd7ede82b5880fee094b42d8ad9e3a31b429a6a15fa57e707c7"
+    },
+    {
+      "path": "android/aosp-patches/0015-libdrm-empty-version-strings.patch",
+      "sha256": "9d3c7ed2f6e3a773084904b063377707a5c6feac928d4608401d615bb7bfbfad"
+    },
+    {
+      "path": "android/aosp-patches/0015-v4l2-codec2-zero-unknown-dimensions.patch",
+      "sha256": "4d909d6afe7d6eb561ff4d36e442f171948001fc7acdae35425822de31e2dd77"
+    },
+    {
+      "path": "android/aosp-patches/0016-mesa-turnip-hwui-queues.patch",
+      "sha256": "4d9bf5386a55619602cdb10071c5868f0456c9f7f6da237dc2e03ab767de1f87"
+    },
+    {
+      "path": "android/aosp-patches/0017-build-hwui-vulkan-unset.patch",
+      "sha256": "b932832d6d177bd401ed985270841465c640fe21825a24362a7a49c9c24d6f3a"
+    },
+    {
+      "path": "android/aosp-patches/0018-mesa-ir3-alias-array-sources.patch",
+      "sha256": "69ae82f03af9171b65b6e457c6627fb3b074f85bd682e94f1149140ed374a016"
+    },
+    {
+      "path": "android/aosp-patches/0018-v4l2-codec2-drc-output-reconfigure.patch",
+      "sha256": "6511c2dc9a63d0da15f3871a7efd2249c8f150cc2ec44425ea81113c0b10d977"
+    },
+    {
+      "path": "android/aosp-patches/0019-mesa-turnip-a722-no-bv.patch",
+      "sha256": "70a7d9115b6208c88d3910c16804d953116fd454657331586ba89b041d6b0b29"
+    },
+    {
+      "path": "android/aosp-patches/0019-v4l2-codec2-gralloc-dmabuf-identity.patch",
+      "sha256": "b0a8be603a2e3f21b6621323dfc7493ad86ceba3fa42bf0766b712c09b90ef2b"
+    },
+    {
+      "path": "android/aosp-patches/0020-v4l2-codec2-guard-unmapped-capture-buffer.patch",
+      "sha256": "f4e3ee12017d698f69bca2340068f782da2d867b42b210864f8a492422944e31"
+    },
+    {
+      "path": "android/aosp-patches/0021-v4l2-codec2-recycle-initial-eos-buffer.patch",
+      "sha256": "0e6b6cf305327f43b35fc0db9a353260cbd4b3abbf60189686476e1ca802d8d2"
+    },
+    {
+      "path": "android/aosp-patches/0024-v4l2-codec2-igba-surface-output.patch",
+      "sha256": "d5910b1dabef5220f03fd862e44314368882b5ffb7ca6144801bb9d46837524b"
+    },
+    {
+      "path": "android/aosp-patches/0025-v4l2-codec2-query-required-input-buffer-size.patch",
+      "sha256": "3fa54cc77b5d397c8218e1cd98ff90818799763b6ece60a8cf96d8448f9fa9b4"
+    },
+    {
+      "path": "android/aosp-patches/0027-v4l2-codec2-av1-decoder.patch",
+      "sha256": "f26155151fe9745ec500294ca5197348084606e7845cee0210a192e39606e226"
+    },
+    {
+      "path": "android/aosp-patches/0028-v4l2-codec2-keep-input-buffer-size-floor.patch",
+      "sha256": "fa8a02b100e942cc04d29a4f2754dd4db77d90c625f226a9465661ea3278e9d7"
+    },
+    {
+      "path": "android/aosp-patches/0033-static-virtual-accelerometer.patch",
+      "sha256": "73eaa54c7796127cd48ddba89530e893dd0d49dbc0e0d2b354feb2878a2f94f3"
+    },
+    {
+      "path": "android/aosp-patches/0035-keymint-allow-extended-attestation-challenge.patch",
+      "sha256": "7f192b73de02bb64e67810a5a6a4d12ef8b9ad3677485067e98e7f88ac124580"
+    }
+  ]
+}
