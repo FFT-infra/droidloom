@@ -106,7 +106,7 @@ existing targeted InputDispatcher path. WMS publishes bounds and application
 tokens on changes, outside its global lock. This removes per-event task-bounds
 Binder queries, Java event conversion and the bridge-to-InputFlinger event-parcel
 transaction. Task/token replacement and disconnects cancel active input before
-releasing the old Binder token. Input ABI 7 and native input ABI 2 are checked
+releasing the old Binder token. Input ABI 9 and native input ABI 2 are checked
 across the compiled peers. The framework policy starts the listener and handles
 infrequent power effects on its existing handler.
 

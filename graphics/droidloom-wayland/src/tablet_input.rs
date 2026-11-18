@@ -213,7 +213,7 @@ impl App {
     }
 
     pub(super) fn cancel_tablet_tool(&mut self, tool_id: u32) {
-        if self.direct_input.supports_mouse() {
+        if self.direct_input.supports_stylus() {
             let _ = self.send_native_pen(tool_id, 5);
         }
         let (surface, is_down) = {
@@ -225,7 +225,7 @@ impl App {
             (surface, is_down)
         };
         if is_down
-            && !self.direct_input.supports_mouse()
+            && !self.direct_input.supports_stylus()
             && let Some(surface) = surface
             && let Some(object) = self.task_for_surface(&surface)
         {
@@ -250,7 +250,7 @@ impl App {
         if !self.tablet_tool_mut(tool_id).supported {
             return;
         }
-        if self.direct_input.supports_mouse() {
+        if self.direct_input.supports_stylus() {
             self.flush_native_pen(tool_id);
             return;
         }
@@ -600,7 +600,7 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 tool.dirty_motion = true;
             }
             tablet::zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
-                if state.direct_input.supports_mouse() {
+                if state.direct_input.supports_stylus() {
                     state.cancel_tablet_tool(tool_id);
                 }
                 if let Some(object) = state.task_for_surface(&surface) {
@@ -671,7 +671,7 @@ impl Dispatch<ZwpTabletToolV2, ()> for App {
                 state: button_state,
                 ..
             } => {
-                if state.direct_input.supports_mouse() && matches!(button, 0x14b | 0x14c) {
+                if state.direct_input.supports_stylus() && matches!(button, 0x14b | 0x14c) {
                     let bit = if button == 0x14b { 1 } else { 2 };
                     let fallback_surface = state
                         .tablet_tools

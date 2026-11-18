@@ -35,7 +35,7 @@ path. The builder permits only its existing Binder virtual override in
 creation, permissions, shutdown and stale-socket cleanup in a system-private
 directory. A restarted system_server starts its own listener again.
 
-The receiver validates input ABI 7 and rejects stale incarnations. It sleeps in
+The receiver validates input ABI 9 and rejects stale incarnations. It sleeps in
 socket polling at idle, cancels keys/gestures on disconnect or route retirement,
 and retains Binder tokens through cancellation dispatch. Native input ABI 2
 metadata prevents mixed framework/Composer builds. The Wayland presenter writes
