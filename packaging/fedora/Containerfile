@@ -1,0 +1,13 @@
+FROM registry.fedoraproject.org/fedora:45
+RUN ["dnf", "install", "-y", "--setopt=install_weak_deps=False", \
+     "rust", "cargo", "gcc", "gcc-c++", "git", "rsync", "curl", "unzip", "zip", \
+     "meson", "ninja-build", "pkgconf-pkg-config", "llvm-devel", "clang", "clang-devel", \
+     "glslang", "spirv-llvm-translator-devel", "spirv-tools-devel", "expat-devel", \
+     "bison", "flex", "android-tools", "erofs-utils", "e2fsprogs", "fakeroot", "attr", \
+     "python3", "python3-pyyaml", "python3-mako", "ccache", "mesa-libgbm-devel", \
+     "libdrm-devel", "wayland-devel", "libxkbcommon-devel", "pipewire-devel", \
+     "rpm-build", "checkpolicy", "policycoreutils", "policycoreutils-devel", \
+     "tar", "zstd", "libarchive"]
+RUN ["dnf", "clean", "all"]
+ENV CARGO_HOME=/build/cargo-home
+WORKDIR /source

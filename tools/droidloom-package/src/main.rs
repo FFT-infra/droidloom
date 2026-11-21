@@ -1,6 +1,7 @@
 //! Rust orchestration around makepkg's standard package interface.
 mod base;
 mod components;
+mod fedora;
 mod runner;
 mod shipping;
 mod validation;
@@ -91,6 +92,42 @@ enum Action {
         /// Optional older package pair for real upgrade/downgrade transactions.
         #[arg(long)]
         previous: Option<PathBuf>,
+    },
+    /// Compile the complete runtime and produce Fedora RPM packages in a rootless Fedora builder.
+    BuildRpm {
+        #[arg(long, value_enum)]
+        architecture: Option<Architecture>,
+        /// ARM64 root filesystem providing the native libraries aarch64 links against.
+        #[arg(long)]
+        sysroot: Option<PathBuf>,
+        /// Reuse an existing package-stage payload (runtime/ and image/) and rebuild host binaries for Fedora.
+        #[arg(long)]
+        payload: Option<PathBuf>,
+        #[arg(long)]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Pin the container to a CPU subset (requires rootless cpuset delegation).
+        #[arg(long)]
+        cpuset: bool,
+        /// Remove this workflow's compiler outputs while retaining downloaded inputs.
+        #[arg(long)]
+        clean: bool,
+        /// Seed the source cache from an existing sparse AOSP checkout (never binaries).
+        #[arg(long)]
+        source_cache: Option<PathBuf>,
+        /// Build Teto directly from a local Git checkout, including edits.
+        #[arg(long)]
+        native_bridge_source: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    InFedoraContainer {
+        #[arg(long, value_enum, default_value = "x86_64")]
+        architecture: Architecture,
+        #[arg(long)]
+        jobs: usize,
+        #[arg(long)]
+        clean: bool,
     },
     #[command(hide = true)]
     InContainer {
@@ -305,6 +342,28 @@ fn build_workspace(repo: &Path) -> Result<PathBuf> {
     }
     Ok(work)
 }
+fn copy_download_archives(repo: &Path, snapshot: &Path) -> Result<()> {
+    // Download archives are inputs, not installed runtime artifacts. Copy them only
+    // when absent; the existing upstream-input preparation handles their cache.
+    fs::create_dir_all(snapshot.join(".work"))?;
+    if let Ok(entries) = fs::read_dir(repo.join(".work")) {
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_file()
+                && ((name.starts_with("aosp_cf_") && name.ends_with(".zip"))
+                    || (name.starts_with("mesa-") && name.ends_with(".tar.xz")))
+            {
+                let destination = snapshot.join(".work").join(entry.file_name());
+                if !destination.exists() {
+                    fs::copy(entry.path(), destination)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 fn copy_inputs(repo: &Path, snapshot: &Path) -> Result<()> {
     fs::create_dir_all(snapshot)?;
     let mut command = Command::new("rsync");
@@ -427,25 +486,7 @@ fn build(
         seed_sources(&seed, temporary.path(), Path::new(""))?;
         fs::rename(temporary.path(), &destination)?;
     }
-    // Download archives are inputs, not installed runtime artifacts. Copy them only
-    // when absent; the existing upstream-input preparation handles their cache.
-    fs::create_dir_all(snapshot.join(".work"))?;
-    if let Ok(entries) = fs::read_dir(repo.join(".work")) {
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if entry.file_type()?.is_file()
-                && ((name.starts_with("aosp_cf_") && name.ends_with(".zip"))
-                    || (name.starts_with("mesa-") && name.ends_with(".tar.xz")))
-            {
-                let destination = snapshot.join(".work").join(entry.file_name());
-                if !destination.exists() {
-                    fs::copy(entry.path(), destination)?;
-                }
-            }
-        }
-    }
+    copy_download_archives(&repo, &snapshot)?;
     let output = version.output(&repo);
     fs::create_dir_all(&output)?;
     if fs::read_dir(&output)?
@@ -1010,6 +1051,32 @@ fn execute() -> Result<()> {
             source,
         } => candidate(source, &payload, &destination, &work),
         Action::Check { packages, previous } => validation::check(&packages, previous.as_deref()),
+        Action::BuildRpm {
+            architecture,
+            sysroot,
+            payload,
+            source,
+            jobs,
+            cpuset,
+            clean,
+            source_cache,
+            native_bridge_source,
+        } => fedora::build_rpm(
+            source,
+            architecture,
+            sysroot,
+            payload,
+            jobs,
+            cpuset,
+            clean,
+            source_cache,
+            native_bridge_source,
+        ),
+        Action::InFedoraContainer {
+            architecture,
+            jobs,
+            clean,
+        } => fedora::in_fedora_container(architecture, jobs, clean),
         Action::InContainer {
             architecture,
             jobs,

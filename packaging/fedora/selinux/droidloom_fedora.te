@@ -1,0 +1,30 @@
+module droidloom_fedora 1.1;
+
+require {
+    type unconfined_service_t;
+    type unconfined_t;
+    type unlabeled_t;
+    type tmpfs_t;
+    type var_lib_t;
+    type devpts_t;
+    type proc_t;
+    type sysfs_t;
+    type cgroup_t;
+    class binder { call impersonate set_context_mgr transfer };
+    class capability2 { mac_admin mac_override };
+    class file { entrypoint };
+    class filesystem { associate };
+}
+
+allow unconfined_service_t self:binder { call impersonate set_context_mgr transfer };
+allow unconfined_t self:binder { call impersonate set_context_mgr transfer };
+allow unconfined_service_t unconfined_t:binder { call impersonate set_context_mgr transfer };
+allow unconfined_t unconfined_service_t:binder { call impersonate set_context_mgr transfer };
+
+allow unconfined_service_t self:capability2 { mac_admin mac_override };
+allow unconfined_t self:capability2 { mac_admin mac_override };
+
+allow unconfined_service_t { unlabeled_t tmpfs_t var_lib_t }:file entrypoint;
+allow unconfined_t { unlabeled_t tmpfs_t var_lib_t }:file entrypoint;
+
+allow unlabeled_t { devpts_t proc_t sysfs_t cgroup_t }:filesystem associate;
