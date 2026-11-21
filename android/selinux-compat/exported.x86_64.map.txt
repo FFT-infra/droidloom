@@ -1,3 +1,11 @@
+LIBC {
+  global:
+    open;
+    open64;
+    openat;
+    openat64;
+};
+
 LIBSELINUX_R {
   global:
     fgetfilecon;

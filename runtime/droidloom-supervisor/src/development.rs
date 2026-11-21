@@ -1446,6 +1446,7 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     bind_mount(&network_sysctls, &network_sysctls, false)?;
     remount(&network_sysctls, "bind,rw,nosuid,nodev,noexec")?;
     project_private_bpf_sysctls(spec, root)?;
+    project_host_kernel_config(root)?;
 
     // Do not expose the host sysfs device tree. ueventd coldboot would
     // otherwise recreate nodes for every host disk in Android's private /dev.
@@ -1475,6 +1476,31 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     let render_metadata = read_render_node_sysfs_metadata(&spec.render_node)?;
     publish_render_node_sysfs_metadata(&sys, &render_metadata)?;
     remount(&sys, "ro,nosuid,nodev,noexec")
+}
+
+fn project_host_kernel_config(root: &Path) -> Result<(), DevelopmentError> {
+    if Path::new("/proc/config.gz").exists() {
+        return Ok(());
+    }
+    let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        return Ok(());
+    };
+    let release = release.trim();
+    if release.is_empty() || release.contains('/') {
+        return Ok(());
+    }
+    let host_config = PathBuf::from(format!("/boot/config-{release}"));
+    if !fs::metadata(&host_config).is_ok_and(|meta| meta.is_file()) {
+        return Ok(());
+    }
+    let target = root.join("droidloom/proc-config.gz");
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|source| io_error("create /droidloom for kernel config fallback", source))?;
+    }
+    fs::File::create(&target)
+        .map_err(|source| io_error("create kernel config fallback mount point", source))?;
+    bind_mount(&host_config, &target, true)
 }
 
 // Bionic reads the CPU masks for get_nprocs()/sysconf; Unity also classifies

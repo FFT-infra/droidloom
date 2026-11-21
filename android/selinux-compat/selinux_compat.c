@@ -8,7 +8,9 @@
 #include <selinux/android.h>
 #include <selinux/selinux.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +21,75 @@
 static const char kProcessContext[] = "u:r:droidloom_unconfined:s0";
 static const char kServiceContext[] = "u:r:droidloom_service:s0";
 static const char kFileContext[] = "u:object_r:system_file:s0";
-#if defined(__aarch64__)
 static const char kCellMarker[] = "DROIDLOOM_CELL";
+static const char kProcConfigGz[] = "/proc/config.gz";
+static const char kDroidloomProcConfigGz[] = "/droidloom/proc-config.gz";
+
+/*
+ * Distributions such as Fedora omit CONFIG_IKCONFIG_PROC (/proc/config.gz) and
+ * ship the kernel configuration in /boot/config-<release>. The supervisor
+ * projects that file read-only at /droidloom/proc-config.gz; libvintf reads it
+ * through zlib's gzopen(), which transparently accepts uncompressed input.
+ */
+static int openat_with_config_fallback(int dirfd, const char *path, int flags,
+                                       mode_t mode) {
+  int fd = (int)syscall(__NR_openat, dirfd, path, flags, mode);
+  if (fd < 0 && errno == ENOENT && path != NULL &&
+      strcmp(path, kProcConfigGz) == 0 && getenv(kCellMarker) != NULL) {
+    int fallback = (int)syscall(__NR_openat, AT_FDCWD, kDroidloomProcConfigGz,
+                                flags, mode);
+    if (fallback >= 0) {
+      return fallback;
+    }
+    errno = ENOENT;
+  }
+  return fd;
+}
+
+static mode_t extract_open_mode(int flags, va_list *args) {
+  if ((flags & O_CREAT) != 0
+#ifdef O_TMPFILE
+      || (flags & O_TMPFILE) == O_TMPFILE
+#endif
+  ) {
+    return (mode_t)va_arg(*args, int);
+  }
+  return 0;
+}
+
+int open(const char *path, int flags, ...) {
+  va_list args;
+  va_start(args, flags);
+  mode_t mode = extract_open_mode(flags, &args);
+  va_end(args);
+  return openat_with_config_fallback(AT_FDCWD, path, flags, mode);
+}
+
+int open64(const char *path, int flags, ...) {
+  va_list args;
+  va_start(args, flags);
+  mode_t mode = extract_open_mode(flags, &args);
+  va_end(args);
+  return openat_with_config_fallback(AT_FDCWD, path, flags, mode);
+}
+
+int openat(int dirfd, const char *path, int flags, ...) {
+  va_list args;
+  va_start(args, flags);
+  mode_t mode = extract_open_mode(flags, &args);
+  va_end(args);
+  return openat_with_config_fallback(dirfd, path, flags, mode);
+}
+
+int openat64(int dirfd, const char *path, int flags, ...) {
+  va_list args;
+  va_start(args, flags);
+  mode_t mode = extract_open_mode(flags, &args);
+  va_end(args);
+  return openat_with_config_fallback(dirfd, path, flags, mode);
+}
+
+#if defined(__aarch64__)
 static const char kProcSelfFdPrefix[] = "/proc/self/fd/";
 static const char kSyntheticRootPrefix[] = "/newroot";
 
