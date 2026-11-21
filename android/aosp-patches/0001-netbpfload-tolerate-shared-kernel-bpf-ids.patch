@@ -100,7 +100,7 @@ index 70991eb..7b2a1fc 100644
  #define ALOGF(s ...) do { ALOGE(s); fatal = true; } while(0)
  
  enum verify { VERIFY_DIR, VERIFY_BIN, VERIFY_PROG, VERIFY_MAP_RO, VERIFY_MAP_RW };
-@@ -70,8 +75,16 @@ static void verifyPerms(const char * const path,
+@@ -70,8 +75,21 @@ static void verifyPerms(const char * const path,
  
      char b[255] = {};
      int v = lgetxattr(path, "security.selinux", &b, sizeof(b));
@@ -114,7 +114,12 @@ index 70991eb..7b2a1fc 100644
 +            ALOGF("lgetxattr '%s' errno=%d", path, errno);
 +        }
 +    } else if (strncmp(ctxt, b, sizeof(b))) {
-+        ALOGF("context of '%s' is '%s' != '%s'", path, b, ctxt);
++        if (isDroidloomCell()) {
++            ALOGI("Droidloom cell: SELinux context '%s' on '%s' differs from Android '%s'; preserving other checks",
++                  b, path, ctxt);
++        } else {
++            ALOGF("context of '%s' is '%s' != '%s'", path, b, ctxt);
++        }
 +    }
  
      int fd = -1;
