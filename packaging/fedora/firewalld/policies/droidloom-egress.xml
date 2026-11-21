@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policy target="ACCEPT">
+  <short>Droidloom Outbound</short>
+  <description>Allow outbound forwarding from Droidloom Android cell zone.</description>
+  <ingress-zone name="droidloom"/>
+  <egress-zone name="ANY"/>
+</policy>

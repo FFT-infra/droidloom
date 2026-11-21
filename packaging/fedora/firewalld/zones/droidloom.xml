@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<zone target="DROP">
+  <short>Droidloom</short>
+  <description>Private veth zone for Droidloom Android cell.</description>
+  <interface name="dlh+"/>
+  <source address="10.177.0.0/30"/>
+</zone>
