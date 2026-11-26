@@ -55,6 +55,13 @@ To reuse an already-staged `droidloom-update package-stage` directory (recompili
 cargo run --locked -j 1 -p droidloom-package -- build-rpm --payload /path/to/package-stage
 ```
 
+A payload for the other architecture is packaged as it is: nothing is compiled, so the RPMs carry the host programs the payload came with. Upstream's published pacman packages, unpacked into `runtime/`, `image/` and `base/`, make such a payload. `--fedora-release` picks the builder container's Fedora release and with it the RPMs' dist tag:
+
+```sh
+cargo run --locked -j 1 -p droidloom-package -- build-rpm --architecture aarch64 \
+  --payload /path/to/payload --fedora-release 44
+```
+
 Built RPMs are written to `dist/fedora/<version>-<release>/<arch>/`. Install both packages on the host with `sudo dnf install ...`, then configure desktop-mode sizing:
 
 ```sh

@@ -85,6 +85,7 @@ pub fn build_rpm(
     architecture: Option<Architecture>,
     sysroot: Option<PathBuf>,
     payload: Option<PathBuf>,
+    fedora_release: Option<u32>,
     requested: Option<usize>,
     cpuset: bool,
     clean: bool,
@@ -204,6 +205,11 @@ pub fn build_rpm(
     build_image.arg("build");
     if host_network {
         build_image.arg("--network=host");
+    }
+    if let Some(release) = fedora_release {
+        build_image
+            .arg("--build-arg")
+            .arg(format!("FEDORA_RELEASE={release}"));
     }
     build_image
         .args(["--tag", FEDORA_BUILDER_IMAGE, "--file"])
@@ -355,10 +361,17 @@ pub fn in_fedora_container(architecture: Architecture, jobs: usize, clean: bool)
     let payload_stage = staging.join("payload");
     if let Some(prebuilt) = std::env::var_os("DROIDLOOM_PREBUILT_PAYLOAD") {
         install_tree(Path::new(&prebuilt), &payload_stage)?;
-        if architecture.name() != std::env::consts::ARCH {
-            return Err("cross-compiling Fedora host binaries with --payload is not supported; run natively on the target architecture".into());
+        if architecture.name() == std::env::consts::ARCH {
+            compile_host_binaries(repo, work, jobs, &payload_stage.join("runtime"))?;
+        } else {
+            // Nothing here can compile for the other architecture. The host
+            // programs the payload came with are packaged as they are; they
+            // need a glibc at least as new as the one they were linked against.
+            eprintln!(
+                "Packaging the payload's own {} host programs",
+                architecture.name()
+            );
         }
-        compile_host_binaries(repo, work, jobs, &payload_stage.join("runtime"))?;
     } else {
         run(Command::new("cargo")
             .current_dir(repo)
