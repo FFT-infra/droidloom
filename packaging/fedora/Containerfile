@@ -1,4 +1,5 @@
-FROM registry.fedoraproject.org/fedora:45
+ARG FEDORA_RELEASE=45
+FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE}
 RUN ["dnf", "install", "-y", "--setopt=install_weak_deps=False", \
      "rust", "cargo", "gcc", "gcc-c++", "git", "rsync", "curl", "unzip", "zip", \
      "meson", "ninja-build", "pkgconf-pkg-config", "llvm-devel", "clang", "clang-devel", \

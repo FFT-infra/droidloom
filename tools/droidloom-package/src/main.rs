@@ -100,9 +100,13 @@ enum Action {
         /// ARM64 root filesystem providing the native libraries aarch64 links against.
         #[arg(long)]
         sysroot: Option<PathBuf>,
-        /// Reuse an existing package-stage payload (runtime/ and image/) and rebuild host binaries for Fedora.
+        /// Reuse an existing package-stage payload (runtime/, image/ and base/). Host binaries are
+        /// rebuilt for Fedora when the payload matches this machine's architecture and kept otherwise.
         #[arg(long)]
         payload: Option<PathBuf>,
+        /// Fedora release of the builder container and of the RPMs' dist tag.
+        #[arg(long)]
+        fedora_release: Option<u32>,
         #[arg(long)]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -1055,6 +1059,7 @@ fn execute() -> Result<()> {
             architecture,
             sysroot,
             payload,
+            fedora_release,
             source,
             jobs,
             cpuset,
@@ -1066,6 +1071,7 @@ fn execute() -> Result<()> {
             architecture,
             sysroot,
             payload,
+            fedora_release,
             jobs,
             cpuset,
             clean,
