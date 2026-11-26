@@ -31,3 +31,4 @@ cp -al "%{stage_dir}/usr" "%{buildroot}/usr"
 /usr/lib/droidloom/images
 /usr/lib/droidloom/current
 /usr/share/licenses/droidloom-image
+/usr/share/licenses/droidloom-base
