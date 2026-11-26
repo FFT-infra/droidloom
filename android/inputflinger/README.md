@@ -45,7 +45,7 @@ whose US characters would replace the layout's symbols. Its character map also
 remaps the scan code where that layout moves keys; otherwise the receiver's
 US-position key code stands.
 
-The receiver validates input ABI 7 and rejects stale incarnations. It sleeps in
+The receiver validates input ABI 9 and rejects stale incarnations. It sleeps in
 socket polling at idle, cancels keys/gestures on disconnect or route retirement,
 and retains Binder tokens through cancellation dispatch. Native input ABI 2
 metadata prevents mixed framework/Composer builds. The Wayland presenter writes

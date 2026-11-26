@@ -293,7 +293,7 @@ For manual desktop acceptance after activating a matching build:
 Routed input is received inside `libinputflinger`. Rust owns its listening socket
 below `/dev/socket/droidloom-framework`, a system-owned private directory. The
 existing policy's systemReady hook starts it without a support process or FD relay.
-The Rust receiver validates fixed 48-byte input ABI 7 records, including the
+The Rust receiver validates fixed 48-byte input ABI 9 records, including the
 framework task incarnation, and tracks gestures, repeats and modifiers. A small
 C++ adapter constructs native Android events and calls the existing targeted
 InputDispatcher entry point without the support bridge's per-event Java objects
