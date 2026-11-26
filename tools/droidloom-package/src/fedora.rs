@@ -262,8 +262,11 @@ pub fn build_rpm(
     }
     if let Some(payload) = payload {
         let payload = payload.canonicalize()?;
-        if !payload.join("runtime").is_dir() || !payload.join("image").is_dir() {
-            return Err("--payload must point to a package-stage directory containing runtime/ and image/".into());
+        if ["runtime", "image", "base"]
+            .iter()
+            .any(|part| !payload.join(part).is_dir())
+        {
+            return Err("--payload must point to a package-stage directory containing runtime/, image/ and base/".into());
         }
         container
             .arg("--volume")
@@ -472,6 +475,9 @@ pub fn prepare_fedora_stage(
 ) -> Result<()> {
     install_tree(&payload.join("runtime"), stage_runtime)?;
     install_tree(&payload.join("image"), stage_image)?;
+    // package-stage keeps system, system_ext and product apart for Arch's
+    // droidloom-base. Fedora has no such package: the image RPM carries them.
+    install_tree(&payload.join("base"), stage_image)?;
 
     let alpm_hooks = stage_runtime.join("usr/share/libalpm");
     if alpm_hooks.exists() {
@@ -585,11 +591,16 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(img.join("usr/lib/droidloom/runtime/compat")).unwrap();
+        let partitions = payload.join("base/usr/lib/droidloom/images/images");
+        fs::create_dir_all(&partitions).unwrap();
+        fs::write(partitions.join("system.img"), b"system").unwrap();
 
         let stage_runtime = temp.path().join("stage-runtime");
         let stage_image = temp.path().join("stage-image");
         prepare_fedora_stage(&repo, &payload, &stage_runtime, &stage_image, Architecture::X86_64)
             .unwrap();
+
+        assert!(stage_image.join("usr/lib/droidloom/images/images/system.img").is_file());
 
         assert!(!stage_runtime.join("usr/share/libalpm").exists());
         assert!(stage_runtime.join("usr/share/selinux/packages/droidloom_fedora.pp").is_file());
@@ -629,6 +640,8 @@ mod tests {
             "ro.hardware.egl=mesa\n",
         )
         .unwrap();
+
+        fs::create_dir_all(payload.join("base")).unwrap();
 
         let stage_runtime = temp.path().join("stage-runtime");
         let stage_image = temp.path().join("stage-image");
