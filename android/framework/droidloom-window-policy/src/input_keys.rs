@@ -116,8 +116,9 @@ pub(super) fn android_keycode(scan: u32) -> Option<i32> {
         263 => 195, // BUTTON_8 (Double-tap / 双击)
         264 => 196, // BUTTON_9 (Slide Up / 上滑)
         265 => 197, // BUTTON_10 (Slide Down / 下滑)
-        331 => 308, // STYLUS_BUTTON_PRIMARY (书写键), as in Generic.kl
-        332 => 309, // STYLUS_BUTTON_SECONDARY (批注键), as in Generic.kl
+        // Xiaomi's pen key codes, the ones apps on a Xiaomi tablet act on.
+        331 => 194, // BUTTON_7 (pen button 1, Focus Pen Pro pinch)
+        332 => 195, // BUTTON_8 (pen button 2, Focus Pen Pro double-tap)
         0x113 | 0x116 => 4, // Mouse side/back button navigation
         0x114 | 0x115 => 125, // Mouse extra/forward button navigation
         _ => return None,
@@ -134,7 +135,7 @@ mod tests {
         assert_eq!(android_keycode(263), Some(195));
         assert_eq!(android_keycode(264), Some(196));
         assert_eq!(android_keycode(265), Some(197));
-        assert_eq!(android_keycode(331), Some(308));
-        assert_eq!(android_keycode(332), Some(309));
+        assert_eq!(android_keycode(331), Some(194));
+        assert_eq!(android_keycode(332), Some(195));
     }
 }
