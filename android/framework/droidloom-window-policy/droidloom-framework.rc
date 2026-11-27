@@ -20,6 +20,12 @@ on post-fs-data
     # profile-only compilation. Inactive-app storage reclamation is unchanged.
     setprop pm.dexopt.bg-dexopt speed
 
+# Apps that bundle Xiaomi's pen SDK look for its jar in /system_ext/framework
+# before they act on the pen's pinch and slide keys. The directory holds
+# Droidloom's own jar of that name and nothing else.
+on post-fs-data && property:ro.product.manufacturer=Xiaomi
+    mount overlay overlay /system_ext/framework ro lowerdir=/droidloom/ime/xiaomi-pen:/system_ext/framework
+
 # Some apps check the chip or GPU driver by name, as a game's Qualcomm frame
 # generation does. A phone keeps its stock names in these persistent
 # properties; init copies them at every start, before zygote. ro.soc.model

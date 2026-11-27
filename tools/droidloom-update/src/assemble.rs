@@ -390,6 +390,10 @@ pub fn assemble_artifacts(
             "systemui/SystemUI.apk",
         ),
         (
+            "system/framework/xiaomi-pencilengine-pad.jar",
+            "ime/xiaomi-pen/xiaomi-pencilengine-pad.jar",
+        ),
+        (
             "system/system_ext/bin/droidloom-wificond",
             "wifi/wificond",
         ),

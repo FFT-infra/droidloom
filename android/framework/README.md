@@ -20,6 +20,17 @@ and change provisioning before the next boot.
 The existing composer init file imports `/droidloom/ime/droidloom-home.rc`, so
 provisioning does not require adding a file to the immutable vendor image.
 
+`xiaomi-pen-engine` is for apps that bundle Xiaomi's pen SDK, as the note app
+StarNote does. On a Xiaomi host Android is named after the host, so such an app
+looks for `/system_ext/framework/xiaomi-pencilengine-pad.jar` and loads five
+classes from it before it acts on the pen's pinch and slide keys. The jar here
+has those class and method names and Droidloom's own code: stroke prediction,
+shape snapping and handwriting recognition report themselves off, and the
+licence check does nothing. It ships in `/droidloom/ime/xiaomi-pen`, and
+`droidloom-framework.rc` mounts that directory over `/system_ext/framework` as
+a read-only overlay when `ro.product.manufacturer` is `Xiaomi`. Tested with
+StarNote and SELinux disabled; not tested with SELinux enforcing.
+
 `droidloom-systemui` replaces the stock SystemUI APK with a platform-signed,
 persistent service built from scratch. It registers the pinned `IStatusBar`
 interface and implements the minimum keyguard boot callbacks, with no windows,

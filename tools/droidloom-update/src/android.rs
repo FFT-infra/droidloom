@@ -13,6 +13,7 @@ pub const TARGETS: &[&str] = &[
     "DroidloomIME",
     "DroidloomHome",
     "DroidloomSystemUI",
+    "xiaomi-pencilengine-pad",
     "droidloom-wificond",
     "droidloom-lmkd-compat",
     "droidloom-classpath-wrapper",

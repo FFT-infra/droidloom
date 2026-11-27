@@ -95,6 +95,21 @@ java_library {
     lint: { enabled: false },
 }
 
+// Apps that bundle Xiaomi's pen SDK send the pen's pinch and slide keys to
+// their own handlers only after they loaded these classes from a jar of this
+// name in /system_ext/framework. The classes are written for Droidloom; every
+// feature of the SDK reports itself off. droidloom-framework.rc shows the jar
+// to Android on a Xiaomi host only.
+java_library {
+    name: "xiaomi-pencilengine-pad",
+    srcs: ["android/framework/xiaomi-pen-engine/src/**/*.java"],
+    sdk_version: "37",
+    installable: true,
+    dex_preopt: { enabled: false },
+    optimize: { enabled: false },
+    lint: { enabled: false },
+}
+
 // Safe, Binder-independent state used by the Android Composer service. These
 // modules are vendor-only: Droidloom reuses the pinned AOSP system partitions
 // and builds its own vendor partition.
