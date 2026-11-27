@@ -44,7 +44,8 @@ status bar is shown with `xdg_toplevel` fullscreen
 may hide its own bar over it.
 Android's own keyboard and cutout sources retain their own policy. The host's
 on-screen keyboard is a separate IME source with its own id, added only while
-the host reports a height for the window's task
+the host reports a height for the window's task, and then in place of
+Android's own, hidden one
 ([architecture](../architecture.md#on-screen-keyboard)); `WindowMetrics` never
 include it. No tappable
 inset or Android system-bar window is created. Drawing the bars and
@@ -61,6 +62,13 @@ the task's display. With Shell transitions enabled, that API collects the task
 into a synchronized resize transition so its configuration and surface crop
 update together. The resize path supports unorganized tasks in the minimal
 SystemUI configuration as well as organized tasks.
+
+The host owns a task's bounds once it has sized it. Android lays a task out
+again whenever an activity is started into it, as when its app is opened while
+it runs, and would give it the bounds the app's manifest asks for; a launch
+params modifier of the task backend, asked before Android's own, answers with
+the host's bounds for such a task, so its window and the host's stay the same
+size.
 
 ## Build and packaging
 
@@ -113,7 +121,8 @@ authorized installation; rebuilding alone does not change a running cell.
 The patch adds `WmTests:DroidloomSystemBarInsetsTest`. Run that target from a
 framework-capable Android build with the patch applied. It checks actual
 WindowInsets calculations, density, moved/resized/maximum bounds, replacement
-of hidden status/navigation sources, preservation of IME sources, idempotence,
+of hidden status/navigation sources, preservation of IME sources, the host
+keyboard's visibility beside Android's hidden keyboard source, idempotence,
 freeform immersive windows, metrics, lack of hide/show control, and confinement
 to Droidloom app windows.
 
