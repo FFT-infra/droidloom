@@ -188,7 +188,11 @@ bool DroidloomInput::inject(uintptr_t context, const DroidloomInputEvent* event,
         motion.initialize(ids.nextId(), 0,
                 mouse ? AINPUT_SOURCE_MOUSE : stylus ? AINPUT_SOURCE_STYLUS : AINPUT_SOURCE_TOUCHSCREEN, ui::LogicalDisplayId{event->display},
                 {}, event->action, mouse ? event->keyCode : stylus ? event->scanCode : 0,
-                ftl::Flags<MotionFlag>((mouse || stylus) ? 0 : event->flags), 0,
+                // Android reports orientation as 0 unless the event says its
+                // device supports it, and a pen's tilt direction is a full circle.
+                stylus ? ftl::Flags<MotionFlag>{MotionFlag::SUPPORTS_ORIENTATION,
+                                                MotionFlag::SUPPORTS_DIRECTIONAL_ORIENTATION}
+                       : ftl::Flags<MotionFlag>(mouse ? 0 : event->flags), 0,
                 (mouse || stylus) ? event->meta : 0, (mouse || stylus) ? event->flags : 0, MotionClassification::NONE,
                 ui::Transform{}, 1.0f, 1.0f,
                 mouse ? event->pointers[0].x : AMOTION_EVENT_INVALID_CURSOR_POSITION,
