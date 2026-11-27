@@ -3444,7 +3444,9 @@ impl PointerHandler for App {
                     scroll_time = scroll_time.max(time);
                     scrolled = Some((object, event.position));
                 }
-                PointerEventKind::Press { button, time, .. } if matches!(button, 262..=265) => {
+                PointerEventKind::Press { button, time, .. }
+                    if matches!(button, 262..=265 | 0x113..=0x116) =>
+                {
                     if let Some(target) = object.or(self.focused) {
                         let _ = self.input_time(input_time::Device::Pointer, time).and_then(|t| {
                             self.send_input(
@@ -3459,7 +3461,9 @@ impl PointerHandler for App {
                         });
                     }
                 }
-                PointerEventKind::Release { button, time, .. } if matches!(button, 262..=265) => {
+                PointerEventKind::Release { button, time, .. }
+                    if matches!(button, 262..=265 | 0x113..=0x116) =>
+                {
                     if let Some(target) = object.or(self.focused) {
                         let _ = self.input_time(input_time::Device::Pointer, time).and_then(|t| {
                             self.send_input(

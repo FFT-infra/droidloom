@@ -440,13 +440,19 @@ impl Engine {
                 }
             }
             6 => {
-                for bit in [1, 2] {
-                    if (pen.buttons ^ buttons) & bit != 0 {
-                        actions.push((
-                            if buttons & bit != 0 { 11 } else { 12 },
-                            i32::from(bit) << 5,
-                        ));
+                if pen.down {
+                    for bit in [1, 2] {
+                        if (pen.buttons ^ buttons) & bit != 0 {
+                            actions.push((
+                                if buttons & bit != 0 { 11 } else { 12 },
+                                i32::from(bit) << 5,
+                            ));
+                        }
                     }
+                } else if pen.hovering {
+                    // Android drops a button press or release from a pointer that is not
+                    // down. A hovering pen carries its buttons in buttonState.
+                    actions.push((7, 0));
                 }
             }
             _ => return Err("stylus action"),
@@ -989,6 +995,37 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(engine.reset(200)[0].event.action, 10);
+    }
+
+    #[test]
+    fn hovering_pen_reports_buttons_in_button_state_only() {
+        let mut engine = Engine::default();
+        engine.publish(target(), 1);
+        engine.process_batch(pen(0, 9, false, 0)).unwrap();
+        let press = engine.process_batch(pen(6, 9, false, 2)).unwrap();
+        assert_eq!(
+            press
+                .iter()
+                .map(|r| (r.event.action, r.event.scan_code, r.event.flags))
+                .collect::<Vec<_>>(),
+            [(7, 0, 64)]
+        );
+        // The button is already held when the pen touches, so no press follows.
+        let down = engine.process_batch(pen(3, 9, false, 2)).unwrap();
+        assert_eq!(
+            down.iter()
+                .map(|r| (r.event.action, r.event.flags))
+                .collect::<Vec<_>>(),
+            [(10, 64), (0, 64)]
+        );
+        let release = engine.process_batch(pen(6, 9, false, 0)).unwrap();
+        assert_eq!(
+            release
+                .iter()
+                .map(|r| (r.event.action, r.event.scan_code, r.event.flags))
+                .collect::<Vec<_>>(),
+            [(12, 64, 0)]
+        );
     }
 
     #[test]
